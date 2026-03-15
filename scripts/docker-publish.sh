@@ -224,7 +224,7 @@ if [[ "$USE_CROSS" == "false" ]]; then
             --platform "${platform}" \
             --file docker/Dockerfile \
             --tag "${tag}" \
-            "${proxy_args[@]}" \
+            ${proxy_args[@]+"${proxy_args[@]}"} \
             ${action} \
             .
     }
@@ -298,7 +298,7 @@ else
             --file docker/Dockerfile.prebuilt \
             --build-arg "BINARY_PATH=${binary_path}" \
             --tag "${tag}" \
-            "${proxy_args[@]}" \
+            ${proxy_args[@]+"${proxy_args[@]}"} \
             ${action} \
             .
     }
