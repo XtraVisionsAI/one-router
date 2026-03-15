@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  DOCKERHUB_REPO: xtravisions/one-router
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binary
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/one-router dist/
+          cd dist
+          tar czf ../one-router-${{ matrix.target }}.tar.gz one-router
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: one-router-${{ matrix.target }}.tar.gz
+
+  docker:
+    name: Docker images
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-amd64
+          path: artifacts/
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-arm64
+          path: artifacts/
+
+      - name: Extract binaries
+        run: |
+          mkdir -p binaries/amd64 binaries/arm64
+          tar xzf artifacts/one-router-x86_64-unknown-linux-gnu.tar.gz -C binaries/amd64/
+          tar xzf artifacts/one-router-aarch64-unknown-linux-gnu.tar.gz -C binaries/arm64/
+
+      - name: Extract version tag
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build and push per-platform images, then create manifests
+      - name: Build and push amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.prebuilt
+          platforms: linux/amd64
+          build-args: BINARY_PATH=binaries/amd64/one-router
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.version.outputs.tag }}-amd64
+
+      - name: Build and push arm64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.prebuilt
+          platforms: linux/arm64
+          build-args: BINARY_PATH=binaries/arm64/one-router
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.version.outputs.tag }}-arm64
+
+      - name: Create and push multi-arch manifests
+        run: |
+          TAG=${{ steps.version.outputs.tag }}
+          docker buildx imagetools create -t ${{ env.DOCKERHUB_REPO }}:${TAG} \
+            ${{ env.DOCKERHUB_REPO }}:${TAG}-amd64 \
+            ${{ env.DOCKERHUB_REPO }}:${TAG}-arm64
+          docker buildx imagetools create -t ${{ env.DOCKERHUB_REPO }}:latest \
+            ${{ env.DOCKERHUB_REPO }}:${TAG}-amd64 \
+            ${{ env.DOCKERHUB_REPO }}:${TAG}-arm64
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/binary-amd64/*.tar.gz
+            artifacts/binary-arm64/*.tar.gz

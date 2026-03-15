@@ -1,0 +1,109 @@
+//! Storage data models
+//!
+//! Database-agnostic data structures for all 5 tables.
+
+use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// api_keys
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyRecord {
+    pub api_key: String,
+    pub user_id: String,
+    pub name: String,
+    pub is_active: bool,
+    pub rate_limit: i32,
+    pub service_tier: String,
+    pub monthly_budget: Option<f64>,
+    pub budget_used: f64,
+    pub budget_used_mtd: f64,
+    pub budget_mtd_month: Option<String>,
+    pub deactivated_reason: Option<String>,
+    pub tpm_limit: Option<i32>,
+    pub metadata: Option<String>, // JSON
+    pub created_at: i64,
+    pub updated_at: Option<i64>,
+}
+
+impl ApiKeyRecord {
+    pub fn is_valid(&self) -> bool {
+        self.is_active
+    }
+
+    pub fn is_budget_exceeded(&self) -> bool {
+        self.deactivated_reason.as_deref() == Some("budget_exceeded")
+    }
+}
+
+// ============================================================================
+// usage
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub id: Option<i64>,
+    pub api_key: String,
+    pub timestamp: String,
+    pub request_id: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost: f64,
+    pub success: bool,
+    pub duration_ms: Option<i64>,
+    pub error_message: Option<String>,
+}
+
+// ============================================================================
+// model_mappings
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMappingRecord {
+    pub source_model_id: String,
+    pub target_model_id: String,
+    pub provider: String,
+    pub display_name: String,
+    pub input_price: f64,
+    pub output_price: f64,
+    pub cache_read_price: f64,
+    pub cache_write_price: f64,
+    pub priority: i32,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: Option<i64>,
+}
+
+// ============================================================================
+// backends
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendRecord {
+    pub name: String,
+    pub backend_type: String, // "bedrock" / "gemini"
+    pub config: String,       // JSON (possibly encrypted fields)
+    pub enabled: bool,
+    pub priority: i32,
+    pub health_status: String,
+    pub last_health_check: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: Option<i64>,
+}
+
+// ============================================================================
+// feature_flags
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureFlagRecord {
+    pub name: String,
+    pub enabled: bool,
+    pub description: String,
+    pub created_at: i64,
+    pub updated_at: Option<i64>,
+}

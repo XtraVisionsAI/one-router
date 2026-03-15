@@ -1,0 +1,46 @@
+# Download pre-compiled binary from GitHub Release
+FROM debian:bookworm-slim
+
+ARG VERSION
+ARG TARGETARCH
+ARG GITHUB_REPO=xtravisions/one-router
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Map Docker TARGETARCH to release artifact naming
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) ARCH="x86_64-unknown-linux-gnu" ;; \
+        arm64) ARCH="aarch64-unknown-linux-gnu" ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/one-router-${ARCH}.tar.gz" \
+        | tar -xzf - -C /usr/local/bin/; \
+    chmod +x /usr/local/bin/one-router
+
+# Keep curl for healthcheck (already installed for download)
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
+WORKDIR /app
+
+# Create data directory for SQLite with correct permissions
+RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
+
+# Default environment
+ENV DATABASE=sqlite:///app/data/gateway.db
+ENV PORT=8000
+ENV LOG_LEVEL=info
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+USER appuser
+
+CMD ["one-router"]

@@ -1,0 +1,46 @@
+services:
+  # Default: SQLite mode (zero-config local development)
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE: sqlite:///app/data/gateway.db
+      PORT: "8000"
+      LOG_LEVEL: info
+    volumes:
+      - gateway-data:/app/data
+    restart: unless-stopped
+
+  # DynamoDB mode (use with: docker compose --profile dynamodb up)
+  gateway-dynamodb:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE: dynamodb://us-east-1
+      PORT: "8000"
+      LOG_LEVEL: info
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_ENDPOINT_URL: http://dynamodb-local:8000
+    depends_on:
+      dynamodb-local:
+        condition: service_started
+    profiles:
+      - dynamodb
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    ports:
+      - "8001:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    profiles:
+      - dynamodb
+
+volumes:
+  gateway-data:

@@ -1,0 +1,990 @@
+//! SQLite storage backend
+//!
+//! Zero-configuration storage using a local SQLite file.
+//! Implements all five sub-store traits on a single `SqliteBackend` struct.
+
+use anyhow::Result;
+use async_trait::async_trait;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Row, SqlitePool};
+use std::path::Path;
+use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::database::models::*;
+use crate::database::traits::*;
+
+/// SQLite-backed storage.
+///
+/// Holds an async connection pool and implements every sub-store trait
+/// so that `DatabaseService` can simply return `&self` for each accessor.
+#[derive(Debug, Clone)]
+pub struct SqliteBackend {
+    pool: SqlitePool,
+}
+
+impl SqliteBackend {
+    /// Create a new SQLite backend.
+    ///
+    /// * Creates parent directories if they don't exist.
+    /// * Opens (or creates) the database file via `?mode=rwc`.
+    /// * Does NOT call `initialize()` — that is done once by `app.rs`.
+    pub async fn new(path: &str) -> Result<Self> {
+        // Ensure parent directory exists
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}?mode=rwc", path))?
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+
+        let backend = Self { pool };
+
+        tracing::info!(path = %path, "SQLite backend connected");
+        Ok(backend)
+    }
+
+    /// Run schema DDL (CREATE TABLE IF NOT EXISTS).
+    async fn run_migrations(&self) -> Result<()> {
+        // --- api_keys ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS api_keys (
+                api_key TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT DEFAULT '',
+                is_active INTEGER DEFAULT 1,
+                rate_limit INTEGER DEFAULT 100,
+                service_tier TEXT DEFAULT 'default',
+                monthly_budget REAL,
+                budget_used REAL DEFAULT 0.0,
+                budget_used_mtd REAL DEFAULT 0.0,
+                budget_mtd_month TEXT,
+                deactivated_reason TEXT,
+                tpm_limit INTEGER,
+                metadata TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // --- usage ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cached_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                cost REAL DEFAULT 0.0,
+                success INTEGER DEFAULT 1,
+                duration_ms INTEGER,
+                error_message TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_api_key_ts ON usage(api_key, timestamp)")
+            .execute(&self.pool)
+            .await?;
+
+        // --- model_mappings ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS model_mappings (
+                source_model_id TEXT NOT NULL,
+                target_model_id TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT '',
+                display_name TEXT DEFAULT '',
+                input_price REAL DEFAULT 0.0,
+                output_price REAL DEFAULT 0.0,
+                cache_read_price REAL DEFAULT 0.0,
+                cache_write_price REAL DEFAULT 0.0,
+                priority INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER,
+                PRIMARY KEY (source_model_id, provider)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Migration: handle old table with single-column PK
+        self.migrate_model_mappings().await?;
+
+        // --- backends ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS backends (
+                name TEXT PRIMARY KEY,
+                backend_type TEXT NOT NULL,
+                config TEXT NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                priority INTEGER DEFAULT 0,
+                health_status TEXT DEFAULT 'unknown',
+                last_health_check INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // --- feature_flags ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS feature_flags (
+                name TEXT PRIMARY KEY,
+                enabled INTEGER DEFAULT 0,
+                description TEXT DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Migrate old model_mappings table (single PK) to new schema (composite PK + priority).
+    async fn migrate_model_mappings(&self) -> Result<()> {
+        // Check if priority column exists
+        let rows = sqlx::query("PRAGMA table_info(model_mappings)")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let has_priority = rows.iter().any(|r| {
+            let name: String = r.get("name");
+            name == "priority"
+        });
+
+        if !has_priority {
+            tracing::info!(
+                "Migrating model_mappings table to new schema (composite PK + priority)"
+            );
+
+            // Rename old table
+            sqlx::query("ALTER TABLE model_mappings RENAME TO model_mappings_old")
+                .execute(&self.pool)
+                .await?;
+
+            // Create new table with composite PK
+            sqlx::query(
+                "CREATE TABLE model_mappings (
+                    source_model_id TEXT NOT NULL,
+                    target_model_id TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT '',
+                    display_name TEXT DEFAULT '',
+                    input_price REAL DEFAULT 0.0,
+                    output_price REAL DEFAULT 0.0,
+                    cache_read_price REAL DEFAULT 0.0,
+                    cache_write_price REAL DEFAULT 0.0,
+                    priority INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'active',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER,
+                    PRIMARY KEY (source_model_id, provider)
+                )",
+            )
+            .execute(&self.pool)
+            .await?;
+
+            // Migrate data
+            sqlx::query(
+                "INSERT INTO model_mappings \
+                 (source_model_id, target_model_id, provider, display_name, \
+                  input_price, output_price, cache_read_price, cache_write_price, \
+                  priority, status, created_at, updated_at) \
+                 SELECT source_model_id, target_model_id, provider, display_name, \
+                  input_price, output_price, cache_read_price, cache_write_price, \
+                  0, status, created_at, updated_at \
+                 FROM model_mappings_old",
+            )
+            .execute(&self.pool)
+            .await?;
+
+            // Drop old table
+            sqlx::query("DROP TABLE model_mappings_old")
+                .execute(&self.pool)
+                .await?;
+
+            tracing::info!("model_mappings migration completed");
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Helper: current unix timestamp
+// ============================================================================
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs() as i64
+}
+
+// ============================================================================
+// DatabaseService
+// ============================================================================
+
+#[async_trait]
+impl DatabaseService for SqliteBackend {
+    fn api_keys(&self) -> &dyn ApiKeyStore {
+        self
+    }
+
+    fn usage(&self) -> &dyn UsageStore {
+        self
+    }
+
+    fn model_mapping(&self) -> &dyn ModelMappingStore {
+        self
+    }
+
+    fn backends(&self) -> &dyn BackendConfigStore {
+        self
+    }
+
+    fn feature_flags(&self) -> &dyn FeatureFlagStore {
+        self
+    }
+
+    async fn initialize(&self) -> Result<()> {
+        self.run_migrations().await?;
+        self.seed_defaults().await?;
+        Ok(())
+    }
+
+    async fn health_check(&self) -> bool {
+        sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
+    }
+}
+
+// ============================================================================
+// ApiKeyStore
+// ============================================================================
+
+#[async_trait]
+impl ApiKeyStore for SqliteBackend {
+    async fn get_api_key(&self, api_key: &str) -> Result<Option<ApiKeyRecord>> {
+        let row = sqlx::query(
+            "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
+             monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
+             deactivated_reason, tpm_limit, metadata, created_at, updated_at \
+             FROM api_keys WHERE api_key = ?",
+        )
+        .bind(api_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(ApiKeyRecord {
+                api_key: r.get("api_key"),
+                user_id: r.get("user_id"),
+                name: r.get("name"),
+                is_active: r.get::<i32, _>("is_active") != 0,
+                rate_limit: r.get("rate_limit"),
+                service_tier: r.get("service_tier"),
+                monthly_budget: r.get("monthly_budget"),
+                budget_used: r.get("budget_used"),
+                budget_used_mtd: r.get("budget_used_mtd"),
+                budget_mtd_month: r.get("budget_mtd_month"),
+                deactivated_reason: r.get("deactivated_reason"),
+                tpm_limit: r.get("tpm_limit"),
+                metadata: r.get("metadata"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO api_keys \
+             (api_key, user_id, name, is_active, rate_limit, service_tier, \
+              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
+              deactivated_reason, tpm_limit, metadata, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&record.api_key)
+        .bind(&record.user_id)
+        .bind(&record.name)
+        .bind(record.is_active as i32)
+        .bind(record.rate_limit)
+        .bind(&record.service_tier)
+        .bind(record.monthly_budget)
+        .bind(record.budget_used)
+        .bind(record.budget_used_mtd)
+        .bind(&record.budget_mtd_month)
+        .bind(&record.deactivated_reason)
+        .bind(record.tpm_limit)
+        .bind(&record.metadata)
+        .bind(record.created_at)
+        .bind(record.updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "UPDATE api_keys SET \
+             user_id = ?, name = ?, is_active = ?, rate_limit = ?, service_tier = ?, \
+             monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
+             deactivated_reason = ?, tpm_limit = ?, metadata = ?, updated_at = ? \
+             WHERE api_key = ?",
+        )
+        .bind(&record.user_id)
+        .bind(&record.name)
+        .bind(record.is_active as i32)
+        .bind(record.rate_limit)
+        .bind(&record.service_tier)
+        .bind(record.monthly_budget)
+        .bind(record.budget_used)
+        .bind(record.budget_used_mtd)
+        .bind(&record.budget_mtd_month)
+        .bind(&record.deactivated_reason)
+        .bind(record.tpm_limit)
+        .bind(&record.metadata)
+        .bind(now)
+        .bind(&record.api_key)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn deactivate_api_key(&self, api_key: &str, reason: &str) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "UPDATE api_keys SET is_active = 0, deactivated_reason = ?, updated_at = ? \
+             WHERE api_key = ?",
+        )
+        .bind(reason)
+        .bind(now)
+        .bind(api_key)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<bool> {
+        let now = unix_now();
+
+        // Atomically increment budget_used and budget_used_mtd, then check if
+        // the new total exceeds monthly_budget (if one is set).
+        let result = sqlx::query(
+            "UPDATE api_keys SET \
+             budget_used = budget_used + ?, \
+             budget_used_mtd = budget_used_mtd + ?, \
+             updated_at = ? \
+             WHERE api_key = ?",
+        )
+        .bind(amount)
+        .bind(amount)
+        .bind(now)
+        .bind(api_key)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            anyhow::bail!("api_key not found: {api_key}");
+        }
+
+        // Check if budget is now exceeded
+        let row = sqlx::query("SELECT monthly_budget, budget_used FROM api_keys WHERE api_key = ?")
+            .bind(api_key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        if let Some(r) = row {
+            let budget: Option<f64> = r.get("monthly_budget");
+            let used: f64 = r.get("budget_used");
+            if let Some(limit) = budget {
+                if used >= limit {
+                    return Ok(true); // budget exceeded
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
+        let rows = sqlx::query(
+            "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
+             monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
+             deactivated_reason, tpm_limit, metadata, created_at, updated_at \
+             FROM api_keys ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let records = rows
+            .iter()
+            .map(|r| ApiKeyRecord {
+                api_key: r.get("api_key"),
+                user_id: r.get("user_id"),
+                name: r.get("name"),
+                is_active: r.get::<i32, _>("is_active") != 0,
+                rate_limit: r.get("rate_limit"),
+                service_tier: r.get("service_tier"),
+                monthly_budget: r.get("monthly_budget"),
+                budget_used: r.get("budget_used"),
+                budget_used_mtd: r.get("budget_used_mtd"),
+                budget_mtd_month: r.get("budget_mtd_month"),
+                deactivated_reason: r.get("deactivated_reason"),
+                tpm_limit: r.get("tpm_limit"),
+                metadata: r.get("metadata"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+
+        Ok(records)
+    }
+}
+
+// ============================================================================
+// UsageStore
+// ============================================================================
+
+#[async_trait]
+impl UsageStore for SqliteBackend {
+    async fn record_usage(&self, record: &UsageRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO usage \
+             (api_key, timestamp, request_id, model, input_tokens, output_tokens, \
+              cached_tokens, cache_write_tokens, cost, success, duration_ms, error_message) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&record.api_key)
+        .bind(&record.timestamp)
+        .bind(&record.request_id)
+        .bind(&record.model)
+        .bind(record.input_tokens)
+        .bind(record.output_tokens)
+        .bind(record.cached_tokens)
+        .bind(record.cache_write_tokens)
+        .bind(record.cost)
+        .bind(record.success as i32)
+        .bind(record.duration_ms)
+        .bind(&record.error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_usage_by_api_key(
+        &self,
+        api_key: &str,
+        since: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Vec<UsageRecord>> {
+        let rows = match (since, limit) {
+            (Some(since_ts), Some(lim)) => {
+                sqlx::query(
+                    "SELECT id, api_key, timestamp, request_id, model, \
+                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
+                     cost, success, duration_ms, error_message \
+                     FROM usage WHERE api_key = ? AND timestamp >= ? \
+                     ORDER BY timestamp DESC LIMIT ?",
+                )
+                .bind(api_key)
+                .bind(since_ts)
+                .bind(lim)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(since_ts), None) => {
+                sqlx::query(
+                    "SELECT id, api_key, timestamp, request_id, model, \
+                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
+                     cost, success, duration_ms, error_message \
+                     FROM usage WHERE api_key = ? AND timestamp >= ? \
+                     ORDER BY timestamp DESC",
+                )
+                .bind(api_key)
+                .bind(since_ts)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(lim)) => {
+                sqlx::query(
+                    "SELECT id, api_key, timestamp, request_id, model, \
+                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
+                     cost, success, duration_ms, error_message \
+                     FROM usage WHERE api_key = ? \
+                     ORDER BY timestamp DESC LIMIT ?",
+                )
+                .bind(api_key)
+                .bind(lim)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query(
+                    "SELECT id, api_key, timestamp, request_id, model, \
+                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
+                     cost, success, duration_ms, error_message \
+                     FROM usage WHERE api_key = ? \
+                     ORDER BY timestamp DESC",
+                )
+                .bind(api_key)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        let records = rows
+            .iter()
+            .map(|r| UsageRecord {
+                id: r.get("id"),
+                api_key: r.get("api_key"),
+                timestamp: r.get("timestamp"),
+                request_id: r.get("request_id"),
+                model: r.get("model"),
+                input_tokens: r.get("input_tokens"),
+                output_tokens: r.get("output_tokens"),
+                cached_tokens: r.get("cached_tokens"),
+                cache_write_tokens: r.get("cache_write_tokens"),
+                cost: r.get("cost"),
+                success: r.get::<i32, _>("success") != 0,
+                duration_ms: r.get("duration_ms"),
+                error_message: r.get("error_message"),
+            })
+            .collect();
+
+        Ok(records)
+    }
+}
+
+// ============================================================================
+// ModelMappingStore
+// ============================================================================
+
+#[async_trait]
+impl ModelMappingStore for SqliteBackend {
+    async fn get_mappings(&self, source_model_id: &str) -> Result<Vec<ModelMappingRecord>> {
+        let rows = sqlx::query(
+            "SELECT source_model_id, target_model_id, provider, display_name, \
+             input_price, output_price, cache_read_price, cache_write_price, \
+             priority, status, created_at, updated_at \
+             FROM model_mappings WHERE source_model_id = ? ORDER BY priority DESC",
+        )
+        .bind(source_model_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let records = rows
+            .iter()
+            .map(|r| ModelMappingRecord {
+                source_model_id: r.get("source_model_id"),
+                target_model_id: r.get("target_model_id"),
+                provider: r.get("provider"),
+                display_name: r.get("display_name"),
+                input_price: r.get("input_price"),
+                output_price: r.get("output_price"),
+                cache_read_price: r.get("cache_read_price"),
+                cache_write_price: r.get("cache_write_price"),
+                priority: r.get("priority"),
+                status: r.get("status"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn get_mapping(
+        &self,
+        source_model_id: &str,
+        provider: &str,
+    ) -> Result<Option<ModelMappingRecord>> {
+        let row = sqlx::query(
+            "SELECT source_model_id, target_model_id, provider, display_name, \
+             input_price, output_price, cache_read_price, cache_write_price, \
+             priority, status, created_at, updated_at \
+             FROM model_mappings WHERE source_model_id = ? AND provider = ?",
+        )
+        .bind(source_model_id)
+        .bind(provider)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(ModelMappingRecord {
+                source_model_id: r.get("source_model_id"),
+                target_model_id: r.get("target_model_id"),
+                provider: r.get("provider"),
+                display_name: r.get("display_name"),
+                input_price: r.get("input_price"),
+                output_price: r.get("output_price"),
+                cache_read_price: r.get("cache_read_price"),
+                cache_write_price: r.get("cache_write_price"),
+                priority: r.get("priority"),
+                status: r.get("status"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_mappings(&self) -> Result<Vec<ModelMappingRecord>> {
+        let rows = sqlx::query(
+            "SELECT source_model_id, target_model_id, provider, display_name, \
+             input_price, output_price, cache_read_price, cache_write_price, \
+             priority, status, created_at, updated_at \
+             FROM model_mappings ORDER BY source_model_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let records = rows
+            .iter()
+            .map(|r| ModelMappingRecord {
+                source_model_id: r.get("source_model_id"),
+                target_model_id: r.get("target_model_id"),
+                provider: r.get("provider"),
+                display_name: r.get("display_name"),
+                input_price: r.get("input_price"),
+                output_price: r.get("output_price"),
+                cache_read_price: r.get("cache_read_price"),
+                cache_write_price: r.get("cache_write_price"),
+                priority: r.get("priority"),
+                status: r.get("status"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn upsert_mapping(&self, record: &ModelMappingRecord) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "INSERT INTO model_mappings \
+             (source_model_id, target_model_id, provider, display_name, \
+              input_price, output_price, cache_read_price, cache_write_price, \
+              priority, status, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(source_model_id, provider) DO UPDATE SET \
+             target_model_id = excluded.target_model_id, \
+             display_name = excluded.display_name, \
+             input_price = excluded.input_price, \
+             output_price = excluded.output_price, \
+             cache_read_price = excluded.cache_read_price, \
+             cache_write_price = excluded.cache_write_price, \
+             priority = excluded.priority, \
+             status = excluded.status, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(&record.source_model_id)
+        .bind(&record.target_model_id)
+        .bind(&record.provider)
+        .bind(&record.display_name)
+        .bind(record.input_price)
+        .bind(record.output_price)
+        .bind(record.cache_read_price)
+        .bind(record.cache_write_price)
+        .bind(record.priority)
+        .bind(&record.status)
+        .bind(record.created_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_mapping(&self, source_model_id: &str, provider: &str) -> Result<()> {
+        sqlx::query("DELETE FROM model_mappings WHERE source_model_id = ? AND provider = ?")
+            .bind(source_model_id)
+            .bind(provider)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn list_wildcard_mappings(&self) -> Result<Vec<ModelMappingRecord>> {
+        let rows = sqlx::query(
+            "SELECT source_model_id, target_model_id, provider, display_name, \
+             input_price, output_price, cache_read_price, cache_write_price, \
+             priority, status, created_at, updated_at \
+             FROM model_mappings WHERE source_model_id LIKE '%*%' AND status = 'active' \
+             ORDER BY priority DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let records = rows
+            .iter()
+            .map(|r| ModelMappingRecord {
+                source_model_id: r.get("source_model_id"),
+                target_model_id: r.get("target_model_id"),
+                provider: r.get("provider"),
+                display_name: r.get("display_name"),
+                input_price: r.get("input_price"),
+                output_price: r.get("output_price"),
+                cache_read_price: r.get("cache_read_price"),
+                cache_write_price: r.get("cache_write_price"),
+                priority: r.get("priority"),
+                status: r.get("status"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+
+        Ok(records)
+    }
+}
+
+// ============================================================================
+// BackendConfigStore
+// ============================================================================
+
+#[async_trait]
+impl BackendConfigStore for SqliteBackend {
+    async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
+        let row = sqlx::query(
+            "SELECT name, backend_type, config, enabled, priority, \
+             health_status, last_health_check, created_at, updated_at \
+             FROM backends WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(BackendRecord {
+                name: r.get("name"),
+                backend_type: r.get("backend_type"),
+                config: r.get("config"),
+                enabled: r.get::<i32, _>("enabled") != 0,
+                priority: r.get("priority"),
+                health_status: r.get("health_status"),
+                last_health_check: r.get("last_health_check"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
+        let rows = sqlx::query(
+            "SELECT name, backend_type, config, enabled, priority, \
+             health_status, last_health_check, created_at, updated_at \
+             FROM backends WHERE enabled = 1 ORDER BY priority DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let records = rows
+            .iter()
+            .map(|r| BackendRecord {
+                name: r.get("name"),
+                backend_type: r.get("backend_type"),
+                config: r.get("config"),
+                enabled: true,
+                priority: r.get("priority"),
+                health_status: r.get("health_status"),
+                last_health_check: r.get("last_health_check"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
+        let rows = sqlx::query(
+            "SELECT name, backend_type, config, enabled, priority, \
+             health_status, last_health_check, created_at, updated_at \
+             FROM backends ORDER BY priority DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let records = rows
+            .iter()
+            .map(|r| BackendRecord {
+                name: r.get("name"),
+                backend_type: r.get("backend_type"),
+                config: r.get("config"),
+                enabled: r.get::<i32, _>("enabled") != 0,
+                priority: r.get("priority"),
+                health_status: r.get("health_status"),
+                last_health_check: r.get("last_health_check"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn upsert_backend(&self, record: &BackendRecord) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "INSERT INTO backends \
+             (name, backend_type, config, enabled, priority, \
+              health_status, last_health_check, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(name) DO UPDATE SET \
+             backend_type = excluded.backend_type, \
+             config = excluded.config, \
+             enabled = excluded.enabled, \
+             priority = excluded.priority, \
+             health_status = excluded.health_status, \
+             last_health_check = excluded.last_health_check, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(&record.name)
+        .bind(&record.backend_type)
+        .bind(&record.config)
+        .bind(record.enabled as i32)
+        .bind(record.priority)
+        .bind(&record.health_status)
+        .bind(record.last_health_check)
+        .bind(record.created_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_backend(&self, name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM backends WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn update_health_status(&self, name: &str, status: &str) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "UPDATE backends SET health_status = ?, last_health_check = ?, updated_at = ? \
+             WHERE name = ?",
+        )
+        .bind(status)
+        .bind(now)
+        .bind(now)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// FeatureFlagStore
+// ============================================================================
+
+#[async_trait]
+impl FeatureFlagStore for SqliteBackend {
+    async fn get_flag(&self, name: &str) -> Result<Option<FeatureFlagRecord>> {
+        let row = sqlx::query(
+            "SELECT name, enabled, description, created_at, updated_at \
+             FROM feature_flags WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(FeatureFlagRecord {
+                name: r.get("name"),
+                enabled: r.get::<i32, _>("enabled") != 0,
+                description: r.get("description"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn is_enabled(&self, name: &str) -> Result<bool> {
+        let row = sqlx::query("SELECT enabled FROM feature_flags WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(r) => Ok(r.get::<i32, _>("enabled") != 0),
+            None => Ok(false),
+        }
+    }
+
+    async fn list_flags(&self) -> Result<Vec<FeatureFlagRecord>> {
+        let rows = sqlx::query(
+            "SELECT name, enabled, description, created_at, updated_at \
+             FROM feature_flags ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let records = rows
+            .iter()
+            .map(|r| FeatureFlagRecord {
+                name: r.get("name"),
+                enabled: r.get::<i32, _>("enabled") != 0,
+                description: r.get("description"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn upsert_flag(&self, record: &FeatureFlagRecord) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "INSERT INTO feature_flags (name, enabled, description, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(name) DO UPDATE SET \
+             enabled = excluded.enabled, \
+             description = excluded.description, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(&record.name)
+        .bind(record.enabled as i32)
+        .bind(&record.description)
+        .bind(record.created_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}

@@ -1,0 +1,35 @@
+# Lightweight Dockerfile for pre-compiled binaries (used by CI)
+FROM debian:bookworm-slim
+
+ARG BINARY_PATH=one-router
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
+WORKDIR /app
+
+# Copy pre-compiled binary
+COPY ${BINARY_PATH} /usr/local/bin/one-router
+RUN chmod +x /usr/local/bin/one-router
+
+# Create data directory for SQLite with correct permissions
+RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
+
+# Default environment
+ENV DATABASE=sqlite:///app/data/gateway.db
+ENV PORT=8000
+ENV LOG_LEVEL=info
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+USER appuser
+
+CMD ["one-router"]
