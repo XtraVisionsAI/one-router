@@ -174,7 +174,7 @@ else
 fi
 
 if [[ "$need_recreate" == "true" ]]; then
-    docker buildx create --name "${BUILDER_NAME}" --use "${BUILDER_EXTRA_ARGS[@]}"
+    docker buildx create --name "${BUILDER_NAME}" --use ${BUILDER_EXTRA_ARGS[@]+"${BUILDER_EXTRA_ARGS[@]}"}
     if [[ "$HAS_PROXY" == "true" ]]; then
         ok "Created builder: ${BUILDER_NAME} (network=host, proxy=${HOST_HTTP_PROXY})"
     else
