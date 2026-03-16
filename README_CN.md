@@ -158,6 +158,46 @@ DATABASE=postgres://user:pass@host/db
 DATABASE=dynamodb://us-east-1
 ```
 
+### 后端配置
+
+后端凭证存储在 `backends` 数据库表中。使用内置脚本生成配置：
+
+```bash
+# 交互模式
+./scripts/backend-config-builder.sh
+
+# Bedrock 使用 AWS profile
+./scripts/backend-config-builder.sh --type bedrock --region us-east-1 --profile prod
+
+# Bedrock 使用 access key
+./scripts/backend-config-builder.sh --type bedrock --region us-east-1 \
+  --access-key-id AKIA... --secret-access-key ...
+
+# Gemini 使用多个 API key
+./scripts/backend-config-builder.sh --type gemini --api-keys "key1,key2"
+
+# 连接池设置（两种后端通用）
+./scripts/backend-config-builder.sh --type bedrock --region us-east-1 \
+  --strategy weighted --max-failures 5 --retry-after 600
+```
+
+通过 `--format` 指定输出格式：
+
+| 格式 | 说明 |
+|---|---|
+| `json` | 格式化 JSON（默认） |
+| `json-compact` | 单行 JSON（也可用 `--compact`） |
+| `dynamodb` | DynamoDB item JSON，可直接用于 AWS Console / `put-item` |
+| `sql` | SQL INSERT 语句，带 ON CONFLICT upsert（SQLite / PostgreSQL） |
+
+```bash
+# 输出为 DynamoDB item
+./scripts/backend-config-builder.sh --type bedrock --region ap-northeast-1 --format dynamodb
+
+# 输出为 SQL
+./scripts/backend-config-builder.sh --type gemini --api-keys "key1" --format sql
+```
+
 ## 架构
 
 ```

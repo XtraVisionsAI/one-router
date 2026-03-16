@@ -158,6 +158,46 @@ DATABASE=postgres://user:pass@host/db
 DATABASE=dynamodb://us-east-1
 ```
 
+### Backend Configuration
+
+Backend credentials are stored in the `backends` database table. Use the built-in helper script to generate config:
+
+```bash
+# Interactive mode
+./scripts/backend-config-builder.sh
+
+# Bedrock with AWS profile
+./scripts/backend-config-builder.sh --type bedrock --region us-east-1 --profile prod
+
+# Bedrock with access keys
+./scripts/backend-config-builder.sh --type bedrock --region us-east-1 \
+  --access-key-id AKIA... --secret-access-key ...
+
+# Gemini with multiple API keys
+./scripts/backend-config-builder.sh --type gemini --api-keys "key1,key2"
+
+# Pool settings (shared by both backend types)
+./scripts/backend-config-builder.sh --type bedrock --region us-east-1 \
+  --strategy weighted --max-failures 5 --retry-after 600
+```
+
+Output formats via `--format`:
+
+| Format | Description |
+|---|---|
+| `json` | Pretty JSON (default) |
+| `json-compact` | Single-line JSON (also `--compact`) |
+| `dynamodb` | DynamoDB item JSON for AWS Console / `put-item` |
+| `sql` | SQL INSERT with ON CONFLICT upsert (SQLite / PostgreSQL) |
+
+```bash
+# Output as DynamoDB item
+./scripts/backend-config-builder.sh --type bedrock --region ap-northeast-1 --format dynamodb
+
+# Output as SQL
+./scripts/backend-config-builder.sh --type gemini --api-keys "key1" --format sql
+```
+
 ## Architecture
 
 ```

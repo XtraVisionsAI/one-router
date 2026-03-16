@@ -21,7 +21,7 @@ MAX_FAILURES=""
 RETRY_AFTER=""
 PRIORITY=10
 ENABLED=true
-COMPACT=false
+FORMAT=json
 
 # ─── Colors (stderr only) ──────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
@@ -72,7 +72,7 @@ Options:
   --priority N            Priority (default: 10)
   --enabled               Enable backend (default)
   --disabled              Disable backend
-  --compact               Output compact JSON (default: pretty)
+  --format FORMAT         Output format: json (default), json-compact, dynamodb, sql
   -h, --help              Show this help
 
 Examples:
@@ -112,7 +112,8 @@ while [[ $# -gt 0 ]]; do
         --priority)    PRIORITY="$2";       shift 2 ;;
         --enabled)     ENABLED=true;        shift ;;
         --disabled)    ENABLED=false;       shift ;;
-        --compact)     COMPACT=true;        shift ;;
+        --format)      FORMAT="$2";         shift 2 ;;
+        --compact)     FORMAT="json-compact"; shift ;;
         -h|--help)     usage ;;
         *)
             err "Unknown option: $1"
@@ -456,11 +457,12 @@ CONFIG_ESCAPED=$(printf '%s' "$CONFIG" | sed 's/\\/\\\\/g; s/"/\\"/g')
 # Get current unix timestamp
 CREATED_AT=$(date +%s)
 
-# Build final BackendRecord JSON
-if $COMPACT; then
-    printf '{"name":"%s","backend_type":"%s","config":"%s","enabled":%s,"priority":%d,"health_status":"unknown","last_health_check":null,"created_at":%d,"updated_at":null}\n' \
-        "$NAME" "$TYPE" "$CONFIG_ESCAPED" "$ENABLED" "$PRIORITY" "$CREATED_AT"
-else
+# Enabled as integer for SQL
+if $ENABLED; then ENABLED_INT=1; else ENABLED_INT=0; fi
+
+# ─── Output formatters ────────────────────────────────────────────────────
+
+output_json() {
     cat <<ENDJSON
 {
   "name": "$NAME",
@@ -474,4 +476,54 @@ else
   "updated_at": null
 }
 ENDJSON
-fi
+}
+
+output_json_compact() {
+    printf '{"name":"%s","backend_type":"%s","config":"%s","enabled":%s,"priority":%d,"health_status":"unknown","last_health_check":null,"created_at":%d,"updated_at":null}\n' \
+        "$NAME" "$TYPE" "$CONFIG_ESCAPED" "$ENABLED" "$PRIORITY" "$CREATED_AT"
+}
+
+output_dynamodb() {
+    cat <<ENDJSON
+{
+  "name": {"S": "$NAME"},
+  "backend_type": {"S": "$TYPE"},
+  "config": {"S": "$CONFIG_ESCAPED"},
+  "enabled": {"BOOL": $ENABLED},
+  "priority": {"N": "$PRIORITY"},
+  "health_status": {"S": "unknown"},
+  "last_health_check": {"NULL": true},
+  "created_at": {"N": "$CREATED_AT"},
+  "updated_at": {"NULL": true}
+}
+ENDJSON
+}
+
+output_sql() {
+    # Double single-quotes for SQL escaping
+    local sql_config
+    sql_config=$(printf '%s' "$CONFIG" | sed "s/'/''/g")
+    cat <<ENDSQL
+INSERT INTO backends (name, backend_type, config, enabled, priority, health_status, last_health_check, created_at, updated_at)
+VALUES ('$NAME', '$TYPE', '$sql_config', $ENABLED_INT, $PRIORITY, 'unknown', NULL, $CREATED_AT, NULL)
+ON CONFLICT (name) DO UPDATE SET
+  backend_type = excluded.backend_type,
+  config = excluded.config,
+  enabled = excluded.enabled,
+  priority = excluded.priority,
+  updated_at = $(date +%s);
+ENDSQL
+}
+
+# ─── Output ────────────────────────────────────────────────────────────────
+
+case "$FORMAT" in
+    json)         output_json ;;
+    json-compact) output_json_compact ;;
+    dynamodb)     output_dynamodb ;;
+    sql)          output_sql ;;
+    *)
+        err "Unknown format: '$FORMAT' (must be json|json-compact|dynamodb|sql)"
+        exit 1
+        ;;
+esac
