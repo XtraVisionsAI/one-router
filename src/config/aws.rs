@@ -6,6 +6,8 @@ use aws_config::{meta::region::RegionProviderChain, BehaviorVersion, Region, Sdk
 use aws_sdk_bedrockruntime::Client as BedrockRuntimeClient;
 use aws_sdk_dynamodb::Client as DynamoDbSdkClient;
 
+use crate::services::BedrockBackendConfig;
+
 /// AWS configuration builder
 pub struct AwsConfigBuilder {
     region: String,
@@ -73,5 +75,46 @@ pub async fn create_bedrock_client_with_profile(
     };
 
     let sdk_config = config_loader.load().await;
+    BedrockRuntimeClient::new(&sdk_config)
+}
+
+/// Create a Bedrock Runtime client from a typed backend config.
+///
+/// Supports profile, access key, and default credential chain.
+pub async fn create_bedrock_client_from_config(cfg: &BedrockBackendConfig) -> BedrockRuntimeClient {
+    let region = Region::new(cfg.region.clone());
+
+    if let Some(profile_name) = &cfg.profile {
+        tracing::debug!(profile = %profile_name, region = %region, "Creating Bedrock client with profile");
+        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+            .region(region)
+            .profile_name(profile_name)
+            .load()
+            .await;
+        return BedrockRuntimeClient::new(&sdk_config);
+    }
+
+    if let (Some(ak), Some(sk)) = (&cfg.access_key_id, &cfg.secret_access_key) {
+        tracing::debug!(region = %region, "Creating Bedrock client with access key");
+        let creds = aws_sdk_bedrockruntime::config::Credentials::new(
+            ak,
+            sk,
+            cfg.session_token.clone(),
+            None,
+            "one-router-static",
+        );
+        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+            .region(region)
+            .credentials_provider(creds)
+            .load()
+            .await;
+        return BedrockRuntimeClient::new(&sdk_config);
+    }
+
+    tracing::debug!(region = %region, "Creating Bedrock client with default credentials");
+    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region)
+        .load()
+        .await;
     BedrockRuntimeClient::new(&sdk_config)
 }

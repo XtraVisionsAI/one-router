@@ -258,8 +258,25 @@ docker compose --profile dynamodb up
 ### AWS App Runner
 
 ```bash
-./scripts/deploy-apprunner.sh
+# Default: pull from DockerHub via ECR Pull Through Cache
+./scripts/deploy-apprunner.sh --create
+
+# Use a specific DockerHub image (specify --platform on Apple Silicon)
+./scripts/deploy-apprunner.sh --image xtravisions/one-router:latest --platform linux/amd64 --create
+
+# Build locally and push to ECR
+./scripts/deploy-apprunner.sh --build --platform linux/amd64 --create
+
+# Specify region, database, and AWS profile
+./scripts/deploy-apprunner.sh --profile prod -r ap-northeast-1 \
+  --database dynamodb://ap-northeast-1 --create
+
+# Pass secrets directly (otherwise set them in the AWS Console after deploy)
+./scripts/deploy-apprunner.sh --create \
+  --master-api-key sk-your-secret --encryption-key your-aes256-key
 ```
+
+Run `./scripts/deploy-apprunner.sh --help` for all options.
 
 ## Development
 

@@ -5,7 +5,8 @@ use crate::{
     database,
     server::{routes, state::AppState},
     services::{
-        BedrockService, GeminiConfig, GeminiService, ModelMappingService, PtcService, UsageTracker,
+        BedrockBackendConfig, BedrockService, GeminiBackendConfig, GeminiConfig, GeminiService,
+        ModelMappingService, PoolConfig, PtcService, UsageTracker,
     },
 };
 use anyhow::Result;
@@ -144,35 +145,47 @@ async fn init_bedrock_from_backends(
 
     let mut clients: Vec<(String, aws_sdk_bedrockruntime::Client)> = Vec::new();
     let mut credentials: Vec<crate::services::AwsCredential> = Vec::new();
+    let mut pool_config = PoolConfig::default();
 
     for (i, backend) in bedrock_backends.iter().enumerate() {
-        let config: serde_json::Value = serde_json::from_str(&backend.config).unwrap_or_default();
+        let cfg: BedrockBackendConfig = serde_json::from_str(&backend.config)
+            .map_err(|e| anyhow::anyhow!("Invalid bedrock config for '{}': {}", backend.name, e))?;
 
-        let region = config
-            .get("region")
-            .and_then(|v| v.as_str())
-            .unwrap_or("us-east-1");
-
-        let profile = config.get("profile").and_then(|v| v.as_str());
-        let weight = config.get("weight").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        // Use pool settings from the first backend
+        if i == 0 {
+            pool_config = PoolConfig::from(&cfg.pool);
+        }
 
         let cred_name = backend.name.clone();
 
         tracing::info!(
             name = %cred_name,
-            region = %region,
-            profile = ?profile,
+            region = %cfg.region,
+            profile = ?cfg.profile,
+            access_key = cfg.access_key_id.is_some(),
+            weight = cfg.weight,
             index = i,
             "Creating Bedrock client from backends table"
         );
 
-        let client = crate::config::create_bedrock_client_with_profile(profile, region, None).await;
+        let client = crate::config::create_bedrock_client_from_config(&cfg).await;
 
-        // Create AwsCredential for the pool
-        let aws_cred = if let Some(p) = profile {
-            crate::services::AwsCredential::with_profile(p, region, &cred_name, weight)
+        let aws_cred = if let Some(ref p) = cfg.profile {
+            crate::services::AwsCredential::with_profile(p, &cfg.region, &cred_name, cfg.weight)
+        } else if let (Some(ref ak), Some(ref sk)) = (&cfg.access_key_id, &cfg.secret_access_key) {
+            let mut cred = crate::services::AwsCredential::with_access_key(
+                ak,
+                sk,
+                &cfg.region,
+                &cred_name,
+                cfg.weight,
+            );
+            if let Some(ref token) = cfg.session_token {
+                cred = cred.with_session_token(token);
+            }
+            cred
         } else {
-            crate::services::AwsCredential::default_credential(region, &cred_name)
+            crate::services::AwsCredential::default_credential(&cfg.region, &cred_name)
         };
 
         clients.push((cred_name, client));
@@ -180,60 +193,80 @@ async fn init_bedrock_from_backends(
     }
 
     if clients.len() == 1 {
-        // Single client: use simple constructor
         let (_, client) = clients.into_iter().next().unwrap();
         return Ok(Some(BedrockService::new(client)));
     }
 
-    // Multiple clients: use credential pool
-    let pool = crate::services::CredentialPool::round_robin(credentials);
+    let pool = crate::services::CredentialPool::new(credentials, pool_config);
     tracing::info!(
         count = clients.len(),
+        strategy = %pool.strategy(),
         "Bedrock service initialized with credential pool"
     );
     Ok(Some(BedrockService::with_pool(clients, pool)))
 }
 
-/// Initialize Gemini service from the backends table
+/// Initialize Gemini service from the backends table.
+///
+/// Merges API keys from all enabled gemini backends into a single credential pool.
 async fn init_gemini_from_backends(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
 ) -> Result<Option<GeminiService>> {
     let backends = database.backends().list_enabled_backends().await?;
 
-    for backend in backends {
-        if backend.backend_type == "gemini" && backend.enabled {
-            let config: serde_json::Value =
-                serde_json::from_str(&backend.config).unwrap_or_default();
+    let gemini_backends: Vec<_> = backends
+        .into_iter()
+        .filter(|b| b.backend_type == "gemini" && b.enabled)
+        .collect();
 
-            let api_keys: Vec<String> = config
-                .get("api_keys")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            if api_keys.is_empty() {
-                continue;
-            }
-
-            let mut gemini_config = GeminiConfig::with_keys(api_keys);
-
-            if let Some(base_url) = config.get("base_url").and_then(|v| v.as_str()) {
-                gemini_config = gemini_config.with_base_url(base_url);
-            }
-
-            if let Some(timeout) = config.get("timeout_seconds").and_then(|v| v.as_u64()) {
-                gemini_config = gemini_config.with_timeout(timeout);
-            }
-
-            return Ok(Some(GeminiService::new(gemini_config)?));
-        }
+    if gemini_backends.is_empty() {
+        return Ok(None);
     }
 
-    Ok(None)
+    let mut all_api_keys: Vec<String> = Vec::new();
+    let mut base_url: Option<String> = None;
+    let mut timeout_seconds: u64 = 120;
+    let mut pool_config = PoolConfig::default();
+
+    for (i, backend) in gemini_backends.iter().enumerate() {
+        let cfg: GeminiBackendConfig = serde_json::from_str(&backend.config)
+            .map_err(|e| anyhow::anyhow!("Invalid gemini config for '{}': {}", backend.name, e))?;
+
+        if cfg.api_keys.is_empty() {
+            continue;
+        }
+
+        // Use settings from the first backend with keys
+        if all_api_keys.is_empty() {
+            base_url = cfg.base_url.clone();
+            timeout_seconds = cfg.timeout_seconds;
+            pool_config = PoolConfig::from(&cfg.pool);
+        }
+
+        tracing::info!(
+            name = %backend.name,
+            key_count = cfg.api_keys.len(),
+            index = i,
+            "Loading Gemini API keys from backends table"
+        );
+
+        all_api_keys.extend(cfg.api_keys);
+    }
+
+    if all_api_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let mut gemini_config = GeminiConfig::with_keys(all_api_keys);
+    if let Some(url) = base_url {
+        gemini_config = gemini_config.with_base_url(url);
+    }
+    gemini_config = gemini_config.with_timeout(timeout_seconds);
+
+    Ok(Some(GeminiService::with_pool_config(
+        gemini_config,
+        pool_config,
+    )?))
 }
 
 /// Create a future that completes when a shutdown signal is received

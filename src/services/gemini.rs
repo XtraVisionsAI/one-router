@@ -5,9 +5,7 @@
 //! load balancing support.
 
 use crate::schemas::gemini::{GeminiError, GeminiRequest, GeminiResponse, StreamChunk};
-use crate::services::backend_pool::{
-    ApiKeyCredential, Credential, CredentialPool, LoadBalanceStrategy, PoolConfig,
-};
+use crate::services::backend_pool::{ApiKeyCredential, Credential, CredentialPool, PoolConfig};
 use reqwest::Client;
 use std::sync::Arc;
 use thiserror::Error;
@@ -59,15 +57,6 @@ pub struct GeminiConfig {
 
     /// Request timeout in seconds
     pub timeout_seconds: u64,
-
-    /// Load balance strategy
-    pub strategy: LoadBalanceStrategy,
-
-    /// Maximum failures before disabling a credential
-    pub max_failures: u32,
-
-    /// Seconds to wait before retrying a disabled credential
-    pub retry_after_secs: u64,
 }
 
 impl GeminiConfig {
@@ -77,9 +66,6 @@ impl GeminiConfig {
             api_keys: vec![api_key.into()],
             base_url: None,
             timeout_seconds: 120,
-            strategy: LoadBalanceStrategy::RoundRobin,
-            max_failures: 3,
-            retry_after_secs: 300,
         }
     }
 
@@ -89,9 +75,6 @@ impl GeminiConfig {
             api_keys,
             base_url: None,
             timeout_seconds: 120,
-            strategy: LoadBalanceStrategy::RoundRobin,
-            max_failures: 3,
-            retry_after_secs: 300,
         }
     }
 
@@ -102,21 +85,6 @@ impl GeminiConfig {
 
     pub fn with_timeout(mut self, seconds: u64) -> Self {
         self.timeout_seconds = seconds;
-        self
-    }
-
-    pub fn with_strategy(mut self, strategy: LoadBalanceStrategy) -> Self {
-        self.strategy = strategy;
-        self
-    }
-
-    pub fn with_max_failures(mut self, max: u32) -> Self {
-        self.max_failures = max;
-        self
-    }
-
-    pub fn with_retry_after(mut self, secs: u64) -> Self {
-        self.retry_after_secs = secs;
         self
     }
 }
@@ -147,6 +115,14 @@ impl Clone for GeminiService {
 impl GeminiService {
     /// Create a new Gemini service
     pub fn new(config: GeminiConfig) -> Result<Self, GeminiServiceError> {
+        Self::with_pool_config(config, PoolConfig::default())
+    }
+
+    /// Create a new Gemini service with explicit pool configuration
+    pub fn with_pool_config(
+        config: GeminiConfig,
+        pool_config: PoolConfig,
+    ) -> Result<Self, GeminiServiceError> {
         if config.api_keys.is_empty() {
             return Err(GeminiServiceError::MissingApiKey);
         }
@@ -163,16 +139,11 @@ impl GeminiService {
             .map(|(idx, key)| ApiKeyCredential::new(key, format!("gemini_key_{}", idx + 1), 1))
             .collect();
 
-        // Create pool config
-        let pool_config = PoolConfig::new(config.strategy)
-            .with_max_failures(config.max_failures)
-            .with_retry_after(config.retry_after_secs);
-
         let credential_pool = CredentialPool::new(credentials, pool_config);
 
         tracing::info!(
             key_count = credential_pool.len(),
-            strategy = %config.strategy,
+            strategy = %credential_pool.strategy(),
             "Initialized Gemini service with credential pool"
         );
 
@@ -473,11 +444,9 @@ mod tests {
             "key1".to_string(),
             "key2".to_string(),
             "key3".to_string(),
-        ])
-        .with_strategy(LoadBalanceStrategy::Weighted);
+        ]);
 
         assert_eq!(config.api_keys.len(), 3);
-        assert_eq!(config.strategy, LoadBalanceStrategy::Weighted);
     }
 
     #[test]

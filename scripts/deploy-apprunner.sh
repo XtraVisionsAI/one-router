@@ -18,6 +18,10 @@ TAG="latest"
 DOCKERHUB_IMAGE="xtravisions/one-router"
 PTC_PREFIX="docker-hub"      # ECR Pull Through Cache prefix
 
+# Application secrets
+MASTER_API_KEY=""
+ENCRYPTION_KEY=""
+
 # AWS authentication
 AWS_PROFILE=""
 AWS_ENDPOINT_URL=""
@@ -44,9 +48,9 @@ Image source (choose one):
   --image IMAGE             Pull a pre-built image and push to private ECR
   (default)                 Use ECR Pull Through Cache to sync from DockerHub automatically
 
-Build options (only with --build):
-  --dockerfile FILE         Dockerfile path (default: docker/Dockerfile)
-  --platform PLATFORM       Docker build platform (e.g. linux/amd64, linux/arm64)
+Build options (with --build or --image):
+  --dockerfile FILE         Dockerfile path (default: docker/Dockerfile, --build only)
+  --platform PLATFORM       Docker platform (e.g. linux/amd64, linux/arm64)
 
 Service configuration:
   -r, --region REGION       AWS region (default: us-east-1)
@@ -55,6 +59,8 @@ Service configuration:
                             Examples: dynamodb://us-east-1, postgres://user:pass@host/db
   --tag TAG                 Image tag (default: latest)
   --create                  Create new service (vs update existing)
+  --master-api-key KEY      MASTER_API_KEY for the gateway
+  --encryption-key KEY      ENCRYPTION_KEY for credential encryption
 
 AWS authentication:
   --profile PROFILE         AWS CLI named profile (maps to aws --profile)
@@ -108,6 +114,8 @@ while [[ $# -gt 0 ]]; do
         --dockerfile)             DOCKERFILE="$2"; shift 2 ;;
         --platform)               BUILD_PLATFORM="$2"; shift 2 ;;
         --tag)                    TAG="$2"; shift 2 ;;
+        --master-api-key)         MASTER_API_KEY="$2"; shift 2 ;;
+        --encryption-key)         ENCRYPTION_KEY="$2"; shift 2 ;;
         --profile)                AWS_PROFILE="$2"; shift 2 ;;
         --endpoint-url)           AWS_ENDPOINT_URL="$2"; shift 2 ;;
         --access-key-id)          AWS_ACCESS_KEY_ID_OPT="$2"; shift 2 ;;
@@ -228,7 +236,12 @@ case "$MODE" in
         ok "ECR repository ready: ${ECR_REPO_NAME}"
 
         echo "  Pulling: ${IMAGE}"
-        docker pull "${IMAGE}"
+        PULL_CMD=(docker pull)
+        if [[ -n "$BUILD_PLATFORM" ]]; then
+            PULL_CMD+=(--platform "${BUILD_PLATFORM}")
+        fi
+        PULL_CMD+=("${IMAGE}")
+        "${PULL_CMD[@]}"
         docker tag "${IMAGE}" "${DEPLOY_IMAGE}"
         docker push "${DEPLOY_IMAGE}"
         ok "Pushed: ${DEPLOY_IMAGE}"
@@ -392,7 +405,13 @@ SOURCE_CONFIG=$(cat <<JSON
         "DATABASE": "${EFFECTIVE_DB}",
         "PORT": "8000",
         "LOG_LEVEL": "info",
-        "AWS_REGION": "${REGION}"
+        "AWS_REGION": "${REGION}"$(
+[[ -n "$MASTER_API_KEY" ]] && echo ",
+        \"MASTER_API_KEY\": \"${MASTER_API_KEY}\""
+)$(
+[[ -n "$ENCRYPTION_KEY" ]] && echo ",
+        \"ENCRYPTION_KEY\": \"${ENCRYPTION_KEY}\""
+)
       }
     },
     "ImageRepositoryType": "ECR"
@@ -467,10 +486,17 @@ echo "  ARN:        ${SERVICE_ARN}"
 echo "  URL:        https://${SERVICE_URL}"
 echo "  Image:      ${DEPLOY_IMAGE}"
 echo ""
-echo -e "${YELLOW}=== ACTION REQUIRED ===${NC}"
-echo "Set these sensitive env vars in the AWS Console (or via aws apprunner update-service):"
-echo "  - MASTER_API_KEY"
-echo "  - ENCRYPTION_KEY"
-echo ""
-echo "Console: https://${REGION}.console.aws.amazon.com/apprunner/home?region=${REGION}"
+MISSING_SECRETS=()
+[[ -z "$MASTER_API_KEY" ]] && MISSING_SECRETS+=("MASTER_API_KEY")
+[[ -z "$ENCRYPTION_KEY" ]] && MISSING_SECRETS+=("ENCRYPTION_KEY")
+
+if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}=== ACTION REQUIRED ===${NC}"
+    echo "Set these sensitive env vars in the AWS Console (or re-run with flags):"
+    for s in "${MISSING_SECRETS[@]}"; do
+        echo "  - ${s}  (--$(echo "${s}" | tr '[:upper:]_' '[:lower:]-'))"
+    done
+    echo ""
+    echo "Console: https://${REGION}.console.aws.amazon.com/apprunner/home?region=${REGION}"
+fi
 echo "Status:  ./scripts/apprunner-status.sh -r ${REGION} -n ${SERVICE_NAME}"

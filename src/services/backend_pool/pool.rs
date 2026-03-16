@@ -33,6 +33,16 @@ impl Default for PoolConfig {
     }
 }
 
+impl From<&super::config::PoolSettings> for PoolConfig {
+    fn from(s: &super::config::PoolSettings) -> Self {
+        Self {
+            strategy: s.strategy,
+            max_failures: s.max_failures,
+            retry_after_secs: s.retry_after_secs,
+        }
+    }
+}
+
 impl PoolConfig {
     pub fn new(strategy: LoadBalanceStrategy) -> Self {
         Self {
@@ -185,6 +195,11 @@ impl<C: Credential> CredentialPool<C> {
     /// Get the number of credentials
     pub fn len(&self) -> usize {
         self.credentials.len()
+    }
+
+    /// Get the load balancing strategy
+    pub fn strategy(&self) -> LoadBalanceStrategy {
+        self.config.strategy
     }
 
     /// Check if the pool is empty

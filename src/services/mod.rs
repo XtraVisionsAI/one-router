@@ -8,8 +8,8 @@ pub mod ptc;
 pub mod usage_tracker;
 
 pub use backend_pool::{
-    ApiKeyCredential, AwsCredential, Credential, CredentialHealth, CredentialPool,
-    LoadBalanceStrategy, PoolConfig, PoolStats,
+    ApiKeyCredential, AwsCredential, BedrockBackendConfig, Credential, CredentialHealth,
+    CredentialPool, GeminiBackendConfig, LoadBalanceStrategy, PoolConfig, PoolSettings, PoolStats,
 };
 pub use bedrock::{
     BedrockError, BedrockService, BedrockStreamError, ConverseRequest, ConverseStreamResponse,

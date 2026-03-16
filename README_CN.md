@@ -258,8 +258,25 @@ docker compose --profile dynamodb up
 ### AWS App Runner
 
 ```bash
-./scripts/deploy-apprunner.sh
+# 默认：通过 ECR Pull Through Cache 从 DockerHub 拉取
+./scripts/deploy-apprunner.sh --create
+
+# 指定 DockerHub 镜像（Apple Silicon 上需指定 --platform）
+./scripts/deploy-apprunner.sh --image xtravisions/one-router:latest --platform linux/amd64 --create
+
+# 本地构建并推送到 ECR
+./scripts/deploy-apprunner.sh --build --platform linux/amd64 --create
+
+# 指定区域、数据库和 AWS profile
+./scripts/deploy-apprunner.sh --profile prod -r ap-northeast-1 \
+  --database dynamodb://ap-northeast-1 --create
+
+# 直接传入密钥（否则部署后在 AWS Console 中设置）
+./scripts/deploy-apprunner.sh --create \
+  --master-api-key sk-your-secret --encryption-key your-aes256-key
 ```
+
+运行 `./scripts/deploy-apprunner.sh --help` 查看完整选项。
 
 ## 开发
 

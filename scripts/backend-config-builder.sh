@@ -9,9 +9,16 @@ TYPE=""
 NAME=""
 REGION="us-east-1"
 PROFILE=""
+ACCESS_KEY_ID=""
+SECRET_ACCESS_KEY=""
+SESSION_TOKEN=""
+WEIGHT=1
 API_KEYS=""
 BASE_URL=""
 TIMEOUT=""
+STRATEGY=""
+MAX_FAILURES=""
+RETRY_AFTER=""
 PRIORITY=10
 ENABLED=true
 COMPACT=false
@@ -31,13 +38,13 @@ prompt_msg() { printf "${BOLD}%s${NC}" "$*" >&2; }
 # Read a line from the terminal (not stdin, which may be a pipe)
 read_tty() {
     local var_name="$1"
-    local input
+    local _read_tty_buf
     if [ -t 0 ]; then
-        IFS= read -r input
+        IFS= read -r _read_tty_buf
     else
-        IFS= read -r input </dev/tty
+        IFS= read -r _read_tty_buf </dev/tty
     fi
-    eval "$var_name=\$input"
+    eval "$var_name=\$_read_tty_buf"
 }
 
 usage() {
@@ -52,9 +59,16 @@ Options:
   --name NAME             Backend name (default: <type>-<region> or <type>-default)
   --region REGION         AWS region (bedrock, default: us-east-1)
   --profile PROFILE       AWS named profile (bedrock, optional)
+  --access-key-id ID      AWS access key ID (bedrock, optional)
+  --secret-access-key KEY AWS secret access key (bedrock, optional)
+  --session-token TOKEN   AWS session token (bedrock, optional)
+  --weight N              Load-balancing weight (bedrock, default: 1)
   --api-keys KEYS         Comma-separated API keys (gemini, required)
   --base-url URL          Custom base URL (gemini, optional)
   --timeout SECONDS       Request timeout (gemini, optional)
+  --strategy STRATEGY     Pool strategy: round_robin|weighted|random|failover
+  --max-failures N        Max failures before disabling credential
+  --retry-after SECONDS   Seconds before retrying disabled credential
   --priority N            Priority (default: 10)
   --enabled               Enable backend (default)
   --disabled              Disable backend
@@ -85,9 +99,16 @@ while [[ $# -gt 0 ]]; do
         --name)        NAME="$2";           shift 2 ;;
         --region)      REGION="$2";         shift 2 ;;
         --profile)     PROFILE="$2";        shift 2 ;;
+        --access-key-id)    ACCESS_KEY_ID="$2";    shift 2 ;;
+        --secret-access-key) SECRET_ACCESS_KEY="$2"; shift 2 ;;
+        --session-token)    SESSION_TOKEN="$2";    shift 2 ;;
+        --weight)      WEIGHT="$2";         shift 2 ;;
         --api-keys)    API_KEYS="$2";       shift 2 ;;
         --base-url)    BASE_URL="$2";       shift 2 ;;
         --timeout)     TIMEOUT="$2";        shift 2 ;;
+        --strategy)    STRATEGY="$2";       shift 2 ;;
+        --max-failures) MAX_FAILURES="$2";  shift 2 ;;
+        --retry-after) RETRY_AFTER="$2";    shift 2 ;;
         --priority)    PRIORITY="$2";       shift 2 ;;
         --enabled)     ENABLED=true;        shift ;;
         --disabled)    ENABLED=false;       shift ;;
@@ -150,12 +171,33 @@ interactive_bedrock_config() {
     REGION="${input:-$REGION}"
     info "-> region: $REGION"
 
-    prompt_msg "AWS profile (leave empty for default): "
+    info "Authentication (leave all empty for default credential chain):"
+    prompt_msg "AWS profile (leave empty to use access keys or default): "
     read_tty input
     PROFILE="${input}"
     if [[ -n "$PROFILE" ]]; then
         info "-> profile: $PROFILE"
+    else
+        prompt_msg "AWS access key ID (leave empty for default): "
+        read_tty input
+        ACCESS_KEY_ID="${input}"
+        if [[ -n "$ACCESS_KEY_ID" ]]; then
+            info "-> access_key_id: ${ACCESS_KEY_ID:0:8}..."
+            prompt_msg "AWS secret access key: "
+            read_tty input
+            SECRET_ACCESS_KEY="${input}"
+            prompt_msg "AWS session token (leave empty if not needed): "
+            read_tty input
+            SESSION_TOKEN="${input}"
+        fi
     fi
+
+    prompt_msg "Weight [$WEIGHT]: "
+    read_tty input
+    if [[ -n "$input" ]]; then
+        WEIGHT="$input"
+    fi
+    info "-> weight: $WEIGHT"
 }
 
 interactive_gemini_config() {
@@ -235,13 +277,41 @@ interactive_enabled() {
 
 # ─── Build config JSON ────────────────────────────────────────────────────
 
-build_bedrock_config() {
-    local config
-    if [[ -n "$PROFILE" ]]; then
-        config=$(printf '{"region":"%s","profile":"%s"}' "$REGION" "$PROFILE")
-    else
-        config=$(printf '{"region":"%s"}' "$REGION")
+build_pool_settings() {
+    local fragment=""
+    if [[ -n "$STRATEGY" ]]; then
+        fragment+=",\"strategy\":\"${STRATEGY}\""
     fi
+    if [[ -n "$MAX_FAILURES" ]]; then
+        fragment+=",\"max_failures\":${MAX_FAILURES}"
+    fi
+    if [[ -n "$RETRY_AFTER" ]]; then
+        fragment+=",\"retry_after_secs\":${RETRY_AFTER}"
+    fi
+    echo "$fragment"
+}
+
+build_bedrock_config() {
+    local config="{\"region\":\"${REGION}\""
+    if [[ -n "$PROFILE" ]]; then
+        config+=",\"profile\":\"${PROFILE}\""
+    fi
+    if [[ -n "$ACCESS_KEY_ID" ]]; then
+        local escaped_ak escaped_sk
+        escaped_ak=$(printf '%s' "$ACCESS_KEY_ID" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        escaped_sk=$(printf '%s' "$SECRET_ACCESS_KEY" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        config+=",\"access_key_id\":\"${escaped_ak}\""
+        config+=",\"secret_access_key\":\"${escaped_sk}\""
+        if [[ -n "$SESSION_TOKEN" ]]; then
+            local escaped_token
+            escaped_token=$(printf '%s' "$SESSION_TOKEN" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            config+=",\"session_token\":\"${escaped_token}\""
+        fi
+    fi
+    config+=",\"weight\":${WEIGHT}"
+    # Append shared pool settings
+    config+=$(build_pool_settings)
+    config+="}"
     echo "$config"
 }
 
@@ -280,6 +350,9 @@ build_gemini_config() {
 
     local timeout_val="${TIMEOUT:-120}"
     config+=",\"timeout_seconds\":${timeout_val}"
+
+    # Append shared pool settings
+    config+=$(build_pool_settings)
 
     config+="}"
     echo "$config"
@@ -335,9 +408,38 @@ if ! [[ "$PRIORITY" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+# Validate weight is numeric (bedrock only)
+if [[ "$TYPE" == "bedrock" ]] && ! [[ "$WEIGHT" =~ ^[0-9]+$ ]]; then
+    err "Weight must be a non-negative integer, got: '$WEIGHT'"
+    exit 1
+fi
+
 # Validate timeout is numeric if set
 if [[ -n "$TIMEOUT" ]] && ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]]; then
     err "Timeout must be a positive integer, got: '$TIMEOUT'"
+    exit 1
+fi
+
+# Validate strategy if set
+if [[ -n "$STRATEGY" ]]; then
+    case "$STRATEGY" in
+        round_robin|weighted|random|failover) ;;
+        *)
+            err "Strategy must be round_robin|weighted|random|failover, got: '$STRATEGY'"
+            exit 1
+            ;;
+    esac
+fi
+
+# Validate max_failures is numeric if set
+if [[ -n "$MAX_FAILURES" ]] && ! [[ "$MAX_FAILURES" =~ ^[0-9]+$ ]]; then
+    err "Max failures must be a non-negative integer, got: '$MAX_FAILURES'"
+    exit 1
+fi
+
+# Validate retry_after is numeric if set
+if [[ -n "$RETRY_AFTER" ]] && ! [[ "$RETRY_AFTER" =~ ^[0-9]+$ ]]; then
+    err "Retry after must be a non-negative integer, got: '$RETRY_AFTER'"
     exit 1
 fi
 
