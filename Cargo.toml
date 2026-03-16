@@ -1,6 +1,6 @@
 [package]
 name = "one-router"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["XtraVisions"]
 description = "Unified LLM API router — route OpenAI & Anthropic protocols to Bedrock, Gemini, and more"
