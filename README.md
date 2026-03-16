@@ -8,7 +8,7 @@
     Unified LLM API gateway — route OpenAI & Anthropic protocols to Bedrock, Gemini, and more.
   </p>
   <p align="center">
-    <a href="https://github.com/XtraVisonsAI/one-router/actions"><img src="https://github.com/XtraVisonsAI/one-router/actions/workflows/release.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/XtraVisionsAI/one-router/actions"><img src="https://github.com/XtraVisionsAI/one-router/actions/workflows/release.yml/badge.svg" alt="CI"></a>
     <a href="https://hub.docker.com/r/xtravisions/one-router"><img src="https://img.shields.io/docker/v/xtravisions/one-router?label=docker" alt="Docker"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
     <img src="https://img.shields.io/badge/rust-1.75+-orange.svg" alt="Rust">
@@ -47,7 +47,7 @@ docker run -p 8000:8000 xtravisions/one-router:latest
 ### Option 2: Docker Compose
 
 ```bash
-git clone https://github.com/XtraVisonsAI/one-router.git
+git clone https://github.com/XtraVisionsAI/one-router.git
 cd one-router
 docker compose up
 ```
@@ -55,7 +55,7 @@ docker compose up
 ### Option 3: Build from source
 
 ```bash
-git clone https://github.com/XtraVisonsAI/one-router.git
+git clone https://github.com/XtraVisionsAI/one-router.git
 cd one-router
 cargo build --release
 ./target/release/one-router
