@@ -1,3 +1,9 @@
+## v0.1.2 (2026-03-16)
+
+### Fix
+
+- update Bedrock model IDs to use global. prefix and improve ECR PTC setup
+
 ## v0.1.1 (2026-03-16)
 
 ### Fix
