@@ -64,7 +64,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4-20250514".into(),
-            target_model_id: "anthropic.claude-sonnet-4-20250514-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-20250514-v1:0".into(),
             provider: "bedrock".into(),
             display_name: "Claude Sonnet 4".into(),
             input_price: 0.0,
@@ -120,7 +120,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-5-20251101".into(),
-            target_model_id: "anthropic.claude-opus-4-5-20251101-v1:0".into(),
+            target_model_id: "global.anthropic.claude-opus-4-5-20251101-v1:0".into(),
             provider: "bedrock".into(),
             display_name: "Claude Opus 4.5".into(),
             input_price: 0.0,
@@ -134,7 +134,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4-6-20260313".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "Claude Sonnet 4.6".into(),
             input_price: 0.0,
@@ -148,7 +148,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-6-20260313".into(),
-            target_model_id: "anthropic.claude-opus-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
             provider: "bedrock".into(),
             display_name: "Claude Opus 4.6".into(),
             input_price: 0.0,
@@ -162,7 +162,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "claude-haiku-4-5-20251001".into(),
-            target_model_id: "anthropic.claude-haiku-4-5-20251001-v1:0".into(),
+            target_model_id: "global.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
             provider: "bedrock".into(),
             display_name: "Claude Haiku 4.5".into(),
             input_price: 0.0,
@@ -177,7 +177,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         // -latest aliases (Claude)
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4-latest".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "Claude Sonnet 4 Latest".into(),
             input_price: 0.0,
@@ -191,7 +191,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-latest".into(),
-            target_model_id: "anthropic.claude-opus-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
             provider: "bedrock".into(),
             display_name: "Claude Opus 4 Latest".into(),
             input_price: 0.0,
@@ -205,7 +205,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "claude-haiku-4-latest".into(),
-            target_model_id: "anthropic.claude-haiku-4-5-20251001-v1:0".into(),
+            target_model_id: "global.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
             provider: "bedrock".into(),
             display_name: "Claude Haiku 4 Latest".into(),
             input_price: 0.0,
@@ -333,7 +333,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         // OpenAI-compatible exact mappings (GPT → Bedrock Claude)
         ModelMappingRecord {
             source_model_id: "gpt-4o".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "GPT-4o → Sonnet 4.6".into(),
             input_price: 0.0,
@@ -347,7 +347,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-2024-05-13".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "GPT-4o 2024-05-13 → Sonnet 4.6".into(),
             input_price: 0.0,
@@ -361,7 +361,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-2024-08-06".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "GPT-4o 2024-08-06 → Sonnet 4.6".into(),
             input_price: 0.0,
@@ -375,7 +375,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-mini".into(),
-            target_model_id: "anthropic.claude-haiku-4-5-20251001-v1:0".into(),
+            target_model_id: "global.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
             provider: "bedrock".into(),
             display_name: "GPT-4o Mini → Haiku 4.5".into(),
             input_price: 0.0,
@@ -389,7 +389,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-mini-2024-07-18".into(),
-            target_model_id: "anthropic.claude-haiku-4-5-20251001-v1:0".into(),
+            target_model_id: "global.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
             provider: "bedrock".into(),
             display_name: "GPT-4o Mini 2024-07-18 → Haiku 4.5".into(),
             input_price: 0.0,
@@ -403,7 +403,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-4".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "GPT-4 → Sonnet 4.6".into(),
             input_price: 0.0,
@@ -417,7 +417,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-4-turbo".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "GPT-4 Turbo → Sonnet 4.6".into(),
             input_price: 0.0,
@@ -431,7 +431,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-4-turbo-preview".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "GPT-4 Turbo Preview → Sonnet 4.6".into(),
             input_price: 0.0,
@@ -445,7 +445,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-3.5-turbo".into(),
-            target_model_id: "anthropic.claude-haiku-4-5-20251001-v1:0".into(),
+            target_model_id: "global.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
             provider: "bedrock".into(),
             display_name: "GPT-3.5 Turbo → Haiku 4.5".into(),
             input_price: 0.0,
@@ -459,7 +459,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "gpt-3.5-turbo-16k".into(),
-            target_model_id: "anthropic.claude-haiku-4-5-20251001-v1:0".into(),
+            target_model_id: "global.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
             provider: "bedrock".into(),
             display_name: "GPT-3.5 Turbo 16K → Haiku 4.5".into(),
             input_price: 0.0,
@@ -473,7 +473,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "o1".into(),
-            target_model_id: "anthropic.claude-opus-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
             provider: "bedrock".into(),
             display_name: "O1 → Opus 4.6".into(),
             input_price: 0.0,
@@ -487,7 +487,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "o1-preview".into(),
-            target_model_id: "anthropic.claude-opus-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
             provider: "bedrock".into(),
             display_name: "O1 Preview → Opus 4.6".into(),
             input_price: 0.0,
@@ -501,7 +501,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "o1-mini".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "O1 Mini → Sonnet 4.6".into(),
             input_price: 0.0,
@@ -516,7 +516,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         // Wildcard catch-all: any claude-* model not matched above
         ModelMappingRecord {
             source_model_id: "claude-*".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "Claude Wildcard (default to Sonnet 4.6)".into(),
             input_price: 0.0,
@@ -546,7 +546,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         // Wildcard catch-all: any gpt-* model not matched above
         ModelMappingRecord {
             source_model_id: "gpt-*".into(),
-            target_model_id: "anthropic.claude-sonnet-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-sonnet-4-6".into(),
             provider: "bedrock".into(),
             display_name: "GPT Wildcard (default to Sonnet 4.6)".into(),
             input_price: 0.0,
@@ -561,7 +561,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         // Wildcard catch-all: any o1-* model not matched above
         ModelMappingRecord {
             source_model_id: "o1-*".into(),
-            target_model_id: "anthropic.claude-opus-4-6-20260313-v1:0".into(),
+            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
             provider: "bedrock".into(),
             display_name: "O1 Wildcard (default to Opus 4.6)".into(),
             input_price: 0.0,

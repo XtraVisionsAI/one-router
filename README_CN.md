@@ -230,9 +230,9 @@ One Router 内置了预配置的模型映射，所有映射存储在数据库中
 
 | 源模型 | 目标 | 提供商 |
 |---|---|---|
-| `claude-sonnet-4-*` | `anthropic.claude-sonnet-4-*` | Bedrock |
-| `claude-opus-4-*` | `anthropic.claude-opus-4-*` | Bedrock |
-| `claude-haiku-4-*` | `anthropic.claude-haiku-4-*` | Bedrock |
+| `claude-sonnet-4-*` | `global.anthropic.claude-sonnet-4-*` | Bedrock |
+| `claude-opus-4-*` | `global.anthropic.claude-opus-4-*` | Bedrock |
+| `claude-haiku-4-*` | `global.anthropic.claude-haiku-4-*` | Bedrock |
 | `claude-3-5-sonnet-*` | `anthropic.claude-3-5-sonnet-*` | Bedrock |
 | `gpt-4o` | Claude Sonnet 4.6 | Bedrock |
 | `gpt-4o-mini` | Claude Haiku 4.5 | Bedrock |

@@ -230,9 +230,9 @@ One Router ships with pre-configured mappings. All mappings are stored in the da
 
 | Source Model | Target | Provider |
 |---|---|---|
-| `claude-sonnet-4-*` | `anthropic.claude-sonnet-4-*` | Bedrock |
-| `claude-opus-4-*` | `anthropic.claude-opus-4-*` | Bedrock |
-| `claude-haiku-4-*` | `anthropic.claude-haiku-4-*` | Bedrock |
+| `claude-sonnet-4-*` | `global.anthropic.claude-sonnet-4-*` | Bedrock |
+| `claude-opus-4-*` | `global.anthropic.claude-opus-4-*` | Bedrock |
+| `claude-haiku-4-*` | `global.anthropic.claude-haiku-4-*` | Bedrock |
 | `claude-3-5-sonnet-*` | `anthropic.claude-3-5-sonnet-*` | Bedrock |
 | `gpt-4o` | Claude Sonnet 4.6 | Bedrock |
 | `gpt-4o-mini` | Claude Haiku 4.5 | Bedrock |

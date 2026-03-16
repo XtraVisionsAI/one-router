@@ -254,24 +254,42 @@ case "$MODE" in
                 --ecr-repository-prefixes "${PTC_PREFIX}" >/dev/null 2>&1; then
 
             echo "  Creating Pull Through Cache rule (${PTC_PREFIX} -> docker.io)..."
-            warn "If your DockerHub repo is private, create a secret first:"
-            warn "  aws secretsmanager create-secret --name ecr-pullthroughcache/docker-hub \\"
-            warn "    --secret-string '{\"username\":\"...\",\"accessToken\":\"...\"}'"
-            echo ""
 
-            PTC_CREATE_ARGS=(
-                --ecr-repository-prefix "${PTC_PREFIX}"
-                --upstream-registry docker-hub
-            )
-
-            # Check if a secret for DockerHub credentials exists
+            # Docker Hub PTC requires credentials in Secrets Manager
             SECRET_ARN=$(awscli secretsmanager describe-secret \
                 --secret-id "ecr-pullthroughcache/docker-hub" \
                 --query 'ARN' --output text 2>/dev/null || echo "")
-            if [[ -n "$SECRET_ARN" && "$SECRET_ARN" != "None" ]]; then
-                PTC_CREATE_ARGS+=(--credential-arn "${SECRET_ARN}")
-                ok "Using DockerHub credentials from Secrets Manager"
+            if [[ -z "$SECRET_ARN" || "$SECRET_ARN" == "None" ]]; then
+                warn "Docker Hub PTC requires credentials in Secrets Manager."
+                if [[ -t 0 ]]; then
+                    # Interactive — prompt for credentials
+                    read -rp "  DockerHub username: " DH_USER
+                    read -rsp "  DockerHub access token: " DH_TOKEN; echo
+                    if [[ -z "$DH_USER" || -z "$DH_TOKEN" ]]; then
+                        err "Username and access token are required."; exit 1
+                    fi
+                    awscli secretsmanager create-secret \
+                        --name "ecr-pullthroughcache/docker-hub" \
+                        --secret-string "{\"username\":\"${DH_USER}\",\"accessToken\":\"${DH_TOKEN}\"}" >/dev/null
+                    SECRET_ARN=$(awscli secretsmanager describe-secret \
+                        --secret-id "ecr-pullthroughcache/docker-hub" \
+                        --query 'ARN' --output text)
+                    ok "Created secret: ecr-pullthroughcache/docker-hub"
+                else
+                    # Non-interactive — fail with instructions
+                    err "Create the secret first:"
+                    err "  aws secretsmanager create-secret --name ecr-pullthroughcache/docker-hub \\"
+                    err "    --secret-string '{\"username\":\"YOUR_USER\",\"accessToken\":\"YOUR_TOKEN\"}'"
+                    exit 1
+                fi
             fi
+            ok "Using DockerHub credentials from Secrets Manager"
+
+            PTC_CREATE_ARGS=(
+                --ecr-repository-prefix "${PTC_PREFIX}"
+                --upstream-registry-url "registry-1.docker.io"
+                --credential-arn "${SECRET_ARN}"
+            )
 
             awscli ecr create-pull-through-cache-rule "${PTC_CREATE_ARGS[@]}" >/dev/null
             ok "Pull Through Cache rule created: ${PTC_PREFIX} -> docker.io"
@@ -279,16 +297,25 @@ case "$MODE" in
             ok "Pull Through Cache rule exists: ${PTC_PREFIX}"
         fi
 
-        # Trigger a cache pull so the image is available in ECR.
-        # App Runner will pull via ECR, which triggers the PTC sync automatically.
-        # But we do an explicit pull here to verify the image resolves.
-        echo "  Verifying image via PTC: ${DEPLOY_IMAGE}"
-        if docker pull "${DEPLOY_IMAGE}" 2>/dev/null; then
-            ok "Image cached in ECR: ${DEPLOY_IMAGE}"
-        else
-            warn "Could not pull locally (expected if running outside AWS)."
-            warn "App Runner will trigger the PTC sync on first deploy."
-        fi
+        # Trigger PTC sync via ECR API and wait for the image to be available.
+        PTC_REPO="${PTC_PREFIX}/${DOCKERHUB_IMAGE}"
+        echo "  Triggering PTC sync for ${PTC_REPO}:${TAG}..."
+        for i in $(seq 1 12); do
+            if awscli ecr batch-get-image \
+                    --repository-name "${PTC_REPO}" \
+                    --image-ids imageTag="${TAG}" \
+                    --query 'images[0].imageId.imageTag' \
+                    --output text 2>/dev/null | grep -q "${TAG}"; then
+                ok "Image cached in ECR: ${DEPLOY_IMAGE}"
+                break
+            fi
+            if [[ $i -eq 12 ]]; then
+                err "Timed out waiting for PTC sync. Check ECR console."
+                exit 1
+            fi
+            echo "  Waiting for PTC sync... (${i}/12)"
+            sleep 10
+        done
         ;;
 esac
 
