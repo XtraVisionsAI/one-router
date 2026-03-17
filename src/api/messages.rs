@@ -17,11 +17,13 @@ use axum::{
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::converters::{
-    anthropic_bedrock, AnthropicToGeminiConverter, ConversionError, GeminiToAnthropicConverter,
+    anthropic_bedrock, AnthropicToGeminiConverter, AnthropicToOpenAIConverter, ConversionError,
+    GeminiToAnthropicConverter,
 };
 use crate::schemas::anthropic::{
     ContentBlock, ErrorResponse, MessageContent, MessageRequest, MessageResponse, StopReason,
@@ -207,6 +209,27 @@ pub async fn create_message(
     // Route to appropriate backend based on resolved provider
     match resolved.provider.as_str() {
         "gemini" => handle_gemini_request(&state, &request, &request_id, start_time).await,
+        "anthropic" => {
+            handle_anthropic_passthrough(
+                &state,
+                &request,
+                &resolved.target_model_id,
+                &request_id,
+                &headers,
+                start_time,
+            )
+            .await
+        }
+        "openai" => {
+            handle_openai_backend(
+                &state,
+                &request,
+                &resolved.target_model_id,
+                &request_id,
+                start_time,
+            )
+            .await
+        }
         _ => {
             handle_bedrock_request(
                 &state,
@@ -250,7 +273,7 @@ async fn handle_bedrock_request(
     // Handle streaming vs non-streaming
     if request.stream {
         let sse_stream = create_streaming_response(
-            bedrock,
+            bedrock.clone(),
             converse_request,
             request_id,
             &request.model,
@@ -283,6 +306,326 @@ async fn handle_bedrock_request(
         stop_reason = ?response.stop_reason,
         duration_ms = duration_ms,
         "Bedrock request completed successfully"
+    );
+
+    Ok(MessageApiResponse::Json(Json(response)))
+}
+
+/// Handle request using Anthropic passthrough backend
+async fn handle_anthropic_passthrough(
+    state: &AppState,
+    request: &MessageRequest,
+    target_model_id: &str,
+    request_id: &str,
+    client_headers: &HeaderMap,
+    start_time: Instant,
+) -> Result<MessageApiResponse, ApiError> {
+    use crate::services::PassthroughService;
+
+    let svc: &Arc<PassthroughService> = state.anthropic_service.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
+        )
+    })?;
+
+    // Serialize the request and replace model with the resolved target model id
+    let mut body_value =
+        serde_json::to_value(request).map_err(|e| ApiError::internal_error(e.to_string()))?;
+    body_value["model"] = serde_json::Value::String(target_model_id.to_string());
+    let body_bytes =
+        serde_json::to_vec(&body_value).map_err(|e| ApiError::internal_error(e.to_string()))?;
+
+    // Forward only safe passthrough headers
+    let mut extra_headers: Vec<(String, String)> = Vec::new();
+    for name in &["anthropic-version", "anthropic-beta"] {
+        if let Some(val) = client_headers.get(*name) {
+            if let Ok(v) = val.to_str() {
+                extra_headers.push((name.to_string(), v.to_string()));
+            }
+        }
+    }
+
+    tracing::debug!(
+        request_id = %request_id,
+        target_model = %target_model_id,
+        stream = request.stream,
+        "Routing to Anthropic passthrough"
+    );
+
+    let (resp, credential_name) = svc
+        .forward("/v1/messages", body_bytes, &extra_headers)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Anthropic passthrough request failed");
+            ApiError::internal_error(format!("Anthropic API error: {}", e))
+        })?;
+
+    let upstream_status = resp.status().as_u16();
+
+    // Non-success: propagate the error body
+    if !(200..300).contains(&upstream_status) {
+        let error_body = resp.text().await.unwrap_or_default();
+        tracing::error!(
+            request_id = %request_id,
+            status = upstream_status,
+            body = %error_body,
+            "Anthropic passthrough returned error"
+        );
+        let status = StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Err(ApiError {
+            status,
+            error_type: "api_error".to_string(),
+            message: error_body,
+        });
+    }
+
+    if request.stream {
+        let sse_stream =
+            proxy_anthropic_sse_stream(resp, request_id, svc.clone(), credential_name).await?;
+        return Ok(MessageApiResponse::Stream(sse_stream));
+    }
+
+    // Non-streaming: read body and return JSON
+    let body_text = resp.text().await.map_err(|e| {
+        ApiError::internal_error(format!("Failed to read Anthropic response: {}", e))
+    })?;
+
+    svc.record_success(&credential_name);
+
+    let duration_ms = start_time.elapsed().as_millis();
+    tracing::info!(
+        request_id = %request_id,
+        target_model = %target_model_id,
+        duration_ms = duration_ms,
+        "Anthropic passthrough completed"
+    );
+
+    let response: MessageResponse =
+        serde_json::from_str(&body_text).map_err(|e| ApiError::internal_error(e.to_string()))?;
+    Ok(MessageApiResponse::Json(Json(response)))
+}
+
+/// Proxy Anthropic SSE stream from upstream to client
+async fn proxy_anthropic_sse_stream(
+    upstream: reqwest::Response,
+    request_id: &str,
+    svc: Arc<crate::services::PassthroughService>,
+    credential_name: String,
+) -> Result<Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, ApiError>
+{
+    let req_id = request_id.to_string();
+
+    let stream = async_stream::stream! {
+        let mut response = upstream;
+        let mut buffer = String::new();
+        let mut stream_error = false;
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if let Ok(text) = std::str::from_utf8(&chunk) {
+                        buffer.push_str(text);
+                    }
+
+                    // Parse complete SSE events (separated by \n\n)
+                    while let Some(pos) = buffer.find("\n\n") {
+                        let event_str = buffer[..pos].to_string();
+                        buffer = buffer[pos + 2..].to_string();
+
+                        // Parse event: and data: lines
+                        let mut event_type: Option<String> = None;
+                        let mut data_line: Option<String> = None;
+
+                        for line in event_str.lines() {
+                            if let Some(evt) = line.strip_prefix("event: ") {
+                                event_type = Some(evt.trim().to_string());
+                            } else if let Some(d) = line.strip_prefix("data: ") {
+                                data_line = Some(d.trim().to_string());
+                            }
+                        }
+
+                        if let Some(data) = data_line {
+                            if data == "[DONE]" {
+                                break;
+                            }
+                            let mut sse_event = Event::default().data(data);
+                            if let Some(evt) = event_type {
+                                sse_event = sse_event.event(evt);
+                            }
+                            yield Ok(sse_event);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!(request_id = %req_id, "Anthropic passthrough stream ended");
+                    break;
+                }
+                Err(e) => {
+                    stream_error = true;
+                    tracing::error!(request_id = %req_id, error = %e, "Anthropic passthrough stream error");
+                    break;
+                }
+            }
+        }
+
+        if stream_error {
+            svc.record_failure(&credential_name);
+        } else {
+            svc.record_success(&credential_name);
+        }
+    };
+
+    Ok(Sse::new(Box::pin(stream)))
+}
+
+/// Handle request using OpenAI backend (converts Anthropic → OpenAI format)
+async fn handle_openai_backend(
+    state: &AppState,
+    request: &MessageRequest,
+    target_model_id: &str,
+    request_id: &str,
+    start_time: Instant,
+) -> Result<MessageApiResponse, ApiError> {
+    use crate::converters::anthropic_openai::OpenAIToAnthropicStreamState;
+    use crate::services::PassthroughService;
+
+    let svc: &Arc<PassthroughService> = state.openai_service.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
+        )
+    })?;
+
+    // Convert Anthropic request to OpenAI format
+    let converter = AnthropicToOpenAIConverter::new();
+    let openai_request = converter
+        .convert_request(request, target_model_id)
+        .map_err(|e| ApiError::bad_request(format!("Request conversion error: {}", e)))?;
+
+    let body_bytes =
+        serde_json::to_vec(&openai_request).map_err(|e| ApiError::internal_error(e.to_string()))?;
+
+    tracing::debug!(
+        request_id = %request_id,
+        target_model = %target_model_id,
+        stream = request.stream,
+        "Routing Anthropic request to OpenAI backend"
+    );
+
+    let (resp, credential_name) = svc
+        .forward("/v1/chat/completions", body_bytes, &[])
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "OpenAI backend request failed");
+            ApiError::internal_error(format!("OpenAI API error: {}", e))
+        })?;
+
+    let upstream_status = resp.status().as_u16();
+
+    if !(200..300).contains(&upstream_status) {
+        let error_body = resp.text().await.unwrap_or_default();
+        tracing::error!(
+            request_id = %request_id,
+            status = upstream_status,
+            body = %error_body,
+            "OpenAI backend returned error"
+        );
+        let status = StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Err(ApiError {
+            status,
+            error_type: "api_error".to_string(),
+            message: error_body,
+        });
+    }
+
+    if request.stream {
+        let req_id = request_id.to_string();
+        let original_model = request.model.clone();
+        let svc_clone = svc.clone();
+        let cred_name = credential_name.clone();
+
+        let stream = async_stream::stream! {
+            let mut response = resp;
+            let mut buffer = String::new();
+            let mut stream_error = false;
+            let response_converter = crate::converters::anthropic_openai::AnthropicToOpenAIConverter::new();
+            let mut conv_state = OpenAIToAnthropicStreamState::default();
+            // We don't have usage info at stream start for OpenAI→Anthropic path
+            let _ = original_model;
+
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if let Ok(text) = std::str::from_utf8(&chunk) {
+                            buffer.push_str(text);
+                        }
+
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let line = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                let data = data.trim();
+                                if data == "[DONE]" {
+                                    return;
+                                }
+                                // Parse the OpenAI chunk and convert to Anthropic events
+                                if let Ok(oai_chunk) = serde_json::from_str::<crate::schemas::openai::ChatCompletionChunk>(data) {
+                                    let events = response_converter.convert_stream_chunk_to_anthropic(&oai_chunk, &mut conv_state);
+                                    for (evt_type, evt_data) in events {
+                                        yield Ok(Event::default().event(evt_type).data(evt_data));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!(request_id = %req_id, "OpenAI backend stream ended");
+                        break;
+                    }
+                    Err(e) => {
+                        stream_error = true;
+                        tracing::error!(request_id = %req_id, error = %e, "OpenAI backend stream error");
+                        break;
+                    }
+                }
+            }
+
+            if stream_error {
+                svc_clone.record_failure(&cred_name);
+            } else {
+                svc_clone.record_success(&cred_name);
+            }
+        };
+
+        return Ok(MessageApiResponse::Stream(Sse::new(Box::pin(stream))));
+    }
+
+    // Non-streaming: read body, convert OpenAI → Anthropic response
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| ApiError::internal_error(format!("Failed to read OpenAI response: {}", e)))?;
+
+    svc.record_success(&credential_name);
+
+    let openai_response: crate::schemas::openai::ChatCompletionResponse =
+        serde_json::from_str(&body_text).map_err(|e| {
+            ApiError::internal_error(format!("Failed to parse OpenAI response: {}", e))
+        })?;
+
+    let response_converter = AnthropicToOpenAIConverter::new();
+    let response = response_converter
+        .convert_response(&openai_response, &request.model)
+        .map_err(|e| ApiError::internal_error(format!("Response conversion error: {}", e)))?;
+
+    let duration_ms = start_time.elapsed().as_millis();
+    tracing::info!(
+        request_id = %request_id,
+        target_model = %target_model_id,
+        input_tokens = response.usage.input_tokens,
+        output_tokens = response.usage.output_tokens,
+        duration_ms = duration_ms,
+        "OpenAI backend request completed"
     );
 
     Ok(MessageApiResponse::Json(Json(response)))
@@ -362,7 +705,7 @@ async fn handle_gemini_request(
 
 /// Create a streaming response using SSE with ConverseStream API
 async fn create_streaming_response(
-    bedrock: &BedrockService,
+    bedrock: Arc<BedrockService>,
     request: ConverseRequest,
     request_id: &str,
     original_model: &str,
@@ -376,11 +719,13 @@ async fn create_streaming_response(
         ApiError::from_bedrock_error(&e)
     })?;
 
+    let cred_name = stream_response.credential_name.clone();
     let model_id = original_model.to_string();
     let bedrock_model_id = bedrock_model.to_string();
     let req_id = request_id.to_string();
     // Clone mapper for use in the async stream
     let mapper = tool_name_mapper;
+    let bedrock_clone = bedrock.clone();
 
     // Create the SSE stream
     let stream = async_stream::stream! {
@@ -525,6 +870,7 @@ async fn create_streaming_response(
                     yield Ok(Event::default()
                         .event("error")
                         .data(error_data.to_string()));
+                    bedrock_clone.record_failure(&cred_name);
                     break;
                 }
             }
@@ -548,6 +894,8 @@ async fn create_streaming_response(
             "type": "message_stop"
         });
         yield Ok(Event::default().event("message_stop").data(message_stop_data.to_string()));
+
+        bedrock_clone.record_success(&cred_name);
 
         tracing::info!(
             request_id = %req_id,

@@ -4,18 +4,21 @@ pub mod backend_pool;
 pub mod bedrock;
 pub mod gemini;
 pub mod model_mapping;
+pub mod passthrough;
 pub mod ptc;
 pub mod usage_tracker;
 
 pub use backend_pool::{
-    ApiKeyCredential, AwsCredential, BedrockBackendConfig, Credential, CredentialHealth,
-    CredentialPool, GeminiBackendConfig, LoadBalanceStrategy, PoolConfig, PoolSettings, PoolStats,
+    AnthropicBackendConfig, ApiKeyCredential, AwsCredential, BedrockBackendConfig, Credential,
+    CredentialHealth, CredentialPool, GeminiBackendConfig, LoadBalanceStrategy,
+    OpenAIBackendConfig, PoolConfig, PoolSettings, PoolStats,
 };
 pub use bedrock::{
     BedrockError, BedrockService, BedrockStreamError, ConverseRequest, ConverseStreamResponse,
 };
 pub use gemini::{GeminiConfig, GeminiService, GeminiServiceError, GeminiStream};
 pub use model_mapping::{ModelMappingService, ModelNotFoundError, ResolvedModel};
+pub use passthrough::{PassthroughConfig, PassthroughError, PassthroughService, PassthroughTarget};
 pub use ptc::{
     ContainerInfo, ExecutionResult, PendingToolCall, PtcError, PtcHealthStatus, PtcResponse,
     PtcResult, PtcService, PtcSession, SandboxConfig, SandboxExecutor, SessionState,

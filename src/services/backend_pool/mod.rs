@@ -33,7 +33,10 @@ mod credential;
 mod pool;
 mod strategy;
 
-pub use config::{BedrockBackendConfig, GeminiBackendConfig, PoolSettings};
+pub use config::{
+    AnthropicBackendConfig, BedrockBackendConfig, GeminiBackendConfig, OpenAIBackendConfig,
+    PoolSettings,
+};
 pub use credential::{ApiKeyCredential, AwsCredential, Credential, CredentialHealth};
 pub use pool::{CredentialPool, PoolConfig, PoolStats};
 pub use strategy::LoadBalanceStrategy;

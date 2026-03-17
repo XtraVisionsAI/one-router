@@ -81,6 +81,40 @@ pub struct GeminiBackendConfig {
 }
 
 // ============================================================================
+// Anthropic backend config
+// ============================================================================
+
+/// Configuration stored in `BackendRecord.config` for `backend_type = "anthropic"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicBackendConfig {
+    pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(flatten)]
+    pub pool: PoolSettings,
+}
+
+// ============================================================================
+// OpenAI backend config
+// ============================================================================
+
+/// Configuration stored in `BackendRecord.config` for `backend_type = "openai"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIBackendConfig {
+    pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(flatten)]
+    pub pool: PoolSettings,
+}
+
+// ============================================================================
 // Defaults
 // ============================================================================
 

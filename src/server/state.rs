@@ -5,7 +5,8 @@
 use crate::config::Settings;
 use crate::database::traits::DatabaseService;
 use crate::services::{
-    BedrockService, GeminiService, ModelMappingService, PtcService, UsageTracker,
+    BedrockService, GeminiService, ModelMappingService, PassthroughService, PtcService,
+    UsageTracker,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,6 +39,12 @@ pub struct AppState {
 
     /// Gemini service for Google Gemini API (optional)
     pub gemini_service: Option<Arc<GeminiService>>,
+
+    /// Anthropic passthrough service (optional)
+    pub anthropic_service: Option<Arc<PassthroughService>>,
+
+    /// OpenAI passthrough service (optional)
+    pub openai_service: Option<Arc<PassthroughService>>,
 }
 
 impl AppState {

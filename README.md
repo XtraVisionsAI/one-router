@@ -22,7 +22,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 ## Features
 
 - **Dual Protocol Support** — accepts both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) request formats
-- **Multi-Backend Routing** — routes to AWS Bedrock and Google Gemini with automatic protocol conversion
+- **Multi-Backend Routing** — routes to AWS Bedrock, Google Gemini, Anthropic API, and OpenAI API with automatic protocol conversion
 - **Smart Model Mapping** — maps model names across providers (e.g. `gpt-4o` -> Claude Sonnet, `claude-*` -> Bedrock), with exact match, wildcard, and configurable priority
 - **Credential Pool & Load Balancing** — manage multiple backend credentials with round-robin, weighted, random, or failover strategies
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
@@ -176,7 +176,13 @@ Backend credentials are stored in the `backends` database table. Use the built-i
 # Gemini with multiple API keys
 ./scripts/backend-config-builder.sh --type gemini --api-keys "key1,key2"
 
-# Pool settings (shared by both backend types)
+# Anthropic with API key
+./scripts/backend-config-builder.sh --type anthropic --api-keys "sk-ant-..."
+
+# OpenAI with API key
+./scripts/backend-config-builder.sh --type openai --api-keys "sk-..."
+
+# Pool settings (shared by all backend types)
 ./scripts/backend-config-builder.sh --type bedrock --region us-east-1 \
   --strategy weighted --max-failures 5 --retry-after 600
 ```
@@ -201,27 +207,31 @@ Output formats via `--format`:
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────┐
-                    │          One Router              │
-                    │                                  │
-  OpenAI SDK ──────►  /v1/chat/completions            │
-                    │       │                          │
-                    │       ├──► Converter ──► Bedrock │──► AWS Bedrock
-                    │       └──► Converter ──► Gemini  │──► Google Gemini
-                    │                                  │
-  Anthropic SDK ───►  /v1/messages                    │
-                    │       │                          │
-                    │       ├──► Converter ──► Bedrock │──► AWS Bedrock
-                    │       └──► Converter ──► Gemini  │──► Google Gemini
-                    │                                  │
-                    │  ┌─────────────────────────────┐ │
-                    │  │ Auth · Rate Limit · Budget  │ │
-                    │  │ Model Mapping · Credential  │ │
-                    │  │ Pool · Usage Tracking       │ │
-                    │  └─────────────────────────────┘ │
-                    │                                  │
-                    │  Storage: SQLite / PG / DynamoDB │
-                    └─────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+                    │            One Router                │
+                    │                                      │
+  OpenAI SDK ──────►  /v1/chat/completions               │
+                    │       │                              │
+                    │       ├──► Converter ──► Bedrock    │──► AWS Bedrock
+                    │       ├──► Converter ──► Gemini     │──► Google Gemini
+                    │       ├──► Converter ──► Anthropic  │──► Anthropic API
+                    │       └──► Passthrough ──► OpenAI   │──► OpenAI API
+                    │                                      │
+  Anthropic SDK ───►  /v1/messages                       │
+                    │       │                              │
+                    │       ├──► Converter ──► Bedrock    │──► AWS Bedrock
+                    │       ├──► Converter ──► Gemini     │──► Google Gemini
+                    │       ├──► Passthrough ──► Anthropic│──► Anthropic API
+                    │       └──► Converter ──► OpenAI     │──► OpenAI API
+                    │                                      │
+                    │  ┌───────────────────────────────┐  │
+                    │  │ Auth · Rate Limit · Budget    │  │
+                    │  │ Model Mapping · Credential    │  │
+                    │  │ Pool · Usage Tracking         │  │
+                    │  └───────────────────────────────┘  │
+                    │                                      │
+                    │  Storage: SQLite / PG / DynamoDB     │
+                    └─────────────────────────────────────┘
 ```
 
 ## Model Mapping
@@ -249,7 +259,7 @@ Wildcard catch-alls (`claude-*`, `gpt-*`, `gemini-*`, `o1-*`) ensure unknown mod
 src/
 ├── api/                 # HTTP handlers (messages, chat_completions, models, health)
 ├── config/              # Settings & AWS config
-├── converters/          # Protocol converters (Anthropic/OpenAI ↔ Bedrock/Gemini)
+├── converters/          # Protocol converters (Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic)
 ├── database/            # Storage backends (SQLite, PostgreSQL, DynamoDB)
 │   ├── sqlite/
 │   ├── postgres/
@@ -263,6 +273,7 @@ src/
 │   ├── ptc/             # Programmatic Tool Calling (sandboxed execution)
 │   ├── bedrock.rs       # AWS Bedrock service
 │   ├── gemini.rs        # Google Gemini service
+│   ├── passthrough.rs   # Anthropic & OpenAI passthrough service
 │   ├── model_mapping.rs # Model resolution with caching
 │   └── usage_tracker.rs # Usage & cost tracking
 └── utils/

@@ -114,10 +114,10 @@ impl BedrockService {
             converse_request = converse_request.tool_config(tool_config);
         }
 
-        let result = converse_request
-            .send()
-            .await
-            .map_err(BedrockError::from_converse_error)?;
+        let result = converse_request.send().await.map_err(|e| {
+            self.record_failure(&cred_name);
+            BedrockError::from_converse_error(e)
+        })?;
 
         self.record_success(&cred_name);
         Ok(result)
@@ -155,10 +155,10 @@ impl BedrockService {
             converse_request = converse_request.additional_model_request_fields(additional_fields);
         }
 
-        let result = converse_request
-            .send()
-            .await
-            .map_err(BedrockError::from_converse_stream_error)?;
+        let result = converse_request.send().await.map_err(|e| {
+            self.record_failure(&cred_name);
+            BedrockError::from_converse_stream_error(e)
+        })?;
 
         // Note: success/failure for streaming is tracked by the caller
         Ok(ConverseStreamResponse {
