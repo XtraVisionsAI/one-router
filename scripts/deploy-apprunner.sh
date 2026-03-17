@@ -483,7 +483,7 @@ if [[ "$CREATE" == "true" ]]; then
     SERVICE_ARN=$(jq -r '.Service.ServiceArn' /tmp/apprunner-result.json)
     SERVICE_URL=$(jq -r '.Service.ServiceUrl' /tmp/apprunner-result.json)
 else
-    echo "  Updating service: ${SERVICE_NAME}..."
+    echo "  Updating service image: ${SERVICE_NAME}..."
     SERVICE_ARN=$(awscli apprunner list-services \
         --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn" \
         --output text)
@@ -493,11 +493,49 @@ else
         exit 1
     fi
 
+    # Update mode: always update image; only include ImageConfiguration if any
+    # env var overrides are explicitly provided — otherwise preserve existing values.
+    if [[ -n "$DATABASE" || -n "$MASTER_API_KEY" || -n "$ENCRYPTION_KEY" ]]; then
+        # Build env vars object with only the provided keys
+        ENV_VARS='"PORT": "8000", "LOG_LEVEL": "info", "AWS_REGION": "'"${REGION}"'"'
+        [[ -n "$DATABASE"       ]] && ENV_VARS+=', "DATABASE": "'"${DATABASE}"'"'
+        [[ -n "$MASTER_API_KEY" ]] && ENV_VARS+=', "MASTER_API_KEY": "'"${MASTER_API_KEY}"'"'
+        [[ -n "$ENCRYPTION_KEY" ]] && ENV_VARS+=', "ENCRYPTION_KEY": "'"${ENCRYPTION_KEY}"'"'
+
+        UPDATE_SOURCE_CONFIG=$(cat <<JSON
+{
+  "ImageRepository": {
+    "ImageIdentifier": "${DEPLOY_IMAGE}",
+    "ImageConfiguration": {
+      "Port": "8000",
+      "RuntimeEnvironmentVariables": { ${ENV_VARS} }
+    },
+    "ImageRepositoryType": "ECR"
+  },
+  "AuthenticationConfiguration": {
+    "AccessRoleArn": "${ACCESS_ROLE_ARN}"
+  }
+}
+JSON
+)
+    else
+        UPDATE_SOURCE_CONFIG=$(cat <<JSON
+{
+  "ImageRepository": {
+    "ImageIdentifier": "${DEPLOY_IMAGE}",
+    "ImageRepositoryType": "ECR"
+  },
+  "AuthenticationConfiguration": {
+    "AccessRoleArn": "${ACCESS_ROLE_ARN}"
+  }
+}
+JSON
+)
+    fi
+
     awscli apprunner update-service \
         --service-arn "${SERVICE_ARN}" \
-        --source-configuration "${SOURCE_CONFIG}" \
-        --instance-configuration "${INSTANCE_CONFIG}" \
-        --health-check-configuration "${HEALTH_CHECK_CONFIG}" \
+        --source-configuration "${UPDATE_SOURCE_CONFIG}" \
         --output json > /tmp/apprunner-result.json
 
     SERVICE_URL=$(jq -r '.Service.ServiceUrl' /tmp/apprunner-result.json)
@@ -513,17 +551,20 @@ echo "  ARN:        ${SERVICE_ARN}"
 echo "  URL:        https://${SERVICE_URL}"
 echo "  Image:      ${DEPLOY_IMAGE}"
 echo ""
-MISSING_SECRETS=()
-[[ -z "$MASTER_API_KEY" ]] && MISSING_SECRETS+=("MASTER_API_KEY")
-[[ -z "$ENCRYPTION_KEY" ]] && MISSING_SECRETS+=("ENCRYPTION_KEY")
 
-if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
-    echo -e "${YELLOW}=== ACTION REQUIRED ===${NC}"
-    echo "Set these sensitive env vars in the AWS Console (or re-run with flags):"
-    for s in "${MISSING_SECRETS[@]}"; do
-        echo "  - ${s}  (--$(echo "${s}" | tr '[:upper:]_' '[:lower:]-'))"
-    done
-    echo ""
-    echo "Console: https://${REGION}.console.aws.amazon.com/apprunner/home?region=${REGION}"
+if [[ "$CREATE" == "true" ]]; then
+    MISSING_SECRETS=()
+    [[ -z "$MASTER_API_KEY" ]] && MISSING_SECRETS+=("MASTER_API_KEY")
+    [[ -z "$ENCRYPTION_KEY" ]] && MISSING_SECRETS+=("ENCRYPTION_KEY")
+
+    if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}=== ACTION REQUIRED ===${NC}"
+        echo "Set these sensitive env vars in the AWS Console (or re-run with flags):"
+        for s in "${MISSING_SECRETS[@]}"; do
+            echo "  - ${s}  (--$(echo "${s}" | tr '[:upper:]_' '[:lower:]-'))"
+        done
+        echo ""
+        echo "Console: https://${REGION}.console.aws.amazon.com/apprunner/home?region=${REGION}"
+    fi
 fi
 echo "Status:  ./scripts/apprunner-status.sh -r ${REGION} -n ${SERVICE_NAME}"
