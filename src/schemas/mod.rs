@@ -6,5 +6,6 @@ pub mod anthropic;
 pub mod bedrock;
 pub mod embeddings;
 pub mod gemini;
+pub mod images;
 pub mod openai;
 pub mod rerank;

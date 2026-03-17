@@ -24,6 +24,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Dual Protocol Support** — accepts both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) request formats
 - **Multi-Backend Routing** — routes to AWS Bedrock, Google Gemini, Anthropic API, and OpenAI API with automatic protocol conversion
 - **Embeddings & Rerank** — OpenAI-compatible `/v1/embeddings` and Cohere-compatible `/v1/rerank` backed by Bedrock (Cohere Embed, Titan Embed, Nova Embed, Cohere Rerank)
+- **Image Generation** — OpenAI-compatible `/v1/images/generations` routed to OpenAI DALL-E, AWS Bedrock (Stability AI SDXL, Amazon Nova Canvas, Titan Image Generator), or Google Gemini
 - **Smart Model Mapping** — maps model names across providers (e.g. `gpt-4o` -> Claude Sonnet, `claude-*` -> Bedrock), with exact match, wildcard, and configurable priority
 - **Credential Pool & Load Balancing** — manage multiple backend credentials with round-robin, weighted, random, or failover strategies
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
@@ -177,6 +178,45 @@ curl http://localhost:8000/v1/rerank \
   }'
 ```
 
+### Image Generation (OpenAI SDK)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="sk-ephemeral-xxxxxxxxxxxx",
+    base_url="http://localhost:8000/v1",
+)
+
+# OpenAI DALL-E (passthrough)
+response = client.images.generate(
+    model="dall-e-3",
+    prompt="a cat sitting on a meadow",
+    size="1024x1024",
+    n=1,
+)
+print(response.data[0].url)
+
+# AWS Bedrock — Amazon Nova Canvas (returns base64)
+response = client.images.generate(
+    model="amazon.nova-canvas-v1:0",
+    prompt="a cat sitting on a meadow",
+    size="1024x1024",
+    response_format="b64_json",
+)
+print(response.data[0].b64_json[:40], "...")
+
+# Google Gemini (returns base64)
+response = client.images.generate(
+    model="gemini-2.0-flash-preview-image-generation",
+    prompt="a cat sitting on a meadow",
+    response_format="b64_json",
+)
+print(response.data[0].b64_json[:40], "...")
+```
+
+> **Note:** Bedrock and Gemini backends only support `response_format=b64_json`. Requesting `url` format for these backends returns a `400 Bad Request`. The OpenAI passthrough supports both `url` and `b64_json`.
+
 ## Configuration
 
 One Router is configured through **5 environment variables**. Everything else lives in the database.
@@ -270,6 +310,7 @@ Output formats via `--format`:
                     │                                      │
   OpenAI SDK ──────►  /v1/embeddings                     │──► AWS Bedrock
   Cohere SDK ──────►  /v1/rerank                         │──► AWS Bedrock
+  OpenAI SDK ──────►  /v1/images/generations             │──► OpenAI / Bedrock / Gemini
                     │                                      │
                     │  ┌───────────────────────────────┐  │
                     │  │ Auth · Rate Limit · Budget    │  │
@@ -320,13 +361,26 @@ One Router ships with pre-configured mappings. All mappings are stored in the da
 | `rerank-english-v3.0` | Cohere Rerank v3.5 | Bedrock |
 | `rerank-multilingual-v3.0` | Cohere Rerank v3.5 | Bedrock |
 
+### Image Generation Models (`/v1/images/generations`)
+
+| Source Model | Target | Provider |
+|---|---|---|
+| `dall-e-3` | direct | OpenAI |
+| `dall-e-2` | direct | OpenAI |
+| `stability.stable-diffusion-xl-v1` | direct | Bedrock |
+| `amazon.nova-canvas-v1:0` | direct | Bedrock |
+| `amazon.titan-image-generator-v2:0` | direct | Bedrock |
+| `gemini-2.0-flash-preview-image-generation` | direct | Gemini |
+
+Bedrock and Gemini return `b64_json` only. OpenAI passthrough supports both `url` and `b64_json`.
+
 Wildcard catch-alls (`claude-*`, `gpt-*`, `gemini-*`, `o1-*`) ensure unknown model variants are still routed.
 
 ## Project Structure
 
 ```
 src/
-├── api/                 # HTTP handlers (messages, chat_completions, embeddings, rerank, models, health)
+├── api/                 # HTTP handlers (messages, chat_completions, embeddings, rerank, images, models, health)
 ├── config/              # Settings & AWS config
 ├── converters/          # Protocol converters (Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic)
 ├── database/            # Storage backends (SQLite, PostgreSQL, DynamoDB)
@@ -335,7 +389,7 @@ src/
 │   └── dynamodb/
 ├── error/               # Error types
 ├── middleware/           # Auth & rate limiting
-├── schemas/             # Request/response schemas (Anthropic, OpenAI, Bedrock, Gemini, Embeddings, Rerank)
+├── schemas/             # Request/response schemas (Anthropic, OpenAI, Bedrock, Gemini, Embeddings, Rerank, Images)
 ├── server/              # App bootstrap, routing, state
 ├── services/            # Business logic
 │   ├── backend_pool/    # Credential pool & load balancing

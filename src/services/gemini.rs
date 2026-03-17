@@ -269,6 +269,87 @@ impl GeminiService {
         }
     }
 
+    /// Generate content with a raw JSON body (non-streaming).
+    ///
+    /// Unlike `generate_content()`, this method accepts and returns raw
+    /// `serde_json::Value`, which allows sending non-standard fields such as
+    /// `responseModalities: ["IMAGE", "TEXT"]` used for image generation.
+    ///
+    /// # Arguments
+    /// * `model` - Model name (e.g., "gemini-2.0-flash-preview-image-generation")
+    /// * `body` - Raw JSON request body
+    pub async fn generate_content_raw(
+        &self,
+        model: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, GeminiServiceError> {
+        let credential = self.get_credential()?;
+        let credential_name = credential.name().to_string();
+        let api_key = credential.api_key().to_string();
+
+        let url = format!("{}/models/{}:generateContent", self.base_url(), model);
+
+        tracing::debug!(
+            model = %model,
+            url = %url,
+            credential = %credential_name,
+            "Calling Gemini generateContent API (raw)"
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", &api_key)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+
+                if !status.is_success() {
+                    let error_text = resp.text().await.unwrap_or_default();
+
+                    if status.as_u16() == 429 || status.as_u16() >= 500 {
+                        let disabled = self.record_failure(&credential_name);
+                        if disabled {
+                            tracing::warn!(
+                                credential = %credential_name,
+                                "Credential disabled due to repeated failures"
+                            );
+                        }
+                    }
+
+                    if let Ok(gemini_error) = serde_json::from_str::<GeminiError>(&error_text) {
+                        return Err(GeminiServiceError::ApiError {
+                            code: gemini_error.error.code,
+                            message: gemini_error.error.message,
+                        });
+                    }
+
+                    return Err(GeminiServiceError::ApiError {
+                        code: status.as_u16() as i32,
+                        message: error_text,
+                    });
+                }
+
+                self.record_success(&credential_name);
+
+                let response_text = resp.text().await?;
+                serde_json::from_str(&response_text).map_err(|e| {
+                    tracing::error!(error = %e, body = %response_text, "Failed to parse Gemini raw response");
+                    GeminiServiceError::ParseError(e.to_string())
+                })
+            }
+            Err(e) => {
+                self.record_failure(&credential_name);
+                Err(GeminiServiceError::HttpError(e))
+            }
+        }
+    }
+
     /// Generate content with streaming
     ///
     /// # Arguments
