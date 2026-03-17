@@ -1,3 +1,14 @@
+## v0.3.0 (2026-03-17)
+
+### Feat
+
+- add /v1/images/generations endpoint with OpenAI/Bedrock/Gemini support
+- add Bedrock embed & rerank support via /v1/embeddings and /v1/rerank
+
+### Fix
+
+- **deploy**: update mode only changes image, preserves existing env vars
+
 ## v0.2.0 (2026-03-17)
 
 ### Feat
