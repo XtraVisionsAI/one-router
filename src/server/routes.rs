@@ -10,7 +10,7 @@ use axum::{
 };
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::api::{chat_completions, health, messages, models};
+use crate::api::{chat_completions, embeddings, health, messages, models, rerank};
 use crate::middleware::{
     auth::{extract_api_key, require_api_key, AuthState},
     rate_limit::{rate_limit, RateLimitState},
@@ -53,6 +53,8 @@ pub fn create_router(state: AppState) -> Router {
             "/chat/completions",
             post(chat_completions::chat_completions),
         )
+        .route("/embeddings", post(embeddings::create_embeddings))
+        .route("/rerank", post(rerank::create_rerank))
         .route("/models", get(models::list_models))
         .route("/models/:model_id", get(models::get_model))
         .layer(middleware::from_fn_with_state(

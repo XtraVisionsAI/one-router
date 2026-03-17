@@ -23,6 +23,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 
 - **Dual Protocol Support** — accepts both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) request formats
 - **Multi-Backend Routing** — routes to AWS Bedrock, Google Gemini, Anthropic API, and OpenAI API with automatic protocol conversion
+- **Embeddings & Rerank** — OpenAI-compatible `/v1/embeddings` and Cohere-compatible `/v1/rerank` backed by Bedrock (Cohere Embed, Titan Embed, Nova Embed, Cohere Rerank)
 - **Smart Model Mapping** — maps model names across providers (e.g. `gpt-4o` -> Claude Sonnet, `claude-*` -> Bedrock), with exact match, wildcard, and configurable priority
 - **Credential Pool & Load Balancing** — manage multiple backend credentials with round-robin, weighted, random, or failover strategies
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
@@ -133,6 +134,49 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
+### Embeddings (OpenAI SDK)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="sk-ephemeral-xxxxxxxxxxxx",
+    base_url="http://localhost:8000/v1",
+)
+
+# OpenAI model names are automatically mapped to Bedrock Titan Embed
+response = client.embeddings.create(
+    model="text-embedding-3-small",
+    input="Hello world",
+)
+print(response.data[0].embedding)
+
+# Or use a Bedrock model directly
+response = client.embeddings.create(
+    model="amazon.titan-embed-text-v2:0",
+    input=["batch text one", "batch text two"],  # Cohere supports batches
+)
+```
+
+### Rerank (cURL)
+
+```bash
+curl http://localhost:8000/v1/rerank \
+  -H "x-api-key: sk-ephemeral-xxxxxxxxxxxx" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "rerank-english-v3.0",
+    "query": "What is machine learning?",
+    "documents": [
+      "Machine learning is a subset of AI.",
+      "The weather is sunny today.",
+      "Deep learning uses neural networks."
+    ],
+    "top_n": 2,
+    "return_documents": true
+  }'
+```
+
 ## Configuration
 
 One Router is configured through **5 environment variables**. Everything else lives in the database.
@@ -224,6 +268,9 @@ Output formats via `--format`:
                     │       ├──► Passthrough ──► Anthropic│──► Anthropic API
                     │       └──► Converter ──► OpenAI     │──► OpenAI API
                     │                                      │
+  OpenAI SDK ──────►  /v1/embeddings                     │──► AWS Bedrock
+  Cohere SDK ──────►  /v1/rerank                         │──► AWS Bedrock
+                    │                                      │
                     │  ┌───────────────────────────────┐  │
                     │  │ Auth · Rate Limit · Budget    │  │
                     │  │ Model Mapping · Credential    │  │
@@ -238,6 +285,8 @@ Output formats via `--format`:
 
 One Router ships with pre-configured mappings. All mappings are stored in the database and can be customized.
 
+### Chat / Completion Models
+
 | Source Model | Target | Provider |
 |---|---|---|
 | `claude-sonnet-4-*` | `global.anthropic.claude-sonnet-4-*` | Bedrock |
@@ -251,13 +300,33 @@ One Router ships with pre-configured mappings. All mappings are stored in the da
 | `gemini-2.5-*` | Gemini 2.5 * | Gemini |
 | `gemini-2.0-*` | Gemini 2.0 * | Gemini |
 
+### Embedding Models (`/v1/embeddings`)
+
+| Source Model | Target | Provider |
+|---|---|---|
+| `cohere.embed-english-v3` | direct | Bedrock |
+| `cohere.embed-multilingual-v3` | direct | Bedrock |
+| `amazon.titan-embed-text-v2:0` | direct | Bedrock |
+| `amazon.titan-embed-text-v1` | direct | Bedrock |
+| `text-embedding-3-small` | Titan Embed Text v2 | Bedrock |
+| `text-embedding-3-large` | Titan Embed Text v2 | Bedrock |
+| `text-embedding-ada-002` | Titan Embed Text v2 | Bedrock |
+
+### Rerank Models (`/v1/rerank`)
+
+| Source Model | Target | Provider |
+|---|---|---|
+| `cohere.rerank-v3-5:0` | direct | Bedrock |
+| `rerank-english-v3.0` | Cohere Rerank v3.5 | Bedrock |
+| `rerank-multilingual-v3.0` | Cohere Rerank v3.5 | Bedrock |
+
 Wildcard catch-alls (`claude-*`, `gpt-*`, `gemini-*`, `o1-*`) ensure unknown model variants are still routed.
 
 ## Project Structure
 
 ```
 src/
-├── api/                 # HTTP handlers (messages, chat_completions, models, health)
+├── api/                 # HTTP handlers (messages, chat_completions, embeddings, rerank, models, health)
 ├── config/              # Settings & AWS config
 ├── converters/          # Protocol converters (Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic)
 ├── database/            # Storage backends (SQLite, PostgreSQL, DynamoDB)
@@ -266,12 +335,12 @@ src/
 │   └── dynamodb/
 ├── error/               # Error types
 ├── middleware/           # Auth & rate limiting
-├── schemas/             # Request/response schemas (Anthropic, OpenAI, Bedrock, Gemini)
+├── schemas/             # Request/response schemas (Anthropic, OpenAI, Bedrock, Gemini, Embeddings, Rerank)
 ├── server/              # App bootstrap, routing, state
 ├── services/            # Business logic
 │   ├── backend_pool/    # Credential pool & load balancing
 │   ├── ptc/             # Programmatic Tool Calling (sandboxed execution)
-│   ├── bedrock.rs       # AWS Bedrock service
+│   ├── bedrock.rs       # AWS Bedrock service (Converse + InvokeModel)
 │   ├── gemini.rs        # Google Gemini service
 │   ├── passthrough.rs   # Anthropic & OpenAI passthrough service
 │   ├── model_mapping.rs # Model resolution with caching

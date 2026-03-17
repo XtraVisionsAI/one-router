@@ -4,5 +4,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod embeddings;
 pub mod gemini;
 pub mod openai;
+pub mod rerank;

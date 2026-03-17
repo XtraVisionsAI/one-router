@@ -6,6 +6,8 @@
 use aws_sdk_bedrockruntime::{
     operation::converse::{ConverseError, ConverseOutput},
     operation::converse_stream::ConverseStreamError,
+    operation::invoke_model::InvokeModelError,
+    primitives::Blob,
     types::{
         ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage,
         SystemContentBlock, ToolConfiguration,
@@ -165,6 +167,38 @@ impl BedrockService {
             inner: result.stream,
             credential_name: cred_name,
         })
+    }
+
+    /// Invoke a model using the InvokeModel API (used for embeddings and rerank).
+    pub async fn invoke_model(
+        &self,
+        model_id: &str,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, BedrockError> {
+        let (cred_name, client) = self.get_client();
+        let cred_name = cred_name.to_string();
+
+        tracing::debug!(
+            model_id = %model_id,
+            credential = %cred_name,
+            "Calling Bedrock InvokeModel API"
+        );
+
+        let result = client
+            .invoke_model()
+            .model_id(model_id)
+            .body(Blob::new(body))
+            .content_type("application/json")
+            .accept("application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                self.record_failure(&cred_name);
+                BedrockError::from_invoke_model_error(e)
+            })?;
+
+        self.record_success(&cred_name);
+        Ok(result.body().as_ref().to_vec())
     }
 }
 
@@ -385,6 +419,54 @@ impl BedrockError {
                         )
                     }
                     ConverseStreamError::ModelErrorException(e) => BedrockError::ApiError {
+                        message: e.message().unwrap_or("Model error").to_string(),
+                        error_type: BedrockErrorType::Server,
+                        is_retryable: true,
+                    },
+                    _ => BedrockError::Unknown(format!("{:?}", error)),
+                }
+            }
+            _ => BedrockError::Unknown(format!("{:?}", err)),
+        }
+    }
+
+    pub fn from_invoke_model_error<R>(err: SdkError<InvokeModelError, R>) -> Self
+    where
+        R: std::fmt::Debug,
+    {
+        match &err {
+            SdkError::ServiceError(service_err) => {
+                let error = service_err.err();
+                match error {
+                    InvokeModelError::ThrottlingException(e) => {
+                        BedrockError::Throttled(e.message().unwrap_or("Rate limited").to_string())
+                    }
+                    InvokeModelError::ValidationException(e) => BedrockError::ValidationError(
+                        e.message().unwrap_or("Validation failed").to_string(),
+                    ),
+                    InvokeModelError::ModelNotReadyException(e) => {
+                        BedrockError::ServiceUnavailable(
+                            e.message().unwrap_or("Model not ready").to_string(),
+                        )
+                    }
+                    InvokeModelError::ModelTimeoutException(e) => BedrockError::ServiceUnavailable(
+                        e.message().unwrap_or("Model timeout").to_string(),
+                    ),
+                    InvokeModelError::InternalServerException(e) => BedrockError::InternalError(
+                        e.message().unwrap_or("Internal server error").to_string(),
+                    ),
+                    InvokeModelError::AccessDeniedException(e) => BedrockError::AccessDenied(
+                        e.message().unwrap_or("Access denied").to_string(),
+                    ),
+                    InvokeModelError::ResourceNotFoundException(e) => BedrockError::ModelNotFound(
+                        e.message().unwrap_or("Resource not found").to_string(),
+                    ),
+                    InvokeModelError::ServiceUnavailableException(e) => {
+                        BedrockError::ServiceUnavailable(
+                            e.message().unwrap_or("Service unavailable").to_string(),
+                        )
+                    }
+                    InvokeModelError::ModelErrorException(e) => BedrockError::ApiError {
                         message: e.message().unwrap_or("Model error").to_string(),
                         error_type: BedrockErrorType::Server,
                         is_retryable: true,
