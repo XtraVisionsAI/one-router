@@ -374,12 +374,74 @@ impl UsageStore for PostgresBackend {
 
     async fn query_usage_summary(
         &self,
-        _api_key: &str,
-        _start: Option<&str>,
-        _end: Option<&str>,
-        _group_by: &str,
+        api_key: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        group_by: &str,
     ) -> Result<Vec<UsageSummaryRow>> {
-        anyhow::bail!("query_usage_summary not yet implemented for Postgres")
+        let group_expr = if group_by == "model" {
+            "model".to_string()
+        } else {
+            "to_char(date_trunc('hour', timestamp::timestamptz), 'YYYY-MM-DD\"T\"HH24')".to_string()
+        };
+
+        // Postgres 使用 $1, $2… 占位符，参数顺序固定：api_key, [start], [end]
+        #[allow(unused_assignments)]
+        let mut param_idx = 2usize; // $1 = api_key
+        let start_clause = if start.is_some() {
+            let s = format!("AND timestamp >= ${}", param_idx);
+            param_idx += 1;
+            s
+        } else {
+            String::new()
+        };
+        let end_clause = if end.is_some() {
+            format!("AND timestamp <= ${}", param_idx)
+        } else {
+            String::new()
+        };
+
+        let sql = format!(
+            "SELECT {group_expr} AS group_key, \
+             SUM(input_tokens) AS input_tokens, \
+             SUM(output_tokens) AS output_tokens, \
+             SUM(cached_tokens) AS cached_tokens, \
+             SUM(cache_write_tokens) AS cache_write_tokens, \
+             SUM(cost) AS total_cost, \
+             COUNT(*) AS total_requests, \
+             SUM(CASE WHEN success = false THEN 1 ELSE 0 END) AS error_requests \
+             FROM usage \
+             WHERE api_key = $1 {start_clause} {end_clause} \
+             GROUP BY {group_expr} \
+             ORDER BY group_key DESC",
+        );
+        // 注意：Postgres 不允许 GROUP BY 引用列别名，必须重复原始表达式。
+
+        let mut q = sqlx::query(&sql).bind(api_key);
+        if let Some(s) = start {
+            q = q.bind(s);
+        }
+        if let Some(e) = end {
+            q = q.bind(e);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+
+        let records = rows
+            .iter()
+            .map(|r| UsageSummaryRow {
+                group_key: r.get("group_key"),
+                input_tokens: r.get("input_tokens"),
+                output_tokens: r.get("output_tokens"),
+                cached_tokens: r.get("cached_tokens"),
+                cache_write_tokens: r.get("cache_write_tokens"),
+                total_cost: r.get("total_cost"),
+                total_requests: r.get("total_requests"),
+                error_requests: r.get("error_requests"),
+            })
+            .collect();
+
+        Ok(records)
     }
 }
 
