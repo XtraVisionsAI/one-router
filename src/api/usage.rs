@@ -191,9 +191,23 @@ pub async fn get_usage_records(
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(100).min(1000);
 
+    // 安全防护：不允许无界查询（既无 start_time 也无 before_id）。
+    // 无限制拉取所有记录可能导致 OOM，强制要求至少提供一个时间或游标边界。
+    if params.start_time.is_none() && params.before_id.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Either 'start_time' or 'before_id' is required to prevent unbounded queries.",
+            )),
+        )
+            .into_response();
+    }
+
     // 拉取 start_time 之后的全部记录（不预设行数限制）。
     // before_id 游标必须在应用层过滤后才能正确判断 has_more。
-    // 实践中调用方应传 start_time 缩小时间窗口，避免拉取过多数据。
+    // 注意：DynamoDB 后端的 before_id 游标不生效（id 字段为 None），
+    // 此时仍需配合 start_time 使用。
     let all_records = match state
         .database
         .usage()
