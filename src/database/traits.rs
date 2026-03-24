@@ -31,6 +31,15 @@ pub trait UsageStore: Send + Sync {
         since: Option<&str>,
         limit: Option<i64>,
     ) -> Result<Vec<UsageRecord>>;
+    /// 聚合查询用量，按 group_by 分组（"hour" 或 "model"）。
+    /// start / end 为 RFC3339 字符串，均可选。
+    async fn query_usage_summary(
+        &self,
+        api_key: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        group_by: &str,
+    ) -> Result<Vec<UsageSummaryRow>>;
 }
 
 #[async_trait]

@@ -577,6 +577,16 @@ impl UsageStore for SqliteBackend {
 
         Ok(records)
     }
+
+    async fn query_usage_summary(
+        &self,
+        _api_key: &str,
+        _start: Option<&str>,
+        _end: Option<&str>,
+        _group_by: &str,
+    ) -> Result<Vec<UsageSummaryRow>> {
+        anyhow::bail!("query_usage_summary not yet implemented for SQLite")
+    }
 }
 
 // ============================================================================
