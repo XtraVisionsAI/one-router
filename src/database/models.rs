@@ -107,3 +107,20 @@ pub struct FeatureFlagRecord {
     pub created_at: i64,
     pub updated_at: Option<i64>,
 }
+
+// ============================================================================
+// usage summary (query result, not a table)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSummaryRow {
+    /// 分组键，按 hour 时格式为 "2026-03-24T15"，按 model 时为模型名
+    pub group_key: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub total_cost: f64,
+    pub total_requests: i64,
+    pub error_requests: i64,
+}
