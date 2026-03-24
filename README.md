@@ -25,6 +25,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Multi-Backend Routing** — routes to AWS Bedrock, Google Gemini, Anthropic API, and OpenAI API with automatic protocol conversion
 - **Embeddings & Rerank** — OpenAI-compatible `/v1/embeddings` and Cohere-compatible `/v1/rerank` backed by Bedrock (Cohere Embed, Titan Embed, Nova Embed, Cohere Rerank)
 - **Image Generation** — OpenAI-compatible `/v1/images/generations` routed to OpenAI DALL-E, AWS Bedrock (Stability AI SDXL, Amazon Nova Canvas, Titan Image Generator), or Google Gemini
+- **Usage Query API** — query your token usage and cost history via `GET /v1/usage` (aggregated, grouped by hour or model) and `GET /v1/usage/records` (paginated raw records)
 - **Smart Model Mapping** — maps model names across providers (e.g. `gpt-4o` -> Claude Sonnet, `claude-*` -> Bedrock), with exact match, wildcard, and configurable priority
 - **Credential Pool & Load Balancing** — manage multiple backend credentials with round-robin, weighted, random, or failover strategies
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
@@ -217,6 +218,70 @@ print(response.data[0].b64_json[:40], "...")
 
 > **Note:** Bedrock and Gemini backends only support `response_format=b64_json`. Requesting `url` format for these backends returns a `400 Bad Request`. The OpenAI passthrough supports both `url` and `b64_json`.
 
+```
+
+### Usage Query API
+
+Query your own token usage statistics. Requires an API key.
+
+```bash
+# Aggregated usage grouped by hour (default)
+curl "http://localhost:8000/v1/usage" \
+  -H "x-api-key: sk-ephemeral-xxxxxxxxxxxx" | jq .
+
+# Grouped by model
+curl "http://localhost:8000/v1/usage?group_by=model" \
+  -H "x-api-key: sk-ephemeral-xxxxxxxxxxxx" | jq .
+
+# Filter by time range
+curl "http://localhost:8000/v1/usage?start_time=2026-03-01T00:00:00Z&group_by=model" \
+  -H "x-api-key: sk-ephemeral-xxxxxxxxxxxx" | jq .
+
+# Paginated raw request records (start_time or before_id required)
+curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&limit=50" \
+  -H "x-api-key: sk-ephemeral-xxxxxxxxxxxx" | jq .
+```
+
+**`GET /v1/usage` response:**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "group_key": "2026-03-24T15",
+      "input_tokens": 12000,
+      "output_tokens": 3400,
+      "cached_tokens": 800,
+      "cache_write_tokens": 0,
+      "total_cost": 0.45,
+      "total_requests": 10,
+      "error_requests": 1
+    }
+  ],
+  "summary": {
+    "total_requests": 10,
+    "total_input_tokens": 12000,
+    "total_output_tokens": 3400,
+    "total_cached_tokens": 800,
+    "total_cost": 0.45,
+    "budget_used_mtd": 4.50,
+    "monthly_budget": 100.0
+  }
+}
+```
+
+| Query Param | Values | Description |
+|---|---|---|
+| `start_time` | RFC3339 | Filter start time |
+| `end_time` | RFC3339 | Filter end time |
+| `group_by` | `hour` (default) \| `model` | Aggregation dimension |
+
+| Query Param | Values | Description |
+|---|---|---|
+| `start_time` | RFC3339 | **Required** (unless `before_id` provided) |
+| `limit` | 1–1000 (default 100) | Records per page |
+| `before_id` | integer | Cursor for next page (use last record's `id`) |
+
 ## Configuration
 
 One Router is configured through **5 environment variables**. Everything else lives in the database.
@@ -312,6 +377,9 @@ Output formats via `--format`:
   Cohere SDK ──────►  /v1/rerank                         │──► AWS Bedrock
   OpenAI SDK ──────►  /v1/images/generations             │──► OpenAI / Bedrock / Gemini
                     │                                      │
+               ─────►  GET /v1/usage                     │  (aggregated usage stats)
+               ─────►  GET /v1/usage/records             │  (paginated raw records)
+                    │                                      │
                     │  ┌───────────────────────────────┐  │
                     │  │ Auth · Rate Limit · Budget    │  │
                     │  │ Model Mapping · Credential    │  │
@@ -380,7 +448,7 @@ Wildcard catch-alls (`claude-*`, `gpt-*`, `gemini-*`, `o1-*`) ensure unknown mod
 
 ```
 src/
-├── api/                 # HTTP handlers (messages, chat_completions, embeddings, rerank, images, models, health)
+├── api/                 # HTTP handlers (messages, chat_completions, embeddings, rerank, images, models, usage, health)
 ├── config/              # Settings & AWS config
 ├── converters/          # Protocol converters (Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic)
 ├── database/            # Storage backends (SQLite, PostgreSQL, DynamoDB)
