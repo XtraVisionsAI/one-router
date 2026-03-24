@@ -465,12 +465,66 @@ impl UsageStore for DynamoDbBackend {
 
     async fn query_usage_summary(
         &self,
-        _api_key: &str,
-        _start: Option<&str>,
-        _end: Option<&str>,
-        _group_by: &str,
+        api_key: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        group_by: &str,
     ) -> Result<Vec<UsageSummaryRow>> {
-        anyhow::bail!("query_usage_summary not yet implemented for DynamoDB")
+        use std::collections::HashMap;
+
+        // 复用已有的 get_usage_by_api_key 拉全量记录
+        // 注意：DynamoDB 后端会拉取指定时间范围内该 api_key 的全量记录到内存再聚合，
+        // 数据量大时（如数百万条）可能造成高内存占用。
+        // 生产环境建议配合合理的 start_time 参数缩小查询范围。
+        let records = self.get_usage_by_api_key(api_key, start, None).await?;
+
+        // 按 end 过滤（DynamoDB 查询只支持 sort_key >= start）
+        let records: Vec<_> = if let Some(end_ts) = end {
+            records
+                .into_iter()
+                .filter(|r| r.timestamp.as_str() <= end_ts)
+                .collect()
+        } else {
+            records
+        };
+
+        // 聚合
+        let mut map: HashMap<String, UsageSummaryRow> = HashMap::new();
+
+        for r in &records {
+            let key = if group_by == "model" {
+                r.model.clone()
+            } else {
+                // 取 timestamp 的前 13 字符："2026-03-24T15"
+                r.timestamp.chars().take(13).collect()
+            };
+
+            let entry = map.entry(key.clone()).or_insert(UsageSummaryRow {
+                group_key: key,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+                total_cost: 0.0,
+                total_requests: 0,
+                error_requests: 0,
+            });
+
+            entry.input_tokens += r.input_tokens;
+            entry.output_tokens += r.output_tokens;
+            entry.cached_tokens += r.cached_tokens;
+            entry.cache_write_tokens += r.cache_write_tokens;
+            entry.total_cost += r.cost;
+            entry.total_requests += 1;
+            if !r.success {
+                entry.error_requests += 1;
+            }
+        }
+
+        let mut result: Vec<UsageSummaryRow> = map.into_values().collect();
+        result.sort_by(|a, b| b.group_key.cmp(&a.group_key));
+
+        Ok(result)
     }
 }
 
