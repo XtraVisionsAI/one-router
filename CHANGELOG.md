@@ -1,3 +1,20 @@
+## v0.4.0 (2026-03-24)
+
+### Feat
+
+- **usage**: usage query API complete — /v1/usage + /v1/usage/records
+- **usage**: register /v1/usage and /v1/usage/records routes
+- **usage**: add usage summary and records handlers
+- **usage**: implement query_usage_summary for DynamoDB
+- **usage**: implement query_usage_summary for Postgres
+- **usage**: implement query_usage_summary for SQLite
+- **usage**: add query_usage_summary to UsageStore trait
+- **usage**: add UsageSummaryRow model
+
+### Fix
+
+- **usage**: require start_time or before_id in records endpoint to prevent unbounded queries
+
 ## v0.3.0 (2026-03-17)
 
 ### Feat
