@@ -133,8 +133,10 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
    APP LAYOUT
    ============================================================ */
 .app-layout {
-  display: flex;
   min-height: 100vh;
+}
+.app-layout:not([hidden]) {
+  display: flex;
 }
 
 /* --- Sidebar --- */
@@ -488,11 +490,13 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   position: fixed;
   inset: 0;
   background: var(--bg-overlay);
-  display: flex;
   align-items: center;
   justify-content: center;
   z-index: 1000;
   padding: 1rem;
+}
+.modal-overlay:not([hidden]) {
+  display: flex;
 }
 
 .modal {
