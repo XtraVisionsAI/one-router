@@ -96,19 +96,87 @@ fn default_service_tier() -> String {
     "default".to_string()
 }
 
+/// Deserialize a field that can be absent (don't touch), null (clear), or a value (set).
+/// - Field absent in JSON → `None` (do not change the existing value)
+/// - Field present as `null` → `Some(None)` (clear the value)
+/// - Field present as a value → `Some(Some(value))` (set to value)
+fn deserialize_optional_field<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::de::DeserializeOwned,
+    D: serde::de::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(d)?))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateKeyRequest {
     pub name: Option<String>,
     pub rate_limit: Option<i32>,
-    pub tpm_limit: Option<i32>,
+    /// None = don't change, Some(None) = clear, Some(Some(v)) = set to v
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub tpm_limit: Option<Option<i32>>,
     pub service_tier: Option<String>,
-    pub monthly_budget: Option<f64>,
+    /// None = don't change, Some(None) = clear, Some(Some(v)) = set to v
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub monthly_budget: Option<Option<f64>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DeleteKeyQuery {
     /// "deactivate" (default) or "delete"
     pub action: Option<String>,
+}
+
+// ============================================================================
+// Private helpers
+// ============================================================================
+
+/// Find a single ApiKeyRecord by its truncated key form.
+/// Returns Err(Response) with 404 if not found, 409 if multiple keys share the same prefix.
+async fn resolve_key(
+    state: &AppState,
+    key_prefix: &str,
+) -> Result<ApiKeyRecord, axum::response::Response> {
+    let records = state
+        .database
+        .api_keys()
+        .list_api_keys()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list API keys");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Failed to retrieve API keys",
+                )),
+            )
+                .into_response()
+        })?;
+
+    let mut matches: Vec<ApiKeyRecord> = records
+        .into_iter()
+        .filter(|r| ApiKeyInfo::truncate_key(&r.api_key) == key_prefix)
+        .collect();
+
+    if matches.len() > 1 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "conflict_error",
+                "Ambiguous key prefix — multiple keys share this prefix",
+            )),
+        )
+            .into_response());
+    }
+
+    matches.pop().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("not_found_error", "API key not found")),
+        )
+            .into_response()
+    })
 }
 
 // ============================================================================
@@ -198,34 +266,9 @@ pub async fn update_key(
     Path(key_prefix): Path<String>,
     Json(body): Json<UpdateKeyRequest>,
 ) -> impl IntoResponse {
-    // Fetch all keys and find one whose truncated form matches key_prefix
-    let records = match state.database.api_keys().list_api_keys().await {
+    let mut record = match resolve_key(&state, &key_prefix).await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to list API keys for update");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    "Failed to retrieve API keys",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    let mut record = match records
-        .into_iter()
-        .find(|r| ApiKeyInfo::truncate_key(&r.api_key) == key_prefix)
-    {
-        Some(r) => r,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("not_found_error", "API key not found")),
-            )
-                .into_response()
-        }
+        Err(resp) => return resp,
     };
 
     // Apply partial updates
@@ -235,14 +278,14 @@ pub async fn update_key(
     if let Some(rate_limit) = body.rate_limit {
         record.rate_limit = rate_limit;
     }
-    if let Some(tpm_limit) = body.tpm_limit {
-        record.tpm_limit = Some(tpm_limit);
+    if let Some(tpm) = body.tpm_limit {
+        record.tpm_limit = tpm; // Some(v) sets it, None clears it
     }
     if let Some(service_tier) = body.service_tier {
         record.service_tier = service_tier;
     }
-    if body.monthly_budget.is_some() {
-        record.monthly_budget = body.monthly_budget;
+    if let Some(budget) = body.monthly_budget {
+        record.monthly_budget = budget; // Some(v) sets it, None clears it
     }
 
     match state.database.api_keys().update_api_key(&record).await {
@@ -264,36 +307,13 @@ pub async fn delete_key(
     Path(key_prefix): Path<String>,
     Query(query): Query<DeleteKeyQuery>,
 ) -> impl IntoResponse {
+    // NOTE: "delete" action calls deactivate_api_key with reason="deleted".
+    // There is no hard-delete in the DatabaseService trait; this is intentional.
     let action = query.action.as_deref().unwrap_or("deactivate");
 
-    // Find full key by truncated prefix
-    let records = match state.database.api_keys().list_api_keys().await {
+    let record = match resolve_key(&state, &key_prefix).await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to list API keys for delete");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    "Failed to retrieve API keys",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    let record = match records
-        .into_iter()
-        .find(|r| ApiKeyInfo::truncate_key(&r.api_key) == key_prefix)
-    {
-        Some(r) => r,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("not_found_error", "API key not found")),
-            )
-                .into_response()
-        }
+        Err(resp) => return resp,
     };
 
     let reason = match action {
@@ -324,33 +344,9 @@ pub async fn activate_key(
     State(state): State<AppState>,
     Path(key_prefix): Path<String>,
 ) -> impl IntoResponse {
-    let records = match state.database.api_keys().list_api_keys().await {
+    let mut record = match resolve_key(&state, &key_prefix).await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to list API keys for activate");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    "Failed to retrieve API keys",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    let mut record = match records
-        .into_iter()
-        .find(|r| ApiKeyInfo::truncate_key(&r.api_key) == key_prefix)
-    {
-        Some(r) => r,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("not_found_error", "API key not found")),
-            )
-                .into_response()
-        }
+        Err(resp) => return resp,
     };
 
     record.is_active = true;
