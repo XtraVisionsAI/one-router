@@ -175,6 +175,11 @@ document.getElementById('modal-overlay').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) closeModal();
 });
 
+// Page-level event delegation (registered once, guards by page)
+document.getElementById('page-content').addEventListener('click', (e) => {
+  if (STATE.currentPage === 'keys') handleKeyAction(e);
+});
+
 // ============================================================
 // DASHBOARD PAGE
 // ============================================================
@@ -335,8 +340,6 @@ function renderKeysList(content, keys) {
     </div>
   `;
 
-  // Single persistent event delegation listener — guards with data-action check
-  content.addEventListener('click', handleKeyAction);
 }
 
 async function handleKeyAction(e) {
