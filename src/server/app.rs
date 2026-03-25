@@ -3,6 +3,7 @@
 use crate::{
     config::Settings,
     database,
+    database::encryption::Encryptor,
     server::{routes, state::AppState},
     services::{
         AnthropicBackendConfig, BedrockBackendConfig, BedrockService, GeminiBackendConfig,
@@ -141,6 +142,12 @@ impl App {
         let model_mapping = Arc::new(ModelMappingService::new(database.clone()));
         let usage_tracker = Arc::new(UsageTracker::new(database.clone()));
 
+        // 8. Create encryptor (no-op when ENCRYPTION_KEY is not set)
+        let encryptor = Encryptor::new(settings.encryption_key.as_deref());
+        if encryptor.is_enabled() {
+            tracing::info!("Credential encryption enabled (AES-256-GCM)");
+        }
+
         let state = AppState {
             settings: settings_arc,
             database,
@@ -152,6 +159,7 @@ impl App {
             gemini_service,
             anthropic_service,
             openai_service,
+            encryptor,
         };
 
         tracing::info!("Application state initialized successfully");

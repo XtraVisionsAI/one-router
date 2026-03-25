@@ -3,6 +3,7 @@
 //! Holds all shared resources that handlers need access to.
 
 use crate::config::Settings;
+use crate::database::encryption::Encryptor;
 use crate::database::traits::DatabaseService;
 use crate::services::{
     BedrockService, GeminiService, ModelMappingService, PassthroughService, PtcService,
@@ -33,6 +34,9 @@ pub struct AppState {
 
     /// Application start time (for uptime calculation)
     pub start_time: Instant,
+
+    /// Encryption helper (AES-256-GCM). No-op when ENCRYPTION_KEY is not set.
+    pub encryptor: Encryptor,
 
     /// PTC service for Programmatic Tool Calling (optional)
     pub ptc_service: Option<Arc<PtcService>>,
