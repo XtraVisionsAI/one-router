@@ -84,6 +84,26 @@ pub fn create_router(state: AppState) -> Router {
         .route("/keys/:key", put(admin::keys::update_key))
         .route("/keys/:key", delete(admin::keys::delete_key))
         .route("/keys/:key/activate", post(admin::keys::activate_key))
+        // Backends
+        .route("/backends", get(admin::backends::list_backends))
+        .route("/backends", post(admin::backends::create_backend))
+        .route("/backends/:name", put(admin::backends::update_backend))
+        .route("/backends/:name", delete(admin::backends::delete_backend))
+        .route(
+            "/backends/:name/toggle",
+            put(admin::backends::toggle_backend),
+        )
+        // Model Mappings
+        .route("/mappings", get(admin::mappings::list_mappings))
+        .route("/mappings", post(admin::mappings::create_mapping))
+        .route(
+            "/mappings/:source_model_id/:provider",
+            put(admin::mappings::update_mapping),
+        )
+        .route(
+            "/mappings/:source_model_id/:provider",
+            delete(admin::mappings::delete_mapping),
+        )
         .layer(middleware::from_fn_with_state(
             admin_auth_state,
             require_admin_key,
