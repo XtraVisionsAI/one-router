@@ -15,12 +15,11 @@ pub struct StatusResponse {
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
+    let uptime = state.uptime_seconds();
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION"),
-        uptime_seconds: state.uptime_seconds(),
+        uptime_seconds: uptime,
         database: "healthy",
-        // Use actual start time derived from uptime
-        started_at: (Utc::now() - chrono::Duration::seconds(state.uptime_seconds() as i64))
-            .to_rfc3339(),
+        started_at: (Utc::now() - chrono::Duration::seconds(uptime as i64)).to_rfc3339(),
     })
 }
