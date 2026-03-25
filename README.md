@@ -33,7 +33,8 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Streaming Support** — full SSE streaming for both OpenAI and Anthropic protocols
 - **Extended Thinking** — pass-through support for Anthropic extended thinking
 - **Tool Use & PTC** — tool calling support including Programmatic Tool Calling with sandboxed code execution
-- **AES-256-GCM Encryption** — encrypt backend credentials at rest
+- **Admin Web UI** — built-in browser UI at `/admin` for managing API keys, backends, model mappings, feature flags, and usage stats — no external tools needed
+- **AES-256-GCM Encryption** — encrypt backend credentials at rest; the Admin UI handles plaintext input and encrypts automatically on save
 - **Prometheus Metrics** — built-in `/health`, `/ready`, `/liveness` endpoints
 - **Feature Flags** — toggle capabilities (tool use, PTC, caching, rate limiting) via database
 - **Multi-Arch Docker** — ships `linux/amd64` and `linux/arm64` images
@@ -282,6 +283,21 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
 | `limit` | 1–1000 (default 100) | Records per page |
 | `before_id` | integer | Cursor for next page (use last record's `id`) |
 
+## Admin Web UI
+
+One Router includes a built-in admin UI at **`/admin`**. Open it in a browser and sign in with your master key or ephemeral key.
+
+| Page | What you can do |
+|---|---|
+| **Dashboard** | Overview: backend health, API key count, uptime |
+| **API Keys** | Create keys (plaintext shown once), edit rate limits / budgets, deactivate / reactivate |
+| **Backends** | Add / edit backends (Gemini, Anthropic, OpenAI, Bedrock) — credentials entered in plaintext, encrypted before saving |
+| **Model Maps** | Manage source → target model mappings, priorities, and pricing |
+| **Usage** | Query usage statistics by API key, time range, and grouping |
+| **Flags** | Toggle feature flags (tool use, PTC, caching, etc.) |
+
+The UI is embedded directly in the binary (no separate deployment). It requires **no build step** — it's plain HTML + CSS + vanilla JS.
+
 ## Configuration
 
 One Router is configured through **5 environment variables**. Everything else lives in the database.
@@ -380,6 +396,9 @@ Output formats via `--format`:
                ─────►  GET /v1/usage                     │  (aggregated usage stats)
                ─────►  GET /v1/usage/records             │  (paginated raw records)
                     │                                      │
+  Browser ─────────►  GET /admin                         │  (Admin Web UI)
+               ─────►  /admin/api/*                      │  (Admin REST API)
+                    │                                      │
                     │  ┌───────────────────────────────┐  │
                     │  │ Auth · Rate Limit · Budget    │  │
                     │  │ Model Mapping · Credential    │  │
@@ -448,7 +467,7 @@ Wildcard catch-alls (`claude-*`, `gpt-*`, `gemini-*`, `o1-*`) ensure unknown mod
 
 ```
 src/
-├── api/                 # HTTP handlers (messages, chat_completions, embeddings, rerank, images, models, usage, health)
+├── api/                 # HTTP handlers (messages, chat_completions, embeddings, rerank, images, models, usage, health, admin)
 ├── config/              # Settings & AWS config
 ├── converters/          # Protocol converters (Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic)
 ├── database/            # Storage backends (SQLite, PostgreSQL, DynamoDB)
@@ -468,6 +487,11 @@ src/
 │   ├── model_mapping.rs # Model resolution with caching
 │   └── usage_tracker.rs # Usage & cost tracking
 └── utils/
+static/
+└── admin/               # Admin Web UI (embedded into binary via rust-embed)
+    ├── index.html
+    ├── app.js
+    └── app.css
 docker/
 ├── Dockerfile           # Multi-stage build
 ├── Dockerfile.prebuilt  # Pre-built binary (used in CI)
