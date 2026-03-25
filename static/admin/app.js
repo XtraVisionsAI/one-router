@@ -179,6 +179,9 @@ document.getElementById('modal-overlay').addEventListener('click', (e) => {
 document.getElementById('page-content').addEventListener('click', (e) => {
   if (STATE.currentPage === 'keys') handleKeyAction(e);
 });
+document.getElementById('page-content').addEventListener('click', (e) => {
+  if (STATE.currentPage === 'backends') handleBackendAction(e);
+});
 
 // ============================================================
 // DASHBOARD PAGE
@@ -472,8 +475,127 @@ function showEditKeyModal(dataset) {
 // STUB PAGES (implemented in Phase 3c)
 // ============================================================
 
+// ============================================================
+// BACKENDS PAGE
+// ============================================================
+
 async function pageBackends(content) {
-  content.innerHTML = '<div class="loading">Backends page — coming soon</div>';
+  const data = await api('GET', '/backends');
+  const backends = data.data || [];
+  content.innerHTML = `
+    <div class="page-header">
+      <h1 class="page-title">Backends</h1>
+      <button class="btn btn-primary" id="btn-create-backend">+ Add Backend</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Name</th><th>Type</th><th>Priority</th><th>Health</th><th>Enabled</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+          ${backends.length === 0
+            ? '<tr><td colspan="6" class="table-empty">No backends configured</td></tr>'
+            : backends.map((b) => `
+              <tr>
+                <td class="mono">${esc(b.name)}</td>
+                <td><span class="badge badge-blue">${esc(b.backend_type)}</span></td>
+                <td>${b.priority}</td>
+                <td><span class="health-dot ${healthDotClass(b.health_status)}"></span>${esc(b.health_status)}</td>
+                <td>${b.enabled ? '<span class="badge badge-green">enabled</span>' : '<span class="badge badge-gray">disabled</span>'}</td>
+                <td><div class="actions">
+                  <button class="btn btn-secondary btn-sm" data-action="edit-backend" data-name="${esc(b.name)}" data-type="${esc(b.backend_type)}" data-priority="${b.priority}" data-enabled="${b.enabled}">Edit</button>
+                  <button class="btn btn-secondary btn-sm" data-action="toggle-backend" data-name="${esc(b.name)}">${b.enabled ? 'Disable' : 'Enable'}</button>
+                  <button class="btn btn-danger btn-sm" data-action="delete-backend" data-name="${esc(b.name)}">Delete</button>
+                </div></td>
+              </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+async function handleBackendAction(e) {
+  const btn = e.target.closest('[data-action], #btn-create-backend');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  if (btn.id === 'btn-create-backend') { showBackendModal(); return; }
+  const name = btn.dataset.name;
+  const content = document.getElementById('page-content');
+
+  if (action === 'edit-backend') {
+    showBackendModal({ name, backend_type: btn.dataset.type, priority: parseInt(btn.dataset.priority), enabled: btn.dataset.enabled === 'true' });
+  } else if (action === 'toggle-backend') {
+    try {
+      await api('PUT', `/backends/${encodeURIComponent(name)}/toggle`);
+      toast('Backend updated', 'success');
+      await pageBackends(content);
+    } catch (err) { toast(err.message, 'error'); }
+  } else if (action === 'delete-backend') {
+    if (!confirm(`Delete backend "${name}"?`)) return;
+    try {
+      await api('DELETE', `/backends/${encodeURIComponent(name)}`);
+      toast('Backend deleted', 'success');
+      await pageBackends(content);
+    } catch (err) { toast(err.message, 'error'); }
+  }
+}
+
+function showBackendModal(existing) {
+  const isEdit = !!existing;
+  const title = isEdit ? `Edit Backend: ${existing.name}` : 'Add Backend';
+  const types = ['gemini', 'anthropic', 'openai', 'bedrock'];
+
+  openModal(title, `
+    ${!isEdit ? `<div class="form-group"><label class="form-label">Name *</label>
+      <input class="form-input" id="m-be-name" placeholder="e.g. gemini-prod"></div>` : `<p class="text-secondary" style="margin-bottom:14px;font-size:12px">Backend: <span class="mono">${esc(existing.name)}</span></p>`}
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Type *</label>
+        <select class="form-input" id="m-be-type">
+          ${types.map((t) => `<option value="${t}" ${(existing?.backend_type || 'gemini') === t ? 'selected' : ''}>${t}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group"><label class="form-label">Priority</label>
+        <input class="form-input" id="m-be-priority" type="number" value="${existing?.priority ?? 0}">
+      </div>
+    </div>
+    <div class="form-group form-full"><label class="form-label">Config JSON${isEdit ? ' (leave empty to keep existing)' : ' *'}</label>
+      <textarea class="form-textarea" id="m-be-config" placeholder='{"api_keys":["AIza..."]}'></textarea>
+      <p class="form-hint">Credentials are encrypted before storage. For Gemini/Anthropic/OpenAI: {"api_keys":["key1"]}. For Bedrock: {"region":"us-east-1"}.</p>
+    </div>
+  `, `
+    <button class="btn btn-secondary" id="m-be-cancel">Cancel</button>
+    <button class="btn btn-primary" id="m-be-save">${isEdit ? 'Save' : 'Create'}</button>
+  `);
+
+  document.getElementById('m-be-cancel').addEventListener('click', closeModal);
+  document.getElementById('m-be-save').addEventListener('click', async () => {
+    const name = isEdit ? existing.name : document.getElementById('m-be-name').value.trim();
+    const backend_type = document.getElementById('m-be-type').value;
+    const priority = parseInt(document.getElementById('m-be-priority').value) || 0;
+    const configRaw = document.getElementById('m-be-config').value.trim();
+
+    if (!name) { toast('Name is required', 'error'); return; }
+    if (!isEdit && !configRaw) { toast('Config JSON is required', 'error'); return; }
+
+    let config;
+    if (configRaw) {
+      try { config = JSON.parse(configRaw); }
+      catch { toast('Invalid JSON in config field', 'error'); return; }
+    }
+
+    const body = { name, backend_type, priority, enabled: existing?.enabled ?? true };
+    if (config !== undefined) body.config = config;
+
+    try {
+      if (isEdit) {
+        await api('PUT', `/backends/${encodeURIComponent(name)}`, body);
+      } else {
+        await api('POST', '/backends', body);
+      }
+      closeModal();
+      toast(isEdit ? 'Backend updated' : 'Backend created', 'success');
+      await pageBackends(document.getElementById('page-content'));
+    } catch (err) { toast(err.message, 'error'); }
+  });
 }
 
 async function pageMappings(content) {
