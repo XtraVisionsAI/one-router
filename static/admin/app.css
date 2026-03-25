@@ -63,11 +63,13 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
    AUTH GATE
    ============================================================ */
 .auth-gate {
-  display: flex;
   align-items: center;
   justify-content: center;
   min-height: 100vh;
   padding: 2rem;
+}
+.auth-gate:not([hidden]) {
+  display: flex;
 }
 
 .auth-card {
