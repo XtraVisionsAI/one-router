@@ -90,7 +90,6 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   align-items: center;
   gap: 8px;
 }
-.logo-one    { color: var(--text-primary); }
 .logo-router { color: var(--accent-blue); }
 .logo-badge {
   font-size: 10px;
@@ -337,7 +336,6 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 .badge-red    { background: var(--badge-red-bg);    color: var(--accent-red); }
 .badge-blue   { background: var(--badge-blue-bg);   color: var(--accent-blue); }
 .badge-gray   { background: var(--badge-gray-bg);   color: var(--text-secondary); }
-.badge-yellow { background: #3d2f00; color: var(--accent-yellow); }
 
 /* Health dot */
 .health-dot {
@@ -350,7 +348,6 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 .health-dot.green  { background: var(--accent-green); }
 .health-dot.red    { background: var(--accent-red); }
 .health-dot.gray   { background: var(--text-muted); }
-.health-dot.yellow { background: var(--accent-yellow); }
 
 /* ============================================================
    BUTTONS
@@ -640,38 +637,6 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   color: var(--text-secondary);
   margin-bottom: 6px;
 }
-
-/* ============================================================
-   CHART (bar chart for usage)
-   ============================================================ */
-.chart-wrap {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  padding: 16px;
-  margin-bottom: 20px;
-}
-.chart-title {
-  font-size: 11px;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
-  margin-bottom: 12px;
-}
-.bar-chart {
-  display: flex;
-  align-items: flex-end;
-  gap: 3px;
-  height: 80px;
-}
-.bar-chart-bar {
-  flex: 1;
-  background: var(--badge-blue-bg);
-  border-radius: 2px 2px 0 0;
-  min-height: 2px;
-  transition: background 0.1s;
-}
-.bar-chart-bar:hover { background: var(--accent-blue); }
 
 /* ============================================================
    MISC
