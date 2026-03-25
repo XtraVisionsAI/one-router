@@ -114,23 +114,8 @@ pub async fn get_usage_summary(
             .into_response();
     }
 
-    // The existing `query_usage_summary` trait method uses an exact api_key match.
-    // Passing "" would return zero results (no records have api_key = "").
-    // For admin "all keys" aggregation, we require the api_key param to be provided.
-    let api_key_filter = match params.api_key.as_deref() {
-        Some(k) if !k.is_empty() => k,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "api_key is required for admin usage summary. The DatabaseService trait \
-                     does not support cross-key aggregation yet.",
-                )),
-            )
-                .into_response();
-        }
-    };
+    // Empty or absent api_key means "all keys" — the DB layer now supports this.
+    let api_key_filter = params.api_key.as_deref().unwrap_or("");
 
     let rows = match state
         .database

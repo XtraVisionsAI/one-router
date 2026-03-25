@@ -501,60 +501,41 @@ impl UsageStore for SqliteBackend {
         since: Option<&str>,
         limit: Option<i64>,
     ) -> Result<Vec<UsageRecord>> {
-        let rows = match (since, limit) {
-            (Some(since_ts), Some(lim)) => {
-                sqlx::query(
-                    "SELECT id, api_key, timestamp, request_id, model, \
-                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-                     cost, success, duration_ms, error_message \
-                     FROM usage WHERE api_key = ? AND timestamp >= ? \
-                     ORDER BY timestamp DESC LIMIT ?",
-                )
-                .bind(api_key)
-                .bind(since_ts)
-                .bind(lim)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (Some(since_ts), None) => {
-                sqlx::query(
-                    "SELECT id, api_key, timestamp, request_id, model, \
-                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-                     cost, success, duration_ms, error_message \
-                     FROM usage WHERE api_key = ? AND timestamp >= ? \
-                     ORDER BY timestamp DESC",
-                )
-                .bind(api_key)
-                .bind(since_ts)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (None, Some(lim)) => {
-                sqlx::query(
-                    "SELECT id, api_key, timestamp, request_id, model, \
-                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-                     cost, success, duration_ms, error_message \
-                     FROM usage WHERE api_key = ? \
-                     ORDER BY timestamp DESC LIMIT ?",
-                )
-                .bind(api_key)
-                .bind(lim)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (None, None) => {
-                sqlx::query(
-                    "SELECT id, api_key, timestamp, request_id, model, \
-                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-                     cost, success, duration_ms, error_message \
-                     FROM usage WHERE api_key = ? \
-                     ORDER BY timestamp DESC",
-                )
-                .bind(api_key)
-                .fetch_all(&self.pool)
-                .await?
-            }
+        // Empty api_key means "all keys" (admin query with no key filter)
+        let filter_by_key = !api_key.is_empty();
+
+        let key_clause = if filter_by_key {
+            "WHERE api_key = ?"
+        } else {
+            "WHERE 1=1"
         };
+        let since_clause = if since.is_some() {
+            "AND timestamp >= ?"
+        } else {
+            ""
+        };
+        let limit_clause = if limit.is_some() { "LIMIT ?" } else { "" };
+
+        let sql = format!(
+            "SELECT id, api_key, timestamp, request_id, model, \
+             input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
+             cost, success, duration_ms, error_message \
+             FROM usage {key_clause} {since_clause} \
+             ORDER BY timestamp DESC {limit_clause}",
+        );
+
+        let mut q = sqlx::query(&sql);
+        if filter_by_key {
+            q = q.bind(api_key);
+        }
+        if let Some(s) = since {
+            q = q.bind(s);
+        }
+        if let Some(l) = limit {
+            q = q.bind(l);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
 
         let records = rows
             .iter()
@@ -594,6 +575,14 @@ impl UsageStore for SqliteBackend {
         };
 
         // 构建动态 SQL（group_expr 是内部常量，无注入风险）
+        // Empty api_key means "all keys" (admin query with no key filter)
+        let filter_by_key = !api_key.is_empty();
+        let key_clause = if filter_by_key {
+            "WHERE api_key = ?"
+        } else {
+            "WHERE 1=1"
+        };
+
         let sql = format!(
             "SELECT {group_expr} AS group_key, \
              SUM(input_tokens) AS input_tokens, \
@@ -604,10 +593,11 @@ impl UsageStore for SqliteBackend {
              COUNT(*) AS total_requests, \
              SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS error_requests \
              FROM usage \
-             WHERE api_key = ? {start_clause} {end_clause} \
+             {key_clause} {start_clause} {end_clause} \
              GROUP BY {group_expr} \
              ORDER BY group_key DESC",
             group_expr = group_expr,
+            key_clause = key_clause,
             start_clause = if start.is_some() {
                 "AND timestamp >= ?"
             } else {
@@ -620,7 +610,10 @@ impl UsageStore for SqliteBackend {
             },
         );
 
-        let mut q = sqlx::query(&sql).bind(api_key);
+        let mut q = sqlx::query(&sql);
+        if filter_by_key {
+            q = q.bind(api_key);
+        }
         if let Some(s) = start {
             q = q.bind(s);
         }

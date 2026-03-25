@@ -748,7 +748,7 @@ async function pageUsage(content) {
       <h1 class="page-title">Usage</h1>
     </div>
     <div class="filter-bar">
-      <input class="form-input" id="usage-key-filter" placeholder="API key (e.g. sk-abc123...)" style="min-width:220px">
+      <input class="form-input" id="usage-key-filter" placeholder="API key (optional, e.g. sk-abc123...)" style="min-width:220px">
       <input class="form-input" type="date" id="usage-start" style="width:140px">
       <span class="text-muted">—</span>
       <input class="form-input" type="date" id="usage-end" style="width:140px">
@@ -758,7 +758,7 @@ async function pageUsage(content) {
       </select>
       <button class="btn btn-primary" id="btn-usage-query">Query</button>
     </div>
-    <div id="usage-results"><p class="text-muted" style="padding:1rem 0">Enter an API key and click Query to view usage.</p></div>
+    <div id="usage-results"><p class="text-muted" style="padding:1rem 0">Select filters and click Query. Leave API key empty to aggregate all keys.</p></div>
   `;
 
   document.getElementById('btn-usage-query').addEventListener('click', async () => {
@@ -768,10 +768,6 @@ async function pageUsage(content) {
     const groupBy = document.getElementById('usage-group-by').value;
     const resultsEl = document.getElementById('usage-results');
 
-    if (!keyFilter) {
-      resultsEl.innerHTML = '<p class="text-red" style="padding:0.5rem 0">API key is required. Enter a truncated key (e.g. sk-abc123...) to query usage.</p>';
-      return;
-    }
     resultsEl.innerHTML = '<div class="loading">Loading...</div>';
 
     const params = new URLSearchParams({ group_by: groupBy });
