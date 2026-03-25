@@ -438,27 +438,46 @@ impl UsageStore for DynamoDbBackend {
         since: Option<&str>,
         limit: Option<i64>,
     ) -> Result<Vec<UsageRecord>> {
-        let mut query = self
-            .client
-            .query()
-            .table_name(Self::table_name("usage"))
-            .key_condition_expression("api_key = :ak")
-            .expression_attribute_values(":ak", av_s(api_key))
-            .scan_index_forward(false); // DESC order
+        // Empty api_key means "all keys" — use Scan instead of Query
+        let records = if api_key.is_empty() {
+            let mut scan = self.client.scan().table_name(Self::table_name("usage"));
 
-        if let Some(since_ts) = since {
-            query = query
-                .key_condition_expression("api_key = :ak AND sort_key >= :since")
-                .expression_attribute_values(":since", av_s(since_ts));
-        }
+            if let Some(lim) = limit {
+                scan = scan.limit(lim as i32);
+            }
 
-        if let Some(lim) = limit {
-            query = query.limit(lim as i32);
-        }
+            let result = scan.send().await?;
+            let mut records: Vec<UsageRecord> =
+                result.items().iter().map(usage_from_item).collect();
 
-        let result = query.send().await?;
+            // Filter by since in application layer (Scan has no sort key condition)
+            if let Some(since_ts) = since {
+                records.retain(|r| r.timestamp.as_str() >= since_ts);
+            }
+            records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            records
+        } else {
+            let mut query = self
+                .client
+                .query()
+                .table_name(Self::table_name("usage"))
+                .key_condition_expression("api_key = :ak")
+                .expression_attribute_values(":ak", av_s(api_key))
+                .scan_index_forward(false); // DESC order
 
-        let records = result.items().iter().map(usage_from_item).collect();
+            if let Some(since_ts) = since {
+                query = query
+                    .key_condition_expression("api_key = :ak AND sort_key >= :since")
+                    .expression_attribute_values(":since", av_s(since_ts));
+            }
+
+            if let Some(lim) = limit {
+                query = query.limit(lim as i32);
+            }
+
+            let result = query.send().await?;
+            result.items().iter().map(usage_from_item).collect()
+        };
 
         Ok(records)
     }

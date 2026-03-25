@@ -295,60 +295,51 @@ impl UsageStore for PostgresBackend {
         since: Option<&str>,
         limit: Option<i64>,
     ) -> Result<Vec<UsageRecord>> {
-        let rows = match (since, limit) {
-            (Some(since_ts), Some(lim)) => {
-                sqlx::query(
-                    "SELECT id, api_key, timestamp, request_id, model, \
-                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-                     cost, success, duration_ms, error_message \
-                     FROM usage WHERE api_key = $1 AND timestamp >= $2 \
-                     ORDER BY timestamp DESC LIMIT $3",
-                )
-                .bind(api_key)
-                .bind(since_ts)
-                .bind(lim)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (Some(since_ts), None) => {
-                sqlx::query(
-                    "SELECT id, api_key, timestamp, request_id, model, \
-                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-                     cost, success, duration_ms, error_message \
-                     FROM usage WHERE api_key = $1 AND timestamp >= $2 \
-                     ORDER BY timestamp DESC",
-                )
-                .bind(api_key)
-                .bind(since_ts)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (None, Some(lim)) => {
-                sqlx::query(
-                    "SELECT id, api_key, timestamp, request_id, model, \
-                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-                     cost, success, duration_ms, error_message \
-                     FROM usage WHERE api_key = $1 \
-                     ORDER BY timestamp DESC LIMIT $2",
-                )
-                .bind(api_key)
-                .bind(lim)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (None, None) => {
-                sqlx::query(
-                    "SELECT id, api_key, timestamp, request_id, model, \
-                     input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-                     cost, success, duration_ms, error_message \
-                     FROM usage WHERE api_key = $1 \
-                     ORDER BY timestamp DESC",
-                )
-                .bind(api_key)
-                .fetch_all(&self.pool)
-                .await?
-            }
+        // Empty api_key means "all keys" (admin query with no key filter)
+        let filter_by_key = !api_key.is_empty();
+
+        // Build dynamic SQL with numbered placeholders ($1, $2, …)
+        let mut param_idx = 1usize;
+        let key_clause = if filter_by_key {
+            let s = format!("WHERE api_key = ${}", param_idx);
+            param_idx += 1;
+            s
+        } else {
+            "WHERE 1=1".to_string()
         };
+        let since_clause = if since.is_some() {
+            let s = format!("AND timestamp >= ${}", param_idx);
+            param_idx += 1;
+            s
+        } else {
+            String::new()
+        };
+        let limit_clause = if limit.is_some() {
+            format!("LIMIT ${}", param_idx)
+        } else {
+            String::new()
+        };
+
+        let sql = format!(
+            "SELECT id, api_key, timestamp, request_id, model, \
+             input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
+             cost, success, duration_ms, error_message \
+             FROM usage {key_clause} {since_clause} \
+             ORDER BY timestamp DESC {limit_clause}",
+        );
+
+        let mut q = sqlx::query(&sql);
+        if filter_by_key {
+            q = q.bind(api_key);
+        }
+        if let Some(s) = since {
+            q = q.bind(s);
+        }
+        if let Some(l) = limit {
+            q = q.bind(l);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
 
         let records = rows
             .iter()
@@ -385,9 +376,17 @@ impl UsageStore for PostgresBackend {
             "to_char(date_trunc('hour', timestamp::timestamptz), 'YYYY-MM-DD\"T\"HH24')".to_string()
         };
 
-        // Postgres 使用 $1, $2… 占位符，参数顺序固定：api_key, [start], [end]
+        // Postgres 使用 $1, $2… 占位符，参数顺序动态调整
+        // Empty api_key means "all keys" (admin query with no key filter)
+        let filter_by_key = !api_key.is_empty();
+
         #[allow(unused_assignments)]
-        let mut param_idx = 2usize; // $1 = api_key
+        let mut param_idx = if filter_by_key { 2usize } else { 1usize }; // $1 = api_key (if filtered)
+        let key_clause = if filter_by_key {
+            "WHERE api_key = $1".to_string()
+        } else {
+            "WHERE 1=1".to_string()
+        };
         let start_clause = if start.is_some() {
             let s = format!("AND timestamp >= ${}", param_idx);
             param_idx += 1;
@@ -411,13 +410,16 @@ impl UsageStore for PostgresBackend {
              COUNT(*) AS total_requests, \
              SUM(CASE WHEN success = false THEN 1 ELSE 0 END) AS error_requests \
              FROM usage \
-             WHERE api_key = $1 {start_clause} {end_clause} \
+             {key_clause} {start_clause} {end_clause} \
              GROUP BY {group_expr} \
              ORDER BY group_key DESC",
         );
         // 注意：Postgres 不允许 GROUP BY 引用列别名，必须重复原始表达式。
 
-        let mut q = sqlx::query(&sql).bind(api_key);
+        let mut q = sqlx::query(&sql);
+        if filter_by_key {
+            q = q.bind(api_key);
+        }
         if let Some(s) = start {
             q = q.bind(s);
         }
