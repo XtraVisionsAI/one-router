@@ -182,6 +182,9 @@ document.getElementById('page-content').addEventListener('click', (e) => {
 document.getElementById('page-content').addEventListener('click', (e) => {
   if (STATE.currentPage === 'backends') handleBackendAction(e);
 });
+document.getElementById('page-content').addEventListener('click', (e) => {
+  if (STATE.currentPage === 'mappings') handleMappingAction(e);
+});
 
 // ============================================================
 // DASHBOARD PAGE
@@ -598,8 +601,141 @@ function showBackendModal(existing) {
   });
 }
 
+// ============================================================
+// MODEL MAPPINGS PAGE
+// ============================================================
+
 async function pageMappings(content) {
-  content.innerHTML = '<div class="loading">Model Mappings page — coming soon</div>';
+  const data = await api('GET', '/mappings');
+  const mappings = data.data || [];
+  content.innerHTML = `
+    <div class="page-header">
+      <h1 class="page-title">Model Mappings</h1>
+      <button class="btn btn-primary" id="btn-create-mapping">+ Add Mapping</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Source Model</th><th>Target Model</th><th>Provider</th><th>Priority</th><th>Status</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+          ${mappings.length === 0
+            ? '<tr><td colspan="6" class="table-empty">No model mappings configured</td></tr>'
+            : mappings.map((m) => `
+              <tr>
+                <td class="mono">${esc(m.source_model_id)}</td>
+                <td class="mono text-secondary">${esc(m.target_model_id)}</td>
+                <td><span class="badge badge-gray">${esc(m.provider)}</span></td>
+                <td>${m.priority}</td>
+                <td>${m.status === 'active' ? '<span class="badge badge-green">active</span>' : '<span class="badge badge-gray">inactive</span>'}</td>
+                <td><div class="actions">
+                  <button class="btn btn-secondary btn-sm" data-action="edit-mapping"
+                    data-src="${esc(m.source_model_id)}" data-tgt="${esc(m.target_model_id)}"
+                    data-provider="${esc(m.provider)}" data-priority="${m.priority}"
+                    data-status="${esc(m.status)}" data-display="${esc(m.display_name)}"
+                    data-input="${m.input_price}" data-output="${m.output_price}">Edit</button>
+                  <button class="btn btn-danger btn-sm" data-action="delete-mapping"
+                    data-src="${esc(m.source_model_id)}" data-provider="${esc(m.provider)}">Delete</button>
+                </div></td>
+              </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+async function handleMappingAction(e) {
+  const btn = e.target.closest('[data-action], #btn-create-mapping');
+  if (!btn) return;
+  if (btn.id === 'btn-create-mapping') { showMappingModal(); return; }
+  const action = btn.dataset.action;
+  const content = document.getElementById('page-content');
+
+  if (action === 'edit-mapping') {
+    showMappingModal({
+      source_model_id: btn.dataset.src,
+      target_model_id: btn.dataset.tgt,
+      provider: btn.dataset.provider,
+      priority: parseInt(btn.dataset.priority),
+      status: btn.dataset.status,
+      display_name: btn.dataset.display,
+      input_price: parseFloat(btn.dataset.input),
+      output_price: parseFloat(btn.dataset.output),
+    });
+  } else if (action === 'delete-mapping') {
+    const src = btn.dataset.src;
+    const provider = btn.dataset.provider;
+    if (!confirm(`Delete mapping "${src}" -> ${provider}?`)) return;
+    try {
+      await api('DELETE', `/mappings/${encodeURIComponent(src)}/${encodeURIComponent(provider)}`);
+      toast('Mapping deleted', 'success');
+      await pageMappings(content);
+    } catch (err) { toast(err.message, 'error'); }
+  }
+}
+
+function showMappingModal(existing) {
+  const isEdit = !!existing;
+  openModal(isEdit ? 'Edit Mapping' : 'Add Mapping', `
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Source Model ID *</label>
+        <input class="form-input" id="m-map-src" value="${esc(existing?.source_model_id || '')}" placeholder="claude-3-5-sonnet*" ${isEdit ? 'readonly' : ''}></div>
+      <div class="form-group"><label class="form-label">Provider *</label>
+        <select class="form-input" id="m-map-provider" ${isEdit ? 'disabled' : ''}>
+          ${['bedrock','gemini','anthropic','openai'].map((p) =>
+            `<option value="${p}" ${existing?.provider === p ? 'selected' : ''}>${p}</option>`).join('')}
+        </select></div>
+    </div>
+    <div class="form-group"><label class="form-label">Target Model ID *</label>
+      <input class="form-input" id="m-map-tgt" value="${esc(existing?.target_model_id || '')}" placeholder="anthropic.claude-3-5-sonnet-20241022-v2:0"></div>
+    <div class="form-group"><label class="form-label">Display Name</label>
+      <input class="form-input" id="m-map-display" value="${esc(existing?.display_name || '')}"></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Priority</label>
+        <input class="form-input" id="m-map-priority" type="number" value="${existing?.priority ?? 0}"></div>
+      <div class="form-group"><label class="form-label">Status</label>
+        <select class="form-input" id="m-map-status">
+          <option value="active" ${existing?.status !== 'inactive' ? 'selected' : ''}>active</option>
+          <option value="inactive" ${existing?.status === 'inactive' ? 'selected' : ''}>inactive</option>
+        </select></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Input Price (per 1K)</label>
+        <input class="form-input" id="m-map-input" type="number" step="0.0001" value="${existing?.input_price ?? 0}"></div>
+      <div class="form-group"><label class="form-label">Output Price (per 1K)</label>
+        <input class="form-input" id="m-map-output" type="number" step="0.0001" value="${existing?.output_price ?? 0}"></div>
+    </div>
+  `, `
+    <button class="btn btn-secondary" id="m-map-cancel">Cancel</button>
+    <button class="btn btn-primary" id="m-map-save">${isEdit ? 'Save' : 'Create'}</button>
+  `);
+
+  document.getElementById('m-map-cancel').addEventListener('click', closeModal);
+  document.getElementById('m-map-save').addEventListener('click', async () => {
+    const source_model_id = isEdit ? existing.source_model_id : document.getElementById('m-map-src').value.trim();
+    const provider = isEdit ? existing.provider : document.getElementById('m-map-provider').value;
+    const body = {
+      source_model_id,
+      target_model_id: document.getElementById('m-map-tgt').value.trim(),
+      provider,
+      display_name: document.getElementById('m-map-display').value.trim(),
+      priority: parseInt(document.getElementById('m-map-priority').value) || 0,
+      status: document.getElementById('m-map-status').value,
+      input_price: parseFloat(document.getElementById('m-map-input').value) || 0,
+      output_price: parseFloat(document.getElementById('m-map-output').value) || 0,
+    };
+    if (!body.source_model_id || !body.target_model_id) { toast('Source and target model IDs are required', 'error'); return; }
+
+    try {
+      if (isEdit) {
+        await api('PUT', `/mappings/${encodeURIComponent(source_model_id)}/${encodeURIComponent(provider)}`, body);
+      } else {
+        await api('POST', '/mappings', body);
+      }
+      closeModal();
+      toast(isEdit ? 'Mapping updated' : 'Mapping created', 'success');
+      await pageMappings(document.getElementById('page-content'));
+    } catch (err) { toast(err.message, 'error'); }
+  });
 }
 
 async function pageUsage(content) {
