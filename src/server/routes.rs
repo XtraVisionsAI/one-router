@@ -5,7 +5,7 @@ use axum::{
     http::Request,
     middleware,
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -78,6 +78,12 @@ pub fn create_router(state: AppState) -> Router {
     // Admin API routes (protected by require_admin_key)
     let admin_api_routes = Router::new()
         .route("/status", get(admin::status::get_status))
+        // API Keys
+        .route("/keys", get(admin::keys::list_keys))
+        .route("/keys", post(admin::keys::create_key))
+        .route("/keys/:key", put(admin::keys::update_key))
+        .route("/keys/:key", delete(admin::keys::delete_key))
+        .route("/keys/:key/activate", post(admin::keys::activate_key))
         .layer(middleware::from_fn_with_state(
             admin_auth_state,
             require_admin_key,
