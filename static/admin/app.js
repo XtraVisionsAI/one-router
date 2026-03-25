@@ -738,12 +738,131 @@ function showMappingModal(existing) {
   });
 }
 
+// ============================================================
+// USAGE PAGE
+// ============================================================
+
 async function pageUsage(content) {
-  content.innerHTML = '<div class="loading">Usage page — coming soon</div>';
+  content.innerHTML = `
+    <div class="page-header">
+      <h1 class="page-title">Usage</h1>
+    </div>
+    <div class="filter-bar">
+      <input class="form-input" id="usage-key-filter" placeholder="API key (e.g. sk-abc123...)" style="min-width:220px">
+      <input class="form-input" type="date" id="usage-start" style="width:140px">
+      <span class="text-muted">—</span>
+      <input class="form-input" type="date" id="usage-end" style="width:140px">
+      <select class="form-input" id="usage-group-by" style="width:110px">
+        <option value="hour">By Hour</option>
+        <option value="model">By Model</option>
+      </select>
+      <button class="btn btn-primary" id="btn-usage-query">Query</button>
+    </div>
+    <div id="usage-results"><p class="text-muted" style="padding:1rem 0">Enter an API key and click Query to view usage.</p></div>
+  `;
+
+  document.getElementById('btn-usage-query').addEventListener('click', async () => {
+    const keyFilter = document.getElementById('usage-key-filter').value.trim();
+    const start = document.getElementById('usage-start').value;
+    const end = document.getElementById('usage-end').value;
+    const groupBy = document.getElementById('usage-group-by').value;
+    const resultsEl = document.getElementById('usage-results');
+
+    if (!keyFilter) {
+      resultsEl.innerHTML = '<p class="text-red" style="padding:0.5rem 0">API key is required. Enter a truncated key (e.g. sk-abc123...) to query usage.</p>';
+      return;
+    }
+    resultsEl.innerHTML = '<div class="loading">Loading...</div>';
+
+    const params = new URLSearchParams({ group_by: groupBy });
+    if (keyFilter) params.set('api_key', keyFilter);
+    if (start) params.set('start_time', new Date(start).toISOString());
+    if (end) params.set('end_time', new Date(end + 'T23:59:59').toISOString());
+
+    try {
+      const data = await api('GET', '/usage/summary?' + params.toString());
+      const rows = data.data || [];
+      const s = data.summary;
+
+      resultsEl.innerHTML = `
+        <div class="stat-grid" style="margin-bottom:16px">
+          <div class="stat-card"><div class="stat-label">Requests</div><div class="stat-value">${s.total_requests.toLocaleString()}</div></div>
+          <div class="stat-card"><div class="stat-label">Input Tokens</div><div class="stat-value blue">${fmtTokens(s.total_input_tokens)}</div></div>
+          <div class="stat-card"><div class="stat-label">Output Tokens</div><div class="stat-value blue">${fmtTokens(s.total_output_tokens)}</div></div>
+          <div class="stat-card"><div class="stat-label">Total Cost</div><div class="stat-value">${fmtMoney(s.total_cost)}</div></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>${groupBy === 'model' ? 'Model' : 'Hour'}</th><th>Requests</th><th>Errors</th><th>Input</th><th>Output</th><th>Cost</th></tr>
+            </thead>
+            <tbody>
+              ${rows.length === 0
+                ? '<tr><td colspan="6" class="table-empty">No usage data for this period</td></tr>'
+                : rows.map((r) => `
+                  <tr>
+                    <td class="mono">${esc(r.group_key)}</td>
+                    <td>${r.total_requests.toLocaleString()}</td>
+                    <td class="${r.error_requests > 0 ? 'text-red' : ''}">${r.error_requests}</td>
+                    <td>${fmtTokens(r.input_tokens)}</td>
+                    <td>${fmtTokens(r.output_tokens)}</td>
+                    <td>${fmtMoney(r.total_cost)}</td>
+                  </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>`;
+    } catch (err) {
+      resultsEl.innerHTML = `<p class="text-red">${esc(err.message)}</p>`;
+    }
+  });
 }
 
+function fmtTokens(n) {
+  if (n == null) return '—';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+// ============================================================
+// FEATURE FLAGS PAGE
+// ============================================================
+
 async function pageFlags(content) {
-  content.innerHTML = '<div class="loading">Feature Flags page — coming soon</div>';
+  const data = await api('GET', '/flags');
+  const flags = data.data || [];
+
+  content.innerHTML = `
+    <div class="page-header">
+      <h1 class="page-title">Feature Flags</h1>
+    </div>
+    <div class="table-wrap">
+      ${flags.length === 0
+        ? '<div class="table-empty">No feature flags configured</div>'
+        : flags.map((f) => `
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <div class="toggle-name">${esc(f.name)}</div>
+              ${f.description ? `<div class="toggle-desc">${esc(f.description)}</div>` : ''}
+            </div>
+            <label class="toggle">
+              <input type="checkbox" data-action="toggle-flag" data-name="${esc(f.name)}" ${f.enabled ? 'checked' : ''}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>`).join('')}
+    </div>`;
+
+  content.querySelectorAll('[data-action="toggle-flag"]').forEach((checkbox) => {
+    checkbox.addEventListener('change', async () => {
+      try {
+        await api('PUT', `/flags/${encodeURIComponent(checkbox.dataset.name)}`, { enabled: checkbox.checked });
+        toast(`${checkbox.dataset.name} ${checkbox.checked ? 'enabled' : 'disabled'}`, 'success');
+      } catch (err) {
+        toast(err.message, 'error');
+        checkbox.checked = !checkbox.checked;
+      }
+    });
+  });
 }
 
 // ============================================================
