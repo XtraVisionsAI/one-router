@@ -17,6 +17,7 @@ use rust_embed::Embed;
 
 pub mod backends;
 pub mod keys;
+pub mod mappings;
 pub mod status;
 
 /// Embedded static files from `static/admin/`
