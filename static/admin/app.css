@@ -211,7 +211,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 
 .page-content {
   padding: 24px 28px;
-  max-width: 1200px;
+  width: 100%;
 }
 
 /* ============================================================
