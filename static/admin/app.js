@@ -64,7 +64,7 @@ document.getElementById('auth-form').addEventListener('submit', async (e) => {
   errEl.hidden = true;
   const btn = e.target.querySelector('button[type=submit]');
   btn.disabled = true;
-  btn.textContent = 'Signing in…';
+  btn.innerHTML = '<i class="bi bi-hourglass-split"></i> Signing in…';
   try {
     const status = await validateKey(key);
     STATE.apiKey = key;
@@ -77,7 +77,7 @@ document.getElementById('auth-form').addEventListener('submit', async (e) => {
     errEl.hidden = false;
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Sign in';
+    btn.innerHTML = '<i class="bi bi-box-arrow-in-right"></i> Sign in';
   }
 });
 
@@ -296,7 +296,7 @@ function renderKeysList(content, keys) {
   content.innerHTML = `
     <div class="page-header">
       <h1 class="page-title">API Keys</h1>
-      <button class="btn btn-primary" id="btn-create-key">+ Create Key</button>
+      <button class="btn btn-primary" id="btn-create-key"><i class="bi bi-plus-lg"></i> Create Key</button>
     </div>
 
     <div id="key-reveal-area"></div>
@@ -334,10 +334,10 @@ function renderKeysList(content, keys) {
                 <td class="text-secondary">${fmtDate(k.created_at)}</td>
                 <td>
                   <div class="actions">
-                    <button class="btn btn-secondary btn-sm" data-action="edit-key" data-key="${esc(k.api_key)}" data-name="${esc(k.name)}" data-user="${esc(k.user_id)}" data-rate="${k.rate_limit}" data-budget="${k.monthly_budget ?? ''}" data-tier="${esc(k.service_tier)}">Edit</button>
+                    <button class="btn btn-secondary btn-sm" data-action="edit-key" data-key="${esc(k.api_key)}" data-name="${esc(k.name)}" data-user="${esc(k.user_id)}" data-rate="${k.rate_limit}" data-budget="${k.monthly_budget ?? ''}" data-tier="${esc(k.service_tier)}"><i class="bi bi-pencil"></i> Edit</button>
                     ${k.is_active
-                      ? `<button class="btn btn-danger btn-sm" data-action="deactivate-key" data-key="${esc(k.api_key)}">Deactivate</button>`
-                      : `<button class="btn btn-secondary btn-sm" data-action="activate-key" data-key="${esc(k.api_key)}">Activate</button>`}
+                      ? `<button class="btn btn-danger btn-sm" data-action="deactivate-key" data-key="${esc(k.api_key)}"><i class="bi bi-slash-circle"></i> Deactivate</button>`
+                      : `<button class="btn btn-secondary btn-sm" data-action="activate-key" data-key="${esc(k.api_key)}"><i class="bi bi-check-circle"></i> Activate</button>`}
                   </div>
                 </td>
               </tr>`).join('')}
@@ -415,12 +415,12 @@ function showCreateKeyModal() {
       if (revealArea) {
         revealArea.innerHTML = `
           <div class="key-reveal">
-            <div class="key-reveal-label">✓ API Key Created — save this key now, it will not be shown again</div>
+            <div class="key-reveal-label"><i class="bi bi-check-circle-fill"></i> API Key Created — save this key now, it will not be shown again</div>
             <div class="key-reveal-value" id="new-key-value">${esc(result.api_key)}</div>
             <div style="display:flex;gap:8px;align-items:center">
-              <button class="btn btn-secondary btn-sm" id="copy-new-key">Copy</button>
+              <button class="btn btn-secondary btn-sm" id="copy-new-key"><i class="bi bi-clipboard"></i> Copy</button>
               <span class="key-reveal-hint">Close this banner to dismiss</span>
-              <button class="btn btn-ghost btn-sm" id="dismiss-reveal" style="margin-left:auto">✕</button>
+              <button class="btn btn-ghost btn-sm" id="dismiss-reveal" style="margin-left:auto"><i class="bi bi-x-lg"></i></button>
             </div>
           </div>`;
         document.getElementById('copy-new-key').addEventListener('click', () => {
@@ -488,7 +488,7 @@ async function pageBackends(content) {
   content.innerHTML = `
     <div class="page-header">
       <h1 class="page-title">Backends</h1>
-      <button class="btn btn-primary" id="btn-create-backend">+ Add Backend</button>
+      <button class="btn btn-primary" id="btn-create-backend"><i class="bi bi-plus-lg"></i> Add Backend</button>
     </div>
     <div class="table-wrap">
       <table>
@@ -506,9 +506,9 @@ async function pageBackends(content) {
                 <td><span class="health-dot ${healthDotClass(b.health_status)}"></span>${esc(b.health_status)}</td>
                 <td>${b.enabled ? '<span class="badge badge-green">enabled</span>' : '<span class="badge badge-gray">disabled</span>'}</td>
                 <td><div class="actions">
-                  <button class="btn btn-secondary btn-sm" data-action="edit-backend" data-name="${esc(b.name)}" data-type="${esc(b.backend_type)}" data-priority="${b.priority}" data-enabled="${b.enabled}">Edit</button>
-                  <button class="btn btn-secondary btn-sm" data-action="toggle-backend" data-name="${esc(b.name)}">${b.enabled ? 'Disable' : 'Enable'}</button>
-                  <button class="btn btn-danger btn-sm" data-action="delete-backend" data-name="${esc(b.name)}">Delete</button>
+                  <button class="btn btn-secondary btn-sm" data-action="edit-backend" data-name="${esc(b.name)}" data-type="${esc(b.backend_type)}" data-priority="${b.priority}" data-enabled="${b.enabled}"><i class="bi bi-pencil"></i> Edit</button>
+                  <button class="btn btn-secondary btn-sm" data-action="toggle-backend" data-name="${esc(b.name)}">${b.enabled ? '<i class="bi bi-pause-circle"></i> Disable' : '<i class="bi bi-play-circle"></i> Enable'}</button>
+                  <button class="btn btn-danger btn-sm" data-action="delete-backend" data-name="${esc(b.name)}"><i class="bi bi-trash"></i> Delete</button>
                 </div></td>
               </tr>`).join('')}
         </tbody>
@@ -611,7 +611,7 @@ async function pageMappings(content) {
   content.innerHTML = `
     <div class="page-header">
       <h1 class="page-title">Model Mappings</h1>
-      <button class="btn btn-primary" id="btn-create-mapping">+ Add Mapping</button>
+      <button class="btn btn-primary" id="btn-create-mapping"><i class="bi bi-plus-lg"></i> Add Mapping</button>
     </div>
     <div class="table-wrap">
       <table>
@@ -633,9 +633,9 @@ async function pageMappings(content) {
                     data-src="${esc(m.source_model_id)}" data-tgt="${esc(m.target_model_id)}"
                     data-provider="${esc(m.provider)}" data-priority="${m.priority}"
                     data-status="${esc(m.status)}" data-display="${esc(m.display_name)}"
-                    data-input="${m.input_price}" data-output="${m.output_price}">Edit</button>
+                    data-input="${m.input_price}" data-output="${m.output_price}"><i class="bi bi-pencil"></i> Edit</button>
                   <button class="btn btn-danger btn-sm" data-action="delete-mapping"
-                    data-src="${esc(m.source_model_id)}" data-provider="${esc(m.provider)}">Delete</button>
+                    data-src="${esc(m.source_model_id)}" data-provider="${esc(m.provider)}"><i class="bi bi-trash"></i> Delete</button>
                 </div></td>
               </tr>`).join('')}
         </tbody>
@@ -756,7 +756,7 @@ async function pageUsage(content) {
         <option value="hour">By Hour</option>
         <option value="model">By Model</option>
       </select>
-      <button class="btn btn-primary" id="btn-usage-query">Query</button>
+      <button class="btn btn-primary" id="btn-usage-query"><i class="bi bi-search"></i> Query</button>
     </div>
     <div id="usage-results"><p class="text-muted" style="padding:1rem 0">Select filters and click Query. Leave API key empty to aggregate all keys.</p></div>
   `;

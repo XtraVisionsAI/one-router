@@ -185,7 +185,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   background: var(--bg-elevated);
   border-left-color: var(--accent-blue);
 }
-.nav-icon { width: 16px; text-align: center; font-size: 14px; }
+.nav-icon { width: 16px; text-align: center; font-size: 15px; flex-shrink: 0; }
 
 .sidebar-footer {
   padding: 12px 16px;

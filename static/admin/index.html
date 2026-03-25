@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>one-router Admin</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
   <link rel="stylesheet" href="/admin/assets/app.css">
 </head>
 <body>
@@ -27,7 +28,9 @@
         autocomplete="new-password"
         spellcheck="false"
       >
-      <button type="submit" class="btn btn-primary auth-btn">Sign in</button>
+    <button type="submit" class="btn btn-primary auth-btn">
+      <i class="bi bi-box-arrow-in-right"></i> Sign in
+    </button>
     </form>
     <p id="auth-error" class="auth-error" hidden></p>
   </div>
@@ -45,27 +48,29 @@
     </div>
     <nav class="sidebar-nav">
       <a class="nav-item" href="#dashboard" data-page="dashboard">
-        <span class="nav-icon">⬡</span> Dashboard
+        <i class="bi bi-speedometer2 nav-icon"></i> Dashboard
       </a>
       <a class="nav-item" href="#keys" data-page="keys">
-        <span class="nav-icon">⚿</span> API Keys
+        <i class="bi bi-key nav-icon"></i> API Keys
       </a>
       <a class="nav-item" href="#backends" data-page="backends">
-        <span class="nav-icon">⚡</span> Backends
+        <i class="bi bi-hdd-stack nav-icon"></i> Backends
       </a>
       <a class="nav-item" href="#mappings" data-page="mappings">
-        <span class="nav-icon">⇄</span> Model Maps
+        <i class="bi bi-arrow-left-right nav-icon"></i> Model Maps
       </a>
       <a class="nav-item" href="#usage" data-page="usage">
-        <span class="nav-icon">◈</span> Usage
+        <i class="bi bi-bar-chart-line nav-icon"></i> Usage
       </a>
       <a class="nav-item" href="#flags" data-page="flags">
-        <span class="nav-icon">⚑</span> Flags
+        <i class="bi bi-toggles nav-icon"></i> Flags
       </a>
     </nav>
     <div class="sidebar-footer">
       <span id="sidebar-version" class="sidebar-version">v—</span>
-      <button class="btn-ghost sign-out-btn" id="sign-out-btn">Sign out</button>
+      <button class="btn-ghost sign-out-btn" id="sign-out-btn">
+        <i class="bi bi-box-arrow-right"></i> Sign out
+      </button>
     </div>
   </aside>
 
@@ -85,7 +90,7 @@
   <div class="modal" id="modal-box" role="dialog" aria-modal="true">
     <div class="modal-header">
       <h3 class="modal-title" id="modal-title"></h3>
-      <button class="modal-close" id="modal-close" aria-label="Close">✕</button>
+      <button class="modal-close" id="modal-close" aria-label="Close"><i class="bi bi-x-lg"></i></button>
     </div>
     <div class="modal-body" id="modal-body"></div>
     <div class="modal-footer" id="modal-footer"></div>
