@@ -246,6 +246,15 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stat-icon {
+  font-size: 18px;
+  color: var(--text-muted);
+  margin-bottom: 2px;
 }
 
 .stat-label {
