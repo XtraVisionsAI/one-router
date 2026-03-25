@@ -410,4 +410,29 @@ mod tests {
         assert_eq!(req.service_tier, "default");
         assert_eq!(req.rate_limit, None);
     }
+
+    #[test]
+    fn update_request_absent_fields_are_none() {
+        let json = r#"{"name":"New Name"}"#;
+        let req: UpdateKeyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.tpm_limit, None); // absent → don't change
+        assert_eq!(req.monthly_budget, None); // absent → don't change
+        assert_eq!(req.name, Some("New Name".to_string()));
+    }
+
+    #[test]
+    fn update_request_null_clears_optional_fields() {
+        let json = r#"{"tpm_limit": null, "monthly_budget": null}"#;
+        let req: UpdateKeyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.tpm_limit, Some(None)); // explicit null → clear
+        assert_eq!(req.monthly_budget, Some(None)); // explicit null → clear
+    }
+
+    #[test]
+    fn update_request_value_sets_optional_fields() {
+        let json = r#"{"tpm_limit": 5000, "monthly_budget": 99.5}"#;
+        let req: UpdateKeyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.tpm_limit, Some(Some(5000)));
+        assert_eq!(req.monthly_budget, Some(Some(99.5)));
+    }
 }
