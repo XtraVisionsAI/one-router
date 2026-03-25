@@ -245,16 +245,18 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  padding: 14px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+  padding: 14px 44px 14px 16px;
+  position: relative;
+  overflow: hidden;
 }
 
 .stat-icon {
-  font-size: 18px;
-  color: var(--text-muted);
-  margin-bottom: 2px;
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  font-size: 22px;
+  color: var(--border-strong);
+  pointer-events: none;
 }
 
 .stat-label {
