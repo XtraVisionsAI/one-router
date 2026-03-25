@@ -10,8 +10,11 @@ use axum::{
 };
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::api::{chat_completions, embeddings, health, images, messages, models, rerank, usage};
+use crate::api::{
+    admin, chat_completions, embeddings, health, images, messages, models, rerank, usage,
+};
 use crate::middleware::{
+    admin_auth::{require_admin_key, AdminAuthState},
     auth::{extract_api_key, require_api_key, AuthState},
     rate_limit::{rate_limit, RateLimitState},
 };
@@ -69,11 +72,30 @@ pub fn create_router(state: AppState) -> Router {
             require_api_key,
         ));
 
+    // Admin auth state
+    let admin_auth_state = AdminAuthState::new(state.settings.clone());
+
+    // Admin API routes (protected by require_admin_key)
+    let admin_api_routes = Router::new()
+        .route("/status", get(admin::status::get_status))
+        .layer(middleware::from_fn_with_state(
+            admin_auth_state,
+            require_admin_key,
+        ));
+
+    // Admin static file routes (no auth — browser fetches these directly)
+    // Assets are served under /admin/assets/* to avoid shadowing /admin/api/*
+    let admin_static_routes = Router::new()
+        .route("/", get(admin::serve_index))
+        .route("/assets/*path", get(admin::serve_asset));
+
     // Combine all routes
     Router::new()
         .nest("/v1", anthropic_routes)
         .nest("/v1", openai_routes)
         .merge(health_routes)
+        .nest("/admin/api", admin_api_routes) // more specific first
+        .nest("/admin", admin_static_routes) // broader wildcard second
         .fallback(move |request: Request<Body>| async move { fallback_handler(request) })
         .layer(create_cors_layer())
         .with_state(state)
