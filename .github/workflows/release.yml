@@ -125,26 +125,9 @@ jobs:
           docker buildx imagetools create -t ${{ env.DOCKERHUB_REPO }}:${TAG} \
             ${{ env.DOCKERHUB_REPO }}:${TAG}-amd64 \
             ${{ env.DOCKERHUB_REPO }}:${TAG}-arm64
-
-          # Only update `latest` if this tag is the highest semver currently on DockerHub.
-          # This prevents a race condition when two releases are triggered in quick succession
-          # and the older one finishes last, overwriting latest with a stale version.
-          LATEST_TAG=$(curl -s "https://hub.docker.com/v2/repositories/${{ env.DOCKERHUB_REPO }}/tags?page_size=50" \
-            | python3 -c "
-import sys, json, re
-tags = [t['name'] for t in json.load(sys.stdin)['results'] if re.match(r'^v\d+\.\d+\.\d+\$', t['name'])]
-tags.sort(key=lambda x: list(map(int, x[1:].split('.'))))
-print(tags[-1] if tags else '')
-")
-          echo "Current highest semver on DockerHub: ${LATEST_TAG}"
-          if [[ "$TAG" == "$LATEST_TAG" ]]; then
-            docker buildx imagetools create -t ${{ env.DOCKERHUB_REPO }}:latest \
-              ${{ env.DOCKERHUB_REPO }}:${TAG}-amd64 \
-              ${{ env.DOCKERHUB_REPO }}:${TAG}-arm64
-            echo "Updated latest -> ${TAG}"
-          else
-            echo "Skipped latest update: ${TAG} is not the highest semver (${LATEST_TAG} is)"
-          fi
+          docker buildx imagetools create -t ${{ env.DOCKERHUB_REPO }}:latest \
+            ${{ env.DOCKERHUB_REPO }}:${TAG}-amd64 \
+            ${{ env.DOCKERHUB_REPO }}:${TAG}-arm64
 
   release:
     name: GitHub Release
