@@ -104,6 +104,12 @@ pub fn create_router(state: AppState) -> Router {
             "/mappings/:source_model_id/:provider",
             delete(admin::mappings::delete_mapping),
         )
+        // Feature Flags
+        .route("/flags", get(admin::flags::list_flags))
+        .route("/flags/:name", put(admin::flags::update_flag))
+        // Usage (admin — no unbounded query guard)
+        .route("/usage/summary", get(admin::admin_usage::get_usage_summary))
+        .route("/usage/records", get(admin::admin_usage::get_usage_records))
         .layer(middleware::from_fn_with_state(
             admin_auth_state,
             require_admin_key,
