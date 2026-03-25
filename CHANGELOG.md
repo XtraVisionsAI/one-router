@@ -1,3 +1,18 @@
+## v0.6.0 (2026-03-26)
+
+### Feat
+
+- **admin**: simplify logo — full one-router in blue
+- **admin**: float stat card icons to top-right corner
+- **admin**: add icons to stat cards on Dashboard and Usage pages
+- **admin**: add Bootstrap Icons via CDN, replace unicode symbols with bi-* icons
+
+### Fix
+
+- **admin**: restore logo-router blue color in auth card
+- **admin**: fix logo spacing in auth card, widen auth card to 400px
+- **admin**: center sidebar footer version and sign-out button
+
 ## v0.5.0 (2026-03-26)
 
 ### Feat
