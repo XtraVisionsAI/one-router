@@ -15,6 +15,7 @@ use axum::{
 };
 use rust_embed::Embed;
 
+pub mod backends;
 pub mod keys;
 pub mod status;
 
