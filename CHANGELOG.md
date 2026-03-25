@@ -1,3 +1,36 @@
+## v0.5.0 (2026-03-26)
+
+### Feat
+
+- **admin**: support all-key aggregation in usage query — empty api_key returns all records
+- **admin**: implement Feature Flags and Usage pages
+- **admin**: implement Model Mappings page
+- **admin**: implement Backends page
+- **admin**: implement auth flow, Dashboard, and API Keys pages
+- **admin**: implement HTML shell and CSS design system
+- **admin**: register /admin/api/flags and /admin/api/usage routes
+- **admin**: add admin usage summary and records handlers
+- **admin**: add feature flags list + update handlers
+- **admin**: register /admin/api/backends and /admin/api/mappings routes
+- **admin**: add model mappings CRUD handlers
+- **admin**: add backends CRUD handlers with encryption
+- **admin**: register /admin/api/keys routes
+- **admin**: add API keys CRUD handlers
+- **admin**: register /admin static and /admin/api routes, add status endpoint
+- **admin**: add static file embedding via rust-embed
+- **admin**: add require_admin_key middleware
+- **admin**: add Encryptor to AppState
+
+### Fix
+
+- **usage**: support all-key aggregation in Postgres and DynamoDB implementations
+- **admin**: page-content should fill available width
+- **admin**: fix auth-gate visible after sign-in due to CSS display overriding hidden
+- **admin**: fix modal and app-layout always visible due to CSS display overriding hidden attribute
+- **admin**: prevent event listener accumulation on keys page re-render
+- **admin**: handle ambiguous key prefix and allow clearing optional fields
+- **admin**: avoid double uptime_seconds() call in status handler
+
 ## v0.4.0 (2026-03-24)
 
 ### Feat
