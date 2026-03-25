@@ -1,0 +1,280 @@
+//! Admin API — usage statistics (bypasses per-key guards)
+//!
+//! GET /admin/api/usage/summary → aggregated usage (filtered by api_key)
+//! GET /admin/api/usage/records → raw records (admin: no start_time guard)
+
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::schemas::anthropic::ErrorResponse;
+use crate::server::state::AppState;
+
+// ============================================================================
+// Query params
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct AdminUsageQueryParams {
+    /// Filter by API key (required — cross-key aggregation not yet supported)
+    pub api_key: Option<String>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    #[serde(default = "default_group_by")]
+    pub group_by: String,
+}
+
+fn default_group_by() -> String {
+    "hour".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminRecordsQueryParams {
+    pub api_key: Option<String>,
+    pub start_time: Option<String>,
+    pub limit: Option<i64>,
+}
+
+// ============================================================================
+// Response types (re-use same shapes as /v1/usage)
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct UsageSummaryResponse {
+    pub object: &'static str,
+    pub data: Vec<UsageBucket>,
+    pub summary: UsageTotals,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageBucket {
+    pub group_key: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub total_cost: f64,
+    pub total_requests: i64,
+    pub error_requests: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageTotals {
+    pub total_requests: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cached_tokens: i64,
+    pub total_cost: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageRecordsResponse {
+    pub object: &'static str,
+    pub data: Vec<UsageRecordItem>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageRecordItem {
+    pub id: Option<i64>,
+    pub api_key: String,
+    pub timestamp: String,
+    pub request_id: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost: f64,
+    pub success: bool,
+    pub duration_ms: Option<i64>,
+}
+
+// ============================================================================
+// Handlers
+// ============================================================================
+
+/// GET /admin/api/usage/summary
+pub async fn get_usage_summary(
+    State(state): State<AppState>,
+    Query(params): Query<AdminUsageQueryParams>,
+) -> impl IntoResponse {
+    if params.group_by != "hour" && params.group_by != "model" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "group_by must be 'hour' or 'model'",
+            )),
+        )
+            .into_response();
+    }
+
+    // The existing `query_usage_summary` trait method uses an exact api_key match.
+    // Passing "" would return zero results (no records have api_key = "").
+    // For admin "all keys" aggregation, we require the api_key param to be provided.
+    let api_key_filter = match params.api_key.as_deref() {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "api_key is required for admin usage summary. The DatabaseService trait \
+                     does not support cross-key aggregation yet.",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let rows = match state
+        .database
+        .usage()
+        .query_usage_summary(
+            api_key_filter,
+            params.start_time.as_deref(),
+            params.end_time.as_deref(),
+            &params.group_by,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to query admin usage summary");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Failed to retrieve usage data",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let summary = UsageTotals {
+        total_requests: rows.iter().map(|r| r.total_requests).sum(),
+        total_input_tokens: rows.iter().map(|r| r.input_tokens).sum(),
+        total_output_tokens: rows.iter().map(|r| r.output_tokens).sum(),
+        total_cached_tokens: rows.iter().map(|r| r.cached_tokens).sum(),
+        total_cost: rows.iter().map(|r| r.total_cost).sum(),
+    };
+
+    let data = rows
+        .into_iter()
+        .map(|r| UsageBucket {
+            group_key: r.group_key,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            cached_tokens: r.cached_tokens,
+            cache_write_tokens: r.cache_write_tokens,
+            total_cost: r.total_cost,
+            total_requests: r.total_requests,
+            error_requests: r.error_requests,
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(UsageSummaryResponse {
+            object: "list",
+            data,
+            summary,
+        }),
+    )
+        .into_response()
+}
+
+/// GET /admin/api/usage/records
+/// Admin version: no start_time guard, default limit 500.
+pub async fn get_usage_records(
+    State(state): State<AppState>,
+    Query(params): Query<AdminRecordsQueryParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(500).min(1000);
+    let api_key_filter = params.api_key.as_deref().unwrap_or("");
+
+    // Fetch limit+1 rows so we can detect has_more without an extra query.
+    // Passes the limit directly to the DB to avoid loading unbounded rows into RAM.
+    let mut records = match state
+        .database
+        .usage()
+        .get_usage_by_api_key(
+            api_key_filter,
+            params.start_time.as_deref(),
+            Some(limit + 1),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to query admin usage records");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Failed to retrieve usage records",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let has_more = records.len() as i64 > limit;
+    if has_more {
+        records.truncate(limit as usize);
+    }
+
+    let data = records
+        .into_iter()
+        .map(|r| UsageRecordItem {
+            id: r.id,
+            api_key: r.api_key,
+            timestamp: r.timestamp,
+            request_id: r.request_id,
+            model: r.model,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            cached_tokens: r.cached_tokens,
+            cache_write_tokens: r.cache_write_tokens,
+            cost: r.cost,
+            success: r.success,
+            duration_ms: r.duration_ms,
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(UsageRecordsResponse {
+            object: "list",
+            data,
+            has_more,
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_group_by_is_hour() {
+        let group_by = default_group_by();
+        assert_eq!(group_by, "hour");
+    }
+
+    #[test]
+    fn admin_records_params_default_limit_is_none() {
+        let json = r#"{}"#;
+        let params: AdminRecordsQueryParams = serde_json::from_str(json).unwrap();
+        assert!(params.limit.is_none());
+        assert!(params.api_key.is_none());
+        assert!(params.start_time.is_none());
+    }
+}
