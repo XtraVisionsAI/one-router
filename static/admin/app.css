@@ -1,42 +1,46 @@
 /* ============================================================
    one-router Admin UI — Design System
-   Dark theme, GitHub-inspired color palette
+   Slate dark theme — professional SaaS ops palette
    ============================================================ */
 
 /* --- CSS Custom Properties (Design Tokens) --- */
 :root {
-  --bg-base:        #0d1117;
-  --bg-surface:     #161b22;
-  --bg-elevated:    #21262d;
-  --bg-overlay:     rgba(0, 0, 0, 0.6);
+  --bg-base:        #020617;   /* slate-950 — deeper OLED-friendly base */
+  --bg-surface:     #0f172a;   /* slate-900 */
+  --bg-sidebar:     #080f1f;   /* darker than surface for sidebar depth */
+  --bg-elevated:    #1e293b;   /* slate-800 */
+  --bg-overlay:     rgba(0, 0, 0, 0.65);
 
-  --border-subtle:  #21262d;
-  --border-default: #30363d;
-  --border-strong:  #484f58;
+  --border-subtle:  #1e293b;
+  --border-default: #334155;   /* slate-600 — cleaner definition */
+  --border-strong:  #475569;   /* slate-500 */
+  --border-highlight: rgba(255, 255, 255, 0.08);
 
-  --text-primary:   #e6edf3;
-  --text-secondary: #8b949e;
-  --text-muted:     #7d8590;  /* bumped from #6e7681 — meets 4.5:1 on #0d1117 */
+  --text-primary:   #f1f5f9;   /* slate-100 */
+  --text-secondary: #94a3b8;   /* slate-400 */
+  --text-muted:     #64748b;   /* slate-500 — sufficient contrast on surface */
 
-  --accent-blue:    #58a6ff;
-  --accent-green:   #3fb950;
-  --accent-red:     #f85149;
-  --accent-yellow:  #d29922;
-  --accent-purple:  #bc8cff;
+  --accent-blue:    #3b82f6;   /* blue-500 — more saturated, modern */
+  --accent-blue-hover: #2563eb; /* blue-600 */
+  --accent-green:   #22c55e;   /* green-500 */
+  --accent-red:     #ef4444;   /* red-500 */
+  --accent-yellow:  #eab308;   /* yellow-500 */
+  --accent-purple:  #a78bfa;   /* violet-400 */
 
-  --badge-green-bg: #1a4d2e;
-  --badge-red-bg:   #4d1a1a;
-  --badge-blue-bg:  #1a3a5c;
-  --badge-gray-bg:  #21262d;
+  --badge-green-bg: rgba(34, 197, 94, 0.12);
+  --badge-red-bg:   rgba(239, 68, 68, 0.12);
+  --badge-blue-bg:  rgba(59, 130, 246, 0.12);
+  --badge-gray-bg:  rgba(100, 116, 139, 0.15);
 
-  --sidebar-width:  200px;
+  --sidebar-width:  220px;
   --header-height:  0px;
 
   --radius-sm:  4px;
-  --radius-md:  6px;
-  --radius-lg:  8px;
+  --radius-md:  8px;   /* bumped from 6px — more modern card feel */
+  --radius-lg:  10px;
 
-  --shadow-md: 0 4px 16px rgba(0,0,0,0.4);
+  --shadow-md:  0 4px 20px rgba(0, 0, 0, 0.5);
+  --shadow-sm:  0 1px 4px rgba(0, 0, 0, 0.3);
 
   --font-mono: "Fira Code", ui-monospace, "SFMono-Regular", "Consolas", monospace;
   --font-sans: "Fira Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -58,6 +62,13 @@ a:hover { text-decoration: underline; }
 h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 p { margin: 0; }
 input, select, textarea, button { font-family: inherit; font-size: inherit; }
+
+/* Global focus-visible — keyboard navigation ring */
+:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
 
 /* ============================================================
    AUTH GATE
@@ -143,7 +154,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 /* --- Sidebar --- */
 .sidebar {
   width: var(--sidebar-width);
-  background: var(--bg-surface);
+  background: var(--bg-sidebar);
   border-right: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
@@ -156,39 +167,43 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 }
 
 .sidebar-logo {
-  padding: 16px 16px 12px;
+  display: flex;
+  align-items: center;
+  height: 52px;
+  padding: 0 18px;
   font-size: 15px;
   font-weight: 700;
   border-bottom: 1px solid var(--border-default);
+  flex-shrink: 0;
 }
 
 .sidebar-nav {
   flex: 1;
-  padding: 8px 0;
+  padding: 10px 0;
 }
 
 .nav-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 16px;
+  gap: 9px;
+  padding: 8px 18px;
   color: var(--text-secondary);
   text-decoration: none;
-  border-left: 2px solid transparent;
-  transition: color 0.1s, background 0.1s;
-  font-size: 12px;
+  border-left: 3px solid transparent;
+  transition: color 0.15s, background 0.15s;
+  font-size: 12.5px;
   cursor: pointer;
 }
 .nav-item:hover { color: var(--text-primary); background: var(--bg-elevated); text-decoration: none; }
 .nav-item.active {
   color: var(--text-primary);
-  background: var(--bg-elevated);
+  background: rgba(59, 130, 246, 0.08);
   border-left-color: var(--accent-blue);
 }
 .nav-icon { width: 16px; text-align: center; font-size: 15px; flex-shrink: 0; }
 
 .sidebar-footer {
-  padding: 12px 16px;
+  padding: 14px 18px;
   border-top: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
@@ -211,7 +226,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 }
 
 .page-content {
-  padding: 24px 28px;
+  padding: 28px 32px;
   width: 100%;
   animation: page-fade-in 0.15s ease-out;
 }
@@ -236,7 +251,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 }
 
 .page-title {
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
   color: var(--text-primary);
 }
@@ -254,11 +269,14 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 .stat-card {
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
+  border-top: 1px solid var(--border-highlight);
   border-radius: var(--radius-md);
-  padding: 14px 44px 14px 16px;
+  padding: 16px 48px 16px 18px;
   position: relative;
   overflow: hidden;
+  transition: border-color 0.15s;
 }
+.stat-card:hover { border-color: var(--border-strong); }
 
 .stat-icon {
   position: absolute;
@@ -308,18 +326,18 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 
 .table-wrap th {
   text-align: left;
-  padding: 8px 14px;
+  padding: 10px 16px;
   font-size: 11px;
   font-weight: 500;
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.4px;
-  background: var(--bg-elevated);
+  background: rgba(255, 255, 255, 0.03);
   border-bottom: 1px solid var(--border-default);
 }
 
 .table-wrap td {
-  padding: 9px 14px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--border-subtle);
   vertical-align: middle;
   color: var(--text-primary);
@@ -369,43 +387,45 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 12px;
+  padding: 6px 14px;
   border-radius: var(--radius-md);
   border: 1px solid transparent;
   cursor: pointer;
   font-size: 12px;
   font-weight: 500;
   line-height: 1.4;
-  transition: opacity 0.1s;
+  transition: background 0.15s, opacity 0.15s, border-color 0.15s;
   white-space: nowrap;
 }
-.btn:hover { opacity: 0.85; }
+.btn:hover { opacity: 0.88; }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .btn-primary {
-  background: #238636;
+  background: var(--accent-blue);
   color: #fff;
-  border-color: #2ea043;
+  border-color: var(--accent-blue);
 }
+.btn-primary:hover { background: var(--accent-blue-hover); border-color: var(--accent-blue-hover); opacity: 1; }
 .btn-danger {
-  background: #da3633;
+  background: var(--accent-red);
   color: #fff;
-  border-color: #f85149;
+  border-color: var(--accent-red);
 }
 .btn-secondary {
   background: var(--bg-elevated);
   color: var(--text-primary);
   border-color: var(--border-default);
 }
+.btn-secondary:hover { border-color: var(--border-strong); opacity: 1; }
 .btn-ghost {
   background: transparent;
   color: var(--text-secondary);
   border-color: transparent;
   padding: 4px 8px;
 }
-.btn-ghost:hover { color: var(--text-primary); background: var(--bg-elevated); }
+.btn-ghost:hover { color: var(--text-primary); background: var(--bg-elevated); opacity: 1; }
 
-.btn-sm { padding: 3px 8px; font-size: 11px; }
+.btn-sm { padding: 3px 9px; font-size: 11px; }
 
 .sign-out-btn { font-size: 11px; color: var(--text-muted); }
 
@@ -527,6 +547,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 .modal {
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
+  border-top: 1px solid var(--border-highlight);
   border-radius: var(--radius-lg);
   width: 100%;
   max-width: 520px;
@@ -627,7 +648,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  margin: 16px 0 8px;
+  margin: 20px 0 10px;
 }
 
 /* ============================================================
