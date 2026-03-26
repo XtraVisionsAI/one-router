@@ -20,8 +20,8 @@
   --text-secondary: #94a3b8;   /* slate-400 */
   --text-muted:     #64748b;   /* slate-500 — sufficient contrast on surface */
 
-  --accent-blue:    #3b82f6;   /* blue-500 — more saturated, modern */
-  --accent-blue-hover: #2563eb; /* blue-600 */
+  --accent-blue:    #6366f1;   /* indigo-500 — more presence on dark bg */
+  --accent-blue-hover: #4f46e5; /* indigo-600 */
   --accent-green:   #22c55e;   /* green-500 */
   --accent-red:     #ef4444;   /* red-500 */
   --accent-yellow:  #eab308;   /* yellow-500 */
@@ -29,7 +29,7 @@
 
   --badge-green-bg: rgba(34, 197, 94, 0.12);
   --badge-red-bg:   rgba(239, 68, 68, 0.12);
-  --badge-blue-bg:  rgba(59, 130, 246, 0.12);
+  --badge-blue-bg:  rgba(99, 102, 241, 0.12);
   --badge-gray-bg:  rgba(100, 116, 139, 0.15);
 
   --sidebar-width:  220px;
@@ -43,7 +43,7 @@
   --shadow-sm:  0 1px 4px rgba(0, 0, 0, 0.3);
 
   --font-mono: "Fira Code", ui-monospace, "SFMono-Regular", "Consolas", monospace;
-  --font-sans: "Fira Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
 
 /* --- Reset --- */
@@ -175,6 +175,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   font-weight: 700;
   border-bottom: 1px solid var(--border-default);
   flex-shrink: 0;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.14) 0%, transparent 65%);
 }
 
 .sidebar-nav {
@@ -197,7 +198,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 .nav-item:hover { color: var(--text-primary); background: var(--bg-elevated); text-decoration: none; }
 .nav-item.active {
   color: var(--text-primary);
-  background: rgba(59, 130, 246, 0.08);
+  background: linear-gradient(90deg, rgba(99, 102, 241, 0.18), transparent);
   border-left-color: var(--accent-blue);
 }
 .nav-icon { width: 16px; text-align: center; font-size: 15px; flex-shrink: 0; }
@@ -247,7 +248,9 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 20px;
+  margin-bottom: 24px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border-default);
 }
 
 .page-title {
@@ -270,20 +273,32 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   border-top: 1px solid var(--border-highlight);
+  border-left: 3px solid var(--stat-accent, var(--accent-blue));
   border-radius: var(--radius-md);
   padding: 16px 48px 16px 18px;
   position: relative;
   overflow: hidden;
-  transition: border-color 0.15s;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-.stat-card:hover { border-color: var(--border-strong); }
+.stat-card:hover {
+  border-color: var(--border-strong);
+  border-left-color: var(--stat-accent, var(--accent-blue));
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
+}
+
+/* Per-card accent color variants */
+.stat-card.accent-blue   { --stat-accent: var(--accent-blue); }
+.stat-card.accent-green  { --stat-accent: var(--accent-green); }
+.stat-card.accent-purple { --stat-accent: var(--accent-purple); }
+.stat-card.accent-yellow { --stat-accent: var(--accent-yellow); }
 
 .stat-icon {
   position: absolute;
-  top: 10px;
-  right: 12px;
-  font-size: 22px;
-  color: var(--border-strong);
+  top: 12px;
+  right: 14px;
+  font-size: 20px;
+  color: var(--stat-accent, var(--accent-blue));
+  opacity: 0.7;
   pointer-events: none;
 }
 
@@ -344,7 +359,9 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   font-size: 12px;
 }
 .table-wrap tr:last-child td { border-bottom: none; }
-.table-wrap tr:hover td { background: var(--bg-elevated); }
+.table-wrap tr:hover td { background: rgba(255, 255, 255, 0.04); }
+.table-wrap tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.015); }
+.table-wrap tbody tr:nth-child(even):hover td { background: rgba(255, 255, 255, 0.05); }
 
 .table-empty {
   text-align: center;
@@ -363,8 +380,8 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   font-size: 10px;
   font-weight: 500;
 }
-.badge-green  { background: var(--badge-green-bg);  color: var(--accent-green); }
-.badge-red    { background: var(--badge-red-bg);    color: var(--accent-red); }
+.badge-green  { background: var(--badge-green-bg);  color: var(--accent-green); box-shadow: 0 0 8px rgba(34, 197, 94, 0.18); }
+.badge-red    { background: var(--badge-red-bg);    color: var(--accent-red);   box-shadow: 0 0 8px rgba(239, 68, 68, 0.18); }
 .badge-blue   { background: var(--badge-blue-bg);   color: var(--accent-blue); }
 .badge-gray   { background: var(--badge-gray-bg);   color: var(--text-secondary); }
 
@@ -404,8 +421,14 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   background: var(--accent-blue);
   color: #fff;
   border-color: var(--accent-blue);
+  box-shadow: 0 0 16px rgba(99, 102, 241, 0.28);
 }
-.btn-primary:hover { background: var(--accent-blue-hover); border-color: var(--accent-blue-hover); opacity: 1; }
+.btn-primary:hover {
+  background: var(--accent-blue-hover);
+  border-color: var(--accent-blue-hover);
+  box-shadow: 0 0 24px rgba(99, 102, 241, 0.45);
+  opacity: 1;
+}
 .btn-danger {
   background: var(--accent-red);
   color: #fff;

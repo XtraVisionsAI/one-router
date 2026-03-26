@@ -236,22 +236,22 @@ async function pageDashboard(content) {
     </div>
 
     <div class="stat-grid">
-      <div class="stat-card">
+      <div class="stat-card accent-blue">
         <i class="bi bi-key stat-icon"></i>
         <div class="stat-label">API Keys</div>
         <div class="stat-value blue">${keys.length}</div>
       </div>
-      <div class="stat-card">
+      <div class="stat-card ${healthyCount > 0 ? 'accent-green' : 'accent-red'}">
         <i class="bi bi-hdd-stack stat-icon"></i>
         <div class="stat-label">Backends</div>
         <div class="stat-value ${healthyCount > 0 ? 'green' : 'red'}">${backends.length}</div>
       </div>
-      <div class="stat-card">
+      <div class="stat-card accent-purple">
         <i class="bi bi-check-circle stat-icon"></i>
         <div class="stat-label">Active Keys</div>
         <div class="stat-value">${keys.filter((k) => k.is_active).length}</div>
       </div>
-      <div class="stat-card">
+      <div class="stat-card accent-yellow">
         <i class="bi bi-clock stat-icon"></i>
         <div class="stat-label">Uptime</div>
         <div class="stat-value">${fmtUptime(statusData.uptime_seconds)}</div>
@@ -824,10 +824,10 @@ async function pageUsage(content) {
 
       resultsEl.innerHTML = `
         <div class="stat-grid" style="margin-bottom:16px">
-          <div class="stat-card"><i class="bi bi-send stat-icon"></i><div class="stat-label">Requests</div><div class="stat-value">${s.total_requests.toLocaleString()}</div></div>
-          <div class="stat-card"><i class="bi bi-arrow-down-circle stat-icon"></i><div class="stat-label">Input Tokens</div><div class="stat-value blue">${fmtTokens(s.total_input_tokens)}</div></div>
-          <div class="stat-card"><i class="bi bi-arrow-up-circle stat-icon"></i><div class="stat-label">Output Tokens</div><div class="stat-value blue">${fmtTokens(s.total_output_tokens)}</div></div>
-          <div class="stat-card"><i class="bi bi-currency-dollar stat-icon"></i><div class="stat-label">Total Cost</div><div class="stat-value">${fmtMoney(s.total_cost)}</div></div>
+          <div class="stat-card accent-blue"><i class="bi bi-send stat-icon"></i><div class="stat-label">Requests</div><div class="stat-value">${s.total_requests.toLocaleString()}</div></div>
+          <div class="stat-card accent-purple"><i class="bi bi-arrow-down-circle stat-icon"></i><div class="stat-label">Input Tokens</div><div class="stat-value blue">${fmtTokens(s.total_input_tokens)}</div></div>
+          <div class="stat-card accent-green"><i class="bi bi-arrow-up-circle stat-icon"></i><div class="stat-label">Output Tokens</div><div class="stat-value blue">${fmtTokens(s.total_output_tokens)}</div></div>
+          <div class="stat-card accent-yellow"><i class="bi bi-currency-dollar stat-icon"></i><div class="stat-label">Total Cost</div><div class="stat-value">${fmtMoney(s.total_cost)}</div></div>
         </div>
         <div class="table-wrap">
           <table>
