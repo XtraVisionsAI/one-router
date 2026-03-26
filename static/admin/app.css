@@ -123,14 +123,18 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   background: var(--bg-base);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  padding: 8px 12px;
+  padding: 8px 36px 8px 12px;
   color: var(--text-primary);
-  margin-bottom: 0.75rem;
   outline: none;
   font-family: var(--font-mono);
   font-size: 12px;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-.auth-input:focus { border-color: var(--accent-blue); }
+.auth-input:focus {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+}
+.auth-input::placeholder { color: var(--text-muted); }
 
 .auth-btn { width: 100%; justify-content: center; }
 
@@ -464,7 +468,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   font-size: 11px;
   font-weight: 500;
   color: var(--text-secondary);
-  margin-bottom: 4px;
+  margin-bottom: 5px;
   text-transform: uppercase;
   letter-spacing: 0.3px;
 }
@@ -473,21 +477,109 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 .form-select,
 .form-textarea {
   width: 100%;
-  background: var(--bg-base);
+  background: var(--bg-elevated);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  padding: 7px 10px;
+  padding: 8px 12px;
   color: var(--text-primary);
   outline: none;
   font-size: 12px;
-  transition: border-color 0.1s;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  line-height: 1.5;
 }
+
 .form-input:focus,
 .form-select:focus,
-.form-textarea:focus { border-color: var(--accent-blue); }
+.form-textarea:focus {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+}
 
-.form-textarea { resize: vertical; min-height: 80px; font-family: var(--font-mono); }
-.form-select { appearance: none; cursor: pointer; }
+/* Placeholder */
+.form-input::placeholder,
+.form-textarea::placeholder { color: var(--text-muted); }
+::placeholder { color: var(--text-muted); }
+
+/* Disabled / readonly states */
+.form-input:disabled,
+.form-select:disabled,
+.form-textarea:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: var(--bg-surface);
+}
+
+.form-input[readonly],
+.form-textarea[readonly] {
+  background: var(--bg-surface);
+  border-color: var(--border-subtle);
+  color: var(--text-secondary);
+  cursor: default;
+}
+.form-input[readonly]:focus,
+.form-textarea[readonly]:focus {
+  border-color: var(--border-subtle);
+  box-shadow: none;
+}
+
+.form-textarea {
+  resize: vertical;
+  min-height: 80px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+/* Custom select arrow (replaces OS-native arrow) */
+.form-select {
+  appearance: none;
+  cursor: pointer;
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 16 16'%3E%3Cpath fill='%2394a3b8' d='M7.247 11.14 2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.form-select:focus {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 16 16'%3E%3Cpath fill='%236366f1' d='M7.247 11.14 2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+}
+
+/* Input with inline action button (e.g. password show/hide) */
+.input-wrap {
+  position: relative;
+}
+.input-wrap .form-input {
+  padding-right: 36px;
+}
+.input-wrap .input-action {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 2px 4px;
+  line-height: 1;
+  font-size: 13px;
+}
+.input-wrap .input-action:hover { color: var(--text-secondary); }
+
+/* JSON textarea with validation state */
+.form-textarea.json-invalid {
+  border-color: var(--accent-red);
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.15);
+}
+.form-textarea.json-valid {
+  border-color: var(--accent-green);
+}
+.json-status {
+  font-size: 10px;
+  margin-top: 3px;
+  min-height: 14px;
+}
+.json-status.error { color: var(--accent-red); }
+.json-status.ok    { color: var(--accent-green); }
 
 .form-hint {
   font-size: 11px;

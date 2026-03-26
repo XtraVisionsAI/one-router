@@ -204,6 +204,36 @@ document.getElementById('modal-overlay').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) closeModal();
 });
 
+// Auth input show/hide toggle
+document.getElementById('auth-toggle-visibility').addEventListener('click', () => {
+  const input = document.getElementById('auth-key-input');
+  const icon = document.querySelector('#auth-toggle-visibility i');
+  if (input.type === 'password') {
+    input.type = 'text';
+    icon.className = 'bi bi-eye-slash';
+  } else {
+    input.type = 'password';
+    icon.className = 'bi bi-eye';
+  }
+});
+
+/** Attach show/hide toggle to a password input inside an .input-wrap */
+function attachPasswordToggle(inputId, btnId) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const input = document.getElementById(inputId);
+    const icon = btn.querySelector('i');
+    if (input.type === 'password') {
+      input.type = 'text';
+      icon.className = 'bi bi-eye-slash';
+    } else {
+      input.type = 'password';
+      icon.className = 'bi bi-eye';
+    }
+  });
+}
+
 // Page-level event delegation (registered once, guards by page)
 document.getElementById('page-content').addEventListener('click', (e) => {
   if (STATE.currentPage === 'keys') handleKeyAction(e);
@@ -599,6 +629,7 @@ function showBackendModal(existing) {
     </div>
     <div class="form-group form-full"><label class="form-label">Config JSON${isEdit ? ' (leave empty to keep existing)' : ' *'}</label>
       <textarea class="form-textarea" id="m-be-config" placeholder='{"api_keys":["AIza..."]}'></textarea>
+      <div class="json-status" id="m-be-config-status"></div>
       <p class="form-hint">Credentials are encrypted before storage. For Gemini/Anthropic/OpenAI: {"api_keys":["key1"]}. For Bedrock: {"region":"us-east-1"}.</p>
     </div>
   `, `
@@ -607,6 +638,32 @@ function showBackendModal(existing) {
   `);
 
   document.getElementById('m-be-cancel').addEventListener('click', closeModal);
+
+  // JSON textarea: validate on input, auto-format on blur
+  const configEl = document.getElementById('m-be-config');
+  const configStatus = document.getElementById('m-be-config-status');
+  function validateJson(val) {
+    if (!val.trim()) { configEl.className = 'form-textarea'; configStatus.textContent = ''; return; }
+    try {
+      JSON.parse(val);
+      configEl.className = 'form-textarea json-valid';
+      configStatus.className = 'json-status ok';
+      configStatus.textContent = '✓ Valid JSON';
+    } catch (e) {
+      configEl.className = 'form-textarea json-invalid';
+      configStatus.className = 'json-status error';
+      configStatus.textContent = '✗ ' + e.message;
+    }
+  }
+  configEl.addEventListener('input', (e) => validateJson(e.target.value));
+  configEl.addEventListener('blur', (e) => {
+    const val = e.target.value.trim();
+    if (!val) return;
+    try {
+      e.target.value = JSON.stringify(JSON.parse(val), null, 2);
+      validateJson(e.target.value);
+    } catch { /* keep as-is, error already shown */ }
+  });
   document.getElementById('m-be-save').addEventListener('click', async () => {
     const name = isEdit ? existing.name : document.getElementById('m-be-name').value.trim();
     const backend_type = document.getElementById('m-be-type').value;

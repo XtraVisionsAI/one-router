@@ -23,14 +23,19 @@
     </div>
     <p class="auth-hint">Enter your master or ephemeral API key to continue.</p>
     <form id="auth-form" autocomplete="off">
-      <input
-        id="auth-key-input"
-        type="password"
-        class="auth-input"
-        placeholder="sk-..."
-        autocomplete="new-password"
-        spellcheck="false"
-      >
+      <div class="input-wrap" style="margin-bottom:0.75rem">
+        <input
+          id="auth-key-input"
+          type="password"
+          class="auth-input"
+          placeholder="sk-..."
+          autocomplete="new-password"
+          spellcheck="false"
+        >
+        <button type="button" class="input-action" id="auth-toggle-visibility" aria-label="Toggle key visibility">
+          <i class="bi bi-eye"></i>
+        </button>
+      </div>
     <button type="submit" class="btn btn-primary auth-btn">
       <i class="bi bi-box-arrow-in-right"></i> Sign in
     </button>
