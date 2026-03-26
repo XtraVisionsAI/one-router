@@ -1,3 +1,18 @@
+## v0.7.0 (2026-03-26)
+
+### Feat
+
+- **admin**: add Tom Select, Flatpickr, Chart.js, Tippy.js; fix chart resize loop with responsive:false and CSS fixed height
+- **admin**: enhance form inputs — focus glow, custom select arrow, readonly/disabled states, JSON auto-format+validate, password show/hide
+- split API key name/key columns, add mapping filters, sort mappings by provider+priority+source
+- **admin**: elevate UI — Inter font, indigo accent, button glow, sidebar gradient, colored stat cards, zebra table, badge glow
+- **admin**: retheme to Slate dark palette — deeper bg, blue primary, modern cards, wider sidebar, focus ring
+- **admin**: UX improvements — fonts, contrast, loading states, confirm dialogs, a11y, table scroll, page transitions
+
+### Fix
+
+- **ci**: prevent race condition overwriting latest tag when releases run concurrently
+
 ## v0.6.0 (2026-03-26)
 
 ### Feat
