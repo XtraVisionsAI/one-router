@@ -116,6 +116,12 @@ function navigate(hash) {
 window.addEventListener('hashchange', () => navigate(location.hash));
 
 async function renderPage(page) {
+  // Destroy any active Chart.js instances before clearing the DOM
+  Object.keys(_charts).forEach((id) => {
+    _charts[id].destroy();
+    delete _charts[id];
+  });
+
   const content = document.getElementById('page-content');
   content.innerHTML = '<div class="loading">Loading…</div>';
   try {
@@ -124,12 +130,73 @@ async function renderPage(page) {
     content.style.animation = 'none';
     content.offsetHeight; // reflow trigger
     content.style.animation = '';
+    // init tooltips after page renders
+    initTooltips(content);
   } catch (err) {
     content.innerHTML = `<div class="empty-state">
       <div class="empty-state-title">Failed to load page</div>
       <p class="text-muted">${esc(err.message)}</p>
     </div>`;
   }
+}
+
+// ============================================================
+// THIRD-PARTY LIBRARY HELPERS
+// ============================================================
+
+/** Initialize Tom Select on all .ts-select elements inside a container */
+function initTomSelects(container) {
+  if (typeof TomSelect === 'undefined') return;
+  (container || document).querySelectorAll('.ts-select').forEach((el) => {
+    if (el.tomselect) el.tomselect.destroy();
+    new TomSelect(el, {
+      create: false,
+      allowEmptyOption: true,
+      maxOptions: 200,
+      plugins: el.dataset.search ? ['input_autogrow'] : [],
+    });
+  });
+}
+
+/** Destroy Tom Select instances inside a container */
+function destroyTomSelects(container) {
+  if (typeof TomSelect === 'undefined') return;
+  (container || document).querySelectorAll('.ts-select').forEach((el) => {
+    if (el.tomselect) el.tomselect.destroy();
+  });
+}
+
+/** Initialize Tippy tooltips on all [data-tippy-content] elements */
+function initTooltips(container) {
+  if (typeof tippy === 'undefined') return;
+  tippy((container || document).querySelectorAll('[data-tippy-content]'), {
+    theme: 'admin',
+    placement: 'top',
+    arrow: true,
+    delay: [200, 0],
+    duration: [150, 100],
+  });
+}
+
+/** Active Chart.js instances keyed by canvas id — destroy before re-render */
+const _charts = {};
+function renderChart(canvasId, config) {
+  if (typeof Chart === 'undefined') return;
+  initChartDefaults();
+  if (_charts[canvasId]) { _charts[canvasId].destroy(); delete _charts[canvasId]; }
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  _charts[canvasId] = new Chart(canvas, config);
+}
+
+/** Chart.js defaults for dark theme — called lazily before first chart render */
+function initChartDefaults() {
+  if (typeof Chart === 'undefined' || initChartDefaults._done) return;
+  initChartDefaults._done = true;
+  Chart.defaults.color = '#94a3b8';
+  Chart.defaults.borderColor = '#334155';
+  Chart.defaults.font.family = 'Inter, system-ui, sans-serif';
+  Chart.defaults.font.size = 11;
 }
 
 // ============================================================
@@ -168,6 +235,10 @@ function openModal(title, bodyHtml, footerHtml) {
   document.getElementById('modal-body').innerHTML = bodyHtml;
   document.getElementById('modal-footer').innerHTML = footerHtml || '';
   document.getElementById('modal-overlay').hidden = false;
+  // init Tom Select on any .ts-select inside modal
+  setTimeout(() => {
+    initTomSelects(document.getElementById('modal-body'));
+  }, 0);
   // focus first focusable element
   setTimeout(() => {
     const first = document.querySelector('#modal-body input, #modal-body select, #modal-body textarea, #modal-footer button');
@@ -176,6 +247,7 @@ function openModal(title, bodyHtml, footerHtml) {
 }
 
 function closeModal() {
+  destroyTomSelects(document.getElementById('modal-body'));
   document.getElementById('modal-overlay').hidden = true;
 }
 
@@ -288,6 +360,13 @@ async function pageDashboard(content) {
       </div>
     </div>
 
+    <div class="chart-container">
+      <div class="chart-container-title">
+        <span>Requests — Last 24 Hours</span>
+      </div>
+      <canvas id="chart-dashboard-requests"></canvas>
+    </div>
+
     <div class="section-title">Backend Status</div>
     <div class="table-wrap">
       <table>
@@ -330,6 +409,35 @@ async function pageDashboard(content) {
       </table>
     </div>
   `;
+
+  // Fetch last 24h usage data for chart (all keys, group by hour)
+  // Guard: abort if the user navigated away before the async response arrived
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const usageData = await api('GET', `/usage/summary?group_by=hour&start_time=${encodeURIComponent(since)}`);
+    if (!document.getElementById('chart-dashboard-requests')) return; // navigated away
+    const rows = (usageData.data || []).slice().reverse(); // oldest first
+    renderChart('chart-dashboard-requests', {
+      type: 'line',
+      data: {
+        labels: rows.map((r) => r.group_key.slice(11) + ':00'), // "15:00"
+        datasets: [{
+          label: 'Requests',
+          data: rows.map((r) => r.total_requests),
+          borderColor: '#6366f1',
+          backgroundColor: 'rgba(99,102,241,0.12)',
+          fill: true,
+          tension: 0.4,
+          pointRadius: rows.length > 20 ? 0 : 3,
+          pointHoverRadius: 5,
+          borderWidth: 2,
+        }],
+      },
+      options: {
+        responsive: false,
+      },
+    });
+  } catch { /* chart is optional, silently ignore if no data */ }
 }
 
 function fmtUptime(secs) {
@@ -384,7 +492,7 @@ function renderKeysList(content, keys) {
             : keys.map((k) => `
               <tr>
                 <td>${esc(k.name)}</td>
-                <td class="mono text-secondary" style="font-size:11px">${esc(k.api_key)}</td>
+                <td class="mono text-secondary" style="font-size:11px" data-tippy-content="${esc(k.api_key)}">${esc(k.api_key)}</td>
                 <td class="text-secondary">${esc(k.user_id)}</td>
                 <td>${k.rate_limit > 0 ? k.rate_limit + ' rpm' : '—'}</td>
                 <td>${k.monthly_budget != null
@@ -619,7 +727,7 @@ function showBackendModal(existing) {
       <input class="form-input" id="m-be-name" placeholder="e.g. gemini-prod"></div>` : `<p class="text-secondary" style="margin-bottom:14px;font-size:12px">Backend: <span class="mono">${esc(existing.name)}</span></p>`}
     <div class="form-row">
       <div class="form-group"><label class="form-label">Type *</label>
-        <select class="form-input" id="m-be-type">
+        <select class="form-input ts-select" id="m-be-type">
           ${types.map((t) => `<option value="${t}" ${(existing?.backend_type || 'gemini') === t ? 'selected' : ''}>${t}</option>`).join('')}
         </select>
       </div>
@@ -721,7 +829,7 @@ async function pageMappings(content) {
               : mappings.map((m) => `
                 <tr>
                   <td class="mono">${esc(m.source_model_id)}</td>
-                  <td class="mono text-secondary">${esc(m.target_model_id)}</td>
+                  <td class="mono text-secondary" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" data-tippy-content="${esc(m.target_model_id)}">${esc(m.target_model_id)}</td>
                   <td><span class="badge badge-gray">${esc(m.provider)}</span></td>
                   <td>${m.priority}</td>
                   <td>${m.status === 'active' ? '<span class="badge badge-green">active</span>' : '<span class="badge badge-gray">inactive</span>'}</td>
@@ -747,11 +855,11 @@ async function pageMappings(content) {
     </div>
     <div class="filter-bar">
       <input class="form-input" id="map-filter-src" placeholder="Filter by source model…" style="min-width:200px">
-      <select class="form-input" id="map-filter-provider" style="width:140px">
+      <select class="form-input ts-select" id="map-filter-provider" style="width:140px">
         <option value="">All Providers</option>
         ${providers.map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}
       </select>
-      <select class="form-input" id="map-filter-status" style="width:120px">
+      <select class="form-input ts-select" id="map-filter-status" style="width:120px">
         <option value="">All Status</option>
         <option value="active">Active</option>
         <option value="inactive">Inactive</option>
@@ -781,7 +889,11 @@ async function pageMappings(content) {
         : `${filtered.length} / ${allMappings.length} mappings`;
   }
 
+  // Init Tom Select on filter dropdowns
+  initTomSelects(content);
+
   document.getElementById('map-filter-src').addEventListener('input', applyFilters);
+  // Tom Select fires 'change' on the underlying select element
   document.getElementById('map-filter-provider').addEventListener('change', applyFilters);
   document.getElementById('map-filter-status').addEventListener('change', applyFilters);
 }
@@ -823,7 +935,7 @@ function showMappingModal(existing) {
       <div class="form-group"><label class="form-label">Source Model ID *</label>
         <input class="form-input" id="m-map-src" value="${esc(existing?.source_model_id || '')}" placeholder="claude-3-5-sonnet*" ${isEdit ? 'readonly' : ''}></div>
       <div class="form-group"><label class="form-label">Provider *</label>
-        <select class="form-input" id="m-map-provider" ${isEdit ? 'disabled' : ''}>
+        <select class="form-input ts-select" id="m-map-provider" ${isEdit ? 'disabled' : ''}>
           ${['bedrock','gemini','anthropic','openai'].map((p) =>
             `<option value="${p}" ${existing?.provider === p ? 'selected' : ''}>${p}</option>`).join('')}
         </select></div>
@@ -836,7 +948,7 @@ function showMappingModal(existing) {
       <div class="form-group"><label class="form-label">Priority</label>
         <input class="form-input" id="m-map-priority" type="number" value="${existing?.priority ?? 0}"></div>
       <div class="form-group"><label class="form-label">Status</label>
-        <select class="form-input" id="m-map-status">
+        <select class="form-input ts-select" id="m-map-status">
           <option value="active" ${existing?.status !== 'inactive' ? 'selected' : ''}>active</option>
           <option value="inactive" ${existing?.status === 'inactive' ? 'selected' : ''}>inactive</option>
         </select></div>
@@ -893,11 +1005,9 @@ async function pageUsage(content) {
       <h1 class="page-title">Usage</h1>
     </div>
     <div class="filter-bar">
-      <input class="form-input" id="usage-key-filter" placeholder="API key (optional, e.g. sk-abc123...)" style="min-width:220px">
-      <input class="form-input" type="date" id="usage-start" style="width:140px">
-      <span class="text-muted">—</span>
-      <input class="form-input" type="date" id="usage-end" style="width:140px">
-      <select class="form-input" id="usage-group-by" style="width:110px">
+      <input class="form-input" id="usage-key-filter" placeholder="API key (optional)" style="min-width:200px">
+      <input class="form-input" id="usage-date-range" placeholder="Date range…" style="min-width:200px" readonly>
+      <select class="form-input ts-select" id="usage-group-by" style="width:120px">
         <option value="hour">By Hour</option>
         <option value="model">By Model</option>
       </select>
@@ -906,19 +1016,33 @@ async function pageUsage(content) {
     <div id="usage-results"><p class="text-muted" style="padding:1rem 0">Select filters and click Query. Leave API key empty to aggregate all keys.</p></div>
   `;
 
+  // Init Tom Select for group-by
+  initTomSelects(content);
+
+  // Init Flatpickr date range picker
+  const fp = (typeof flatpickr !== 'undefined')
+    ? flatpickr('#usage-date-range', {
+        mode: 'range',
+        dateFormat: 'Y-m-d',
+        allowInput: false,
+        disableMobile: true,
+      })
+    : null;
+
   document.getElementById('btn-usage-query').addEventListener('click', async () => {
     const keyFilter = document.getElementById('usage-key-filter').value.trim();
-    const start = document.getElementById('usage-start').value;
-    const end = document.getElementById('usage-end').value;
     const groupBy = document.getElementById('usage-group-by').value;
     const resultsEl = document.getElementById('usage-results');
+    const dates = fp ? fp.selectedDates : [];
+    const start = dates[0] ? dates[0].toISOString() : null;
+    const end   = dates[1] ? new Date(dates[1].getFullYear(), dates[1].getMonth(), dates[1].getDate(), 23, 59, 59).toISOString() : null;
 
     resultsEl.innerHTML = '<div class="loading">Loading...</div>';
 
     const params = new URLSearchParams({ group_by: groupBy });
     if (keyFilter) params.set('api_key', keyFilter);
-    if (start) params.set('start_time', new Date(start).toISOString());
-    if (end) params.set('end_time', new Date(end + 'T23:59:59').toISOString());
+    if (start) params.set('start_time', start);
+    if (end) params.set('end_time', end);
 
     try {
       const data = await api('GET', '/usage/summary?' + params.toString());
@@ -931,6 +1055,12 @@ async function pageUsage(content) {
           <div class="stat-card accent-purple"><i class="bi bi-arrow-down-circle stat-icon"></i><div class="stat-label">Input Tokens</div><div class="stat-value blue">${fmtTokens(s.total_input_tokens)}</div></div>
           <div class="stat-card accent-green"><i class="bi bi-arrow-up-circle stat-icon"></i><div class="stat-label">Output Tokens</div><div class="stat-value blue">${fmtTokens(s.total_output_tokens)}</div></div>
           <div class="stat-card accent-yellow"><i class="bi bi-currency-dollar stat-icon"></i><div class="stat-label">Total Cost</div><div class="stat-value">${fmtMoney(s.total_cost)}</div></div>
+        </div>
+        <div class="chart-container">
+          <div class="chart-container-title">
+            <span>${groupBy === 'model' ? 'Requests by Model' : 'Requests over Time'}</span>
+          </div>
+          <canvas id="chart-usage"></canvas>
         </div>
         <div class="table-wrap">
           <table>
@@ -952,6 +1082,66 @@ async function pageUsage(content) {
             </tbody>
           </table>
         </div>`;
+
+      // Render chart after DOM is updated
+      if (rows.length > 0) {
+        if (groupBy === 'model') {
+          // Horizontal bar chart for model comparison
+          renderChart('chart-usage', {
+            type: 'bar',
+            data: {
+              labels: rows.map((r) => r.group_key),
+              datasets: [{
+                label: 'Requests',
+                data: rows.map((r) => r.total_requests),
+                backgroundColor: 'rgba(99,102,241,0.7)',
+                borderColor: '#6366f1',
+                borderWidth: 1,
+                borderRadius: 4,
+              }],
+            },
+            options: {
+              indexAxis: 'y',
+              responsive: false,
+              maintainAspectRatio: false,
+              plugins: { legend: { display: false } },
+              scales: {
+                x: { beginAtZero: true, grid: { color: 'rgba(51,65,85,0.5)' }, ticks: { precision: 0 } },
+                y: { grid: { display: false } },
+              },
+            },
+          });
+        } else {
+          // Line chart for hourly trend
+          const orderedRows = [...rows].reverse();
+          renderChart('chart-usage', {
+            type: 'line',
+            data: {
+              labels: orderedRows.map((r) => r.group_key.slice(11) + ':00'),
+              datasets: [{
+                label: 'Requests',
+                data: orderedRows.map((r) => r.total_requests),
+                borderColor: '#6366f1',
+                backgroundColor: 'rgba(99,102,241,0.12)',
+                fill: true,
+                tension: 0.4,
+                pointRadius: orderedRows.length > 20 ? 0 : 3,
+                pointHoverRadius: 5,
+                borderWidth: 2,
+              }],
+            },
+            options: {
+              responsive: false,
+              maintainAspectRatio: false,
+              plugins: { legend: { display: false } },
+              scales: {
+                x: { grid: { display: false }, ticks: { maxTicksLimit: 12 } },
+                y: { beginAtZero: true, grid: { color: 'rgba(51,65,85,0.5)' }, ticks: { precision: 0 } },
+              },
+            },
+          });
+        }
+      }
     } catch (err) {
       resultsEl.innerHTML = `<p class="text-red">${esc(err.message)}</p>`;
     }

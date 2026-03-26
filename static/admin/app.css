@@ -808,3 +808,181 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 }
 .filter-bar .form-input,
 .filter-bar .form-select { width: auto; min-width: 120px; }
+
+/* ============================================================
+   TOM SELECT — dark theme override
+   ============================================================ */
+.ts-wrapper { width: 100%; }
+.ts-control {
+  background: var(--bg-elevated) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: var(--radius-md) !important;
+  color: var(--text-primary) !important;
+  font-size: 12px !important;
+  font-family: var(--font-sans) !important;
+  padding: 6px 32px 6px 12px !important;
+  min-height: 34px !important;
+  box-shadow: none !important;
+  transition: border-color 0.15s, box-shadow 0.15s !important;
+  cursor: pointer;
+}
+.ts-wrapper.focus .ts-control {
+  border-color: var(--accent-blue) !important;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18) !important;
+}
+.ts-control input {
+  color: var(--text-primary) !important;
+  font-size: 12px !important;
+  font-family: var(--font-sans) !important;
+}
+.ts-control input::placeholder { color: var(--text-muted) !important; }
+.ts-dropdown {
+  background: var(--bg-elevated) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: var(--radius-md) !important;
+  box-shadow: var(--shadow-md) !important;
+  font-size: 12px !important;
+  margin-top: 4px !important;
+}
+.ts-dropdown .option {
+  color: var(--text-secondary) !important;
+  padding: 8px 12px !important;
+}
+.ts-dropdown .option:hover,
+.ts-dropdown .option.active {
+  background: var(--bg-surface) !important;
+  color: var(--text-primary) !important;
+}
+.ts-dropdown .option.selected {
+  color: var(--accent-blue) !important;
+  background: rgba(99, 102, 241, 0.08) !important;
+}
+.ts-dropdown-content { max-height: 200px; }
+/* Arrow caret */
+.ts-wrapper::after {
+  content: '';
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 12px;
+  height: 12px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 16 16'%3E%3Cpath fill='%2394a3b8' d='M7.247 11.14 2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  pointer-events: none;
+}
+.ts-wrapper.single .ts-control::after { display: none; }
+/* Disabled state */
+.ts-wrapper.disabled .ts-control {
+  opacity: 0.45 !important;
+  cursor: not-allowed !important;
+  background: var(--bg-surface) !important;
+}
+
+/* ============================================================
+   FLATPICKR — dark theme override
+   ============================================================ */
+.flatpickr-calendar {
+  background: var(--bg-elevated) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: var(--radius-md) !important;
+  box-shadow: var(--shadow-md) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 12px !important;
+  color: var(--text-primary) !important;
+}
+.flatpickr-months {
+  background: var(--bg-surface) !important;
+  border-radius: var(--radius-md) var(--radius-md) 0 0 !important;
+  padding: 6px 0 !important;
+}
+.flatpickr-month, .flatpickr-current-month, .flatpickr-monthDropdown-months {
+  color: var(--text-primary) !important;
+  fill: var(--text-primary) !important;
+  background: transparent !important;
+}
+.flatpickr-monthDropdown-months {
+  background: var(--bg-elevated) !important;
+  border: none !important;
+}
+.flatpickr-prev-month svg, .flatpickr-next-month svg { fill: var(--text-secondary) !important; }
+.flatpickr-prev-month:hover svg, .flatpickr-next-month:hover svg { fill: var(--text-primary) !important; }
+.flatpickr-weekday {
+  background: var(--bg-surface) !important;
+  color: var(--text-muted) !important;
+  font-size: 11px !important;
+}
+.flatpickr-day {
+  color: var(--text-secondary) !important;
+  border-radius: var(--radius-sm) !important;
+}
+.flatpickr-day:hover { background: var(--bg-surface) !important; color: var(--text-primary) !important; }
+.flatpickr-day.selected,
+.flatpickr-day.startRange,
+.flatpickr-day.endRange {
+  background: var(--accent-blue) !important;
+  border-color: var(--accent-blue) !important;
+  color: #fff !important;
+}
+.flatpickr-day.inRange {
+  background: rgba(99, 102, 241, 0.15) !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  color: var(--text-primary) !important;
+}
+.flatpickr-day.today { border-color: var(--accent-blue) !important; }
+.flatpickr-day.today:hover { background: rgba(99, 102, 241, 0.12) !important; }
+.flatpickr-day.flatpickr-disabled, .flatpickr-day.prevMonthDay, .flatpickr-day.nextMonthDay {
+  color: var(--text-muted) !important; opacity: 0.4;
+}
+.numInputWrapper:hover { background: transparent !important; }
+.numInputWrapper span { border-color: var(--border-default) !important; }
+.numInputWrapper span:hover { background: var(--bg-surface) !important; }
+.numInputWrapper input { color: var(--text-primary) !important; }
+
+/* ============================================================
+   TIPPY.JS — dark theme override
+   ============================================================ */
+.tippy-box[data-theme~='admin'] {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  font-size: 11px;
+  font-family: var(--font-sans);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  max-width: 280px;
+  line-height: 1.5;
+}
+.tippy-box[data-theme~='admin'] .tippy-content { padding: 6px 10px; }
+.tippy-box[data-theme~='admin'] > .tippy-arrow::before { color: var(--bg-elevated); }
+
+/* ============================================================
+   CHART.JS — canvas container
+   ============================================================ */
+.chart-container {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-top: 1px solid var(--border-highlight);
+  border-radius: var(--radius-md);
+  padding: 16px 20px;
+  margin-bottom: 20px;
+  position: relative;
+}
+/* Fix Chart.js responsive resize loop: fix height on the canvas wrapper */
+.chart-container canvas {
+  display: block;
+  height: 120px !important;
+  max-height: 120px;
+}
+.chart-container-title {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
