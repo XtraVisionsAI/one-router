@@ -525,7 +525,7 @@ impl ModelMappingStore for PostgresBackend {
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
              priority, status, created_at, updated_at \
-             FROM model_mappings ORDER BY source_model_id",
+             FROM model_mappings ORDER BY provider, priority DESC, source_model_id",
         )
         .fetch_all(&self.pool)
         .await?;

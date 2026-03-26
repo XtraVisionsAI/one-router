@@ -338,7 +338,8 @@ function renderKeysList(content, keys) {
       <table>
         <thead>
           <tr>
-            <th>Name / Key</th>
+            <th>Name</th>
+            <th>Key</th>
             <th>User</th>
             <th>Rate Limit</th>
             <th>Budget MTD</th>
@@ -349,13 +350,11 @@ function renderKeysList(content, keys) {
         </thead>
         <tbody>
           ${keys.length === 0
-            ? '<tr><td colspan="7" class="table-empty">No API keys yet. Click "+ Create Key" to add one.</td></tr>'
+            ? '<tr><td colspan="8" class="table-empty">No API keys yet. Click "+ Create Key" to add one.</td></tr>'
             : keys.map((k) => `
               <tr>
-                <td>
-                  <div>${esc(k.name)}</div>
-                  <div class="mono text-secondary" style="font-size:11px">${esc(k.api_key)}</div>
-                </td>
+                <td>${esc(k.name)}</td>
+                <td class="mono text-secondary" style="font-size:11px">${esc(k.api_key)}</td>
                 <td class="text-secondary">${esc(k.user_id)}</td>
                 <td>${k.rate_limit > 0 ? k.rate_limit + ' rpm' : '—'}</td>
                 <td>${k.monthly_budget != null
@@ -647,40 +646,87 @@ function showBackendModal(existing) {
 
 async function pageMappings(content) {
   const data = await api('GET', '/mappings');
-  const mappings = data.data || [];
+  const allMappings = data.data || [];
+
+  // Derive unique providers for the filter dropdown
+  const providers = [...new Set(allMappings.map((m) => m.provider))].sort();
+
+  function renderTable(mappings) {
+    return `
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Source Model</th><th>Target Model</th><th>Provider</th><th>Priority</th><th>Status</th><th>Actions</th></tr>
+          </thead>
+          <tbody>
+            ${mappings.length === 0
+              ? '<tr><td colspan="6" class="table-empty">No mappings match the current filters</td></tr>'
+              : mappings.map((m) => `
+                <tr>
+                  <td class="mono">${esc(m.source_model_id)}</td>
+                  <td class="mono text-secondary">${esc(m.target_model_id)}</td>
+                  <td><span class="badge badge-gray">${esc(m.provider)}</span></td>
+                  <td>${m.priority}</td>
+                  <td>${m.status === 'active' ? '<span class="badge badge-green">active</span>' : '<span class="badge badge-gray">inactive</span>'}</td>
+                  <td><div class="actions">
+                    <button class="btn btn-secondary btn-sm" data-action="edit-mapping"
+                      data-src="${esc(m.source_model_id)}" data-tgt="${esc(m.target_model_id)}"
+                      data-provider="${esc(m.provider)}" data-priority="${m.priority}"
+                      data-status="${esc(m.status)}" data-display="${esc(m.display_name)}"
+                      data-input="${m.input_price}" data-output="${m.output_price}"><i class="bi bi-pencil"></i> Edit</button>
+                    <button class="btn btn-danger btn-sm" data-action="delete-mapping"
+                      data-src="${esc(m.source_model_id)}" data-provider="${esc(m.provider)}"><i class="bi bi-trash"></i> Delete</button>
+                  </div></td>
+                </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  }
+
   content.innerHTML = `
     <div class="page-header">
       <h1 class="page-title">Model Mappings</h1>
       <button class="btn btn-primary" id="btn-create-mapping"><i class="bi bi-plus-lg"></i> Add Mapping</button>
     </div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Source Model</th><th>Target Model</th><th>Provider</th><th>Priority</th><th>Status</th><th>Actions</th></tr>
-        </thead>
-        <tbody>
-          ${mappings.length === 0
-            ? '<tr><td colspan="6" class="table-empty">No model mappings configured</td></tr>'
-            : mappings.map((m) => `
-              <tr>
-                <td class="mono">${esc(m.source_model_id)}</td>
-                <td class="mono text-secondary">${esc(m.target_model_id)}</td>
-                <td><span class="badge badge-gray">${esc(m.provider)}</span></td>
-                <td>${m.priority}</td>
-                <td>${m.status === 'active' ? '<span class="badge badge-green">active</span>' : '<span class="badge badge-gray">inactive</span>'}</td>
-                <td><div class="actions">
-                  <button class="btn btn-secondary btn-sm" data-action="edit-mapping"
-                    data-src="${esc(m.source_model_id)}" data-tgt="${esc(m.target_model_id)}"
-                    data-provider="${esc(m.provider)}" data-priority="${m.priority}"
-                    data-status="${esc(m.status)}" data-display="${esc(m.display_name)}"
-                    data-input="${m.input_price}" data-output="${m.output_price}"><i class="bi bi-pencil"></i> Edit</button>
-                  <button class="btn btn-danger btn-sm" data-action="delete-mapping"
-                    data-src="${esc(m.source_model_id)}" data-provider="${esc(m.provider)}"><i class="bi bi-trash"></i> Delete</button>
-                </div></td>
-              </tr>`).join('')}
-        </tbody>
-      </table>
-    </div>`;
+    <div class="filter-bar">
+      <input class="form-input" id="map-filter-src" placeholder="Filter by source model…" style="min-width:200px">
+      <select class="form-input" id="map-filter-provider" style="width:140px">
+        <option value="">All Providers</option>
+        ${providers.map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}
+      </select>
+      <select class="form-input" id="map-filter-status" style="width:120px">
+        <option value="">All Status</option>
+        <option value="active">Active</option>
+        <option value="inactive">Inactive</option>
+      </select>
+      <span class="text-muted" id="map-filter-count" style="font-size:12px">${allMappings.length} mappings</span>
+    </div>
+    <div id="map-table-container">${renderTable(allMappings)}</div>
+  `;
+
+  // Real-time client-side filtering
+  function applyFilters() {
+    const srcFilter = document.getElementById('map-filter-src').value.toLowerCase();
+    const provFilter = document.getElementById('map-filter-provider').value;
+    const statusFilter = document.getElementById('map-filter-status').value;
+
+    const filtered = allMappings.filter((m) => {
+      if (srcFilter && !m.source_model_id.toLowerCase().includes(srcFilter)) return false;
+      if (provFilter && m.provider !== provFilter) return false;
+      if (statusFilter && m.status !== statusFilter) return false;
+      return true;
+    });
+
+    document.getElementById('map-table-container').innerHTML = renderTable(filtered);
+    document.getElementById('map-filter-count').textContent =
+      filtered.length === allMappings.length
+        ? `${allMappings.length} mappings`
+        : `${filtered.length} / ${allMappings.length} mappings`;
+  }
+
+  document.getElementById('map-filter-src').addEventListener('input', applyFilters);
+  document.getElementById('map-filter-provider').addEventListener('change', applyFilters);
+  document.getElementById('map-filter-status').addEventListener('change', applyFilters);
 }
 
 async function handleMappingAction(e) {

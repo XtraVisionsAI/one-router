@@ -596,7 +596,16 @@ impl ModelMappingStore for DynamoDbBackend {
             .send()
             .await?;
 
-        let records = result.items().iter().map(model_mapping_from_item).collect();
+        let mut records: Vec<ModelMappingRecord> =
+            result.items().iter().map(model_mapping_from_item).collect();
+
+        // DynamoDB Scan returns unordered results; sort client-side
+        records.sort_by(|a, b| {
+            a.provider
+                .cmp(&b.provider)
+                .then(b.priority.cmp(&a.priority))
+                .then(a.source_model_id.cmp(&b.source_model_id))
+        });
 
         Ok(records)
     }
