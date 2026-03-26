@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>one-router Admin</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600&display=swap">
   <link rel="stylesheet" href="/admin/assets/app.css">
 </head>
 <body>
@@ -90,7 +93,7 @@
   <div class="modal" id="modal-box" role="dialog" aria-modal="true">
     <div class="modal-header">
       <h3 class="modal-title" id="modal-title"></h3>
-      <button class="modal-close" id="modal-close" aria-label="Close"><i class="bi bi-x-lg"></i></button>
+      <button class="modal-close" id="modal-close" aria-label="Close dialog"><i class="bi bi-x-lg"></i></button>
     </div>
     <div class="modal-body" id="modal-body"></div>
     <div class="modal-footer" id="modal-footer"></div>
@@ -100,7 +103,7 @@
 <!-- ============================================================
      TOAST — transient notification
      ============================================================ -->
-<div id="toast" class="toast" hidden></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
 <script src="/admin/assets/app.js"></script>
 </body>

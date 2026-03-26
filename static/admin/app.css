@@ -16,7 +16,7 @@
 
   --text-primary:   #e6edf3;
   --text-secondary: #8b949e;
-  --text-muted:     #6e7681;
+  --text-muted:     #7d8590;  /* bumped from #6e7681 — meets 4.5:1 on #0d1117 */
 
   --accent-blue:    #58a6ff;
   --accent-green:   #3fb950;
@@ -38,8 +38,8 @@
 
   --shadow-md: 0 4px 16px rgba(0,0,0,0.4);
 
-  --font-mono: ui-monospace, "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Fira Code", ui-monospace, "SFMono-Regular", "Consolas", monospace;
+  --font-sans: "Fira Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
 
 /* --- Reset --- */
@@ -177,6 +177,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   border-left: 2px solid transparent;
   transition: color 0.1s, background 0.1s;
   font-size: 12px;
+  cursor: pointer;
 }
 .nav-item:hover { color: var(--text-primary); background: var(--bg-elevated); text-decoration: none; }
 .nav-item.active {
@@ -212,6 +213,16 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 .page-content {
   padding: 24px 28px;
   width: 100%;
+  animation: page-fade-in 0.15s ease-out;
+}
+
+@keyframes page-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-content { animation: none; }
 }
 
 /* ============================================================
@@ -271,6 +282,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   font-weight: 600;
   color: var(--text-primary);
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 .stat-value.green  { color: var(--accent-green); }
 .stat-value.blue   { color: var(--accent-blue); }
@@ -285,6 +297,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   overflow: hidden;
+  overflow-x: auto;
   margin-bottom: 20px;
 }
 
@@ -451,6 +464,7 @@ input, select, textarea, button { font-family: inherit; font-size: inherit; }
 .toggle-row {
   display: flex;
   align-items: center;
+  cursor: pointer;
   justify-content: space-between;
   padding: 10px 14px;
   border-bottom: 1px solid var(--border-subtle);

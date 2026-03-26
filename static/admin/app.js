@@ -120,6 +120,10 @@ async function renderPage(page) {
   content.innerHTML = '<div class="loading">Loading…</div>';
   try {
     await PAGES[page](content);
+    // restart fade-in animation on each navigation
+    content.style.animation = 'none';
+    content.offsetHeight; // reflow trigger
+    content.style.animation = '';
   } catch (err) {
     content.innerHTML = `<div class="empty-state">
       <div class="empty-state-title">Failed to load page</div>
@@ -164,10 +168,35 @@ function openModal(title, bodyHtml, footerHtml) {
   document.getElementById('modal-body').innerHTML = bodyHtml;
   document.getElementById('modal-footer').innerHTML = footerHtml || '';
   document.getElementById('modal-overlay').hidden = false;
+  // focus first focusable element
+  setTimeout(() => {
+    const first = document.querySelector('#modal-body input, #modal-body select, #modal-body textarea, #modal-footer button');
+    if (first) first.focus();
+  }, 50);
 }
 
 function closeModal() {
   document.getElementById('modal-overlay').hidden = true;
+}
+
+/** Show a styled confirmation dialog instead of native confirm(). Returns a Promise<boolean>. */
+function confirmDialog(message) {
+  return new Promise((resolve) => {
+    openModal('Confirm', `<p style="margin:0;font-size:13px">${esc(message)}</p>`, `
+      <button class="btn btn-secondary" id="m-confirm-cancel">Cancel</button>
+      <button class="btn btn-danger" id="m-confirm-ok">Confirm</button>
+    `);
+    document.getElementById('m-confirm-cancel').addEventListener('click', () => { closeModal(); resolve(false); });
+    document.getElementById('m-confirm-ok').addEventListener('click', () => { closeModal(); resolve(true); });
+  });
+}
+
+/** Disable a button and show a loading spinner; returns a restore function. */
+function btnLoading(btn, label = 'Saving…') {
+  btn.disabled = true;
+  btn._origHtml = btn.innerHTML;
+  btn.innerHTML = `<i class="bi bi-hourglass-split"></i> ${label}`;
+  return () => { btn.disabled = false; btn.innerHTML = btn._origHtml; };
 }
 
 document.getElementById('modal-close').addEventListener('click', closeModal);
@@ -367,7 +396,7 @@ async function handleKeyAction(e) {
   if (action === 'edit-key') {
     showEditKeyModal(btn.dataset);
   } else if (action === 'deactivate-key') {
-    if (!confirm('Deactivate this API key?')) return;
+    if (!await confirmDialog('Deactivate this API key?')) return;
     try {
       await api('DELETE', `/keys/${encodeURIComponent(key)}?action=deactivate`);
       toast('Key deactivated', 'success');
@@ -412,6 +441,9 @@ function showCreateKeyModal() {
 
     if (!name || !user_id) { toast('Name and User ID are required', 'error'); return; }
 
+    const btn = document.getElementById('m-create-key-submit');
+    const restore = btnLoading(btn);
+
     try {
       const result = await api('POST', '/keys', { name, user_id, rate_limit, monthly_budget, service_tier });
       closeModal();
@@ -436,7 +468,7 @@ function showCreateKeyModal() {
       }
       toast('API key created', 'success');
       await pageKeys(document.getElementById('page-content'));
-    } catch (err) { toast(err.message, 'error'); }
+    } catch (err) { toast(err.message, 'error'); } finally { restore(); }
   });
 }
 
@@ -469,12 +501,14 @@ function showEditKeyModal(dataset) {
     const budgetVal = document.getElementById('m-edit-budget').value;
     body.monthly_budget = budgetVal ? parseFloat(budgetVal) : null;
 
+    const btn = document.getElementById('m-edit-save');
+    const restore = btnLoading(btn);
     try {
       await api('PUT', `/keys/${encodeURIComponent(key)}`, body);
       closeModal();
       toast('Key updated', 'success');
       await pageKeys(document.getElementById('page-content'));
-    } catch (err) { toast(err.message, 'error'); }
+    } catch (err) { toast(err.message, 'error'); } finally { restore(); }
   });
 }
 
@@ -537,7 +571,7 @@ async function handleBackendAction(e) {
       await pageBackends(content);
     } catch (err) { toast(err.message, 'error'); }
   } else if (action === 'delete-backend') {
-    if (!confirm(`Delete backend "${name}"?`)) return;
+    if (!await confirmDialog(`Delete backend "${name}"?`)) return;
     try {
       await api('DELETE', `/backends/${encodeURIComponent(name)}`);
       toast('Backend deleted', 'success');
@@ -592,6 +626,8 @@ function showBackendModal(existing) {
     const body = { name, backend_type, priority, enabled: existing?.enabled ?? true };
     if (config !== undefined) body.config = config;
 
+    const btn = document.getElementById('m-be-save');
+    const restore = btnLoading(btn);
     try {
       if (isEdit) {
         await api('PUT', `/backends/${encodeURIComponent(name)}`, body);
@@ -601,7 +637,7 @@ function showBackendModal(existing) {
       closeModal();
       toast(isEdit ? 'Backend updated' : 'Backend created', 'success');
       await pageBackends(document.getElementById('page-content'));
-    } catch (err) { toast(err.message, 'error'); }
+    } catch (err) { toast(err.message, 'error'); } finally { restore(); }
   });
 }
 
@@ -668,7 +704,7 @@ async function handleMappingAction(e) {
   } else if (action === 'delete-mapping') {
     const src = btn.dataset.src;
     const provider = btn.dataset.provider;
-    if (!confirm(`Delete mapping "${src}" -> ${provider}?`)) return;
+    if (!await confirmDialog(`Delete mapping "${src}" → ${provider}?`)) return;
     try {
       await api('DELETE', `/mappings/${encodeURIComponent(src)}/${encodeURIComponent(provider)}`);
       toast('Mapping deleted', 'success');
@@ -729,6 +765,8 @@ function showMappingModal(existing) {
     };
     if (!body.source_model_id || !body.target_model_id) { toast('Source and target model IDs are required', 'error'); return; }
 
+    const btn = document.getElementById('m-map-save');
+    const restore = btnLoading(btn);
     try {
       if (isEdit) {
         await api('PUT', `/mappings/${encodeURIComponent(source_model_id)}/${encodeURIComponent(provider)}`, body);
@@ -738,7 +776,7 @@ function showMappingModal(existing) {
       closeModal();
       toast(isEdit ? 'Mapping updated' : 'Mapping created', 'success');
       await pageMappings(document.getElementById('page-content'));
-    } catch (err) { toast(err.message, 'error'); }
+    } catch (err) { toast(err.message, 'error'); } finally { restore(); }
   });
 }
 
