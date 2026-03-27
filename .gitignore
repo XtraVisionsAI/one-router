@@ -21,3 +21,7 @@
 
 # superpowers
 docs/superpowers/
+.superpowers/
+
+# Runtime data
+data/
