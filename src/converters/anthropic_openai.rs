@@ -1349,7 +1349,9 @@ mod tests {
 mod openai_to_anthropic_cache_tests {
     use super::*;
     use crate::schemas::anthropic::{ContentBlock, MessageContent, SystemContent};
-    use crate::schemas::openai::{ChatCompletionRequest, ChatMessage, ChatRole, MessageContent as OpenAIMessageContent};
+    use crate::schemas::openai::{
+        ChatCompletionRequest, ChatMessage, ChatRole, MessageContent as OpenAIMessageContent,
+    };
 
     fn make_request(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -1399,7 +1401,9 @@ mod openai_to_anthropic_cache_tests {
     fn system_gets_cache_control_injected() {
         let req = make_request(vec![system_msg("Be helpful."), user_msg("Hi")]);
         let converter = OpenAIToAnthropicConverter::new();
-        let result = converter.convert_request(&req, "claude-3-5-sonnet-20241022").unwrap();
+        let result = converter
+            .convert_request(&req, "claude-3-5-sonnet-20241022")
+            .unwrap();
         match result.system.unwrap() {
             SystemContent::Messages(msgs) => {
                 assert!(msgs.last().unwrap().cache_control.is_some());
@@ -1412,7 +1416,9 @@ mod openai_to_anthropic_cache_tests {
     fn last_user_message_last_block_gets_cache_control() {
         let req = make_request(vec![user_msg("Hello there")]);
         let converter = OpenAIToAnthropicConverter::new();
-        let result = converter.convert_request(&req, "claude-3-5-sonnet-20241022").unwrap();
+        let result = converter
+            .convert_request(&req, "claude-3-5-sonnet-20241022")
+            .unwrap();
         let last_msg = result.messages.last().unwrap();
         match &last_msg.content {
             MessageContent::Blocks(blocks) => {

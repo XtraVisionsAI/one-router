@@ -7,11 +7,10 @@
 //! Uses AWS SDK types directly.
 
 use aws_sdk_bedrockruntime::types::{
-    CachePointBlock, CachePointType,
-    ContentBlock as SdkContentBlock, ConversationRole, InferenceConfiguration,
-    Message as SdkMessage, SystemContentBlock, Tool as SdkTool, ToolConfiguration,
-    ToolInputSchema as SdkToolInputSchema, ToolResultContentBlock, ToolResultStatus,
-    ToolSpecification, ToolUseBlock,
+    CachePointBlock, CachePointType, ContentBlock as SdkContentBlock, ConversationRole,
+    InferenceConfiguration, Message as SdkMessage, SystemContentBlock, Tool as SdkTool,
+    ToolConfiguration, ToolInputSchema as SdkToolInputSchema, ToolResultContentBlock,
+    ToolResultStatus, ToolSpecification, ToolUseBlock,
 };
 use thiserror::Error;
 
@@ -320,43 +319,6 @@ fn parse_data_url_to_image(url: &str) -> Result<SdkContentBlock, OpenAIConversio
     Ok(SdkContentBlock::Image(image))
 }
 
-/// Convert OpenAI tools to SDK ToolConfiguration.
-fn convert_openai_tools_to_sdk(
-    tools: &[crate::schemas::openai::Tool],
-) -> Result<ToolConfiguration, OpenAIConversionError> {
-    let mut sdk_tools = Vec::new();
-
-    for tool in tools {
-        if tool.tool_type != "function" {
-            continue;
-        }
-
-        let input_schema = tool
-            .function
-            .parameters
-            .clone()
-            .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
-
-        let tool_spec = ToolSpecification::builder()
-            .name(&tool.function.name)
-            .description(tool.function.description.as_deref().unwrap_or(""))
-            .input_schema(SdkToolInputSchema::Json(json_to_document(&input_schema)))
-            .build()
-            .map_err(|e| {
-                OpenAIConversionError::InvalidTool(format!("Failed to build tool spec: {}", e))
-            })?;
-
-        sdk_tools.push(SdkTool::ToolSpec(tool_spec));
-    }
-
-    ToolConfiguration::builder()
-        .set_tools(Some(sdk_tools))
-        .build()
-        .map_err(|e| {
-            OpenAIConversionError::InvalidTool(format!("Failed to build tool config: {}", e))
-        })
-}
-
 /// Convert OpenAI tools to SDK ToolConfiguration, appending a CachePoint after the last tool.
 fn convert_openai_tools_to_sdk_with_cache(
     tools: &[crate::schemas::openai::Tool],
@@ -380,7 +342,7 @@ fn convert_openai_tools_to_sdk_with_cache(
             .input_schema(SdkToolInputSchema::Json(json_to_document(&input_schema)))
             .build()
             .map_err(|e| {
-                OpenAIConversionError::InvalidTool(format!("Failed to build tool spec: {}", e))
+                OpenAIConversionError::InvalidTool(format!("Failed to build tool spec: {e}"))
             })?;
 
         sdk_tools.push(SdkTool::ToolSpec(tool_spec));
@@ -394,7 +356,7 @@ fn convert_openai_tools_to_sdk_with_cache(
         .set_tools(Some(sdk_tools))
         .build()
         .map_err(|e| {
-            OpenAIConversionError::InvalidTool(format!("Failed to build tool config: {}", e))
+            OpenAIConversionError::InvalidTool(format!("Failed to build tool config: {e}"))
         })
 }
 
@@ -553,10 +515,7 @@ mod tests {
 
     #[test]
     fn system_gets_cache_point_injected() {
-        let req = make_request(vec![
-            system_msg("You are helpful."),
-            user_msg("Hello"),
-        ]);
+        let req = make_request(vec![system_msg("You are helpful."), user_msg("Hello")]);
         let result = convert_request(&req, "anthropic.claude-3-5-sonnet").unwrap();
         let system = result.system.unwrap();
         assert_eq!(system.len(), 2);

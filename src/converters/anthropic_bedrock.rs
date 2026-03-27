@@ -7,11 +7,10 @@
 //! Uses AWS SDK types directly (not the old custom `schemas::bedrock` types).
 
 use aws_sdk_bedrockruntime::types::{
-    CachePointBlock, CachePointType,
-    ContentBlock as SdkContentBlock, ConversationRole, InferenceConfiguration,
-    Message as SdkMessage, SystemContentBlock, Tool as SdkTool, ToolConfiguration,
-    ToolInputSchema as SdkToolInputSchema, ToolResultContentBlock, ToolResultStatus,
-    ToolSpecification, ToolUseBlock,
+    CachePointBlock, CachePointType, ContentBlock as SdkContentBlock, ConversationRole,
+    InferenceConfiguration, Message as SdkMessage, SystemContentBlock, Tool as SdkTool,
+    ToolConfiguration, ToolInputSchema as SdkToolInputSchema, ToolResultContentBlock,
+    ToolResultStatus, ToolSpecification, ToolUseBlock,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -160,13 +159,11 @@ fn convert_content_to_sdk(
 ) -> Result<Vec<SdkContentBlock>, ConversionError> {
     match content {
         MessageContent::Text(text) => Ok(vec![SdkContentBlock::Text(text.clone())]),
-        MessageContent::Blocks(blocks) => {
-            blocks
-                .iter()
-                .map(convert_content_block_to_sdk)
-                .collect::<Result<Vec<Vec<_>>, _>>()
-                .map(|v| v.into_iter().flatten().collect())
-        }
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .map(convert_content_block_to_sdk)
+            .collect::<Result<Vec<Vec<_>>, _>>()
+            .map(|v| v.into_iter().flatten().collect()),
     }
 }
 
@@ -186,7 +183,10 @@ fn convert_content_block_to_sdk(
     block: &ContentBlock,
 ) -> Result<Vec<SdkContentBlock>, ConversionError> {
     match block {
-        ContentBlock::Text { text, cache_control } => {
+        ContentBlock::Text {
+            text,
+            cache_control,
+        } => {
             let mut out = vec![SdkContentBlock::Text(text.clone())];
             if cache_control.is_some() {
                 out.push(make_cache_point()?);
@@ -194,7 +194,10 @@ fn convert_content_block_to_sdk(
             Ok(out)
         }
 
-        ContentBlock::Image { source, cache_control } => {
+        ContentBlock::Image {
+            source,
+            cache_control,
+        } => {
             use aws_sdk_bedrockruntime::types::{ImageBlock, ImageFormat, ImageSource};
             use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
@@ -227,7 +230,9 @@ fn convert_content_block_to_sdk(
             Ok(out)
         }
 
-        ContentBlock::ToolUse { id, name, input, .. } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             let tool_use = ToolUseBlock::builder()
                 .tool_use_id(id)
                 .name(name)
@@ -239,7 +244,12 @@ fn convert_content_block_to_sdk(
             Ok(vec![SdkContentBlock::ToolUse(tool_use)])
         }
 
-        ContentBlock::ToolResult { tool_use_id, content, is_error, cache_control } => {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            cache_control,
+        } => {
             use aws_sdk_bedrockruntime::types::ToolResultBlock;
 
             let result_content = match content {
@@ -280,7 +290,10 @@ fn convert_content_block_to_sdk(
             Ok(out)
         }
 
-        ContentBlock::Document { source, cache_control } => {
+        ContentBlock::Document {
+            source,
+            cache_control,
+        } => {
             use aws_sdk_bedrockruntime::types::{
                 DocumentBlock, DocumentFormat, DocumentSource as SdkDocumentSource,
             };
