@@ -101,9 +101,7 @@ async fn create_table_if_not_exists(
                 tracing::debug!(table = %table_name, "DynamoDB table already exists");
             } else {
                 return Err(anyhow::anyhow!(
-                    "Failed to create DynamoDB table {}: {}",
-                    table_name,
-                    service_err
+                    "Failed to create DynamoDB table {table_name}: {service_err}"
                 ));
             }
         }

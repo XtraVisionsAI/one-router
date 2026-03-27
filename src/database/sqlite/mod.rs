@@ -37,7 +37,7 @@ impl SqliteBackend {
             }
         }
 
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}?mode=rwc", path))?
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{path}?mode=rwc"))?
             .create_if_missing(true);
 
         let pool = SqlitePoolOptions::new()

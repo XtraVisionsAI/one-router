@@ -371,10 +371,10 @@ impl BedrockError {
                     ConverseError::ResourceNotFoundException(e) => BedrockError::ModelNotFound(
                         e.message().unwrap_or("Resource not found").to_string(),
                     ),
-                    _ => BedrockError::Unknown(format!("{:?}", error)),
+                    _ => BedrockError::Unknown(format!("{error:?}")),
                 }
             }
-            _ => BedrockError::Unknown(format!("{:?}", err)),
+            _ => BedrockError::Unknown(format!("{err:?}")),
         }
     }
 
@@ -423,10 +423,10 @@ impl BedrockError {
                         error_type: BedrockErrorType::Server,
                         is_retryable: true,
                     },
-                    _ => BedrockError::Unknown(format!("{:?}", error)),
+                    _ => BedrockError::Unknown(format!("{error:?}")),
                 }
             }
-            _ => BedrockError::Unknown(format!("{:?}", err)),
+            _ => BedrockError::Unknown(format!("{err:?}")),
         }
     }
 
@@ -471,10 +471,10 @@ impl BedrockError {
                         error_type: BedrockErrorType::Server,
                         is_retryable: true,
                     },
-                    _ => BedrockError::Unknown(format!("{:?}", error)),
+                    _ => BedrockError::Unknown(format!("{error:?}")),
                 }
             }
-            _ => BedrockError::Unknown(format!("{:?}", err)),
+            _ => BedrockError::Unknown(format!("{err:?}")),
         }
     }
 

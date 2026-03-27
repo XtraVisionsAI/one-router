@@ -141,7 +141,7 @@ impl SandboxExecutor {
         docker
             .ping()
             .await
-            .map_err(|e| PtcError::DockerNotAvailable(format!("Failed to ping Docker: {}", e)))?;
+            .map_err(|e| PtcError::DockerNotAvailable(format!("Failed to ping Docker: {e}")))?;
 
         Ok(Self { docker, config })
     }
@@ -247,7 +247,7 @@ impl SandboxExecutor {
         self.docker
             .stop_container(container_id, Some(options))
             .await
-            .map_err(|e| PtcError::Internal(format!("Failed to stop container: {}", e)))?;
+            .map_err(|e| PtcError::Internal(format!("Failed to stop container: {e}")))?;
 
         Ok(())
     }
@@ -262,7 +262,7 @@ impl SandboxExecutor {
         self.docker
             .remove_container(container_id, Some(options))
             .await
-            .map_err(|e| PtcError::Internal(format!("Failed to remove container: {}", e)))?;
+            .map_err(|e| PtcError::Internal(format!("Failed to remove container: {e}")))?;
 
         Ok(())
     }
@@ -328,7 +328,7 @@ impl SandboxExecutor {
             let mut header = tar::Header::new_gnu();
             header
                 .set_path(filename)
-                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to set tar path: {}", e)))?;
+                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to set tar path: {e}")))?;
             header.set_size(content.len() as u64);
             header.set_mode(0o755);
             header.set_cksum();
@@ -336,11 +336,11 @@ impl SandboxExecutor {
             // Add file to archive
             tar_builder
                 .append(&header, content)
-                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to append to tar: {}", e)))?;
+                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to append to tar: {e}")))?;
 
             tar_builder
                 .finish()
-                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to finish tar: {}", e)))?;
+                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to finish tar: {e}")))?;
         }
 
         // Get the directory path
@@ -358,9 +358,7 @@ impl SandboxExecutor {
         self.docker
             .upload_to_container(container_id, Some(options), tar_buffer.into())
             .await
-            .map_err(|e| {
-                PtcError::FileCopyFailed(format!("Failed to upload to container: {}", e))
-            })?;
+            .map_err(|e| PtcError::FileCopyFailed(format!("Failed to upload to container: {e}")))?;
 
         Ok(())
     }
@@ -399,7 +397,7 @@ impl SandboxExecutor {
             .docker
             .create_exec(container_id, exec_config)
             .await
-            .map_err(|e| PtcError::ExecFailed(format!("Failed to create exec: {}", e)))?;
+            .map_err(|e| PtcError::ExecFailed(format!("Failed to create exec: {e}")))?;
 
         // Start exec and collect output with timeout
         let exec_result = timeout(
@@ -442,7 +440,7 @@ impl SandboxExecutor {
             .docker
             .start_exec(exec_id, None)
             .await
-            .map_err(|e| PtcError::ExecFailed(format!("Failed to start exec: {}", e)))?;
+            .map_err(|e| PtcError::ExecFailed(format!("Failed to start exec: {e}")))?;
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -469,7 +467,7 @@ impl SandboxExecutor {
             .docker
             .inspect_exec(exec_id)
             .await
-            .map_err(|e| PtcError::ExecFailed(format!("Failed to inspect exec: {}", e)))?;
+            .map_err(|e| PtcError::ExecFailed(format!("Failed to inspect exec: {e}")))?;
 
         let exit_code = inspect.exit_code.unwrap_or(-1);
 

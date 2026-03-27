@@ -24,10 +24,10 @@ async fn main() -> Result<()> {
     println!("  Listen:    {}:{}", settings.host, settings.port);
     println!();
     println!("  Ephemeral API Key (valid for this session only):");
-    println!("  {}", ephemeral_key);
+    println!("  {ephemeral_key}");
     println!();
     println!("  Usage:");
-    println!("    export ANTHROPIC_API_KEY=\"{}\"", ephemeral_key);
+    println!("    export ANTHROPIC_API_KEY=\"{ephemeral_key}\"");
     println!(
         "    export ANTHROPIC_BASE_URL=\"http://{}:{}\"",
         settings.host, settings.port

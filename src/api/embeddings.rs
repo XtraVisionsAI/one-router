@@ -74,8 +74,7 @@ pub async fn create_embeddings(
         embed_nova(bedrock, model_id, &texts).await?
     } else {
         return Err(OpenAIApiError::bad_request(format!(
-            "Model '{}' is not a supported Bedrock embedding model.",
-            model_id
+            "Model '{model_id}' is not a supported Bedrock embedding model."
         )));
     };
 
@@ -137,7 +136,7 @@ async fn embed_cohere(
     };
 
     let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {e}")))?;
 
     let response_bytes = bedrock
         .invoke_model(model_id, body_bytes)
@@ -145,7 +144,7 @@ async fn embed_cohere(
         .map_err(|e| OpenAIApiError::from_bedrock_error(&e))?;
 
     let response: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|e| {
-        OpenAIApiError::internal_error(format!("Failed to parse Cohere response: {}", e))
+        OpenAIApiError::internal_error(format!("Failed to parse Cohere response: {e}"))
     })?;
 
     // Cohere v3 returns embeddings under response["embeddings"]["float"]
@@ -157,7 +156,7 @@ async fn embed_cohere(
     };
 
     let embeddings: Vec<Vec<f32>> = serde_json::from_value(embeddings_value).map_err(|e| {
-        OpenAIApiError::internal_error(format!("Failed to parse Cohere embeddings: {}", e))
+        OpenAIApiError::internal_error(format!("Failed to parse Cohere embeddings: {e}"))
     })?;
 
     // Estimate token count (Cohere doesn't always return token counts)
@@ -185,7 +184,7 @@ async fn embed_titan(
             async move {
                 let body = json!({ "inputText": text });
                 let body_bytes = serde_json::to_vec(&body).map_err(|e| {
-                    OpenAIApiError::internal_error(format!("Serialization error: {}", e))
+                    OpenAIApiError::internal_error(format!("Serialization error: {e}"))
                 })?;
 
                 let response_bytes = bedrock
@@ -196,16 +195,14 @@ async fn embed_titan(
                 let response: serde_json::Value =
                     serde_json::from_slice(&response_bytes).map_err(|e| {
                         OpenAIApiError::internal_error(format!(
-                            "Failed to parse Titan response: {}",
-                            e
+                            "Failed to parse Titan response: {e}"
                         ))
                     })?;
 
                 let embedding: Vec<f32> = serde_json::from_value(response["embedding"].clone())
                     .map_err(|e| {
                         OpenAIApiError::internal_error(format!(
-                            "Failed to parse Titan embedding: {}",
-                            e
+                            "Failed to parse Titan embedding: {e}"
                         ))
                     })?;
 
@@ -256,7 +253,7 @@ async fn embed_nova(
                     }
                 });
                 let body_bytes = serde_json::to_vec(&body).map_err(|e| {
-                    OpenAIApiError::internal_error(format!("Serialization error: {}", e))
+                    OpenAIApiError::internal_error(format!("Serialization error: {e}"))
                 })?;
 
                 let response_bytes = bedrock
@@ -267,16 +264,14 @@ async fn embed_nova(
                 let response: serde_json::Value =
                     serde_json::from_slice(&response_bytes).map_err(|e| {
                         OpenAIApiError::internal_error(format!(
-                            "Failed to parse Nova response: {}",
-                            e
+                            "Failed to parse Nova response: {e}"
                         ))
                     })?;
 
                 let embedding: Vec<f32> = serde_json::from_value(response["embedding"].clone())
                     .map_err(|e| {
                         OpenAIApiError::internal_error(format!(
-                            "Failed to parse Nova embedding: {}",
-                            e
+                            "Failed to parse Nova embedding: {e}"
                         ))
                     })?;
 

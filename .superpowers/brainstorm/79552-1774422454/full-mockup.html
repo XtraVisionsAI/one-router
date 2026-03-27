@@ -1,0 +1,475 @@
+<h2>整体界面详细 Mockup</h2>
+<p class="subtitle">左侧侧边栏 + 各模块页面设计 — 浏览各页确认细节是否符合预期</p>
+
+<style>
+.admin-shell {
+  display: flex;
+  height: 580px;
+  background: #0d1117;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #30363d;
+  font-family: -apple-system, monospace;
+  font-size: 11px;
+}
+.admin-sidebar {
+  width: 160px;
+  background: #161b22;
+  border-right: 1px solid #30363d;
+  padding: 12px 0;
+  flex-shrink: 0;
+}
+.admin-sidebar .logo {
+  padding: 0 12px 12px;
+  color: #e6edf3;
+  font-weight: bold;
+  font-size: 12px;
+  border-bottom: 1px solid #30363d;
+  margin-bottom: 8px;
+}
+.admin-sidebar .logo span {
+  color: #58a6ff;
+}
+.nav-item {
+  padding: 6px 12px;
+  color: #8b949e;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.nav-item.active {
+  color: #e6edf3;
+  background: #21262d;
+  border-left: 2px solid #58a6ff;
+}
+.nav-item .icon { width: 14px; text-align: center; }
+.admin-main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  color: #e6edf3;
+}
+.page-title {
+  font-size: 14px;
+  font-weight: bold;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.btn {
+  background: #238636;
+  color: #fff;
+  border: none;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.btn-danger { background: #da3633; }
+.btn-secondary { background: #21262d; border: 1px solid #30363d; color: #e6edf3; }
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.stat-card {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 10px;
+}
+.stat-label { color: #8b949e; font-size: 10px; margin-bottom: 4px; }
+.stat-value { font-size: 18px; color: #e6edf3; }
+.stat-value.green { color: #3fb950; }
+.stat-value.blue { color: #58a6ff; }
+.table-wrap {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.table-header {
+  display: grid;
+  padding: 6px 10px;
+  background: #21262d;
+  color: #8b949e;
+  font-size: 10px;
+  border-bottom: 1px solid #30363d;
+}
+.table-row {
+  display: grid;
+  padding: 7px 10px;
+  border-bottom: 1px solid #21262d;
+  align-items: center;
+  font-size: 10px;
+}
+.table-row:last-child { border-bottom: none; }
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 9px;
+}
+.badge-green { background: #1a4d2e; color: #3fb950; }
+.badge-red { background: #4d1a1a; color: #f85149; }
+.badge-gray { background: #21262d; color: #8b949e; }
+.badge-blue { background: #1a3a5c; color: #58a6ff; }
+.chart-placeholder {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  height: 90px;
+  display: flex;
+  align-items: flex-end;
+  padding: 8px;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.bar {
+  flex: 1;
+  background: #1f4e8f;
+  border-radius: 2px 2px 0 0;
+  min-height: 4px;
+}
+.bar:nth-child(3n) { background: #0d419d; }
+.section-title { color: #8b949e; font-size: 10px; margin: 10px 0 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* Tab nav */
+.tab-group { display: flex; gap: 0; margin-bottom: 12px; border-bottom: 1px solid #30363d; }
+.tab { padding: 6px 12px; color: #8b949e; font-size: 10px; cursor: pointer; }
+.tab.active { color: #58a6ff; border-bottom: 2px solid #58a6ff; }
+
+/* Form */
+.form-row { margin-bottom: 8px; }
+.form-label { color: #8b949e; font-size: 10px; margin-bottom: 3px; }
+.form-input {
+  width: 100%;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 5px 8px;
+  color: #e6edf3;
+  font-size: 10px;
+  box-sizing: border-box;
+}
+.key-reveal {
+  background: #1a4d2e;
+  border: 1px solid #3fb950;
+  border-radius: 6px;
+  padding: 10px;
+  margin: 10px 0;
+  color: #3fb950;
+  font-size: 10px;
+}
+.key-value {
+  font-family: monospace;
+  font-size: 12px;
+  color: #e6edf3;
+  background: #0d1117;
+  padding: 5px 8px;
+  border-radius: 4px;
+  margin-top: 5px;
+  word-break: break-all;
+}
+.health-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+.health-dot.green { background: #3fb950; }
+.health-dot.red { background: #f85149; }
+.health-dot.gray { background: #8b949e; }
+</style>
+
+<!-- Page selector -->
+<div class="tab-group" style="margin-bottom:16px">
+  <div class="tab active" onclick="showPage('dashboard', this)">Dashboard</div>
+  <div class="tab" onclick="showPage('apikeys', this)">API Keys</div>
+  <div class="tab" onclick="showPage('backends', this)">Backends</div>
+  <div class="tab" onclick="showPage('models', this)">Model Maps</div>
+  <div class="tab" onclick="showPage('usage', this)">Usage</div>
+  <div class="tab" onclick="showPage('flags', this)">Flags</div>
+</div>
+
+<!-- DASHBOARD -->
+<div id="page-dashboard" class="admin-shell">
+  <div class="admin-sidebar">
+    <div class="logo">one-<span>router</span></div>
+    <div class="nav-item active"><span class="icon">▣</span> Dashboard</div>
+    <div class="nav-item"><span class="icon">🔑</span> API Keys</div>
+    <div class="nav-item"><span class="icon">⚡</span> Backends</div>
+    <div class="nav-item"><span class="icon">↔</span> Models</div>
+    <div class="nav-item"><span class="icon">📊</span> Usage</div>
+    <div class="nav-item"><span class="icon">⚑</span> Flags</div>
+    <div style="position:absolute;bottom:12px;left:0;right:0;padding:0 12px">
+      <div style="color:#8b949e;font-size:9px">v0.4.0 · SQLite</div>
+    </div>
+  </div>
+  <div class="admin-main">
+    <div class="page-title">Dashboard</div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="stat-label">API Keys</div><div class="stat-value blue">12</div></div>
+      <div class="stat-card"><div class="stat-label">Backends</div><div class="stat-value green">3 ✓</div></div>
+      <div class="stat-card"><div class="stat-label">今日请求</div><div class="stat-value">2,418</div></div>
+      <div class="stat-card"><div class="stat-label">今日费用</div><div class="stat-value">$1.23</div></div>
+    </div>
+    <div class="section-title">过去 24 小时请求量</div>
+    <div class="chart-placeholder">
+      <div class="bar" style="height:30%"></div><div class="bar" style="height:20%"></div>
+      <div class="bar" style="height:40%"></div><div class="bar" style="height:35%"></div>
+      <div class="bar" style="height:60%"></div><div class="bar" style="height:55%"></div>
+      <div class="bar" style="height:70%"></div><div class="bar" style="height:80%"></div>
+      <div class="bar" style="height:65%"></div><div class="bar" style="height:90%"></div>
+      <div class="bar" style="height:75%"></div><div class="bar" style="height:85%"></div>
+    </div>
+    <div class="section-title">最近请求</div>
+    <div class="table-wrap">
+      <div class="table-header" style="grid-template-columns:2fr 2fr 1fr 1fr 1fr">
+        <span>API Key</span><span>Model</span><span>Tokens</span><span>Cost</span><span>状态</span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 2fr 1fr 1fr 1fr">
+        <span style="color:#8b949e">sk-...a3f2</span><span>claude-3-5-sonnet</span><span>1,240</span><span>$0.01</span><span><span class="badge badge-green">200</span></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 2fr 1fr 1fr 1fr">
+        <span style="color:#8b949e">sk-...b9c1</span><span>gpt-4o</span><span>580</span><span>$0.00</span><span><span class="badge badge-green">200</span></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 2fr 1fr 1fr 1fr">
+        <span style="color:#8b949e">sk-...d7e4</span><span>claude-3-opus</span><span>0</span><span>—</span><span><span class="badge badge-red">429</span></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- API KEYS -->
+<div id="page-apikeys" class="admin-shell" style="display:none">
+  <div class="admin-sidebar">
+    <div class="logo">one-<span>router</span></div>
+    <div class="nav-item"><span class="icon">▣</span> Dashboard</div>
+    <div class="nav-item active"><span class="icon">🔑</span> API Keys</div>
+    <div class="nav-item"><span class="icon">⚡</span> Backends</div>
+    <div class="nav-item"><span class="icon">↔</span> Models</div>
+    <div class="nav-item"><span class="icon">📊</span> Usage</div>
+    <div class="nav-item"><span class="icon">⚑</span> Flags</div>
+  </div>
+  <div class="admin-main">
+    <div class="page-title">API Keys <button class="btn">+ 创建 Key</button></div>
+    <!-- 新建后一次性展示 -->
+    <div class="key-reveal">
+      <div>✓ API Key 已创建 — 请立即复制，此后不再显示</div>
+      <div class="key-value">sk-a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2</div>
+      <div style="margin-top:6px;display:flex;gap:6px">
+        <button class="btn btn-secondary">复制</button>
+        <span style="color:#8b949e;font-size:9px;align-self:center">关闭此提示后将无法再查看</span>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <div class="table-header" style="grid-template-columns:2fr 1.5fr 1fr 1fr 1fr 1fr 80px">
+        <span>名称 / Key</span><span>用户</span><span>速率限制</span><span>月预算</span><span>本月用量</span><span>状态</span><span>操作</span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 1.5fr 1fr 1fr 1fr 1fr 80px">
+        <div><div>Production App</div><div style="color:#8b949e">sk-...a3f2</div></div>
+        <span>user_001</span><span>100 rpm</span><span>$50</span>
+        <span>$12.34</span><span><span class="badge badge-green">活跃</span></span>
+        <span style="display:flex;gap:4px"><button class="btn btn-secondary">编辑</button><button class="btn btn-danger">停用</button></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 1.5fr 1fr 1fr 1fr 1fr 80px">
+        <div><div>Dev Key</div><div style="color:#8b949e">sk-...b9c1</div></div>
+        <span>user_002</span><span>20 rpm</span><span>—</span>
+        <span>$0.45</span><span><span class="badge badge-green">活跃</span></span>
+        <span style="display:flex;gap:4px"><button class="btn btn-secondary">编辑</button><button class="btn btn-danger">停用</button></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 1.5fr 1fr 1fr 1fr 1fr 80px">
+        <div><div>Old Key</div><div style="color:#8b949e">sk-...d7e4</div></div>
+        <span>user_001</span><span>—</span><span>—</span>
+        <span>$0.00</span><span><span class="badge badge-red">已停用</span></span>
+        <span style="display:flex;gap:4px"><button class="btn btn-secondary">启用</button><button class="btn btn-danger">删除</button></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- BACKENDS -->
+<div id="page-backends" class="admin-shell" style="display:none">
+  <div class="admin-sidebar">
+    <div class="logo">one-<span>router</span></div>
+    <div class="nav-item"><span class="icon">▣</span> Dashboard</div>
+    <div class="nav-item"><span class="icon">🔑</span> API Keys</div>
+    <div class="nav-item active"><span class="icon">⚡</span> Backends</div>
+    <div class="nav-item"><span class="icon">↔</span> Models</div>
+    <div class="nav-item"><span class="icon">📊</span> Usage</div>
+    <div class="nav-item"><span class="icon">⚑</span> Flags</div>
+  </div>
+  <div class="admin-main">
+    <div class="page-title">Backends <button class="btn">+ 添加后端</button></div>
+    <div class="table-wrap" style="margin-bottom:12px">
+      <div class="table-header" style="grid-template-columns:1.5fr 1fr 1fr 1fr 80px">
+        <span>名称</span><span>类型</span><span>优先级</span><span>健康状态</span><span>操作</span>
+      </div>
+      <div class="table-row" style="grid-template-columns:1.5fr 1fr 1fr 1fr 80px">
+        <span>gemini-prod</span><span><span class="badge badge-blue">Gemini</span></span><span>10</span>
+        <span><span class="health-dot green"></span>healthy</span>
+        <span style="display:flex;gap:4px"><button class="btn btn-secondary">编辑</button><button class="btn btn-danger">禁用</button></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:1.5fr 1fr 1fr 1fr 80px">
+        <span>anthropic-main</span><span><span class="badge badge-gray">Anthropic</span></span><span>8</span>
+        <span><span class="health-dot green"></span>healthy</span>
+        <span style="display:flex;gap:4px"><button class="btn btn-secondary">编辑</button><button class="btn btn-danger">禁用</button></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:1.5fr 1fr 1fr 1fr 80px">
+        <span>bedrock-us-east</span><span><span class="badge badge-gray">Bedrock</span></span><span>5</span>
+        <span><span class="health-dot red"></span>unhealthy</span>
+        <span style="display:flex;gap:4px"><button class="btn btn-secondary">编辑</button><button class="btn btn-secondary">启用</button></span>
+      </div>
+    </div>
+    <!-- 编辑表单 -->
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px">
+      <div style="font-size:11px;color:#e6edf3;margin-bottom:10px;font-weight:bold">编辑 gemini-prod</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div class="form-row"><div class="form-label">名称</div><input class="form-input" value="gemini-prod"></div>
+        <div class="form-row"><div class="form-label">类型</div>
+          <select class="form-input"><option>Gemini</option><option>Anthropic</option><option>OpenAI</option><option>Bedrock</option></select>
+        </div>
+        <div class="form-row" style="grid-column:1/-1"><div class="form-label">API Key（明文输入，保存时加密存储）</div>
+          <input class="form-input" type="password" placeholder="AIza...（留空则不修改）">
+        </div>
+        <div class="form-row"><div class="form-label">优先级</div><input class="form-input" value="10" type="number"></div>
+        <div class="form-row"><div class="form-label">负载均衡策略</div>
+          <select class="form-input"><option>RoundRobin</option><option>Weighted</option><option>Failover</option></select>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <button class="btn">保存（加密写入）</button>
+        <button class="btn btn-secondary">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MODEL MAPPINGS -->
+<div id="page-models" class="admin-shell" style="display:none">
+  <div class="admin-sidebar">
+    <div class="logo">one-<span>router</span></div>
+    <div class="nav-item"><span class="icon">▣</span> Dashboard</div>
+    <div class="nav-item"><span class="icon">🔑</span> API Keys</div>
+    <div class="nav-item"><span class="icon">⚡</span> Backends</div>
+    <div class="nav-item active"><span class="icon">↔</span> Models</div>
+    <div class="nav-item"><span class="icon">📊</span> Usage</div>
+    <div class="nav-item"><span class="icon">⚑</span> Flags</div>
+  </div>
+  <div class="admin-main">
+    <div class="page-title">Model Mappings <button class="btn">+ 新增映射</button></div>
+    <div class="table-wrap">
+      <div class="table-header" style="grid-template-columns:2fr 2fr 1fr 1fr 1fr 60px">
+        <span>源 Model ID</span><span>目标 Model ID</span><span>Provider</span><span>优先级</span><span>状态</span><span>操作</span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 2fr 1fr 1fr 1fr 60px">
+        <span>claude-3-5-sonnet*</span><span>anthropic.claude-3-5-sonnet-20241022-v2:0</span>
+        <span><span class="badge badge-gray">bedrock</span></span><span>10</span>
+        <span><span class="badge badge-green">active</span></span>
+        <button class="btn btn-secondary">编辑</button>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 2fr 1fr 1fr 1fr 60px">
+        <span>claude-3-5-sonnet*</span><span>claude-3-5-sonnet-20241022</span>
+        <span><span class="badge badge-gray">anthropic</span></span><span>8</span>
+        <span><span class="badge badge-green">active</span></span>
+        <button class="btn btn-secondary">编辑</button>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 2fr 1fr 1fr 1fr 60px">
+        <span>gpt-4o</span><span>gemini-2.0-flash</span>
+        <span><span class="badge badge-blue">gemini</span></span><span>5</span>
+        <span><span class="badge badge-gray">inactive</span></span>
+        <button class="btn btn-secondary">编辑</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- USAGE -->
+<div id="page-usage" class="admin-shell" style="display:none">
+  <div class="admin-sidebar">
+    <div class="logo">one-<span>router</span></div>
+    <div class="nav-item"><span class="icon">▣</span> Dashboard</div>
+    <div class="nav-item"><span class="icon">🔑</span> API Keys</div>
+    <div class="nav-item"><span class="icon">⚡</span> Backends</div>
+    <div class="nav-item"><span class="icon">↔</span> Models</div>
+    <div class="nav-item active"><span class="icon">📊</span> Usage</div>
+    <div class="nav-item"><span class="icon">⚑</span> Flags</div>
+  </div>
+  <div class="admin-main">
+    <div class="page-title">Usage 统计</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+      <select class="form-input" style="width:120px"><option>所有 Key</option><option>sk-...a3f2</option><option>sk-...b9c1</option></select>
+      <input class="form-input" type="date" style="width:110px" value="2026-03-01">
+      <span style="color:#8b949e">—</span>
+      <input class="form-input" type="date" style="width:110px" value="2026-03-25">
+      <select class="form-input" style="width:90px"><option>按小时</option><option>按模型</option></select>
+      <button class="btn">查询</button>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="stat-label">总请求</div><div class="stat-value">48,291</div></div>
+      <div class="stat-card"><div class="stat-label">Input Tokens</div><div class="stat-value blue">12.4M</div></div>
+      <div class="stat-card"><div class="stat-label">Output Tokens</div><div class="stat-value blue">3.1M</div></div>
+      <div class="stat-card"><div class="stat-label">总费用</div><div class="stat-value">$89.23</div></div>
+    </div>
+    <div class="section-title">按模型分布</div>
+    <div class="table-wrap">
+      <div class="table-header" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr">
+        <span>模型</span><span>请求数</span><span>Input Tokens</span><span>Output Tokens</span><span>费用</span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr">
+        <span>claude-3-5-sonnet*</span><span>28,140</span><span>7.2M</span><span>1.8M</span><span>$52.10</span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr">
+        <span>gpt-4o</span><span>12,033</span><span>3.1M</span><span>0.9M</span><span>$24.80</span>
+      </div>
+      <div class="table-row" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr">
+        <span>claude-3-opus</span><span>8,118</span><span>2.1M</span><span>0.4M</span><span>$12.33</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- FEATURE FLAGS -->
+<div id="page-flags" class="admin-shell" style="display:none">
+  <div class="admin-sidebar">
+    <div class="logo">one-<span>router</span></div>
+    <div class="nav-item"><span class="icon">▣</span> Dashboard</div>
+    <div class="nav-item"><span class="icon">🔑</span> API Keys</div>
+    <div class="nav-item"><span class="icon">⚡</span> Backends</div>
+    <div class="nav-item"><span class="icon">↔</span> Models</div>
+    <div class="nav-item"><span class="icon">📊</span> Usage</div>
+    <div class="nav-item active"><span class="icon">⚑</span> Flags</div>
+  </div>
+  <div class="admin-main">
+    <div class="page-title">Feature Flags</div>
+    <div class="table-wrap">
+      <div class="table-header" style="grid-template-columns:1.5fr 3fr 80px">
+        <span>Flag 名称</span><span>描述</span><span>状态</span>
+      </div>
+      <div class="table-row" style="grid-template-columns:1.5fr 3fr 80px">
+        <span>tool_use</span><span style="color:#8b949e">启用 tool_use / function calling 支持</span>
+        <span><label style="cursor:pointer"><input type="checkbox" checked> 开启</label></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:1.5fr 3fr 80px">
+        <span>caching</span><span style="color:#8b949e">启用 prompt caching（Anthropic）</span>
+        <span><label style="cursor:pointer"><input type="checkbox" checked> 开启</label></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:1.5fr 3fr 80px">
+        <span>ptc</span><span style="color:#8b949e">启用 PTC 服务</span>
+        <span><label style="cursor:pointer"><input type="checkbox"> 关闭</label></span>
+      </div>
+      <div class="table-row" style="grid-template-columns:1.5fr 3fr 80px">
+        <span>streaming</span><span style="color:#8b949e">全局启用 SSE streaming 响应</span>
+        <span><label style="cursor:pointer"><input type="checkbox" checked> 开启</label></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function showPage(name, tab) {
+  document.querySelectorAll('[id^="page-"]').forEach(p => p.style.display = 'none');
+  document.getElementById('page-' + name).style.display = 'flex';
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+}
+</script>

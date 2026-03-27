@@ -106,7 +106,7 @@ pub async fn get_model(
 
     let error = OpenAIErrorResponse::with_code(
         "invalid_request_error",
-        &format!("The model '{}' does not exist", model_id),
+        &format!("The model '{model_id}' does not exist"),
         "model_not_found",
     );
     (StatusCode::NOT_FOUND, Json(error)).into_response()

@@ -106,13 +106,13 @@ impl ToolNameMapper {
 
         // Format: t_<prefix>_<hash>
         // Keep prefix short to stay well under limit
-        let hash_str = format!("{:016x}", hash);
-        let short_name = format!("{}{}_{}", SHORT_NAME_PREFIX, meaningful_prefix, hash_str);
+        let hash_str = format!("{hash:016x}");
+        let short_name = format!("{SHORT_NAME_PREFIX}{meaningful_prefix}_{hash_str}");
 
         // Ensure we're under the limit (should always be the case)
         if short_name.len() > BEDROCK_TOOL_NAME_MAX_LENGTH {
             // Fallback to just prefix + hash
-            format!("{}{}", SHORT_NAME_PREFIX, hash_str)
+            format!("{SHORT_NAME_PREFIX}{hash_str}")
         } else {
             short_name
         }

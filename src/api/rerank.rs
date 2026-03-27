@@ -75,7 +75,7 @@ pub async fn create_rerank(
     }
 
     let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {e}")))?;
 
     let response_bytes = bedrock
         .invoke_model(model_id, body_bytes)
@@ -85,7 +85,7 @@ pub async fn create_rerank(
     // Parse Bedrock response: { "results": [{ "index": N, "relevanceScore": F }] }
     let bedrock_response: serde_json::Value =
         serde_json::from_slice(&response_bytes).map_err(|e| {
-            OpenAIApiError::internal_error(format!("Failed to parse rerank response: {}", e))
+            OpenAIApiError::internal_error(format!("Failed to parse rerank response: {e}"))
         })?;
 
     let raw_results = bedrock_response["results"]

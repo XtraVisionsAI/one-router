@@ -180,7 +180,7 @@ impl PassthroughService {
                 req_builder = req_builder.header("x-api-key", &api_key);
             }
             PassthroughTarget::OpenAI => {
-                req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+                req_builder = req_builder.header("Authorization", format!("Bearer {api_key}"));
                 if let Some(ref org) = self.organization {
                     req_builder = req_builder.header("OpenAI-Organization", org.as_str());
                 }

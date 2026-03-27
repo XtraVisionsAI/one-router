@@ -59,8 +59,7 @@ pub async fn create_image(
         "bedrock" | "" => handle_bedrock_images(&state, &request, &target_model_id).await?,
         other => {
             return Err(OpenAIApiError::bad_request(format!(
-                "Provider '{}' is not supported for /v1/images/generations. Supported: openai, bedrock, gemini.",
-                other
+                "Provider '{other}' is not supported for /v1/images/generations. Supported: openai, bedrock, gemini."
             )));
         }
     };
@@ -93,22 +92,22 @@ async fn handle_openai_images(
 
     // Replace model with resolved target, forward everything else as-is
     let mut body = serde_json::to_value(request)
-        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {e}")))?;
     body["model"] = json!(target_model_id);
 
     let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {e}")))?;
 
     let (resp, cred_name) = svc
         .forward("/v1/images/generations", body_bytes, &[])
         .await
-        .map_err(|e| OpenAIApiError::internal_error(format!("OpenAI request failed: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("OpenAI request failed: {e}")))?;
 
     let status = resp.status();
     let body_text = resp
         .text()
         .await
-        .map_err(|e| OpenAIApiError::internal_error(format!("Failed to read response: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Failed to read response: {e}")))?;
 
     if !status.is_success() {
         // Try to propagate the upstream error message
@@ -124,15 +123,14 @@ async fn handle_openai_images(
             });
         }
         return Err(OpenAIApiError::internal_error(format!(
-            "OpenAI returned status {}: {}",
-            status, body_text
+            "OpenAI returned status {status}: {body_text}"
         )));
     }
 
     svc.record_success(&cred_name);
 
     serde_json::from_str(&body_text).map_err(|e| {
-        OpenAIApiError::internal_error(format!("Failed to parse OpenAI image response: {}", e))
+        OpenAIApiError::internal_error(format!("Failed to parse OpenAI image response: {e}"))
     })
 }
 
@@ -179,7 +177,7 @@ async fn handle_gemini_images(
         .generate_content_raw(target_model_id, &body)
         .await
         .map_err(|e| {
-            OpenAIApiError::internal_error(format!("Gemini image generation failed: {}", e))
+            OpenAIApiError::internal_error(format!("Gemini image generation failed: {e}"))
         })?;
 
     // Extract inlineData parts from candidates[0].content.parts
@@ -244,9 +242,8 @@ async fn handle_bedrock_images(
         generate_image_titan(bedrock, request, target_model_id).await
     } else {
         Err(OpenAIApiError::bad_request(format!(
-            "Model '{}' is not a supported Bedrock image generation model. \
-             Supported prefixes: stability.*, amazon.nova-canvas*, amazon.titan-image-generator*.",
-            target_model_id
+            "Model '{target_model_id}' is not a supported Bedrock image generation model. \
+             Supported prefixes: stability.*, amazon.nova-canvas*, amazon.titan-image-generator*."
         )))
     }
 }
@@ -273,7 +270,7 @@ async fn generate_image_stability(
     });
 
     let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {e}")))?;
 
     let response_bytes = bedrock
         .invoke_model(model_id, body_bytes)
@@ -281,7 +278,7 @@ async fn generate_image_stability(
         .map_err(|e| OpenAIApiError::from_bedrock_error(&e))?;
 
     let response: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|e| {
-        OpenAIApiError::internal_error(format!("Failed to parse Stability response: {}", e))
+        OpenAIApiError::internal_error(format!("Failed to parse Stability response: {e}"))
     })?;
 
     let artifacts = response["artifacts"].as_array().ok_or_else(|| {
@@ -378,7 +375,7 @@ async fn invoke_bedrock_image(
     body: serde_json::Value,
 ) -> Result<ImageGenerationResponse, OpenAIApiError> {
     let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Serialization error: {e}")))?;
 
     let response_bytes = bedrock
         .invoke_model(model_id, body_bytes)
@@ -386,15 +383,14 @@ async fn invoke_bedrock_image(
         .map_err(|e| OpenAIApiError::from_bedrock_error(&e))?;
 
     let response: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|e| {
-        OpenAIApiError::internal_error(format!("Failed to parse Bedrock image response: {}", e))
+        OpenAIApiError::internal_error(format!("Failed to parse Bedrock image response: {e}"))
     })?;
 
     // Check for error field
     if let Some(err_msg) = response["error"].as_str() {
         if !err_msg.is_empty() {
             return Err(OpenAIApiError::internal_error(format!(
-                "Bedrock image generation error: {}",
-                err_msg
+                "Bedrock image generation error: {err_msg}"
             )));
         }
     }
@@ -434,15 +430,14 @@ fn parse_size(size: &str) -> Result<(u32, u32), OpenAIApiError> {
     let parts: Vec<&str> = size.split('x').collect();
     if parts.len() != 2 {
         return Err(OpenAIApiError::bad_request(format!(
-            "Invalid size format '{}'. Expected WxH, e.g. '1024x1024'.",
-            size
+            "Invalid size format '{size}'. Expected WxH, e.g. '1024x1024'."
         )));
     }
     let width = parts[0]
         .parse::<u32>()
-        .map_err(|_| OpenAIApiError::bad_request(format!("Invalid width in size '{}'.", size)))?;
+        .map_err(|_| OpenAIApiError::bad_request(format!("Invalid width in size '{size}'.")))?;
     let height = parts[1]
         .parse::<u32>()
-        .map_err(|_| OpenAIApiError::bad_request(format!("Invalid height in size '{}'.", size)))?;
+        .map_err(|_| OpenAIApiError::bad_request(format!("Invalid height in size '{size}'.")))?;
     Ok((width, height))
 }

@@ -1,0 +1,54 @@
+<h2>管理界面功能模块</h2>
+<p class="subtitle">请选择第一期要包含的模块（可多选）</p>
+
+<div class="options" data-multiselect>
+  <div class="option" data-choice="dashboard" onclick="toggleSelect(this)">
+    <div class="letter">1</div>
+    <div class="content">
+      <h3>Dashboard — 概览</h3>
+      <p>API Keys 总数、后端健康状态、今日请求量、今日费用、最近请求列表。只读，无操作。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="apikeys" onclick="toggleSelect(this)">
+    <div class="letter">2</div>
+    <div class="content">
+      <h3>API Keys 管理</h3>
+      <p>列表（含用量/预算）、创建（随机生成，明文一次性展示）、编辑速率/预算/状态、停用/删除。这里解决「key 明文一次性展示」问题。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="backends" onclick="toggleSelect(this)">
+    <div class="letter">3</div>
+    <div class="content">
+      <h3>Backends 配置</h3>
+      <p>列表后端（Bedrock/Gemini/Anthropic/OpenAI）、新增/编辑（表单明文输入凭证，保存时加密写库）、启用/禁用、健康状态显示。这里解决「加密存储」问题。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="models" onclick="toggleSelect(this)">
+    <div class="letter">4</div>
+    <div class="content">
+      <h3>Model Mappings 模型映射</h3>
+      <p>查看/编辑 source → target 模型映射规则，设置优先级、价格、provider。支持通配符。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="usage" onclick="toggleSelect(this)">
+    <div class="letter">5</div>
+    <div class="content">
+      <h3>Usage 用量统计</h3>
+      <p>按 API Key / 时间段查询请求记录、Token 消耗、费用汇总，图表展示。复用现有 /v1/usage API。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="featureflags" onclick="toggleSelect(this)">
+    <div class="letter">6</div>
+    <div class="content">
+      <h3>Feature Flags 功能开关</h3>
+      <p>查看/切换系统功能开关（tool_use、caching、ptc 等）。简单的开关列表。</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:16px">点击可多选，选好后在终端告诉我你的决定</p>

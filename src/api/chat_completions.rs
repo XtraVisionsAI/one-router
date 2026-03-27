@@ -73,16 +73,16 @@ impl OpenAIApiError {
             BedrockError::Throttled(msg) => Self::rate_limited(msg),
             BedrockError::ValidationError(msg) => Self::bad_request(msg),
             BedrockError::ModelNotFound(msg) => {
-                Self::bad_request(format!("Model not found: {}", msg))
+                Self::bad_request(format!("Model not found: {msg}"))
             }
             BedrockError::AccessDenied(msg) => Self::unauthorized(msg),
             BedrockError::ServiceUnavailable(msg) => Self::internal_error(msg),
             BedrockError::InternalError(msg) => Self::internal_error(msg),
             BedrockError::Serialization(msg) => {
-                Self::bad_request(format!("Serialization error: {}", msg))
+                Self::bad_request(format!("Serialization error: {msg}"))
             }
             BedrockError::Deserialization(msg) => {
-                Self::internal_error(format!("Response error: {}", msg))
+                Self::internal_error(format!("Response error: {msg}"))
             }
             BedrockError::ApiError { message, .. } => Self::internal_error(message),
             BedrockError::Unknown(msg) => Self::internal_error(msg),
@@ -95,13 +95,13 @@ impl OpenAIApiError {
             OpenAIConversionError::InvalidMessage(msg) => Self::bad_request(msg),
             OpenAIConversionError::InvalidTool(msg) => Self::bad_request(msg),
             OpenAIConversionError::Base64DecodeError(msg) => {
-                Self::bad_request(format!("Invalid base64: {}", msg))
+                Self::bad_request(format!("Invalid base64: {msg}"))
             }
             OpenAIConversionError::MissingField(field) => {
-                Self::bad_request(format!("Missing required field: {}", field))
+                Self::bad_request(format!("Missing required field: {field}"))
             }
             OpenAIConversionError::UnsupportedFeature(msg) => {
-                Self::bad_request(format!("Unsupported feature: {}", msg))
+                Self::bad_request(format!("Unsupported feature: {msg}"))
             }
             OpenAIConversionError::InvalidImageUrl(msg) => Self::bad_request(msg),
         }
@@ -579,7 +579,7 @@ async fn handle_gemini_backend(
     let converter = OpenAIToGeminiConverter::new();
     let (gemini_model, gemini_request) = converter
         .convert_request(request)
-        .map_err(|e| OpenAIApiError::bad_request(format!("Request conversion error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::bad_request(format!("Request conversion error: {e}")))?;
 
     // Use the resolved target_model_id if set, otherwise use the converted model name
     let final_model = if target_model_id.is_empty() {
@@ -605,7 +605,7 @@ async fn handle_gemini_backend(
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Gemini stream API call failed");
-                OpenAIApiError::internal_error(format!("Gemini API error: {}", e))
+                OpenAIApiError::internal_error(format!("Gemini API error: {e}"))
             })?;
 
         let gemini_service_clone = gemini_service.clone();
@@ -663,13 +663,13 @@ async fn handle_gemini_backend(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Gemini API call failed");
-            OpenAIApiError::internal_error(format!("Gemini API error: {}", e))
+            OpenAIApiError::internal_error(format!("Gemini API error: {e}"))
         })?;
 
     let response_converter = GeminiToOpenAIConverter::new();
     let response = response_converter
         .convert_response(&gemini_response, &request.model)
-        .map_err(|e| OpenAIApiError::internal_error(format!("Response conversion error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Response conversion error: {e}")))?;
 
     let duration_ms = start_time.elapsed().as_millis();
     tracing::info!(
@@ -712,7 +712,7 @@ async fn handle_anthropic_backend(
     let converter = OpenAIToAnthropicConverter::new();
     let anthropic_request = converter
         .convert_request(request, target_model_id)
-        .map_err(|e| OpenAIApiError::bad_request(format!("Request conversion error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::bad_request(format!("Request conversion error: {e}")))?;
 
     let body_bytes = serde_json::to_vec(&anthropic_request)
         .map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
@@ -729,7 +729,7 @@ async fn handle_anthropic_backend(
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Anthropic backend request failed");
-                OpenAIApiError::internal_error(format!("Anthropic API error: {}", e))
+                OpenAIApiError::internal_error(format!("Anthropic API error: {e}"))
             })?;
 
     let upstream_status = resp.status().as_u16();
@@ -834,20 +834,20 @@ async fn handle_anthropic_backend(
 
     // Non-streaming: read body, convert Anthropic → OpenAI response
     let body_text = resp.text().await.map_err(|e| {
-        OpenAIApiError::internal_error(format!("Failed to read Anthropic response: {}", e))
+        OpenAIApiError::internal_error(format!("Failed to read Anthropic response: {e}"))
     })?;
 
     svc.record_success(&credential_name);
 
     let anthropic_response: crate::schemas::anthropic::MessageResponse =
         serde_json::from_str(&body_text).map_err(|e| {
-            OpenAIApiError::internal_error(format!("Failed to parse Anthropic response: {}", e))
+            OpenAIApiError::internal_error(format!("Failed to parse Anthropic response: {e}"))
         })?;
 
     let response_converter = crate::converters::anthropic_openai::OpenAIToAnthropicConverter::new();
     let response = response_converter
         .convert_response(&anthropic_response, &request.model)
-        .map_err(|e| OpenAIApiError::internal_error(format!("Response conversion error: {}", e)))?;
+        .map_err(|e| OpenAIApiError::internal_error(format!("Response conversion error: {e}")))?;
 
     let duration_ms = start_time.elapsed().as_millis();
     tracing::info!(
@@ -910,7 +910,7 @@ async fn handle_openai_passthrough(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "OpenAI passthrough request failed");
-            OpenAIApiError::internal_error(format!("OpenAI API error: {}", e))
+            OpenAIApiError::internal_error(format!("OpenAI API error: {e}"))
         })?;
 
     let upstream_status = resp.status().as_u16();
@@ -938,7 +938,7 @@ async fn handle_openai_passthrough(
 
     // Non-streaming
     let body_text = resp.text().await.map_err(|e| {
-        OpenAIApiError::internal_error(format!("Failed to read OpenAI response: {}", e))
+        OpenAIApiError::internal_error(format!("Failed to read OpenAI response: {e}"))
     })?;
 
     svc.record_success(&credential_name);

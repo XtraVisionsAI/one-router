@@ -301,21 +301,21 @@ impl UsageStore for PostgresBackend {
         // Build dynamic SQL with numbered placeholders ($1, $2, …)
         let mut param_idx = 1usize;
         let key_clause = if filter_by_key {
-            let s = format!("WHERE api_key = ${}", param_idx);
+            let s = format!("WHERE api_key = ${param_idx}");
             param_idx += 1;
             s
         } else {
             "WHERE 1=1".to_string()
         };
         let since_clause = if since.is_some() {
-            let s = format!("AND timestamp >= ${}", param_idx);
+            let s = format!("AND timestamp >= ${param_idx}");
             param_idx += 1;
             s
         } else {
             String::new()
         };
         let limit_clause = if limit.is_some() {
-            format!("LIMIT ${}", param_idx)
+            format!("LIMIT ${param_idx}")
         } else {
             String::new()
         };
@@ -388,14 +388,14 @@ impl UsageStore for PostgresBackend {
             "WHERE 1=1".to_string()
         };
         let start_clause = if start.is_some() {
-            let s = format!("AND timestamp >= ${}", param_idx);
+            let s = format!("AND timestamp >= ${param_idx}");
             param_idx += 1;
             s
         } else {
             String::new()
         };
         let end_clause = if end.is_some() {
-            format!("AND timestamp <= ${}", param_idx)
+            format!("AND timestamp <= ${param_idx}")
         } else {
             String::new()
         };

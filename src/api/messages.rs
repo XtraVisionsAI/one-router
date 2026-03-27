@@ -91,16 +91,16 @@ impl ApiError {
             BedrockError::Throttled(msg) => Self::rate_limited(msg),
             BedrockError::ValidationError(msg) => Self::bad_request(msg),
             BedrockError::ModelNotFound(msg) => {
-                Self::bad_request(format!("Model not found: {}", msg))
+                Self::bad_request(format!("Model not found: {msg}"))
             }
             BedrockError::AccessDenied(msg) => Self::unauthorized(msg),
             BedrockError::ServiceUnavailable(msg) => Self::service_unavailable(msg),
             BedrockError::InternalError(msg) => Self::internal_error(msg),
             BedrockError::Serialization(msg) => {
-                Self::bad_request(format!("Serialization error: {}", msg))
+                Self::bad_request(format!("Serialization error: {msg}"))
             }
             BedrockError::Deserialization(msg) => {
-                Self::internal_error(format!("Response error: {}", msg))
+                Self::internal_error(format!("Response error: {msg}"))
             }
             BedrockError::ApiError { message, .. } => Self::internal_error(message),
             BedrockError::Unknown(msg) => Self::internal_error(msg),
@@ -113,13 +113,13 @@ impl ApiError {
             ConversionError::InvalidMessage(msg) => Self::bad_request(msg),
             ConversionError::InvalidTool(msg) => Self::bad_request(msg),
             ConversionError::Base64DecodeError(msg) => {
-                Self::bad_request(format!("Invalid base64: {}", msg))
+                Self::bad_request(format!("Invalid base64: {msg}"))
             }
             ConversionError::MissingField(field) => {
-                Self::bad_request(format!("Missing required field: {}", field))
+                Self::bad_request(format!("Missing required field: {field}"))
             }
             ConversionError::UnsupportedFeature(msg) => {
-                Self::bad_request(format!("Unsupported feature: {}", msg))
+                Self::bad_request(format!("Unsupported feature: {msg}"))
             }
         }
     }
@@ -357,7 +357,7 @@ async fn handle_anthropic_passthrough(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Anthropic passthrough request failed");
-            ApiError::internal_error(format!("Anthropic API error: {}", e))
+            ApiError::internal_error(format!("Anthropic API error: {e}"))
         })?;
 
     let upstream_status = resp.status().as_u16();
@@ -386,9 +386,10 @@ async fn handle_anthropic_passthrough(
     }
 
     // Non-streaming: read body and return JSON
-    let body_text = resp.text().await.map_err(|e| {
-        ApiError::internal_error(format!("Failed to read Anthropic response: {}", e))
-    })?;
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| ApiError::internal_error(format!("Failed to read Anthropic response: {e}")))?;
 
     svc.record_success(&credential_name);
 
@@ -499,7 +500,7 @@ async fn handle_openai_backend(
     let converter = AnthropicToOpenAIConverter::new();
     let openai_request = converter
         .convert_request(request, target_model_id)
-        .map_err(|e| ApiError::bad_request(format!("Request conversion error: {}", e)))?;
+        .map_err(|e| ApiError::bad_request(format!("Request conversion error: {e}")))?;
 
     let body_bytes =
         serde_json::to_vec(&openai_request).map_err(|e| ApiError::internal_error(e.to_string()))?;
@@ -516,7 +517,7 @@ async fn handle_openai_backend(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "OpenAI backend request failed");
-            ApiError::internal_error(format!("OpenAI API error: {}", e))
+            ApiError::internal_error(format!("OpenAI API error: {e}"))
         })?;
 
     let upstream_status = resp.status().as_u16();
@@ -604,19 +605,19 @@ async fn handle_openai_backend(
     let body_text = resp
         .text()
         .await
-        .map_err(|e| ApiError::internal_error(format!("Failed to read OpenAI response: {}", e)))?;
+        .map_err(|e| ApiError::internal_error(format!("Failed to read OpenAI response: {e}")))?;
 
     svc.record_success(&credential_name);
 
     let openai_response: crate::schemas::openai::ChatCompletionResponse =
         serde_json::from_str(&body_text).map_err(|e| {
-            ApiError::internal_error(format!("Failed to parse OpenAI response: {}", e))
+            ApiError::internal_error(format!("Failed to parse OpenAI response: {e}"))
         })?;
 
     let response_converter = AnthropicToOpenAIConverter::new();
     let response = response_converter
         .convert_response(&openai_response, &request.model)
-        .map_err(|e| ApiError::internal_error(format!("Response conversion error: {}", e)))?;
+        .map_err(|e| ApiError::internal_error(format!("Response conversion error: {e}")))?;
 
     let duration_ms = start_time.elapsed().as_millis();
     tracing::info!(
@@ -647,7 +648,7 @@ async fn handle_gemini_request(
     let converter = AnthropicToGeminiConverter::new();
     let (gemini_model, gemini_request) = converter
         .convert_request(request)
-        .map_err(|e| ApiError::bad_request(format!("Request conversion error: {}", e)))?;
+        .map_err(|e| ApiError::bad_request(format!("Request conversion error: {e}")))?;
 
     tracing::debug!(
         request_id = %request_id,
@@ -674,14 +675,14 @@ async fn handle_gemini_request(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Gemini API call failed");
-            ApiError::internal_error(format!("Gemini API error: {}", e))
+            ApiError::internal_error(format!("Gemini API error: {e}"))
         })?;
 
     // Convert Gemini response to Anthropic format
     let response_converter = GeminiToAnthropicConverter::new();
     let response = response_converter
         .convert_response(&gemini_response, &request.model)
-        .map_err(|e| ApiError::internal_error(format!("Response conversion error: {}", e)))?;
+        .map_err(|e| ApiError::internal_error(format!("Response conversion error: {e}")))?;
 
     let duration_ms = start_time.elapsed().as_millis();
 
@@ -925,7 +926,7 @@ async fn create_gemini_streaming_response(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Gemini stream API call failed");
-            ApiError::internal_error(format!("Gemini API error: {}", e))
+            ApiError::internal_error(format!("Gemini API error: {e}"))
         })?;
 
     let model_id = original_model.to_string();

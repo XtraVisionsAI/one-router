@@ -112,7 +112,7 @@ impl IntoResponse for AuthError {
                             StatusCode::FORBIDDEN,
                             Json(ErrorResponse::new(
                                 "permission_error",
-                                format!("API key is inactive: {}", r),
+                                format!("API key is inactive: {r}"),
                             )),
                         )
                             .into_response()
