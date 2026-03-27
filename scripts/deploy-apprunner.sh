@@ -297,25 +297,12 @@ case "$MODE" in
             ok "Pull Through Cache rule exists: ${PTC_PREFIX}"
         fi
 
-        # Trigger PTC sync via ECR API and wait for the image to be available.
+        # Trigger PTC sync via docker pull — this forces ECR to fetch the latest
+        # image from DockerHub. batch-get-image alone does NOT trigger a refresh.
         PTC_REPO="${PTC_PREFIX}/${DOCKERHUB_IMAGE}"
-        echo "  Triggering PTC sync for ${PTC_REPO}:${TAG}..."
-        for i in $(seq 1 12); do
-            if awscli ecr batch-get-image \
-                    --repository-name "${PTC_REPO}" \
-                    --image-ids imageTag="${TAG}" \
-                    --query 'images[0].imageId.imageTag' \
-                    --output text 2>/dev/null | grep -q "${TAG}"; then
-                ok "Image cached in ECR: ${DEPLOY_IMAGE}"
-                break
-            fi
-            if [[ $i -eq 12 ]]; then
-                err "Timed out waiting for PTC sync. Check ECR console."
-                exit 1
-            fi
-            echo "  Waiting for PTC sync... (${i}/12)"
-            sleep 10
-        done
+        echo "  Pulling via PTC to trigger sync: ${DEPLOY_IMAGE}..."
+        docker pull "${DEPLOY_IMAGE}"
+        ok "Image cached in ECR: ${DEPLOY_IMAGE}"
         ;;
 esac
 
