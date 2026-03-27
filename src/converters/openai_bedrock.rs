@@ -7,6 +7,7 @@
 //! Uses AWS SDK types directly.
 
 use aws_sdk_bedrockruntime::types::{
+    CachePointBlock, CachePointType,
     ContentBlock as SdkContentBlock, ConversationRole, InferenceConfiguration,
     Message as SdkMessage, SystemContentBlock, Tool as SdkTool, ToolConfiguration,
     ToolInputSchema as SdkToolInputSchema, ToolResultContentBlock, ToolResultStatus,
@@ -54,6 +55,13 @@ pub enum OpenAIConversionError {
 // Request Conversion (OpenAI → Bedrock)
 // ============================================================================
 
+fn bedrock_cache_point() -> CachePointBlock {
+    CachePointBlock::builder()
+        .r#type(CachePointType::Default)
+        .build()
+        .expect("CachePointBlock requires only r#type which is set")
+}
+
 /// Convert an OpenAI ChatCompletionRequest to a Bedrock ConverseRequest.
 pub fn convert_request(
     request: &crate::schemas::openai::ChatCompletionRequest,
@@ -65,7 +73,22 @@ pub fn convert_request(
         .iter()
         .partition(|m| m.role == ChatRole::System);
 
-    let sdk_messages = convert_openai_messages_to_sdk(&chat_messages)?;
+    let mut sdk_messages = convert_openai_messages_to_sdk(&chat_messages)?;
+
+    // Auto-inject CachePoint at the end of the last user message
+    if let Some(last_user) = sdk_messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role() == &ConversationRole::User)
+    {
+        let mut content = last_user.content().to_vec();
+        content.push(SdkContentBlock::CachePoint(bedrock_cache_point()));
+        *last_user = SdkMessage::builder()
+            .role(ConversationRole::User)
+            .set_content(Some(content))
+            .build()
+            .map_err(|e| OpenAIConversionError::InvalidMessage(e.to_string()))?;
+    }
 
     // Build inference config
     let max_tokens = request
@@ -91,7 +114,7 @@ pub fn convert_request(
 
     // Convert system messages
     if !system_messages.is_empty() {
-        let system_blocks: Vec<SystemContentBlock> = system_messages
+        let mut system_blocks: Vec<SystemContentBlock> = system_messages
             .iter()
             .filter_map(|m| {
                 m.content
@@ -101,6 +124,8 @@ pub fn convert_request(
             .collect();
 
         if !system_blocks.is_empty() {
+            // Auto-inject cache point after system prompt
+            system_blocks.push(SystemContentBlock::CachePoint(bedrock_cache_point()));
             converse_req = converse_req.with_system(system_blocks);
         }
     }
@@ -108,7 +133,7 @@ pub fn convert_request(
     // Convert tools
     if let Some(ref tools) = request.tools {
         if !tools.is_empty() {
-            let tool_config = convert_openai_tools_to_sdk(tools)?;
+            let tool_config = convert_openai_tools_to_sdk_with_cache(tools)?;
             converse_req = converse_req.with_tool_config(tool_config);
         }
     }
@@ -332,6 +357,47 @@ fn convert_openai_tools_to_sdk(
         })
 }
 
+/// Convert OpenAI tools to SDK ToolConfiguration, appending a CachePoint after the last tool.
+fn convert_openai_tools_to_sdk_with_cache(
+    tools: &[crate::schemas::openai::Tool],
+) -> Result<ToolConfiguration, OpenAIConversionError> {
+    let mut sdk_tools = Vec::new();
+
+    for tool in tools {
+        if tool.tool_type != "function" {
+            continue;
+        }
+
+        let input_schema = tool
+            .function
+            .parameters
+            .clone()
+            .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
+
+        let tool_spec = ToolSpecification::builder()
+            .name(&tool.function.name)
+            .description(tool.function.description.as_deref().unwrap_or(""))
+            .input_schema(SdkToolInputSchema::Json(json_to_document(&input_schema)))
+            .build()
+            .map_err(|e| {
+                OpenAIConversionError::InvalidTool(format!("Failed to build tool spec: {}", e))
+            })?;
+
+        sdk_tools.push(SdkTool::ToolSpec(tool_spec));
+    }
+
+    if !sdk_tools.is_empty() {
+        sdk_tools.push(SdkTool::CachePoint(bedrock_cache_point()));
+    }
+
+    ToolConfiguration::builder()
+        .set_tools(Some(sdk_tools))
+        .build()
+        .map_err(|e| {
+            OpenAIConversionError::InvalidTool(format!("Failed to build tool config: {}", e))
+        })
+}
+
 // ============================================================================
 // Response Conversion (Bedrock → OpenAI)
 // ============================================================================
@@ -438,6 +504,73 @@ pub fn convert_stop_reason_to_openai(reason: &aws_sdk_bedrockruntime::types::Sto
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
+    use crate::schemas::openai::{ChatCompletionRequest, ChatMessage, ChatRole, MessageContent};
+
+    fn make_request(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages,
+            max_tokens: Some(100),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream: false,
+            stream_options: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            response_format: None,
+            user: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
+        }
+    }
+
+    fn user_msg(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::User,
+            content: Some(MessageContent::Text(text.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn system_msg(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::System,
+            content: Some(MessageContent::Text(text.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn system_gets_cache_point_injected() {
+        let req = make_request(vec![
+            system_msg("You are helpful."),
+            user_msg("Hello"),
+        ]);
+        let result = convert_request(&req, "anthropic.claude-3-5-sonnet").unwrap();
+        let system = result.system.unwrap();
+        assert_eq!(system.len(), 2);
+        assert!(matches!(system[0], SystemContentBlock::Text(_)));
+        assert!(system[1].is_cache_point());
+    }
+
+    #[test]
+    fn last_user_message_gets_cache_point_injected() {
+        let req = make_request(vec![user_msg("Hello")]);
+        let result = convert_request(&req, "anthropic.claude-3-5-sonnet").unwrap();
+        let messages = result.messages;
+        let last_content = messages.last().unwrap().content();
+        let last_block = last_content.last().unwrap();
+        assert!(last_block.is_cache_point());
+    }
 }
