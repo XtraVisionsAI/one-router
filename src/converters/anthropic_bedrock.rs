@@ -7,6 +7,7 @@
 //! Uses AWS SDK types directly (not the old custom `schemas::bedrock` types).
 
 use aws_sdk_bedrockruntime::types::{
+    CachePointBlock, CachePointType,
     ContentBlock as SdkContentBlock, ConversationRole, InferenceConfiguration,
     Message as SdkMessage, SystemContentBlock, Tool as SdkTool, ToolConfiguration,
     ToolInputSchema as SdkToolInputSchema, ToolResultContentBlock, ToolResultStatus,
@@ -160,25 +161,40 @@ fn convert_content_to_sdk(
     match content {
         MessageContent::Text(text) => Ok(vec![SdkContentBlock::Text(text.clone())]),
         MessageContent::Blocks(blocks) => {
-            let mut sdk_blocks = Vec::new();
-            for block in blocks {
-                if let Some(sdk_block) = convert_content_block_to_sdk(block)? {
-                    sdk_blocks.push(sdk_block);
-                }
-            }
-            Ok(sdk_blocks)
+            blocks
+                .iter()
+                .map(convert_content_block_to_sdk)
+                .collect::<Result<Vec<Vec<_>>, _>>()
+                .map(|v| v.into_iter().flatten().collect())
         }
     }
 }
 
+/// Build a Bedrock CachePoint block (maps from any Anthropic cache_control).
+fn make_cache_point() -> Result<SdkContentBlock, ConversionError> {
+    Ok(SdkContentBlock::CachePoint(
+        CachePointBlock::builder()
+            .r#type(CachePointType::Default)
+            .build()
+            .map_err(|e| ConversionError::InvalidContentBlock(e.to_string()))?,
+    ))
+}
+
 /// Convert a single content block to SDK format.
+/// Returns a Vec because a cached block emits two SDK blocks: the block itself + a CachePoint.
 fn convert_content_block_to_sdk(
     block: &ContentBlock,
-) -> Result<Option<SdkContentBlock>, ConversionError> {
+) -> Result<Vec<SdkContentBlock>, ConversionError> {
     match block {
-        ContentBlock::Text { text, .. } => Ok(Some(SdkContentBlock::Text(text.clone()))),
+        ContentBlock::Text { text, cache_control } => {
+            let mut out = vec![SdkContentBlock::Text(text.clone())];
+            if cache_control.is_some() {
+                out.push(make_cache_point()?);
+            }
+            Ok(out)
+        }
 
-        ContentBlock::Image { source, .. } => {
+        ContentBlock::Image { source, cache_control } => {
             use aws_sdk_bedrockruntime::types::{ImageBlock, ImageFormat, ImageSource};
             use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
@@ -204,12 +220,14 @@ fn convert_content_block_to_sdk(
                     ConversionError::InvalidContentBlock(format!("Failed to build image: {}", e))
                 })?;
 
-            Ok(Some(SdkContentBlock::Image(image)))
+            let mut out = vec![SdkContentBlock::Image(image)];
+            if cache_control.is_some() {
+                out.push(make_cache_point()?);
+            }
+            Ok(out)
         }
 
-        ContentBlock::ToolUse {
-            id, name, input, ..
-        } => {
+        ContentBlock::ToolUse { id, name, input, .. } => {
             let tool_use = ToolUseBlock::builder()
                 .tool_use_id(id)
                 .name(name)
@@ -218,16 +236,10 @@ fn convert_content_block_to_sdk(
                 .map_err(|e| {
                     ConversionError::InvalidContentBlock(format!("Failed to build tool use: {}", e))
                 })?;
-
-            Ok(Some(SdkContentBlock::ToolUse(tool_use)))
+            Ok(vec![SdkContentBlock::ToolUse(tool_use)])
         }
 
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-            ..
-        } => {
+        ContentBlock::ToolResult { tool_use_id, content, is_error, cache_control } => {
             use aws_sdk_bedrockruntime::types::ToolResultBlock;
 
             let result_content = match content {
@@ -261,10 +273,14 @@ fn convert_content_block_to_sdk(
                     ))
                 })?;
 
-            Ok(Some(SdkContentBlock::ToolResult(tool_result)))
+            let mut out = vec![SdkContentBlock::ToolResult(tool_result)];
+            if cache_control.is_some() {
+                out.push(make_cache_point()?);
+            }
+            Ok(out)
         }
 
-        ContentBlock::Document { source, .. } => {
+        ContentBlock::Document { source, cache_control } => {
             use aws_sdk_bedrockruntime::types::{
                 DocumentBlock, DocumentFormat, DocumentSource as SdkDocumentSource,
             };
@@ -293,14 +309,18 @@ fn convert_content_block_to_sdk(
                     ConversionError::InvalidContentBlock(format!("Failed to build document: {}", e))
                 })?;
 
-            Ok(Some(SdkContentBlock::Document(doc)))
+            let mut out = vec![SdkContentBlock::Document(doc)];
+            if cache_control.is_some() {
+                out.push(make_cache_point()?);
+            }
+            Ok(out)
         }
 
-        // Skip thinking blocks
-        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => Ok(None),
+        // Skip thinking blocks — no cache_control field
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => Ok(vec![]),
 
-        // Skip server tool blocks
-        ContentBlock::ServerToolUse { .. } | ContentBlock::ServerToolResult { .. } => Ok(None),
+        // Skip server tool blocks — no cache_control field
+        ContentBlock::ServerToolUse { .. } | ContentBlock::ServerToolResult { .. } => Ok(vec![]),
     }
 }
 
@@ -460,5 +480,34 @@ fn convert_stop_reason(reason: &aws_sdk_bedrockruntime::types::StopReason) -> St
         aws_sdk_bedrockruntime::types::StopReason::ContentFiltered => StopReason::EndTurn,
         aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened => StopReason::EndTurn,
         _ => StopReason::EndTurn,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schemas::anthropic::{CacheControl, ContentBlock};
+
+    #[test]
+    fn text_with_cache_control_emits_cache_point() {
+        let block = ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: Some(CacheControl::new()),
+        };
+        let result = convert_content_block_to_sdk(&block).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], SdkContentBlock::Text(_)));
+        assert!(result[1].is_cache_point());
+    }
+
+    #[test]
+    fn text_without_cache_control_no_cache_point() {
+        let block = ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        };
+        let result = convert_content_block_to_sdk(&block).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], SdkContentBlock::Text(_)));
     }
 }
