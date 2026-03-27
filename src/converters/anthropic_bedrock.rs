@@ -325,13 +325,29 @@ fn convert_content_block_to_sdk(
 }
 
 /// Convert system content to SDK format.
+/// Appends a CachePoint after any system message that carries cache_control.
 fn convert_system_to_sdk(system: &SystemContent) -> Vec<SystemContentBlock> {
+    let cache_point = || {
+        SystemContentBlock::CachePoint(
+            CachePointBlock::builder()
+                .r#type(CachePointType::Default)
+                .build()
+                .expect("CachePointBlock builder never fails with required field set"),
+        )
+    };
+
     match system {
         SystemContent::Text(text) => vec![SystemContentBlock::Text(text.clone())],
-        SystemContent::Messages(messages) => messages
-            .iter()
-            .map(|m| SystemContentBlock::Text(m.text.clone()))
-            .collect(),
+        SystemContent::Messages(messages) => {
+            let mut out = Vec::new();
+            for msg in messages {
+                out.push(SystemContentBlock::Text(msg.text.clone()));
+                if msg.cache_control.is_some() {
+                    out.push(cache_point());
+                }
+            }
+            out
+        }
     }
 }
 
@@ -353,7 +369,6 @@ fn convert_tools_to_sdk(
             .and_then(|v| v.as_str())
             .ok_or_else(|| ConversionError::InvalidTool("Tool missing name".to_string()))?;
 
-        // Use the mapper to get a short name if needed (Bedrock has 64 char limit)
         let name = tool_name_mapper.get_or_create_short_name(original_name);
 
         let description = tool
@@ -376,6 +391,15 @@ fn convert_tools_to_sdk(
             })?;
 
         sdk_tools.push(SdkTool::ToolSpec(tool_spec));
+
+        // Inject CachePoint if this tool carries cache_control
+        if tool.get("cache_control").is_some() {
+            let cp = CachePointBlock::builder()
+                .r#type(CachePointType::Default)
+                .build()
+                .map_err(|e| ConversionError::InvalidTool(e.to_string()))?;
+            sdk_tools.push(SdkTool::CachePoint(cp));
+        }
     }
 
     if tool_name_mapper.has_mappings() {
@@ -509,5 +533,45 @@ mod tests {
         let result = convert_content_block_to_sdk(&block).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], SdkContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn system_with_cache_control_emits_cache_point() {
+        use crate::schemas::anthropic::{CacheControl, SystemContent, SystemMessage};
+        let system = SystemContent::Messages(vec![SystemMessage {
+            message_type: "text".to_string(),
+            text: "You are helpful.".to_string(),
+            cache_control: Some(CacheControl::new()),
+        }]);
+        let result = convert_system_to_sdk(&system);
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], SystemContentBlock::Text(_)));
+        assert!(result[1].is_cache_point());
+    }
+
+    #[test]
+    fn system_text_shorthand_no_cache_point() {
+        use crate::schemas::anthropic::SystemContent;
+        let system = SystemContent::Text("You are helpful.".to_string());
+        let result = convert_system_to_sdk(&system);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], SystemContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn tool_with_cache_control_emits_cache_point() {
+        use crate::utils::ToolNameMapper;
+        let tools = vec![serde_json::json!({
+            "name": "my_tool",
+            "description": "does stuff",
+            "input_schema": {"type": "object", "properties": {}},
+            "cache_control": {"type": "ephemeral"}
+        })];
+        let mut mapper = ToolNameMapper::new();
+        let config = convert_tools_to_sdk(&tools, &mut mapper).unwrap();
+        let tool_list = config.tools();
+        assert_eq!(tool_list.len(), 2);
+        assert!(tool_list[0].is_tool_spec());
+        assert!(tool_list[1].is_cache_point());
     }
 }
