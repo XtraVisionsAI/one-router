@@ -623,12 +623,50 @@ impl OpenAIToAnthropicConverter {
             if text.is_empty() {
                 None
             } else {
-                Some(SystemContent::Text(text))
+                use crate::schemas::anthropic::{CacheControl, SystemMessage};
+                Some(SystemContent::Messages(vec![SystemMessage {
+                    message_type: "text".to_string(),
+                    text,
+                    cache_control: Some(CacheControl::new()),
+                }]))
             }
         };
 
         // Convert messages
         let messages = self.convert_messages(&chat_messages)?;
+
+        // Auto-inject cache_control on the last content block of the last user message
+        let messages = {
+            use crate::schemas::anthropic::CacheControl;
+            let mut msgs = messages;
+            if let Some(last_user) = msgs.iter_mut().rev().find(|m| m.role == "user") {
+                match &mut last_user.content {
+                    MessageContent::Text(text) => {
+                        let text_val = text.clone();
+                        last_user.content = MessageContent::Blocks(vec![ContentBlock::Text {
+                            text: text_val,
+                            cache_control: Some(CacheControl::new()),
+                        }]);
+                    }
+                    MessageContent::Blocks(blocks) => {
+                        if let Some(last_block) = blocks.last_mut() {
+                            match last_block {
+                                ContentBlock::Text { cache_control, .. } => {
+                                    *cache_control = Some(CacheControl::new());
+                                }
+                                _ => {
+                                    blocks.push(ContentBlock::Text {
+                                        text: String::new(),
+                                        cache_control: Some(CacheControl::new()),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            msgs
+        };
 
         // max_tokens (required by Anthropic)
         let max_tokens = request
@@ -641,6 +679,17 @@ impl OpenAIToAnthropicConverter {
 
         // Convert tools
         let tools = self.convert_tools(&request.tools)?;
+
+        // Auto-inject cache_control on the last tool so Anthropic caches the tool list
+        let tools = match tools {
+            Some(mut tool_list) if !tool_list.is_empty() => {
+                if let Some(last) = tool_list.last_mut() {
+                    last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+                Some(tool_list)
+            }
+            other => other,
+        };
 
         // Convert tool_choice
         let tool_choice = self.convert_tool_choice(&request.tool_choice)?;
@@ -1293,5 +1342,89 @@ mod tests {
         };
         let result = converter.convert_request(&request, "claude-3-5-sonnet-20241022");
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod openai_to_anthropic_cache_tests {
+    use super::*;
+    use crate::schemas::anthropic::{ContentBlock, MessageContent, SystemContent};
+    use crate::schemas::openai::{ChatCompletionRequest, ChatMessage, ChatRole, MessageContent as OpenAIMessageContent};
+
+    fn make_request(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages,
+            max_tokens: Some(100),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream: false,
+            stream_options: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            response_format: None,
+            user: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
+        }
+    }
+
+    fn user_msg(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::User,
+            content: Some(OpenAIMessageContent::Text(text.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn system_msg(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::System,
+            content: Some(OpenAIMessageContent::Text(text.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn system_gets_cache_control_injected() {
+        let req = make_request(vec![system_msg("Be helpful."), user_msg("Hi")]);
+        let converter = OpenAIToAnthropicConverter::new();
+        let result = converter.convert_request(&req, "claude-3-5-sonnet-20241022").unwrap();
+        match result.system.unwrap() {
+            SystemContent::Messages(msgs) => {
+                assert!(msgs.last().unwrap().cache_control.is_some());
+            }
+            SystemContent::Text(_) => panic!("Expected Messages variant"),
+        }
+    }
+
+    #[test]
+    fn last_user_message_last_block_gets_cache_control() {
+        let req = make_request(vec![user_msg("Hello there")]);
+        let converter = OpenAIToAnthropicConverter::new();
+        let result = converter.convert_request(&req, "claude-3-5-sonnet-20241022").unwrap();
+        let last_msg = result.messages.last().unwrap();
+        match &last_msg.content {
+            MessageContent::Blocks(blocks) => {
+                let last = blocks.last().unwrap();
+                match last {
+                    ContentBlock::Text { cache_control, .. } => {
+                        assert!(cache_control.is_some());
+                    }
+                    _ => panic!("Expected Text block"),
+                }
+            }
+            MessageContent::Text(_) => panic!("Expected Blocks variant after cache injection"),
+        }
     }
 }
