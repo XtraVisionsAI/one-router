@@ -526,6 +526,11 @@ JSON
         --output json > /tmp/apprunner-result.json
 
     SERVICE_URL=$(jq -r '.Service.ServiceUrl' /tmp/apprunner-result.json)
+
+    # update-service does not re-deploy when the image URI is unchanged (e.g. `latest` tag).
+    # start-deployment forces App Runner to pull the current image from ECR regardless.
+    awscli apprunner start-deployment --service-arn "${SERVICE_ARN}" --output json > /dev/null
+    ok "Deployment triggered"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
