@@ -398,9 +398,7 @@ fn convert_tools_to_sdk(
             .description(description)
             .input_schema(SdkToolInputSchema::Json(json_to_document(&input_schema)))
             .build()
-            .map_err(|e| {
-                ConversionError::InvalidTool(format!("Failed to build tool spec: {e}"))
-            })?;
+            .map_err(|e| ConversionError::InvalidTool(format!("Failed to build tool spec: {e}")))?;
 
         sdk_tools.push(SdkTool::ToolSpec(tool_spec));
 
