@@ -446,8 +446,8 @@ pub fn convert_response(
         .map(|u| Usage {
             input_tokens: u.input_tokens(),
             output_tokens: u.output_tokens(),
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_creation_input_tokens: u.cache_write_input_tokens(),
+            cache_read_input_tokens: u.cache_read_input_tokens(),
         })
         .unwrap_or(Usage {
             input_tokens: 0,
@@ -571,5 +571,20 @@ mod tests {
         assert_eq!(tool_list.len(), 2);
         assert!(tool_list[0].is_tool_spec());
         assert!(tool_list[1].is_cache_point());
+    }
+
+    #[test]
+    fn response_cache_tokens_sdk_api_shape() {
+        use aws_sdk_bedrockruntime::types::TokenUsage;
+        let usage = TokenUsage::builder()
+            .input_tokens(100)
+            .output_tokens(50)
+            .total_tokens(150)
+            .cache_read_input_tokens(30)
+            .cache_write_input_tokens(10)
+            .build()
+            .unwrap();
+        assert_eq!(usage.cache_read_input_tokens(), Some(30));
+        assert_eq!(usage.cache_write_input_tokens(), Some(10));
     }
 }
