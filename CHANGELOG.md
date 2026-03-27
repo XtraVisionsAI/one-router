@@ -1,3 +1,13 @@
+## v0.8.0 (2026-03-27)
+
+### Feat
+
+- **caching**: auto-inject cache_control in openai→anthropic conversions
+- **caching**: auto-inject CachePoint in openai→bedrock conversions
+- **caching**: populate cache token counts from Bedrock response
+- **caching**: cache_control → CachePoint for system messages and tools in anthropic→bedrock
+- **caching**: translate cache_control to CachePoint in anthropic→bedrock content blocks
+
 ## v0.7.0 (2026-03-26)
 
 ### Feat
