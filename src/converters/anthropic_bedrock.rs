@@ -131,8 +131,8 @@ fn convert_messages_to_sdk(messages: &[Message]) -> Result<Vec<SdkMessage>, Conv
             "assistant" => ConversationRole::Assistant,
             _ => {
                 return Err(ConversionError::InvalidMessage(format!(
-                    "Invalid role: {}",
-                    msg.role
+                    "Invalid role: {role}",
+                    role = msg.role
                 )));
             }
         };
@@ -144,7 +144,7 @@ fn convert_messages_to_sdk(messages: &[Message]) -> Result<Vec<SdkMessage>, Conv
             .set_content(Some(content_blocks))
             .build()
             .map_err(|e| {
-                ConversionError::InvalidMessage(format!("Failed to build message: {}", e))
+                ConversionError::InvalidMessage(format!("Failed to build message: {e}"))
             })?;
 
         sdk_messages.push(sdk_msg);
@@ -220,7 +220,7 @@ fn convert_content_block_to_sdk(
                 ))
                 .build()
                 .map_err(|e| {
-                    ConversionError::InvalidContentBlock(format!("Failed to build image: {}", e))
+                    ConversionError::InvalidContentBlock(format!("Failed to build image: {e}"))
                 })?;
 
             let mut out = vec![SdkContentBlock::Image(image)];
@@ -239,7 +239,7 @@ fn convert_content_block_to_sdk(
                 .input(json_to_document(input))
                 .build()
                 .map_err(|e| {
-                    ConversionError::InvalidContentBlock(format!("Failed to build tool use: {}", e))
+                    ConversionError::InvalidContentBlock(format!("Failed to build tool use: {e}"))
                 })?;
             Ok(vec![SdkContentBlock::ToolUse(tool_use)])
         }
@@ -278,8 +278,7 @@ fn convert_content_block_to_sdk(
                 .build()
                 .map_err(|e| {
                     ConversionError::InvalidContentBlock(format!(
-                        "Failed to build tool result: {}",
-                        e
+                        "Failed to build tool result: {e}"
                     ))
                 })?;
 
@@ -319,7 +318,7 @@ fn convert_content_block_to_sdk(
                 ))
                 .build()
                 .map_err(|e| {
-                    ConversionError::InvalidContentBlock(format!("Failed to build document: {}", e))
+                    ConversionError::InvalidContentBlock(format!("Failed to build document: {e}"))
                 })?;
 
             let mut out = vec![SdkContentBlock::Document(doc)];
@@ -400,7 +399,7 @@ fn convert_tools_to_sdk(
             .input_schema(SdkToolInputSchema::Json(json_to_document(&input_schema)))
             .build()
             .map_err(|e| {
-                ConversionError::InvalidTool(format!("Failed to build tool spec: {}", e))
+                ConversionError::InvalidTool(format!("Failed to build tool spec: {e}"))
             })?;
 
         sdk_tools.push(SdkTool::ToolSpec(tool_spec));
@@ -425,7 +424,7 @@ fn convert_tools_to_sdk(
     ToolConfiguration::builder()
         .set_tools(Some(sdk_tools))
         .build()
-        .map_err(|e| ConversionError::InvalidTool(format!("Failed to build tool config: {}", e)))
+        .map_err(|e| ConversionError::InvalidTool(format!("Failed to build tool config: {e}")))
 }
 
 // ============================================================================

@@ -170,8 +170,7 @@ mod request {
                     "assistant" => "model",
                     other => {
                         return Err(AnthropicToGeminiError::InvalidMessage(format!(
-                            "Unknown role: {}",
-                            other
+                            "Unknown role: {other}"
                         )))
                     }
                 };

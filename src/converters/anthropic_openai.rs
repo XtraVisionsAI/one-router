@@ -138,8 +138,7 @@ impl AnthropicToOpenAIConverter {
             "assistant" => ChatRole::Assistant,
             other => {
                 return Err(AnthropicOpenAIError::InvalidMessage(format!(
-                    "Unknown role: {}",
-                    other
+                    "Unknown role: {other}"
                 )))
             }
         };

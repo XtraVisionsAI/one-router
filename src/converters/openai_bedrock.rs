@@ -165,7 +165,7 @@ fn convert_openai_messages_to_sdk(
             .set_content(Some(content_blocks))
             .build()
             .map_err(|e| {
-                OpenAIConversionError::InvalidMessage(format!("Failed to build message: {}", e))
+                OpenAIConversionError::InvalidMessage(format!("Failed to build message: {e}"))
             })?;
 
         sdk_messages.push(sdk_msg);
@@ -200,7 +200,7 @@ fn convert_openai_content_to_sdk(
             .status(ToolResultStatus::Success)
             .build()
             .map_err(|e| {
-                OpenAIConversionError::InvalidContent(format!("Failed to build tool result: {}", e))
+                OpenAIConversionError::InvalidContent(format!("Failed to build tool result: {e}"))
             })?;
 
         return Ok(vec![SdkContentBlock::ToolResult(tool_result)]);
@@ -231,8 +231,7 @@ fn convert_openai_content_to_sdk(
                     .build()
                     .map_err(|e| {
                         OpenAIConversionError::InvalidContent(format!(
-                            "Failed to build tool use: {}",
-                            e
+                            "Failed to build tool use: {e}"
                         ))
                     })?;
 
@@ -313,7 +312,7 @@ fn parse_data_url_to_image(url: &str) -> Result<SdkContentBlock, OpenAIConversio
         ))
         .build()
         .map_err(|e| {
-            OpenAIConversionError::InvalidContent(format!("Failed to build image: {}", e))
+            OpenAIConversionError::InvalidContent(format!("Failed to build image: {e}"))
         })?;
 
     Ok(SdkContentBlock::Image(image))
