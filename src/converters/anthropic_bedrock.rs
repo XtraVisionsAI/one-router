@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn system_with_cache_control_emits_cache_point() {
-        use crate::schemas::anthropic::{CacheControl, SystemContent, SystemMessage};
+        use crate::schemas::anthropic::{CacheControl, SystemMessage};
         let system = SystemContent::Messages(vec![SystemMessage {
             message_type: "text".to_string(),
             text: "You are helpful.".to_string(),
@@ -551,7 +551,6 @@ mod tests {
 
     #[test]
     fn system_text_shorthand_no_cache_point() {
-        use crate::schemas::anthropic::SystemContent;
         let system = SystemContent::Text("You are helpful.".to_string());
         let result = convert_system_to_sdk(&system);
         assert_eq!(result.len(), 1);
@@ -560,7 +559,6 @@ mod tests {
 
     #[test]
     fn tool_with_cache_control_emits_cache_point() {
-        use crate::utils::ToolNameMapper;
         let tools = vec![serde_json::json!({
             "name": "my_tool",
             "description": "does stuff",
