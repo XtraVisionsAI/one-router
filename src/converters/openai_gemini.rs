@@ -97,6 +97,9 @@ impl OpenAIToGeminiConverter {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<(String, GeminiRequest), OpenAIGeminiError> {
+        // TODO(caching): Gemini context caching is not yet supported.
+        // OpenAI requests have no cache_control field; no caching is applied for this path.
+        // See: https://ai.google.dev/gemini-api/docs/caching
         let model = self.get_gemini_model(&request.model);
 
         let (system_messages, chat_messages) = self.split_messages(&request.messages);

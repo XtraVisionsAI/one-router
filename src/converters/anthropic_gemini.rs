@@ -191,6 +191,7 @@ mod request {
             &self,
             content: &MessageContent,
         ) -> Result<Vec<Part>, AnthropicToGeminiError> {
+            // TODO(caching): cache_control on content blocks is silently ignored for Gemini.
             match content {
                 MessageContent::Text(text) => Ok(vec![Part::text(text)]),
                 MessageContent::Blocks(blocks) => {
@@ -269,6 +270,10 @@ mod request {
             &self,
             system: &Option<SystemContent>,
         ) -> Result<Option<GeminiContent>, AnthropicToGeminiError> {
+            // TODO(caching): Gemini context caching is not yet supported.
+            // cache_control fields on SystemContent and ContentBlock are silently ignored.
+            // Gemini caching requires pre-creating a cachedContent resource (32k token min,
+            // hourly billing) — see: https://ai.google.dev/gemini-api/docs/caching
             match system {
                 None => Ok(None),
                 Some(SystemContent::Text(text)) => Ok(Some(GeminiContent::system(text))),
