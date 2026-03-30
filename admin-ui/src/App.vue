@@ -2,5 +2,9 @@
 </script>
 
 <template>
-  <RouterView />
+  <NMessageProvider>
+    <NNotificationProvider>
+      <RouterView />
+    </NNotificationProvider>
+  </NMessageProvider>
 </template>
