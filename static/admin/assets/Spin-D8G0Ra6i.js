@@ -1,6 +1,6 @@
-import { e as f, f as c, P as C, g as h, d as S, j as o, I as x, T as k, k as T, l as v, Q as $, m as w, a as m, R, K as _, J as j, r as O, S as P } from "./index-DgE7LE3Y.js";
-import { u as B } from "./use-compitable-Dd8PnVYW.js";
-const I = f([f("@keyframes spin-rotate", `
+import { e as f, f as c, V as C, g as h, d as S, j as o, M as x, W as k, k as $, l as v, X as w, m as T, a as m, Y as R, Q as _, P as j, r as O, Z as P } from "./index-DicalUKt.js";
+import { u as B } from "./use-compitable-Cxdw_G8M.js";
+const V = f([f("@keyframes spin-rotate", `
  from {
  transform: rotate(0);
  }
@@ -42,11 +42,11 @@ const I = f([f("@keyframes spin-rotate", `
  -webkit-user-select: none;
  pointer-events: none;
  opacity: var(--n-opacity-spinning);
- `)])]), V = { small: 20, medium: 18, large: 16 }, N = Object.assign(Object.assign(Object.assign({}, v.props), { contentClass: String, contentStyle: [Object, String], description: String, size: { type: [String, Number], default: "medium" }, show: { type: Boolean, default: true }, rotate: { type: Boolean, default: true }, spinning: { type: Boolean, validator: () => true, default: void 0 }, delay: Number }), P), K = S({ name: "Spin", props: N, slots: Object, setup(e) {
-  const { mergedClsPrefixRef: r, inlineThemeDisabled: t } = T(e), s = v("Spin", "-spin", I, $, e, r), d = m(() => {
+ `)])]), W = { small: 20, medium: 18, large: 16 }, I = Object.assign(Object.assign(Object.assign({}, v.props), { contentClass: String, contentStyle: [Object, String], description: String, size: { type: [String, Number], default: "medium" }, show: { type: Boolean, default: true }, rotate: { type: Boolean, default: true }, spinning: { type: Boolean, validator: () => true, default: void 0 }, delay: Number }), P), L = S({ name: "Spin", props: I, slots: Object, setup(e) {
+  const { mergedClsPrefixRef: r, inlineThemeDisabled: t } = $(e), s = v("Spin", "-spin", V, w, e, r), d = m(() => {
     const { size: n } = e, { common: { cubicBezierEaseInOut: a }, self: u } = s.value, { opacitySpinning: y, color: g, textColor: b } = u, z = typeof n == "number" ? _(n) : u[j("size", n)];
     return { "--n-bezier": a, "--n-opacity-spinning": y, "--n-size": z, "--n-color": g, "--n-text-color": b };
-  }), i = t ? w("spin", m(() => {
+  }), i = t ? T("spin", m(() => {
     const { size: n } = e;
     return typeof n == "number" ? String(n) : n[0];
   }), d, e) : void 0, p = B(e, ["spinning", "show"]), l = O(false);
@@ -68,7 +68,7 @@ const I = f([f("@keyframes spin-rotate", `
     const { strokeWidth: n } = e;
     if (n !== void 0) return n;
     const { size: a } = e;
-    return V[typeof a == "number" ? "medium" : a];
+    return W[typeof a == "number" ? "medium" : a];
   }), cssVars: t ? void 0 : d, themeClass: i == null ? void 0 : i.themeClass, onRender: i == null ? void 0 : i.onRender };
 }, render() {
   var e, r;
@@ -76,5 +76,5 @@ const I = f([f("@keyframes spin-rotate", `
   return (r = this.onRender) === null || r === void 0 || r.call(this), t.default ? o("div", { class: [`${s}-spin-container`, this.themeClass], style: this.cssVars }, o("div", { class: [`${s}-spin-content`, this.active && `${s}-spin-content--spinning`, this.contentClass], style: this.contentStyle }, t), o(k, { name: "fade-in-transition" }, { default: () => this.active ? l : null })) : l;
 } });
 export {
-  K as _
+  L as _
 };

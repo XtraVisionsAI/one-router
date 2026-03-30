@@ -5,6 +5,7 @@ import { useBackendsApi } from '@/api/backends'
 import { useKeysApi } from '@/api/keys'
 import { useApi } from '@/composables/useApi'
 import type { BackendSummary, ApiKey, StatusResponse } from '@/api/types'
+import { fmtUptime, healthType } from '@/utils/format'
 
 const message = useMessage()
 const backendsApi = useBackendsApi()
@@ -15,18 +16,6 @@ const backends = ref<BackendSummary[]>([])
 const keys = ref<ApiKey[]>([])
 const uptime = ref('')
 const loading = ref(true)
-
-function fmtUptime(secs: number): string {
-  if (secs < 60) return `${secs}s`
-  if (secs < 3600) return `${Math.floor(secs / 60)}m`
-  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`
-}
-
-function healthType(status: string): 'success' | 'error' | 'default' {
-  if (status === 'healthy') return 'success'
-  if (status === 'unhealthy') return 'error'
-  return 'default'
-}
 
 onMounted(async () => {
   try {
@@ -92,30 +81,30 @@ const keyColumns = [
     <NSpin :show="loading">
       <div class="grid grid-cols-4 gap-4 mb-8">
         <NCard size="small" style="position:relative; overflow:hidden">
-          <span class="i-carbon-api" style="position:absolute; top:12px; right:12px; font-size:32px; color:#818cf8; opacity:0.85" />
+          <span class="i-carbon-api absolute top-3 right-3 text-[32px] text-indigo-400 opacity-80" />
           <NStatistic label="API Keys" :value="keys.length" />
         </NCard>
         <NCard size="small" style="position:relative; overflow:hidden">
-          <span class="i-carbon-server-dns" style="position:absolute; top:12px; right:12px; font-size:32px; color:#34d399; opacity:0.85" />
+          <span class="i-carbon-server-dns absolute top-3 right-3 text-[32px] text-emerald-400 opacity-80" />
           <NStatistic label="Backends" :value="backends.length" />
         </NCard>
         <NCard size="small" style="position:relative; overflow:hidden">
-          <span class="i-carbon-checkmark-outline" style="position:absolute; top:12px; right:12px; font-size:32px; color:#60a5fa; opacity:0.85" />
+          <span class="i-carbon-checkmark-outline absolute top-3 right-3 text-[32px] text-blue-400 opacity-80" />
           <NStatistic label="Active Keys" :value="keys.filter(k => k.is_active).length" />
         </NCard>
         <NCard size="small" style="position:relative; overflow:hidden">
-          <span class="i-carbon-time" style="position:absolute; top:12px; right:12px; font-size:32px; color:#fbbf24; opacity:0.85" />
+          <span class="i-carbon-time absolute top-3 right-3 text-[32px] text-amber-400 opacity-80" />
           <NStatistic label="Uptime" :value="uptime" />
         </NCard>
       </div>
 
       <div class="mb-8">
-        <h2 class="text-sm font-medium text-slate-400 uppercase tracking-wider mb-3">Backend Status</h2>
+        <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-3">Backend Status</h2>
         <NDataTable :columns="backendColumns" :data="backends" :pagination="false" size="small" />
       </div>
 
       <div>
-        <h2 class="text-sm font-medium text-slate-400 uppercase tracking-wider mb-3">Recent API Keys</h2>
+        <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-3">Recent API Keys</h2>
         <NDataTable :columns="keyColumns" :data="keys.slice(0, 5)" :pagination="false" size="small" />
       </div>
     </NSpin>

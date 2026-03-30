@@ -4,6 +4,7 @@ import { useMessage } from 'naive-ui'
 import { useUsageApi } from '@/api/usage'
 import type { UsageSummaryParams } from '@/api/usage'
 import type { UsageSummaryRow, UsageSummaryResponse } from '@/api/types'
+import { fmtMoney, fmtTokens } from '@/utils/format'
 
 const message = useMessage()
 const api = useUsageApi()
@@ -13,16 +14,6 @@ const groupBy = ref<'hour' | 'model'>('hour')
 const dateRange = ref<[number, number] | null>(null)
 const result = ref<UsageSummaryResponse | null>(null)
 const loading = ref(false)
-
-function fmtTokens(n: number): string {
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
-  return String(n)
-}
-
-function fmtMoney(n: number): string {
-  return '$' + n.toFixed(2)
-}
 
 async function query() {
   loading.value = true
@@ -80,9 +71,9 @@ const columns = computed(() => [
   <div>
     <h1 class="text-xl font-semibold text-slate-100 mb-6">Usage</h1>
 
-    <div style="display:flex; gap:12px; margin-bottom:24px; align-items:flex-end; flex-wrap:wrap">
+    <div class="flex gap-3 mb-6 flex-wrap items-end">
       <div>
-        <div style="font-size:12px; color:#94a3b8; margin-bottom:4px">API Key</div>
+        <div class="text-xs text-slate-400 mb-1">API Key</div>
         <NInput
           v-model:value="keyFilter"
           placeholder="Optional — leave empty for all"
@@ -91,7 +82,7 @@ const columns = computed(() => [
         />
       </div>
       <div>
-        <div style="font-size:12px; color:#94a3b8; margin-bottom:4px">Date Range</div>
+        <div class="text-xs text-slate-400 mb-1">Date Range</div>
         <NDatePicker
           v-model:value="dateRange"
           type="daterange"
@@ -100,7 +91,7 @@ const columns = computed(() => [
         />
       </div>
       <div>
-        <div style="font-size:12px; color:#94a3b8; margin-bottom:4px">Group By</div>
+        <div class="text-xs text-slate-400 mb-1">Group By</div>
         <NSelect
           v-model:value="groupBy"
           :options="[{ label: 'By Hour', value: 'hour' }, { label: 'By Model', value: 'model' }]"
@@ -120,19 +111,19 @@ const columns = computed(() => [
     <template v-if="result">
       <div class="grid grid-cols-4 gap-4 mb-6">
         <NCard size="small" style="position:relative; overflow:hidden">
-          <span class="i-carbon-send" style="position:absolute; top:12px; right:12px; font-size:32px; color:#818cf8; opacity:0.85" />
+          <span class="i-carbon-send absolute top-3 right-3 text-[32px] text-indigo-400 opacity-80" />
           <NStatistic label="Requests" :value="result.summary.total_requests.toLocaleString()" />
         </NCard>
         <NCard size="small" style="position:relative; overflow:hidden">
-          <span class="i-carbon-arrow-down" style="position:absolute; top:12px; right:12px; font-size:32px; color:#60a5fa; opacity:0.85" />
+          <span class="i-carbon-arrow-down absolute top-3 right-3 text-[32px] text-blue-400 opacity-80" />
           <NStatistic label="Input Tokens" :value="fmtTokens(result.summary.total_input_tokens)" />
         </NCard>
         <NCard size="small" style="position:relative; overflow:hidden">
-          <span class="i-carbon-arrow-up" style="position:absolute; top:12px; right:12px; font-size:32px; color:#34d399; opacity:0.85" />
+          <span class="i-carbon-arrow-up absolute top-3 right-3 text-[32px] text-emerald-400 opacity-80" />
           <NStatistic label="Output Tokens" :value="fmtTokens(result.summary.total_output_tokens)" />
         </NCard>
         <NCard size="small" style="position:relative; overflow:hidden">
-          <span class="i-carbon-currency-dollar" style="position:absolute; top:12px; right:12px; font-size:32px; color:#fbbf24; opacity:0.85" />
+          <span class="i-carbon-currency-dollar absolute top-3 right-3 text-[32px] text-amber-400 opacity-80" />
           <NStatistic label="Total Cost" :value="fmtMoney(result.summary.total_cost)" />
         </NCard>
       </div>

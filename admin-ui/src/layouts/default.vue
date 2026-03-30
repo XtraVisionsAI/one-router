@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { h } from 'vue'
 import type { MenuOption } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 
@@ -28,13 +29,13 @@ function logout() {
 </script>
 
 <template>
-  <div style="display:flex; height:100vh; background:#0f172a; color:#e2e8f0; overflow:hidden">
+  <div class="flex h-screen bg-slate-900 text-slate-200 overflow-hidden">
     <!-- Sidebar -->
-    <aside style="width:208px; display:flex; flex-direction:column; background:#1e293b; border-right:1px solid #334155; flex-shrink:0">
+    <aside class="w-52 flex flex-col bg-slate-800 border-r border-slate-700/60 shrink-0">
       <!-- Logo -->
-      <div style="padding:16px 20px; border-bottom:1px solid #334155">
-        <span style="color:#818cf8; font-weight:600; font-size:15px">one-router</span>
-        <span style="margin-left:8px; font-size:11px; color:#94a3b8; background:#334155; padding:1px 6px; border-radius:4px">admin</span>
+      <div class="px-5 py-4 border-b border-slate-700/60">
+        <span class="text-indigo-400 font-semibold text-[15px]">one-router</span>
+        <span class="ml-2 text-[11px] text-slate-400 bg-slate-700 px-1.5 py-0.5 rounded">admin</span>
       </div>
 
       <!-- Nav -->
@@ -42,13 +43,13 @@ function logout() {
         :options="menuOptions"
         :value="activeKey"
         :indent="16"
-        style="flex:1; padding-top:8px"
+        class="flex-1 pt-2"
         @update:value="onMenuSelect"
       />
 
       <!-- Footer -->
-      <div style="padding:12px 16px; border-top:1px solid #334155; display:flex; align-items:center; justify-content:space-between">
-        <span style="font-size:12px; color:#94a3b8">v{{ auth.version || '—' }}</span>
+      <div class="px-4 py-3 border-t border-slate-700/60 flex items-center justify-between">
+        <span class="text-xs text-slate-500">v{{ auth.version || '—' }}</span>
         <NButton size="tiny" quaternary @click="logout">
           <template #icon><span class="i-carbon-logout" /></template>
           Sign out
@@ -57,8 +58,8 @@ function logout() {
     </aside>
 
     <!-- Main content -->
-    <main style="flex:1; overflow:auto">
-      <div style="padding:24px">
+    <main class="flex-1 overflow-auto">
+      <div class="p-6">
         <RouterView />
       </div>
     </main>

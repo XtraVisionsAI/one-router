@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { h } from 'vue'
-import { useMessage, NTag, NButton } from 'naive-ui'
+import { useMessage, useDialog, NTag, NButton } from 'naive-ui'
 import { useBackendsApi } from '@/api/backends'
 import BackendModal from '@/components/BackendModal.vue'
 import type { BackendSummary } from '@/api/types'
+import { healthType } from '@/utils/format'
 
 const message = useMessage()
+const dialog = useDialog()
 const api = useBackendsApi()
 
 const backends = ref<BackendSummary[]>([])
@@ -45,14 +47,22 @@ async function toggle(name: string) {
   }
 }
 
-async function remove(name: string) {
-  try {
-    await api.delete(name)
-    message.success('Backend deleted')
-    await load()
-  } catch (e: any) {
-    message.error(e.message)
-  }
+function confirmRemove(name: string) {
+  dialog.warning({
+    title: 'Delete Backend',
+    content: `Delete "${name}"? This cannot be undone.`,
+    positiveText: 'Delete',
+    negativeText: 'Cancel',
+    onPositiveClick: async () => {
+      try {
+        await api.delete(name)
+        message.success('Backend deleted')
+        await load()
+      } catch (e: any) {
+        message.error(e.message)
+      }
+    },
+  })
 }
 
 const columns = [
@@ -66,10 +76,8 @@ const columns = [
   {
     title: 'Health',
     key: 'health_status',
-    render: (row: BackendSummary) => {
-      const type = row.health_status === 'healthy' ? 'success' : row.health_status === 'unhealthy' ? 'error' : 'default'
-      return h(NTag, { type, size: 'small' }, { default: () => row.health_status })
-    },
+    render: (row: BackendSummary) =>
+      h(NTag, { type: healthType(row.health_status), size: 'small' }, { default: () => row.health_status }),
   },
   {
     title: 'Enabled',
@@ -83,7 +91,7 @@ const columns = [
     render: (row: BackendSummary) => h('div', { class: 'flex gap-2' }, [
       h(NButton, { size: 'small', onClick: () => openEdit(row) }, { default: () => 'Edit' }),
       h(NButton, { size: 'small', onClick: () => toggle(row.name) }, { default: () => row.enabled ? 'Disable' : 'Enable' }),
-      h(NButton, { size: 'small', type: 'error', onClick: () => remove(row.name) }, { default: () => 'Delete' }),
+      h(NButton, { size: 'small', type: 'error', onClick: () => confirmRemove(row.name) }, { default: () => 'Delete' }),
     ]),
   },
 ]
@@ -107,7 +115,15 @@ onMounted(load)
       :loading="loading"
       :pagination="false"
       size="small"
-    />
+    >
+      <template #empty>
+        <div class="py-12 text-center">
+          <span class="i-carbon-server-dns text-4xl text-slate-600 block mx-auto mb-3" />
+          <p class="text-slate-500 text-sm">No backends configured</p>
+          <NButton type="primary" size="small" class="mt-4" @click="openCreate">Add your first backend</NButton>
+        </div>
+      </template>
+    </NDataTable>
 
     <BackendModal
       v-model:show="modalShow"

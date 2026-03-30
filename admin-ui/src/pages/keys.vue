@@ -4,6 +4,7 @@ import { useMessage, NTag, NButton, NAlert } from 'naive-ui'
 import { useKeysApi } from '@/api/keys'
 import KeyModal from '@/components/KeyModal.vue'
 import type { ApiKey } from '@/api/types'
+import { fmtMoney } from '@/utils/format'
 
 const message = useMessage()
 const api = useKeysApi()
@@ -58,11 +59,6 @@ function onSaved(newKey?: string) {
 
 function copyKey(key: string) {
   navigator.clipboard.writeText(key).then(() => message.success('Copied!'))
-}
-
-function fmtMoney(n: number | null): string {
-  if (n == null) return '—'
-  return '$' + n.toFixed(2)
 }
 
 const columns = [
@@ -146,7 +142,15 @@ onMounted(load)
       :loading="loading"
       :pagination="{ pageSize: 20 }"
       size="small"
-    />
+    >
+      <template #empty>
+        <div class="py-12 text-center">
+          <span class="i-carbon-api text-4xl text-slate-600 block mx-auto mb-3" />
+          <p class="text-slate-500 text-sm">No API keys yet</p>
+          <NButton type="primary" size="small" class="mt-4" @click="openCreate">Create your first key</NButton>
+        </div>
+      </template>
+    </NDataTable>
 
     <KeyModal
       v-model:show="modalShow"

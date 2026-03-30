@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { h } from 'vue'
-import { useMessage, NTag, NButton } from 'naive-ui'
+import { useMessage, useDialog, NTag, NButton } from 'naive-ui'
 import { useMappingsApi } from '@/api/mappings'
 import MappingModal from '@/components/MappingModal.vue'
 import type { ModelMapping } from '@/api/types'
 
 const message = useMessage()
+const dialog = useDialog()
 const api = useMappingsApi()
 
 const allMappings = ref<ModelMapping[]>([])
@@ -51,21 +52,29 @@ function openEdit(m: ModelMapping) {
   modalShow.value = true
 }
 
-async function remove(m: ModelMapping) {
-  try {
-    await api.delete(m.source_model_id, m.provider)
-    message.success('Mapping deleted')
-    await load()
-  } catch (e: any) {
-    message.error(e.message)
-  }
+function confirmRemove(m: ModelMapping) {
+  dialog.warning({
+    title: 'Delete Mapping',
+    content: `Delete mapping "${m.source_model_id}" → ${m.provider}?`,
+    positiveText: 'Delete',
+    negativeText: 'Cancel',
+    onPositiveClick: async () => {
+      try {
+        await api.delete(m.source_model_id, m.provider)
+        message.success('Mapping deleted')
+        await load()
+      } catch (e: any) {
+        message.error(e.message)
+      }
+    },
+  })
 }
 
 const columns = [
   {
     title: 'Source Model',
     key: 'source_model_id',
-    render: (row: ModelMapping) => h('span', { class: 'font-mono text-xs' }, row.source_model_id),
+    render: (row: ModelMapping) => h('span', { class: 'font-mono text-xs text-slate-200' }, row.source_model_id),
   },
   {
     title: 'Target Model',
@@ -90,7 +99,7 @@ const columns = [
     key: 'actions',
     render: (row: ModelMapping) => h('div', { class: 'flex gap-2' }, [
       h(NButton, { size: 'small', onClick: () => openEdit(row) }, { default: () => 'Edit' }),
-      h(NButton, { size: 'small', type: 'error', onClick: () => remove(row) }, { default: () => 'Delete' }),
+      h(NButton, { size: 'small', type: 'error', onClick: () => confirmRemove(row) }, { default: () => 'Delete' }),
     ]),
   },
 ]
@@ -108,7 +117,7 @@ onMounted(load)
       </NButton>
     </div>
 
-    <div class="flex gap-3 mb-4 flex-wrap">
+    <div class="flex gap-3 mb-4 flex-wrap items-center">
       <NInput
         v-model:value="filterSrc"
         placeholder="Filter by source model…"
@@ -125,7 +134,7 @@ onMounted(load)
         :options="[{ label: 'All Status', value: '' }, { label: 'active', value: 'active' }, { label: 'inactive', value: 'inactive' }]"
         style="width: 130px"
       />
-      <span class="text-slate-500 text-sm self-center">
+      <span class="text-slate-500 text-xs">
         {{ filtered.length === allMappings.length ? `${allMappings.length} mappings` : `${filtered.length} / ${allMappings.length}` }}
       </span>
     </div>
@@ -136,7 +145,15 @@ onMounted(load)
       :loading="loading"
       :pagination="{ pageSize: 30 }"
       size="small"
-    />
+    >
+      <template #empty>
+        <div class="py-12 text-center">
+          <span class="i-carbon-arrows-horizontal text-4xl text-slate-600 block mx-auto mb-3" />
+          <p class="text-slate-500 text-sm">No model mappings configured</p>
+          <NButton type="primary" size="small" class="mt-4" @click="openCreate">Add your first mapping</NButton>
+        </div>
+      </template>
+    </NDataTable>
 
     <MappingModal
       v-model:show="modalShow"
