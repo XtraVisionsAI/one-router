@@ -5,6 +5,7 @@
 //! PUT    /admin/api/backends/:name     → update backend (config encrypted if provided)
 //! DELETE /admin/api/backends/:name     → delete backend
 //! PUT    /admin/api/backends/:name/toggle → toggle enabled flag
+//! GET    /admin/api/backends/:name/config → return decrypted config for editing
 
 use axum::{
     extract::{Path, State},
@@ -388,31 +389,39 @@ pub async fn get_backend_config(
         }
     };
 
-    match state.encryptor.decrypt(&record.config) {
-        Ok(plaintext) => match serde_json::from_str::<Value>(&plaintext) {
-            Ok(config_val) => (
-                StatusCode::OK,
-                Json(serde_json::json!({ "config": config_val })),
-            )
-                .into_response(),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new("api_error", "Config is not valid JSON")),
-            )
-                .into_response(),
-        },
+    let plaintext = match state.encryptor.decrypt(&record.config) {
+        Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, backend = %name, "Failed to decrypt backend config");
-            (
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "api_error",
                     "Failed to decrypt backend config",
                 )),
             )
-                .into_response()
+                .into_response();
         }
-    }
+    };
+
+    let config_val = match serde_json::from_str::<Value>(&plaintext) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, backend = %name, "Decrypted config is not valid JSON");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("api_error", "Config is not valid JSON")),
+            )
+                .into_response();
+        }
+    };
+
+    tracing::info!(backend = %name, "Admin accessed decrypted backend config");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "config": config_val })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
