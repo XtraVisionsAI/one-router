@@ -1,0 +1,34 @@
+{
+  "name": "@one-router/admin-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "dependencies": {
+    "naive-ui": "^2.41.0",
+    "pinia": "^3.0.0",
+    "vue": "^3.5.0",
+    "vue-router": "^4.5.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["@swc/core", "esbuild", "unrs-resolver"]
+  },
+  "devDependencies": {
+    "@iconify-json/carbon": "^1.2.0",
+    "@types/node": "^22.0.0",
+    "@vueuse/core": "^13.0.0",
+    "@xv-shared/eslint-config": "^1.0.0",
+    "@xv-shared/stylelint-config": "^1.0.0",
+    "@xv-shared/ts-config": "^1.0.0",
+    "@xv-shared/vite": "^1.0.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.2.0",
+    "vue-tsc": "^2.2.0"
+  }
+}

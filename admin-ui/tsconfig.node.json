@@ -1,0 +1,8 @@
+{
+  "extends": "@xv-shared/ts-config/base.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  },
+  "include": ["vite.config.ts", "uno.config.ts", "eslint.config.ts"]
+}

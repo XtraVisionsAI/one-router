@@ -1,0 +1,5 @@
+{
+  "root": true,
+  "extends": ["@xv-shared/stylelint-config"],
+  "ignoreFiles": ["**/dist/*", "**/public/*"]
+}
