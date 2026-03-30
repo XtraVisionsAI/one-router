@@ -1,10 +1,13 @@
 <script setup lang="ts">
+import { darkTheme } from 'naive-ui'
 </script>
 
 <template>
-  <NMessageProvider>
-    <NNotificationProvider>
-      <RouterView />
-    </NNotificationProvider>
-  </NMessageProvider>
+  <NConfigProvider :theme="darkTheme">
+    <NMessageProvider>
+      <NNotificationProvider>
+        <RouterView />
+      </NNotificationProvider>
+    </NMessageProvider>
+  </NConfigProvider>
 </template>

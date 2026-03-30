@@ -2,6 +2,7 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import { createRouter, createWebHashHistory } from 'vue-router/auto'
 import { routes } from 'vue-router/auto-routes'
+import { setupLayouts } from 'virtual:meta-layouts'
 import { useAuthStore } from './stores/auth'
 import App from './App.vue'
 import 'virtual:uno.css'
@@ -11,7 +12,7 @@ const pinia = createPinia()
 
 const router = createRouter({
   history: createWebHashHistory(),
-  routes,
+  routes: setupLayouts(routes),
 })
 
 // Route guard: redirect to /login when not authenticated, redirect to /dashboard when already authenticated
