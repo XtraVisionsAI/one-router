@@ -80,30 +80,33 @@ const columns = computed(() => [
   <div>
     <h1 class="text-xl font-semibold text-slate-100 mb-6">Usage</h1>
 
-    <div class="flex gap-3 mb-6 flex-wrap items-end">
-      <NFormItem label="API Key" class="mb-0">
+    <div style="display:flex; gap:12px; margin-bottom:24px; align-items:flex-end; flex-wrap:wrap">
+      <div>
+        <div style="font-size:12px; color:#94a3b8; margin-bottom:4px">API Key</div>
         <NInput
           v-model:value="keyFilter"
           placeholder="Optional — leave empty for all"
           style="width:240px"
           clearable
         />
-      </NFormItem>
-      <NFormItem label="Date Range" class="mb-0">
+      </div>
+      <div>
+        <div style="font-size:12px; color:#94a3b8; margin-bottom:4px">Date Range</div>
         <NDatePicker
           v-model:value="dateRange"
           type="daterange"
           clearable
-          style="width:240px"
+          style="width:260px"
         />
-      </NFormItem>
-      <NFormItem label="Group By" class="mb-0">
+      </div>
+      <div>
+        <div style="font-size:12px; color:#94a3b8; margin-bottom:4px">Group By</div>
         <NSelect
           v-model:value="groupBy"
           :options="[{ label: 'By Hour', value: 'hour' }, { label: 'By Model', value: 'model' }]"
           style="width:130px"
         />
-      </NFormItem>
+      </div>
       <NButton type="primary" :loading="loading" @click="query">
         <template #icon><span class="i-carbon-search" /></template>
         Query
