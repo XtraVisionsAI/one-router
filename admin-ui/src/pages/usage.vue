@@ -1,0 +1,141 @@
+<script setup lang="ts">
+import { h } from 'vue'
+import { useMessage } from 'naive-ui'
+import { useUsageApi } from '@/api/usage'
+import type { UsageSummaryParams } from '@/api/usage'
+import type { UsageSummaryRow, UsageSummaryResponse } from '@/api/types'
+
+const message = useMessage()
+const api = useUsageApi()
+
+const keyFilter = ref('')
+const groupBy = ref<'hour' | 'model'>('hour')
+const dateRange = ref<[number, number] | null>(null)
+const result = ref<UsageSummaryResponse | null>(null)
+const loading = ref(false)
+
+function fmtTokens(n: number): string {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+  return String(n)
+}
+
+function fmtMoney(n: number): string {
+  return '$' + n.toFixed(2)
+}
+
+async function query() {
+  loading.value = true
+  try {
+    const params: UsageSummaryParams = { group_by: groupBy.value }
+    if (keyFilter.value.trim()) params.api_key = keyFilter.value.trim()
+    if (dateRange.value) {
+      params.start_time = new Date(dateRange.value[0]).toISOString()
+      params.end_time = new Date(dateRange.value[1] + 86400000 - 1).toISOString()
+    }
+    result.value = await api.summary(params)
+  } catch (e: any) {
+    message.error(e.message)
+  } finally {
+    loading.value = false
+  }
+}
+
+const columns = computed(() => [
+  {
+    title: groupBy.value === 'model' ? 'Model' : 'Hour',
+    key: 'group_key',
+    render: (row: UsageSummaryRow) => h('span', { class: 'font-mono text-xs' }, row.group_key),
+  },
+  {
+    title: 'Requests',
+    key: 'total_requests',
+    render: (row: UsageSummaryRow) => row.total_requests.toLocaleString(),
+  },
+  {
+    title: 'Errors',
+    key: 'error_requests',
+    render: (row: UsageSummaryRow) =>
+      h('span', { class: row.error_requests > 0 ? 'text-red-400' : '' }, String(row.error_requests)),
+  },
+  {
+    title: 'Input',
+    key: 'input_tokens',
+    render: (row: UsageSummaryRow) => fmtTokens(row.input_tokens),
+  },
+  {
+    title: 'Output',
+    key: 'output_tokens',
+    render: (row: UsageSummaryRow) => fmtTokens(row.output_tokens),
+  },
+  {
+    title: 'Cost',
+    key: 'total_cost',
+    render: (row: UsageSummaryRow) => fmtMoney(row.total_cost),
+  },
+])
+</script>
+
+<template>
+  <div>
+    <h1 class="text-xl font-semibold text-slate-100 mb-6">Usage</h1>
+
+    <div class="flex gap-3 mb-6 flex-wrap items-end">
+      <NFormItem label="API Key" class="mb-0">
+        <NInput
+          v-model:value="keyFilter"
+          placeholder="Optional — leave empty for all"
+          style="width:240px"
+          clearable
+        />
+      </NFormItem>
+      <NFormItem label="Date Range" class="mb-0">
+        <NDatePicker
+          v-model:value="dateRange"
+          type="daterange"
+          clearable
+          style="width:240px"
+        />
+      </NFormItem>
+      <NFormItem label="Group By" class="mb-0">
+        <NSelect
+          v-model:value="groupBy"
+          :options="[{ label: 'By Hour', value: 'hour' }, { label: 'By Model', value: 'model' }]"
+          style="width:130px"
+        />
+      </NFormItem>
+      <NButton type="primary" :loading="loading" @click="query">
+        <template #icon><span class="i-carbon-search" /></template>
+        Query
+      </NButton>
+    </div>
+
+    <p v-if="!result && !loading" class="text-slate-500 text-sm">
+      Select filters and click Query. Leave API key empty to aggregate all keys.
+    </p>
+
+    <template v-if="result">
+      <div class="grid grid-cols-4 gap-4 mb-6">
+        <NCard size="small">
+          <NStatistic label="Requests" :value="result.summary.total_requests.toLocaleString()" />
+        </NCard>
+        <NCard size="small">
+          <NStatistic label="Input Tokens" :value="fmtTokens(result.summary.total_input_tokens)" />
+        </NCard>
+        <NCard size="small">
+          <NStatistic label="Output Tokens" :value="fmtTokens(result.summary.total_output_tokens)" />
+        </NCard>
+        <NCard size="small">
+          <NStatistic label="Total Cost" :value="fmtMoney(result.summary.total_cost)" />
+        </NCard>
+      </div>
+
+      <NDataTable
+        :columns="columns"
+        :data="result.data"
+        :pagination="{ pageSize: 50 }"
+        size="small"
+      />
+    </template>
+  </div>
+</template>
