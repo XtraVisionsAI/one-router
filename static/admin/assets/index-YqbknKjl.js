@@ -1,4 +1,4 @@
-const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/index-CrekjoU-.js","assets/route-block-B_A1xBdJ.js","assets/backends-DWzTfIb2.js","assets/backends-CdG_WrM9.js","assets/useApi-Dn3Fgv7i.js","assets/use-form-item-C0_shOgu.js","assets/use-message-ATPVOnVB.js","assets/FormItem-QsNyBlj1.js","assets/Input-DWI3RPho.js","assets/Button-BTod08TO.js","assets/DataTable-BJIWqNGu.js","assets/InputNumber-8BaSFOJn.js","assets/dashboard-DkYjo4Ea.js","assets/keys-C1zTkIiK.js","assets/Statistic-B5MM433v.js","assets/Spin-Dwws5ON9.js","assets/flags-DRNGYpoz.js","assets/keys-Ct4lqnIh.js","assets/login-DBSfuCk9.js","assets/mappings-Bb8ENQDR.js","assets/usage-BA2D--QX.js","assets/default-BuaW0bMg.js"])))=>i.map(i=>d[i]);
+const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/index-CFYQhzWw.js","assets/route-block-B_A1xBdJ.js","assets/backends-BXeVOxcI.js","assets/backends-By8nl6Vb.js","assets/useApi-ClSvQxGZ.js","assets/use-form-item-B02FE9As.js","assets/use-message-B7xbmhU1.js","assets/FormItem-DHwZ_qLU.js","assets/Input-DK9mG32G.js","assets/Button-CV4-g0dr.js","assets/DataTable-14e5pRmB.js","assets/InputNumber-B74hWMDY.js","assets/dashboard-C1gt3Xj2.js","assets/keys-DtrRsEFo.js","assets/Statistic-BA45VDrC.js","assets/Spin-CObAkYad.js","assets/flags-BKqtB-8H.js","assets/keys-I9rNC3pg.js","assets/login-COM2woMg.js","assets/mappings-Bz-QOEN6.js","assets/usage-D_5DExzr.js","assets/default-DxAMwicK.js"])))=>i.map(i=>d[i]);
 let Fl, kf, Ni, dl, $e, ZS, V, sl, qm, cC, Gt, Ym, Js, qe, dd, jy, uC, uw, Gn, aC, Lr, TC, X, AC, Kc, md, lC, Dl, ie, Jr, fd, gd, pd, hd, Ko, Bl, cw, Kb, Jt, qy, si, Zs, to, Qr, Gb, R1, sw, dw, qr, Bo, tt, Nm, gc, ri, da, yc, wc, Bp, Hu, ua, Ol, ir, Rv, Gu, zl, Ev, On, Tm, Uy, Gy, xn, vr, qn, Xn, Po, tw, Yy, Qy, To, z1, _c, Vb, bo, ky, Cd, Vy, Ub, Vn, aw, hb, Xm, rw, jl, Te, p0, Qu, sr, nr, ni, Ea, qu, ar, Yu, lr, S1, lw, v1, Gr, ew, iw, JC, n0, rx, F1, Mp, Br, Lo, Vu, Nu, ol, Wu, Xx, i0, Ll, cr, wd, Zy, en, nw, Jn, yC, pa, PC, Jy, t1, p1, Fu, h1, m1, w1, C1, ow, oo, Le, Q, pe, ge, Ue, Ae, z, Yr, ko, Il, Tn, Fo, En, fn, Ce, mo, Cl, Ky, Ke, Jo, Ny, Uc, Wy;
 let __tla = (async () => {
   (function() {
@@ -4993,7 +4993,7 @@ let __tla = (async () => {
     {
       path: "/",
       name: "/",
-      component: () => Mt(() => import("./index-CrekjoU-.js"), __vite__mapDeps([0,1])),
+      component: () => Mt(() => import("./index-CFYQhzWw.js"), __vite__mapDeps([0,1])),
       meta: {
         layout: "auth"
       }
@@ -5001,27 +5001,27 @@ let __tla = (async () => {
     {
       path: "/backends",
       name: "/backends",
-      component: () => Mt(() => import("./backends-DWzTfIb2.js"), __vite__mapDeps([2,3,4,5,6,7,8,9,10,11]))
+      component: () => Mt(() => import("./backends-BXeVOxcI.js"), __vite__mapDeps([2,3,4,5,6,7,8,9,10,11]))
     },
     {
       path: "/dashboard",
       name: "/dashboard",
-      component: () => Mt(() => import("./dashboard-DkYjo4Ea.js"), __vite__mapDeps([12,3,4,5,13,14,15,6,10,8,9]))
+      component: () => Mt(() => import("./dashboard-C1gt3Xj2.js"), __vite__mapDeps([12,3,4,5,13,14,15,6,10,8,9]))
     },
     {
       path: "/flags",
       name: "/flags",
-      component: () => Mt(() => import("./flags-DRNGYpoz.js"), __vite__mapDeps([16,4,5,6,15]))
+      component: () => Mt(() => import("./flags-BKqtB-8H.js"), __vite__mapDeps([16,4,5,6,15]))
     },
     {
       path: "/keys",
       name: "/keys",
-      component: () => Mt(() => import("./keys-Ct4lqnIh.js"), __vite__mapDeps([17,13,4,5,9,6,7,8,11,10]))
+      component: () => Mt(() => import("./keys-I9rNC3pg.js"), __vite__mapDeps([17,13,4,5,9,6,7,8,11,10]))
     },
     {
       path: "/login",
       name: "/login",
-      component: () => Mt(() => import("./login-DBSfuCk9.js"), __vite__mapDeps([18,9,5,7,8,6,1])),
+      component: () => Mt(() => import("./login-COM2woMg.js"), __vite__mapDeps([18,9,5,7,8,6,1])),
       meta: {
         layout: "auth"
       }
@@ -5029,19 +5029,19 @@ let __tla = (async () => {
     {
       path: "/mappings",
       name: "/mappings",
-      component: () => Mt(() => import("./mappings-Bb8ENQDR.js"), __vite__mapDeps([19,4,5,9,6,7,8,10,11]))
+      component: () => Mt(() => import("./mappings-Bz-QOEN6.js"), __vite__mapDeps([19,4,5,9,6,7,8,10,11]))
     },
     {
       path: "/usage",
       name: "/usage",
-      component: () => Mt(() => import("./usage-BA2D--QX.js"), __vite__mapDeps([20,4,5,8,9,6,10,7,14]))
+      component: () => Mt(() => import("./usage-D_5DExzr.js"), __vite__mapDeps([20,4,5,8,9,6,10,7,14]))
     }
   ];
   function Pm(e) {
     const t = {};
     Object.entries(Object.assign({
-      "/src/layouts/auth.vue": () => Mt(() => import("./auth-D3GkMWR1.js"), []),
-      "/src/layouts/default.vue": () => Mt(() => import("./default-BuaW0bMg.js"), __vite__mapDeps([21,9,5]))
+      "/src/layouts/auth.vue": () => Mt(() => import("./auth-BeHcq1pV.js"), []),
+      "/src/layouts/default.vue": () => Mt(() => import("./default-DxAMwicK.js"), __vite__mapDeps([21,9,5]))
     })).forEach(([n, i]) => {
       let l = n.replace("/src/layouts/", "").replace(".vue", "");
       t[l] = i;

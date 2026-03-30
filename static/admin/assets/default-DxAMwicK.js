@@ -1,6 +1,6 @@
-import { d as v, aa as y, z as r, y as e, M as k, O as w, A as l, s as i, v as o, q as a, u as B, a9 as C, bK as c, n as d, C as p, B as u } from "./index-05ypFx4P.js";
-import { B as R } from "./Button-BTod08TO.js";
-import "./use-form-item-C0_shOgu.js";
+import { d as v, aa as y, z as r, y as e, M as k, O as w, A as l, s as i, v as o, q as a, u as B, a9 as C, bK as c, n as d, C as p, B as u } from "./index-YqbknKjl.js";
+import { B as R } from "./Button-CV4-g0dr.js";
+import "./use-form-item-B02FE9As.js";
 const V = { class: "flex h-screen bg-[#0f172a] text-slate-200 overflow-hidden" }, z = { class: "w-52 flex flex-col bg-[#1e293b] border-r border-slate-700 shrink-0" }, N = { class: "flex-1 py-3 space-y-0.5 px-2" }, A = { class: "px-4 py-3 border-t border-slate-700 flex items-center justify-between" }, L = { class: "text-xs text-slate-500" }, M = { class: "flex-1 overflow-auto" }, S = { class: "p-6" }, j = v({ __name: "default", setup(q) {
   const n = y(), b = B(), x = C(), h = [{ path: "/dashboard", icon: "i-carbon-dashboard", label: "Dashboard" }, { path: "/keys", icon: "i-carbon-api", label: "API Keys" }, { path: "/backends", icon: "i-carbon-server-dns", label: "Backends" }, { path: "/mappings", icon: "i-carbon-arrows-horizontal", label: "Model Maps" }, { path: "/usage", icon: "i-carbon-chart-bar", label: "Usage" }, { path: "/flags", icon: "i-carbon-toggle", label: "Flags" }];
   function g() {
