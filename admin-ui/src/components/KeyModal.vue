@@ -88,7 +88,9 @@ async function save() {
   >
     <div class="space-y-1">
       <NFormItem v-if="isEdit" label="Key">
-        <NInput :value="existing!.api_key" readonly />
+        <div style="font-family:monospace; font-size:12px; color:#94a3b8; padding:6px 0; word-break:break-all">
+          {{ existing!.api_key }}
+        </div>
       </NFormItem>
 
       <NFormItem label="Name" required>
