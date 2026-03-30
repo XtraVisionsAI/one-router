@@ -361,6 +361,60 @@ pub async fn toggle_backend(
     }
 }
 
+/// GET /admin/api/backends/:name/config — return decrypted config JSON
+pub async fn get_backend_config(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let record = match state.database.backends().get_backend(&name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new("not_found_error", "Backend not found")),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to fetch backend config");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Failed to retrieve backend",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    match state.encryptor.decrypt(&record.config) {
+        Ok(plaintext) => match serde_json::from_str::<Value>(&plaintext) {
+            Ok(config_val) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "config": config_val })),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("api_error", "Config is not valid JSON")),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            tracing::error!(error = %e, backend = %name, "Failed to decrypt backend config");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Failed to decrypt backend config",
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -93,6 +93,10 @@ pub fn create_router(state: AppState) -> Router {
             "/backends/:name/toggle",
             put(admin::backends::toggle_backend),
         )
+        .route(
+            "/backends/:name/config",
+            get(admin::backends::get_backend_config),
+        )
         // Model Mappings
         .route("/mappings", get(admin::mappings::list_mappings))
         .route("/mappings", post(admin::mappings::create_mapping))
