@@ -15,7 +15,7 @@ export function useApi() {
 
     if (res.status === 401 || res.status === 403) {
       auth.logout()
-      window.location.hash = '#/login'
+      window.location.hash = '/login'
       throw new Error('Unauthorized')
     }
 
