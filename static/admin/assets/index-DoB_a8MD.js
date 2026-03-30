@@ -1,4 +1,4 @@
-import { d as o, u as r } from "./index-YqbknKjl.js";
+import { d as o, u as r } from "./index-BeCJuQaP.js";
 import { b as e } from "./route-block-B_A1xBdJ.js";
 const t = o({ __name: "index", setup(n) {
   return r().replace("/dashboard"), (s, u) => null;

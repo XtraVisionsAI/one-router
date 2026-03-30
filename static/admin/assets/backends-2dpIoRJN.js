@@ -1,13 +1,15 @@
-import { u as Q } from "./backends-By8nl6Vb.js";
-import { u as X } from "./use-message-B7xbmhU1.js";
-import { _ as ee } from "./FormItem-DHwZ_qLU.js";
-import { _ as te } from "./Input-DK9mG32G.js";
-import { i as ne, c as se, a as B, b as le, e as P, f as ae, g as G, h as oe, d as W, j as C, k as ie, o as Y, w as V, t as K, l as Z, m as re, r as k, n as j, p as q, q as x, s as n, v as _, x as F, y, z as E, A as J, B as O, C as ue, D as ce } from "./index-YqbknKjl.js";
-import { _ as de, a as me, N as U } from "./DataTable-14e5pRmB.js";
-import { _ as fe, a as he } from "./InputNumber-B74hWMDY.js";
-import { B as L } from "./Button-CV4-g0dr.js";
-import "./useApi-ClSvQxGZ.js";
-import "./use-form-item-B02FE9As.js";
+import { u as Q } from "./backends-DXMWoUgT.js";
+import { u as X } from "./use-message-DKczUg3b.js";
+import { _ as ee } from "./FormItem-Bv_x9aEm.js";
+import { _ as te } from "./Input-ZeuXgzVS.js";
+import { i as ne, c as se, a as B, b as le, e as P, f as ae, g as G, h as oe, d as W, j as C, k as ie, o as Y, w as V, t as K, l as Z, m as re, r as k, n as j, p as q, q as x, s as n, v as _, x as F, y, z as E, A as J, B as O, C as ue, D as ce } from "./index-BeCJuQaP.js";
+import { _ as de, a as me, N as U } from "./DataTable-oI1U9dT2.js";
+import { _ as fe, a as he } from "./InputNumber-3jxQTUTU.js";
+import { B as L } from "./Button-VZQzYgCk.js";
+import "./useApi-vKujPf0b.js";
+import "./use-form-item-FVzrOHI4.js";
+import "./Dropdown-Ci2kVRZD.js";
+import "./use-compitable-E97dXjzV.js";
 function ve(s, e) {
   const a = ne(se, null);
   return B(() => s.hljs || (a == null ? void 0 : a.mergedHljsRef.value));
@@ -216,7 +218,7 @@ const pe = { common: le, self: ge }, ye = P([ae("code", `
     const z = te, T = ee, M = de, A = fe, I = L, H = he;
     return j(), q(H, { show: s.show, title: n(N), preset: "card", style: { width: "520px" }, "onUpdate:show": o[4] || (o[4] = (w) => p("update:show", w)) }, { footer: x(() => [y("div", ze, [_(I, { onClick: o[3] || (o[3] = (w) => p("update:show", false)) }, { default: x(() => [...o[7] || (o[7] = [O("Cancel", -1)])]), _: 1 }), _(I, { type: "primary", loading: n(l), onClick: S }, { default: x(() => [O(J(n(f) ? "Save" : "Create"), 1)]), _: 1 }, 8, ["loading"])])]), default: x(() => [n(f) ? F("", true) : (j(), q(T, { key: 0, label: "Name", required: "" }, { default: x(() => [_(z, { value: n(v).name, "onUpdate:value": o[0] || (o[0] = (w) => n(v).name = w), placeholder: "e.g. gemini-prod" }, null, 8, ["value"])]), _: 1 })), y("div", xe, [_(T, { label: "Type", class: "flex-1", required: "" }, { default: x(() => [_(M, { value: n(v).backend_type, "onUpdate:value": o[1] || (o[1] = (w) => n(v).backend_type = w), options: ["gemini", "anthropic", "openai", "bedrock"].map((w) => ({ label: w, value: w })) }, null, 8, ["value", "options"])]), _: 1 }), _(T, { label: "Priority", class: "w-28" }, { default: x(() => [_(A, { value: n(v).priority, "onUpdate:value": o[2] || (o[2] = (w) => n(v).priority = w), min: -999, max: 999 }, null, 8, ["value"])]), _: 1 })]), _(T, { label: n(f) ? "Config" : "Config JSON", required: !n(f) }, { default: x(() => [n(f) ? (j(), E("div", ke, [y("div", $e, [y("span", we, J(n(c) ? "Decrypted config (editable)" : "Current config summary"), 1), _(I, { size: "tiny", loading: n(t), onClick: R }, { icon: x(() => [y("span", { class: ue(n(c) ? "i-carbon-view-off" : "i-carbon-view") }, null, 2)]), default: x(() => [O(" " + J(n(c) ? "Hide" : "View / Edit Config"), 1)]), _: 1 }, 8, ["loading"])]), n(c) ? (j(), q(z, { key: 1, value: n(i), type: "textarea", rows: 8, placeholder: "Leave empty to keep existing config", status: n(r) === "invalid" ? "error" : n(r) === "valid" ? "success" : void 0, onInput: g, onBlur: b }, null, 8, ["value", "status"])) : (j(), q(n(be), { key: 0, code: n(D), language: "json", class: "text-xs" }, null, 8, ["code"])), n(r) === "invalid" ? (j(), E("div", je, "\u2717 " + J(n($)), 1)) : n(r) === "valid" && n(c) ? (j(), E("div", Ce, "\u2713 Valid JSON")) : F("", true), o[5] || (o[5] = y("p", { class: "text-xs text-slate-500 mt-1" }, "Leave empty to keep existing config.", -1))])) : (j(), E("div", Ne, [_(z, { value: n(i), type: "textarea", rows: 6, placeholder: '{"api_keys":["AIza..."]}', status: n(r) === "invalid" ? "error" : n(r) === "valid" ? "success" : void 0, onInput: g, onBlur: b }, null, 8, ["value", "status"]), n(r) === "invalid" ? (j(), E("div", Be, "\u2717 " + J(n($)), 1)) : n(r) === "valid" ? (j(), E("div", Se, "\u2713 Valid JSON")) : F("", true), o[6] || (o[6] = y("p", { class: "text-xs text-slate-500 mt-1" }, [O(" Credentials are encrypted before storage."), y("br"), O(" Gemini/Anthropic/OpenAI: "), y("code", null, '{"api_keys":["key1"]}'), y("br"), O(" Bedrock: "), y("code", null, '{"region":"us-east-1"}')], -1))]))]), _: 1 }, 8, ["label", "required"])]), _: 1 }, 8, ["show", "title"]);
   };
-} }), Oe = { class: "flex items-center justify-between mb-6" }, Me = W({ __name: "backends", setup(s) {
+} }), Oe = { class: "flex items-center justify-between mb-6" }, Fe = W({ __name: "backends", setup(s) {
   const e = X(), a = Q(), p = k([]), u = k(true), m = k(false), f = k();
   async function N() {
     u.value = true;
@@ -259,5 +261,5 @@ const pe = { common: le, self: ge }, ye = P([ae("code", `
   };
 } });
 export {
-  Me as default
+  Fe as default
 };

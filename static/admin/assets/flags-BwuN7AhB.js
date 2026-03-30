@@ -1,8 +1,9 @@
-import { u as pe, _ as we } from "./useApi-ClSvQxGZ.js";
-import { b as xe, E as ye, F as _e, f as q, h as a, G, e as W, g as f, H as X, d as ee, j as s, N as ke, I as Ce, k as Se, l as te, r as N, m as Be, a as T, t as $e, J as k, K as E, L as v, o as Re, n as z, z as O, y as V, v as Y, q as J, s as P, x as Q, M as ze, O as Ve, p as Fe, A as Z } from "./index-YqbknKjl.js";
-import { i as H, r as C, u as Ne, c as L } from "./use-form-item-B02FE9As.js";
-import { a as je, u as Te } from "./use-message-B7xbmhU1.js";
-import { _ as Oe } from "./Spin-CObAkYad.js";
+import { u as pe, _ as we } from "./useApi-vKujPf0b.js";
+import { b as xe, E as ye, F as _e, f as q, h as a, G, e as W, g as f, H as X, d as ee, j as s, N as ke, I as Ce, k as Se, l as te, r as N, m as Be, a as T, t as $e, J as k, K as E, L as v, o as Re, n as z, z as O, y as V, v as Y, q as J, s as P, x as Q, M as ze, O as Ve, p as Fe, A as Z } from "./index-BeCJuQaP.js";
+import { i as H, r as C, u as Ne, a as je, c as L } from "./use-form-item-FVzrOHI4.js";
+import { u as Te } from "./use-message-DKczUg3b.js";
+import { _ as Oe } from "./Spin-CZNDcIsW.js";
+import "./use-compitable-E97dXjzV.js";
 function Pe(e) {
   const { primaryColor: r, opacityDisabled: c, borderRadius: i, textColor3: d } = e;
   return Object.assign(Object.assign({}, ye), { iconColor: d, textColor: "white", loadingColor: r, opacityDisabled: c, railColor: "rgba(0, 0, 0, .14)", railColorActive: r, buttonBoxShadow: "0 1px 4px 0 rgba(0, 0, 0, 0.3), inset 0 0 1px 0 rgba(0, 0, 0, 0.05)", buttonColor: "#FFF", railBorderRadiusSmall: i, railBorderRadiusMedium: i, railBorderRadiusLarge: i, buttonBorderRadiusSmall: i, buttonBorderRadiusMedium: i, buttonBorderRadiusLarge: i, boxShadowFocus: `0 0 0 2px ${_e(r, { alpha: 0.2 })}` });
@@ -165,7 +166,7 @@ function Ke() {
   const { request: e } = pe();
   return { list: () => e("GET", "/flags"), update: (r, c) => e("PUT", `/flags/${encodeURIComponent(r)}`, { enabled: c }) };
 }
-const We = { key: 0, class: "text-slate-500 text-sm" }, Ee = { class: "space-y-2" }, He = { class: "flex items-center justify-between" }, Le = { class: "text-sm font-medium text-slate-200" }, Ie = { key: 0, class: "text-xs text-slate-500 mt-0.5" }, Qe = ee({ __name: "flags", setup(e) {
+const We = { key: 0, class: "text-slate-500 text-sm" }, Ee = { class: "space-y-2" }, He = { class: "flex items-center justify-between" }, Le = { class: "text-sm font-medium text-slate-200" }, Ie = { key: 0, class: "text-xs text-slate-500 mt-0.5" }, Ze = ee({ __name: "flags", setup(e) {
   const r = Te(), c = Ke(), i = N([]), d = N(true);
   async function h() {
     d.value = true;
@@ -193,5 +194,5 @@ const We = { key: 0, class: "text-slate-500 text-sm" }, Ee = { class: "space-y-2
   };
 } });
 export {
-  Qe as default
+  Ze as default
 };
