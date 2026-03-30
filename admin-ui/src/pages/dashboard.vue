@@ -91,16 +91,20 @@ const keyColumns = [
 
     <NSpin :show="loading">
       <div class="grid grid-cols-4 gap-4 mb-8">
-        <NCard size="small">
+        <NCard size="small" style="position:relative; overflow:hidden">
+          <span class="i-carbon-api" style="position:absolute; top:12px; right:12px; font-size:32px; color:#818cf8; opacity:0.85" />
           <NStatistic label="API Keys" :value="keys.length" />
         </NCard>
-        <NCard size="small">
+        <NCard size="small" style="position:relative; overflow:hidden">
+          <span class="i-carbon-server-dns" style="position:absolute; top:12px; right:12px; font-size:32px; color:#34d399; opacity:0.85" />
           <NStatistic label="Backends" :value="backends.length" />
         </NCard>
-        <NCard size="small">
+        <NCard size="small" style="position:relative; overflow:hidden">
+          <span class="i-carbon-checkmark-outline" style="position:absolute; top:12px; right:12px; font-size:32px; color:#60a5fa; opacity:0.85" />
           <NStatistic label="Active Keys" :value="keys.filter(k => k.is_active).length" />
         </NCard>
-        <NCard size="small">
+        <NCard size="small" style="position:relative; overflow:hidden">
+          <span class="i-carbon-time" style="position:absolute; top:12px; right:12px; font-size:32px; color:#fbbf24; opacity:0.85" />
           <NStatistic label="Uptime" :value="uptime" />
         </NCard>
       </div>

@@ -119,16 +119,20 @@ const columns = computed(() => [
 
     <template v-if="result">
       <div class="grid grid-cols-4 gap-4 mb-6">
-        <NCard size="small">
+        <NCard size="small" style="position:relative; overflow:hidden">
+          <span class="i-carbon-send" style="position:absolute; top:12px; right:12px; font-size:32px; color:#818cf8; opacity:0.85" />
           <NStatistic label="Requests" :value="result.summary.total_requests.toLocaleString()" />
         </NCard>
-        <NCard size="small">
+        <NCard size="small" style="position:relative; overflow:hidden">
+          <span class="i-carbon-arrow-down" style="position:absolute; top:12px; right:12px; font-size:32px; color:#60a5fa; opacity:0.85" />
           <NStatistic label="Input Tokens" :value="fmtTokens(result.summary.total_input_tokens)" />
         </NCard>
-        <NCard size="small">
+        <NCard size="small" style="position:relative; overflow:hidden">
+          <span class="i-carbon-arrow-up" style="position:absolute; top:12px; right:12px; font-size:32px; color:#34d399; opacity:0.85" />
           <NStatistic label="Output Tokens" :value="fmtTokens(result.summary.total_output_tokens)" />
         </NCard>
-        <NCard size="small">
+        <NCard size="small" style="position:relative; overflow:hidden">
+          <span class="i-carbon-currency-dollar" style="position:absolute; top:12px; right:12px; font-size:32px; color:#fbbf24; opacity:0.85" />
           <NStatistic label="Total Cost" :value="fmtMoney(result.summary.total_cost)" />
         </NCard>
       </div>

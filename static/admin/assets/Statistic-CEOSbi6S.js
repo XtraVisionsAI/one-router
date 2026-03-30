@@ -1,5 +1,5 @@
-import { f as n, h as o, d as C, j as a, k as S, l as v, aK as R, _ as $, m as T, a as w } from "./index-BKXoSCv0.js";
-import { r } from "./use-form-item-PZPZ68wM.js";
+import { f as n, h as o, d as C, j as a, k as S, l as v, aK as R, _ as $, m as T, a as w } from "./index-DgE7LE3Y.js";
+import { r } from "./use-form-item-DYUW7DU-.js";
 const E = n("statistic", [o("label", `
  font-weight: var(--n-label-font-weight);
  transition: .3s color var(--n-bezier);

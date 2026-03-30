@@ -1,14 +1,14 @@
-import { u as L } from "./useApi-C-MENBV9.js";
-import { B as N } from "./Button-BG9pNlUY.js";
-import { d as h, w as O, n as B, p as V, q as r, y as v, v as s, s as e, B as D, A as E, a as I, r as _, o as F, z as K, D as C, j as M } from "./index-BKXoSCv0.js";
-import { u as A } from "./use-message-Diy95wEL.js";
-import { _ as G } from "./FormItem-Cc6dA3q3.js";
-import { _ as q } from "./Input-DKOKpeJJ.js";
-import { _ as z, a as H, N as T } from "./DataTable-DsJvKjqU.js";
-import { _ as J, a as Q } from "./InputNumber-D8wOYa0x.js";
-import "./use-form-item-PZPZ68wM.js";
-import "./Dropdown-BC1cSchD.js";
-import "./use-compitable-UGUh8sH4.js";
+import { u as L } from "./useApi-XFDP7FvQ.js";
+import { B as N } from "./Button-BEm6njOS.js";
+import { d as h, w as O, n as B, p as V, q as r, y as v, v as s, s as e, B as D, A as E, a as I, r as _, o as F, z as K, D as C, j as M } from "./index-DgE7LE3Y.js";
+import { u as A } from "./use-message-vokklgCK.js";
+import { _ as G } from "./FormItem-Bccte_fY.js";
+import { _ as q } from "./Input-BQpKaaGM.js";
+import { _ as z, a as H, N as T } from "./DataTable--jcaE6v9.js";
+import { _ as J, a as Q } from "./InputNumber-NmSonWBK.js";
+import "./use-form-item-DYUW7DU-.js";
+import "./Dropdown-CaRLK9DA.js";
+import "./use-compitable-Dd8PnVYW.js";
 function R() {
   const { request: f } = L();
   return { list: () => f("GET", "/mappings"), create: (p) => f("POST", "/mappings", p), update: (p, n, u) => f("PUT", `/mappings/${encodeURIComponent(p)}/${encodeURIComponent(n)}`, u), delete: (p, n) => f("DELETE", `/mappings/${encodeURIComponent(p)}/${encodeURIComponent(n)}`) };
