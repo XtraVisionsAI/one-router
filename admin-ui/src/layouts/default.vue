@@ -12,7 +12,7 @@ const menuOptions: MenuOption[] = [
   { key: '/backends', label: 'Backends', icon: () => h('span', { class: 'i-carbon-server-dns text-base' }) },
   { key: '/mappings', label: 'Model Maps', icon: () => h('span', { class: 'i-carbon-arrows-horizontal text-base' }) },
   { key: '/usage', label: 'Usage', icon: () => h('span', { class: 'i-carbon-chart-bar text-base' }) },
-  { key: '/flags', label: 'Flags', icon: () => h('span', { class: 'i-carbon-toggle text-base' }) },
+  { key: '/flags', label: 'Flags', icon: () => h('span', { class: 'i-carbon-toggle-on text-base' }) },
 ]
 
 const activeKey = computed(() => route.path)
