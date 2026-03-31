@@ -200,6 +200,131 @@ impl BedrockService {
         self.record_success(&cred_name);
         Ok(result.body().as_ref().to_vec())
     }
+
+    /// Determine if a target model ID should use Converse API (true) or OpenAI Compat (false).
+    /// Uses the resolved target_model_id (after model mapping), not the original request model.
+    pub fn is_claude_model(target_model_id: &str) -> bool {
+        let lower = target_model_id.to_lowercase();
+        lower.contains("claude") || lower.contains("anthropic")
+    }
+
+    /// Call Bedrock OpenAI-compatible endpoint (Bedrock Mantle) for non-Claude models.
+    /// Uses the same AWS credentials as Converse API but calls /v1/chat/completions.
+    pub async fn chat_completions(
+        &self,
+        openai_request: &serde_json::Value,
+        _target_model_id: &str,
+    ) -> Result<serde_json::Value, BedrockError> {
+        use aws_credential_types::Credentials as AwsCreds;
+        use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+        use aws_sigv4::sign::v4;
+
+        // Gather credential info (clone owned data before any async work)
+        let (cred_name, region, access_key_id, secret_access_key, session_token) = {
+            let cred = self
+                .pool
+                .get_next()
+                .ok_or_else(|| BedrockError::Unknown("No available credentials".to_string()))?;
+            (
+                cred.name().to_string(),
+                cred.region().to_string(),
+                cred.access_key_id().map(|s| s.to_string()),
+                cred.secret_access_key().map(|s| s.to_string()),
+                cred.session_token().map(|s| s.to_string()),
+            )
+        };
+
+        let url = format!("https://bedrock-runtime.{region}.amazonaws.com/v1/chat/completions");
+
+        let body = serde_json::to_vec(openai_request)
+            .map_err(|e| BedrockError::Serialization(e.to_string()))?;
+
+        // Build AWS Identity for signing
+        let aws_creds = AwsCreds::new(
+            access_key_id.as_deref().unwrap_or(""),
+            secret_access_key.as_deref().unwrap_or(""),
+            session_token.clone(),
+            None,
+            "one-router",
+        );
+        let identity: aws_smithy_runtime_api::client::identity::Identity = aws_creds.into();
+
+        let host = format!("bedrock-runtime.{region}.amazonaws.com");
+        let signing_settings = SigningSettings::default();
+        let now = std::time::SystemTime::now();
+
+        let signing_params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(region.as_str())
+            .name("bedrock")
+            .time(now)
+            .settings(signing_settings)
+            .build()
+            .map_err(|e| BedrockError::Unknown(e.to_string()))?
+            .into();
+
+        // Build the list of headers for signing (must include host and content-type)
+        let headers_to_sign = [
+            ("host", host.as_str()),
+            ("content-type", "application/json"),
+        ];
+        let signable = SignableRequest::new(
+            "POST",
+            url.as_str(),
+            headers_to_sign.iter().map(|(k, v)| (*k, *v)),
+            SignableBody::Bytes(&body),
+        )
+        .map_err(|e| BedrockError::Unknown(e.to_string()))?;
+
+        let (signing_instructions, _) = sign(signable, &signing_params)
+            .map_err(|e| BedrockError::Unknown(e.to_string()))?
+            .into_parts();
+
+        // Apply signed headers to reqwest request
+        let client = reqwest::Client::new();
+        let mut req_builder = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("host", &host)
+            .body(body);
+
+        for (name, value) in signing_instructions.headers() {
+            req_builder = req_builder.header(name, value);
+        }
+
+        tracing::debug!(
+            credential = %cred_name,
+            region = %region,
+            url = %url,
+            "Calling Bedrock OpenAI Compat endpoint (Mantle)"
+        );
+
+        let response = req_builder.send().await.map_err(|e| {
+            self.record_failure(&cred_name);
+            BedrockError::Unknown(e.to_string())
+        })?;
+
+        let status = response.status().as_u16();
+        if status == 429 || status >= 500 {
+            self.record_failure(&cred_name);
+        } else {
+            self.record_success(&cred_name);
+        }
+
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(BedrockError::Unknown(format!(
+                "Bedrock Mantle error {status}: {text}"
+            )));
+        }
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| BedrockError::Deserialization(e.to_string()))?;
+
+        Ok(json)
+    }
 }
 
 // ============================================================================
@@ -505,5 +630,36 @@ impl BedrockError {
             BedrockError::ApiError { error_type, .. } => *error_type,
             BedrockError::Unknown(_) => BedrockErrorType::Unknown,
         }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::BedrockService;
+
+    #[test]
+    fn test_is_claude_model_claude() {
+        assert!(BedrockService::is_claude_model(
+            "us.anthropic.claude-sonnet-4-6-v1:0"
+        ));
+        assert!(BedrockService::is_claude_model(
+            "anthropic.claude-3-haiku-20240307-v1:0"
+        ));
+        assert!(BedrockService::is_claude_model(
+            "global.anthropic.claude-opus-4-6-v1"
+        ));
+    }
+
+    #[test]
+    fn test_is_claude_model_non_claude() {
+        assert!(!BedrockService::is_claude_model(
+            "us.amazon.qwen3-235b-instruct-v1:0"
+        ));
+        assert!(!BedrockService::is_claude_model("deepseek-r1"));
+        assert!(!BedrockService::is_claude_model("amazon.nova-pro-v1:0"));
     }
 }
