@@ -31,6 +31,7 @@ pub struct ApiKeyInfo {
     pub service_tier: String,
     pub monthly_budget: Option<f64>,
     pub budget_used_mtd: f64,
+    pub budget_mtd_month: Option<String>,
 }
 
 impl ApiKeyInfo {
@@ -43,6 +44,7 @@ impl ApiKeyInfo {
             service_tier: "master".to_string(),
             monthly_budget: None,
             budget_used_mtd: 0.0,
+            budget_mtd_month: None,
         }
     }
 
@@ -59,6 +61,7 @@ impl ApiKeyInfo {
             service_tier: record.service_tier.clone(),
             monthly_budget: record.monthly_budget,
             budget_used_mtd: record.budget_used_mtd,
+            budget_mtd_month: record.budget_mtd_month.clone(),
         }
     }
 
@@ -76,6 +79,12 @@ impl ApiKeyInfo {
 
     pub fn effective_rate_limit(&self, default: u32) -> u32 {
         self.rate_limit.unwrap_or(default)
+    }
+
+    pub fn is_budget_exceeded(&self) -> bool {
+        self.monthly_budget
+            .map(|limit| self.budget_used_mtd >= limit)
+            .unwrap_or(false)
     }
 }
 
@@ -201,6 +210,7 @@ pub async fn require_api_key(
                 service_tier: "default".to_string(),
                 monthly_budget: None,
                 budget_used_mtd: 0.0,
+                budget_mtd_month: None,
             });
             return Ok(next.run(request).await);
         }

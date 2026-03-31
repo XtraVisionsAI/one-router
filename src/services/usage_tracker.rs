@@ -18,6 +18,10 @@ fn get_tier_multiplier(tier: &str) -> f64 {
     }
 }
 
+fn is_new_month(stored_month: Option<&str>, current_month: &str) -> bool {
+    stored_month.map(|m| m != current_month).unwrap_or(true)
+}
+
 /// Service for tracking API usage statistics.
 #[derive(Clone)]
 pub struct UsageTracker {
@@ -44,6 +48,23 @@ impl UsageTracker {
 
         if key_info.is_master {
             return Ok(false);
+        }
+
+        let current_month = chrono::Utc::now().format("%Y-%m").to_string();
+        if is_new_month(key_info.budget_mtd_month.as_deref(), &current_month) {
+            self.storage
+                .api_keys()
+                .reset_monthly_budget(&key_info.api_key, &current_month)
+                .await
+                .map_err(|e| UsageError::Database(e.to_string()))?;
+            if key_info.is_budget_exceeded() {
+                self.storage
+                    .api_keys()
+                    .reactivate_api_key(&key_info.api_key)
+                    .await
+                    .map_err(|e| UsageError::Database(e.to_string()))?;
+                tracing::info!(api_key = %key_info.api_key, month = %current_month, "Budget key reactivated for new month");
+            }
         }
 
         let record = UsageRecord {
@@ -152,5 +173,12 @@ mod tests {
         assert_eq!(get_tier_multiplier("flex"), 0.5);
         assert_eq!(get_tier_multiplier("priority"), 1.75);
         assert_eq!(get_tier_multiplier("master"), 0.0);
+    }
+
+    #[test]
+    fn test_is_new_month() {
+        assert!(is_new_month(Some("2026-02"), "2026-03"));
+        assert!(!is_new_month(Some("2026-03"), "2026-03"));
+        assert!(is_new_month(None, "2026-03"));
     }
 }
