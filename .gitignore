@@ -23,5 +23,8 @@
 docs/superpowers/
 .superpowers/
 
+# git worktrees
+.worktrees/
+
 # Runtime data
 data/
