@@ -31,6 +31,15 @@ pub struct Settings {
     /// Encryption key for credential storage (AES-256-GCM via HKDF)
     pub encryption_key: Option<String>,
 
+    /// Web search provider name ("tavily" or "brave")
+    pub web_search_provider: Option<String>,
+
+    /// Web search API key
+    pub web_search_api_key: Option<String>,
+
+    /// Maximum content size in KB for web fetch operations
+    pub web_fetch_max_content_kb: u64,
+
     /// Application version (from Cargo.toml)
     pub app_version: String,
 
@@ -59,6 +68,17 @@ impl Settings {
 
         let encryption_key = env::var("ENCRYPTION_KEY").ok().filter(|k| !k.is_empty());
 
+        let web_search_provider = env::var("WEB_SEARCH_PROVIDER")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let web_search_api_key = env::var("WEB_SEARCH_API_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let web_fetch_max_content_kb = env::var("WEB_FETCH_MAX_CONTENT_KB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+
         if encryption_key.is_none() {
             tracing::warn!(
                 "ENCRYPTION_KEY not set — backend credentials will be stored in PLAINTEXT. \
@@ -73,6 +93,9 @@ impl Settings {
             log_level,
             master_api_key,
             encryption_key,
+            web_search_provider,
+            web_search_api_key,
+            web_fetch_max_content_kb,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             ephemeral_api_key: None,
         })
@@ -104,6 +127,9 @@ mod tests {
             log_level: "debug".into(),
             master_api_key: None,
             encryption_key: None,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_max_content_kb: 512,
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
         };
@@ -119,6 +145,9 @@ mod tests {
             log_level: "info".into(),
             master_api_key: None,
             encryption_key: None,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_max_content_kb: 512,
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
         };

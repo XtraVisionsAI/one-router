@@ -5,6 +5,7 @@
 use crate::config::Settings;
 use crate::database::encryption::Encryptor;
 use crate::database::traits::DatabaseService;
+use crate::services::web_tools::executor::WebToolExecutor;
 use crate::services::{
     BedrockService, GeminiService, ModelMappingService, PassthroughService, PtcService,
     UsageTracker,
@@ -49,6 +50,9 @@ pub struct AppState {
 
     /// OpenAI passthrough service (optional)
     pub openai_service: Option<Arc<PassthroughService>>,
+
+    /// Web tool executor for server-side web_search/web_fetch tools (optional)
+    pub web_tool_executor: Option<Arc<WebToolExecutor>>,
 }
 
 impl AppState {
