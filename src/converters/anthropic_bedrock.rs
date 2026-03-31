@@ -59,6 +59,7 @@ pub enum ConversionError {
 pub fn convert_request(
     request: &MessageRequest,
     bedrock_model: &str,
+    tier: Option<&str>,
 ) -> Result<(ConverseRequest, ToolNameMapper), ConversionError> {
     let model_id = bedrock_model.to_string();
 
@@ -118,7 +119,26 @@ pub fn convert_request(
         converse_req = converse_req.with_additional_fields(additional);
     }
 
+    if let Some(perf_config) = resolve_performance_config(bedrock_model, tier) {
+        converse_req = converse_req.with_performance_config(perf_config);
+    }
+
     Ok((converse_req, tool_name_mapper))
+}
+
+fn resolve_performance_config(model_id: &str, tier: Option<&str>) -> Option<String> {
+    let tier = tier?;
+    match tier {
+        "flex" => {
+            if model_id.contains("claude") {
+                None
+            } else {
+                Some("optimized".to_string())
+            }
+        }
+        "priority" | "reserved" => Some("standard".to_string()),
+        _ => None,
+    }
 }
 
 /// Convert Anthropic messages to SDK messages.
@@ -521,6 +541,52 @@ fn convert_stop_reason(reason: &aws_sdk_bedrockruntime::types::StopReason) -> St
 mod tests {
     use super::*;
     use crate::schemas::anthropic::{CacheControl, ContentBlock};
+
+    #[test]
+    fn test_convert_request_flex_tier_non_claude() {
+        let request = MessageRequest::new("qwen3-235b-instruct", vec![Message::user("hello")], 100);
+        let (converse_req, _) =
+            convert_request(&request, "us.amazon.qwen3-235b-instruct-v1:0", Some("flex")).unwrap();
+        assert_eq!(
+            converse_req.performance_config,
+            Some("optimized".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_request_flex_tier_claude_degraded() {
+        let request = MessageRequest::new("claude-sonnet-4-6", vec![Message::user("hello")], 100);
+        let (converse_req, _) = convert_request(
+            &request,
+            "us.anthropic.claude-sonnet-4-6-v1:0",
+            Some("flex"),
+        )
+        .unwrap();
+        assert_eq!(converse_req.performance_config, None);
+    }
+
+    #[test]
+    fn test_convert_request_priority_tier() {
+        let request = MessageRequest::new("qwen3-235b-instruct", vec![Message::user("hello")], 100);
+        let (converse_req, _) = convert_request(
+            &request,
+            "us.amazon.qwen3-235b-instruct-v1:0",
+            Some("priority"),
+        )
+        .unwrap();
+        assert_eq!(
+            converse_req.performance_config,
+            Some("standard".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_request_no_tier() {
+        let request = MessageRequest::new("claude-sonnet-4-6", vec![Message::user("hello")], 100);
+        let (converse_req, _) =
+            convert_request(&request, "us.anthropic.claude-sonnet-4-6-v1:0", None).unwrap();
+        assert_eq!(converse_req.performance_config, None);
+    }
 
     #[test]
     fn text_with_cache_control_emits_cache_point() {
