@@ -6,7 +6,7 @@
 
 use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -25,6 +25,7 @@ use crate::converters::{
     anthropic_bedrock, AnthropicToGeminiConverter, AnthropicToOpenAIConverter, ConversionError,
     GeminiToAnthropicConverter,
 };
+use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::{
     ContentBlock, ErrorResponse, MessageContent, MessageRequest, MessageResponse, StopReason,
     SystemContent, ToolResultValue,
@@ -164,6 +165,7 @@ impl IntoResponse for MessageApiResponse {
 /// Supports both streaming and non-streaming responses.
 pub async fn create_message(
     State(state): State<AppState>,
+    Extension(key_info): Extension<ApiKeyInfo>,
     headers: HeaderMap,
     Json(request): Json<MessageRequest>,
 ) -> Result<MessageApiResponse, ApiError> {
@@ -236,10 +238,23 @@ pub async fn create_message(
                 &request,
                 &resolved.target_model_id,
                 &request_id,
+                &key_info.service_tier,
                 start_time,
             )
             .await
         }
+    }
+}
+
+fn resolve_effective_tier<'a>(request_tier: Option<&'a str>, key_tier: &'a str) -> Option<&'a str> {
+    if let Some(t) = request_tier {
+        if !t.is_empty() && t != "auto" && t != "default" {
+            return Some(t);
+        }
+    }
+    match key_tier {
+        "default" | "auto" | "" => None,
+        t => Some(t),
     }
 }
 
@@ -249,6 +264,7 @@ async fn handle_bedrock_request(
     request: &MessageRequest,
     target_model_id: &str,
     request_id: &str,
+    key_tier: &str,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     let bedrock = state.bedrock.as_ref().ok_or_else(|| {
@@ -265,9 +281,12 @@ async fn handle_bedrock_request(
         "Routing to Bedrock backend"
     );
 
+    // Resolve effective service tier (request-level overrides key-level)
+    let effective_tier = resolve_effective_tier(request.service_tier.as_deref(), key_tier);
+
     // Build Converse request (returns mapper for restoring long tool names)
     let (converse_request, tool_name_mapper) =
-        anthropic_bedrock::convert_request(request, bedrock_model, None)
+        anthropic_bedrock::convert_request(request, bedrock_model, effective_tier)
             .map_err(|e| ApiError::from_conversion_error(&e))?;
 
     // Handle streaming vs non-streaming
@@ -1313,6 +1332,30 @@ mod tests {
             ApiError::service_unavailable("test").status,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn test_resolve_tier_request_overrides_key() {
+        let request_tier = Some("flex".to_string());
+        let key_tier = "priority".to_string();
+        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
+        assert_eq!(resolved, Some("flex"));
+    }
+
+    #[test]
+    fn test_resolve_tier_falls_back_to_key() {
+        let request_tier: Option<String> = None;
+        let key_tier = "priority".to_string();
+        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
+        assert_eq!(resolved, Some("priority"));
+    }
+
+    #[test]
+    fn test_resolve_tier_default_is_none() {
+        let request_tier: Option<String> = None;
+        let key_tier = "default".to_string();
+        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
+        assert_eq!(resolved, None);
     }
 
     #[test]
