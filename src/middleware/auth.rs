@@ -165,6 +165,12 @@ impl AuthState {
 // Middleware
 // ============================================================================
 
+fn is_budget_soft_exceeded(monthly_budget: Option<f64>, budget_used_mtd: f64) -> bool {
+    monthly_budget
+        .map(|limit| budget_used_mtd >= limit)
+        .unwrap_or(false)
+}
+
 pub async fn require_api_key(
     State(auth_state): State<AuthState>,
     mut request: Request<Body>,
@@ -226,9 +232,13 @@ pub async fn require_api_key(
 
     match result {
         Some(record) if record.is_valid() => {
-            request
-                .extensions_mut()
-                .insert(ApiKeyInfo::from_db_record(&record));
+            let key_info = ApiKeyInfo::from_db_record(&record);
+            if is_budget_soft_exceeded(key_info.monthly_budget, key_info.budget_used_mtd) {
+                return Err(AuthError::InactiveKey {
+                    reason: Some("budget_exceeded".to_string()),
+                });
+            }
+            request.extensions_mut().insert(key_info);
             Ok(next.run(request).await)
         }
         Some(record) => Err(AuthError::InactiveKey {
@@ -274,5 +284,13 @@ mod tests {
 
         let short = ApiKeyInfo::truncate_key("short");
         assert_eq!(short, "short");
+    }
+
+    #[test]
+    fn test_is_budget_soft_exceeded() {
+        assert!(is_budget_soft_exceeded(Some(10.0), 10.0));
+        assert!(is_budget_soft_exceeded(Some(10.0), 11.0));
+        assert!(!is_budget_soft_exceeded(Some(10.0), 9.99));
+        assert!(!is_budget_soft_exceeded(None, 999.0));
     }
 }
