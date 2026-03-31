@@ -115,6 +115,20 @@ impl BedrockService {
         if let Some(tool_config) = request.tool_config {
             converse_request = converse_request.tool_config(tool_config);
         }
+        if let Some(additional_fields) = request.additional_model_request_fields {
+            converse_request = converse_request.additional_model_request_fields(additional_fields);
+        }
+        if let Some(ref perf) = request.performance_config {
+            use aws_sdk_bedrockruntime::types::{
+                PerformanceConfigLatency, PerformanceConfiguration,
+            };
+            let latency = match perf.as_str() {
+                "optimized" => PerformanceConfigLatency::Optimized,
+                _ => PerformanceConfigLatency::Standard,
+            };
+            let perf_config = PerformanceConfiguration::builder().latency(latency).build();
+            converse_request = converse_request.performance_config(perf_config);
+        }
 
         let result = converse_request.send().await.map_err(|e| {
             self.record_failure(&cred_name);
@@ -155,6 +169,17 @@ impl BedrockService {
         }
         if let Some(additional_fields) = request.additional_model_request_fields {
             converse_request = converse_request.additional_model_request_fields(additional_fields);
+        }
+        if let Some(ref perf) = request.performance_config {
+            use aws_sdk_bedrockruntime::types::{
+                PerformanceConfigLatency, PerformanceConfiguration,
+            };
+            let latency = match perf.as_str() {
+                "optimized" => PerformanceConfigLatency::Optimized,
+                _ => PerformanceConfigLatency::Standard,
+            };
+            let perf_config = PerformanceConfiguration::builder().latency(latency).build();
+            converse_request = converse_request.performance_config(perf_config);
         }
 
         let result = converse_request.send().await.map_err(|e| {
@@ -214,6 +239,7 @@ pub struct ConverseRequest {
     pub inference_config: Option<InferenceConfiguration>,
     pub tool_config: Option<ToolConfiguration>,
     pub additional_model_request_fields: Option<aws_smithy_types::Document>,
+    pub performance_config: Option<String>, // "standard" | "optimized"
 }
 
 impl ConverseRequest {
@@ -225,6 +251,7 @@ impl ConverseRequest {
             inference_config: None,
             tool_config: None,
             additional_model_request_fields: None,
+            performance_config: None,
         }
     }
 
@@ -250,6 +277,11 @@ impl ConverseRequest {
 
     pub fn with_additional_fields(mut self, fields: aws_smithy_types::Document) -> Self {
         self.additional_model_request_fields = Some(fields);
+        self
+    }
+
+    pub fn with_performance_config(mut self, config: impl Into<String>) -> Self {
+        self.performance_config = Some(config.into());
         self
     }
 }
