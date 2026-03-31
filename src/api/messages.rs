@@ -265,6 +265,22 @@ async fn handle_bedrock_request(
         "Routing to Bedrock backend"
     );
 
+    // Server-side web tool execution loop
+    if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {
+        return match state.web_tool_executor.as_ref() {
+            Some(executor) => {
+                let response = executor
+                    .run(request, bedrock, bedrock_model)
+                    .await
+                    .map_err(|e| ApiError::internal_error(e.to_string()))?;
+                Ok(MessageApiResponse::Json(Json(response)))
+            }
+            None => Err(ApiError::bad_request(
+                "web_search/web_fetch tools require WEB_SEARCH_PROVIDER or WEB_FETCH_MAX_CONTENT_KB to be set",
+            )),
+        };
+    }
+
     // Build Converse request (returns mapper for restoring long tool names)
     let (converse_request, tool_name_mapper) =
         anthropic_bedrock::convert_request(request, bedrock_model)
