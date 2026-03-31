@@ -223,6 +223,31 @@ impl ApiKeyStore for PostgresBackend {
         Ok(false)
     }
 
+    async fn reset_monthly_budget(&self, api_key: &str, month: &str) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "UPDATE api_keys SET budget_used_mtd = 0.0, budget_mtd_month = $1, updated_at = $2 WHERE api_key = $3",
+        )
+        .bind(month)
+        .bind(now)
+        .bind(api_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn reactivate_api_key(&self, api_key: &str) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "UPDATE api_keys SET is_active = TRUE, deactivated_reason = NULL, updated_at = $1 WHERE api_key = $2 AND deactivated_reason = 'budget_exceeded'",
+        )
+        .bind(now)
+        .bind(api_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \

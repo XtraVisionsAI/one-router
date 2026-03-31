@@ -385,6 +385,53 @@ impl ApiKeyStore for DynamoDbBackend {
         Ok(false)
     }
 
+    async fn reset_monthly_budget(&self, api_key: &str, month: &str) -> Result<()> {
+        let now = unix_now();
+        self.client
+            .update_item()
+            .table_name(Self::table_name("api_keys"))
+            .key("api_key", av_s(api_key))
+            .update_expression(
+                "SET budget_used_mtd = :zero, budget_mtd_month = :month, updated_at = :now",
+            )
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
+            .expression_attribute_values(":month", av_s(month))
+            .expression_attribute_values(":now", av_n(now))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("DynamoDB reset_monthly_budget: {e}"))?;
+        Ok(())
+    }
+
+    async fn reactivate_api_key(&self, api_key: &str) -> Result<()> {
+        let now = unix_now();
+        let result = self
+            .client
+            .update_item()
+            .table_name(Self::table_name("api_keys"))
+            .key("api_key", av_s(api_key))
+            .update_expression(
+                "SET is_active = :true_val, updated_at = :now REMOVE deactivated_reason",
+            )
+            .condition_expression("deactivated_reason = :budget_exceeded")
+            .expression_attribute_values(":true_val", av_bool(true))
+            .expression_attribute_values(":now", av_n(now))
+            .expression_attribute_values(":budget_exceeded", av_s("budget_exceeded"))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("ConditionalCheckFailed") {
+                    Ok(()) // key was not budget-deactivated — that's fine
+                } else {
+                    Err(anyhow::anyhow!("DynamoDB reactivate_api_key: {e}"))
+                }
+            }
+        }
+    }
+
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let result = self
             .client

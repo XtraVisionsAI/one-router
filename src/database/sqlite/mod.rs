@@ -429,6 +429,31 @@ impl ApiKeyStore for SqliteBackend {
         Ok(false)
     }
 
+    async fn reset_monthly_budget(&self, api_key: &str, month: &str) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "UPDATE api_keys SET budget_used_mtd = 0.0, budget_mtd_month = ?, updated_at = ? WHERE api_key = ?",
+        )
+        .bind(month)
+        .bind(now)
+        .bind(api_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn reactivate_api_key(&self, api_key: &str) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "UPDATE api_keys SET is_active = 1, deactivated_reason = NULL, updated_at = ? WHERE api_key = ? AND deactivated_reason = 'budget_exceeded'",
+        )
+        .bind(now)
+        .bind(api_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
@@ -1048,5 +1073,135 @@ impl FeatureFlagStore for SqliteBackend {
         .await?;
 
         Ok(())
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn in_memory_db() -> SqliteBackend {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let backend = SqliteBackend { pool };
+        backend.initialize().await.unwrap();
+        backend
+    }
+
+    #[tokio::test]
+    async fn test_reset_monthly_budget() {
+        let db = in_memory_db().await;
+        let record = ApiKeyRecord {
+            api_key: "sk-test-budget".into(),
+            user_id: "user1".into(),
+            name: "test".into(),
+            is_active: true,
+            rate_limit: 0,
+            service_tier: "default".into(),
+            monthly_budget: Some(10.0),
+            budget_used: 5.0,
+            budget_used_mtd: 5.0,
+            budget_mtd_month: Some("2026-02".into()),
+            deactivated_reason: None,
+            tpm_limit: None,
+            metadata: None,
+            created_at: 0,
+            updated_at: None,
+        };
+        db.api_keys().create_api_key(&record).await.unwrap();
+        db.api_keys()
+            .reset_monthly_budget("sk-test-budget", "2026-03")
+            .await
+            .unwrap();
+        let updated = db
+            .api_keys()
+            .get_api_key("sk-test-budget")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.budget_used_mtd, 0.0);
+        assert_eq!(updated.budget_mtd_month, Some("2026-03".into()));
+        assert_eq!(updated.budget_used, 5.0); // cumulative NOT reset
+    }
+
+    #[tokio::test]
+    async fn test_reactivate_api_key_budget_exceeded() {
+        let db = in_memory_db().await;
+        let record = ApiKeyRecord {
+            api_key: "sk-test-reactivate".into(),
+            user_id: "user1".into(),
+            name: "test".into(),
+            is_active: false,
+            rate_limit: 0,
+            service_tier: "default".into(),
+            monthly_budget: Some(10.0),
+            budget_used: 10.0,
+            budget_used_mtd: 10.0,
+            budget_mtd_month: Some("2026-02".into()),
+            deactivated_reason: Some("budget_exceeded".into()),
+            tpm_limit: None,
+            metadata: None,
+            created_at: 0,
+            updated_at: None,
+        };
+        db.api_keys().create_api_key(&record).await.unwrap();
+        db.api_keys()
+            .reactivate_api_key("sk-test-reactivate")
+            .await
+            .unwrap();
+        let updated = db
+            .api_keys()
+            .get_api_key("sk-test-reactivate")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(updated.is_active);
+        assert_eq!(updated.deactivated_reason, None);
+    }
+
+    #[tokio::test]
+    async fn test_reactivate_api_key_does_not_touch_manually_deactivated() {
+        let db = in_memory_db().await;
+        let record = ApiKeyRecord {
+            api_key: "sk-test-manual".into(),
+            user_id: "user1".into(),
+            name: "test".into(),
+            is_active: false,
+            rate_limit: 0,
+            service_tier: "default".into(),
+            monthly_budget: None,
+            budget_used: 0.0,
+            budget_used_mtd: 0.0,
+            budget_mtd_month: None,
+            deactivated_reason: Some("manual_deactivation".into()),
+            tpm_limit: None,
+            metadata: None,
+            created_at: 0,
+            updated_at: None,
+        };
+        db.api_keys().create_api_key(&record).await.unwrap();
+        db.api_keys()
+            .reactivate_api_key("sk-test-manual")
+            .await
+            .unwrap();
+        let updated = db
+            .api_keys()
+            .get_api_key("sk-test-manual")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!updated.is_active);
+        assert_eq!(
+            updated.deactivated_reason,
+            Some("manual_deactivation".into())
+        );
     }
 }

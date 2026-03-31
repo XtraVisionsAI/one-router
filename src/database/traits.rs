@@ -19,6 +19,8 @@ pub trait ApiKeyStore: Send + Sync {
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()>;
     async fn deactivate_api_key(&self, api_key: &str, reason: &str) -> Result<()>;
     async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<bool>;
+    async fn reset_monthly_budget(&self, api_key: &str, month: &str) -> Result<()>;
+    async fn reactivate_api_key(&self, api_key: &str) -> Result<()>;
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>>;
 }
 
