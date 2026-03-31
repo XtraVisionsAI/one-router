@@ -119,6 +119,7 @@ impl BedrockService {
             converse_request = converse_request.additional_model_request_fields(additional_fields);
         }
         if let Some(ref perf) = request.performance_config {
+            // Note: intentional duplication, converse/converse_stream builders are different types
             use aws_sdk_bedrockruntime::types::{
                 PerformanceConfigLatency, PerformanceConfiguration,
             };
@@ -171,6 +172,7 @@ impl BedrockService {
             converse_request = converse_request.additional_model_request_fields(additional_fields);
         }
         if let Some(ref perf) = request.performance_config {
+            // Note: intentional duplication, converse/converse_stream builders are different types
             use aws_sdk_bedrockruntime::types::{
                 PerformanceConfigLatency, PerformanceConfiguration,
             };

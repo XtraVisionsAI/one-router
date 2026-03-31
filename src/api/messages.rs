@@ -246,15 +246,17 @@ pub async fn create_message(
     }
 }
 
-fn resolve_effective_tier<'a>(request_tier: Option<&'a str>, key_tier: &'a str) -> Option<&'a str> {
+fn resolve_effective_tier(request_tier: Option<&str>, key_tier: &str) -> Option<String> {
     if let Some(t) = request_tier {
-        if !t.is_empty() && t != "auto" && t != "default" {
-            return Some(t);
+        let normalized = t.trim().to_lowercase();
+        if !normalized.is_empty() && normalized != "auto" && normalized != "default" {
+            return Some(normalized);
         }
     }
-    match key_tier {
+    let normalized_key = key_tier.trim().to_lowercase();
+    match normalized_key.as_str() {
         "default" | "auto" | "" => None,
-        t => Some(t),
+        _ => Some(normalized_key),
     }
 }
 
@@ -282,11 +284,12 @@ async fn handle_bedrock_request(
     );
 
     // Resolve effective service tier (request-level overrides key-level)
-    let effective_tier = resolve_effective_tier(request.service_tier.as_deref(), key_tier);
+    let effective_tier: Option<String> =
+        resolve_effective_tier(request.service_tier.as_deref(), key_tier);
 
     // Build Converse request (returns mapper for restoring long tool names)
     let (converse_request, tool_name_mapper) =
-        anthropic_bedrock::convert_request(request, bedrock_model, effective_tier)
+        anthropic_bedrock::convert_request(request, bedrock_model, effective_tier.as_deref())
             .map_err(|e| ApiError::from_conversion_error(&e))?;
 
     // Handle streaming vs non-streaming
@@ -1339,7 +1342,7 @@ mod tests {
         let request_tier = Some("flex".to_string());
         let key_tier = "priority".to_string();
         let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
-        assert_eq!(resolved, Some("flex"));
+        assert_eq!(resolved, Some("flex".to_string()));
     }
 
     #[test]
@@ -1347,7 +1350,7 @@ mod tests {
         let request_tier: Option<String> = None;
         let key_tier = "priority".to_string();
         let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
-        assert_eq!(resolved, Some("priority"));
+        assert_eq!(resolved, Some("priority".to_string()));
     }
 
     #[test]
@@ -1355,7 +1358,39 @@ mod tests {
         let request_tier: Option<String> = None;
         let key_tier = "default".to_string();
         let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
-        assert_eq!(resolved, None);
+        assert_eq!(resolved, None::<String>);
+    }
+
+    #[test]
+    fn test_resolve_tier_case_insensitive() {
+        // 大写输入应该被规范化
+        let resolved = resolve_effective_tier(Some("FLEX"), "default");
+        assert_eq!(resolved, Some("flex".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_trims_whitespace() {
+        let resolved = resolve_effective_tier(Some(" flex "), "default");
+        assert_eq!(resolved, Some("flex".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_invalid_value_falls_back_to_key() {
+        // "invalid" 不是 auto/default，所以作为有效 tier 处理
+        let resolved = resolve_effective_tier(Some("invalid"), "priority");
+        assert_eq!(resolved, Some("invalid".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_empty_string_falls_back_to_key() {
+        let resolved = resolve_effective_tier(Some(""), "priority");
+        assert_eq!(resolved, Some("priority".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_whitespace_only_falls_back_to_key() {
+        let resolved = resolve_effective_tier(Some("  "), "priority");
+        assert_eq!(resolved, Some("priority".to_string()));
     }
 
     #[test]
