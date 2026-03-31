@@ -95,6 +95,7 @@ mod tests {
             encryption_key: None,
             app_version: "0.0.0".to_string(),
             ephemeral_api_key: ephemeral.map(|s| s.to_string()),
+            default_cache_ttl: None,
         }
     }
 
