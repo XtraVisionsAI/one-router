@@ -236,6 +236,7 @@ pub async fn create_message(
                 &request,
                 &resolved.target_model_id,
                 &request_id,
+                state.settings.default_cache_ttl.as_deref(),
                 start_time,
             )
             .await
@@ -249,6 +250,7 @@ async fn handle_bedrock_request(
     request: &MessageRequest,
     target_model_id: &str,
     request_id: &str,
+    default_cache_ttl: Option<&str>,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     let bedrock = state.bedrock.as_ref().ok_or_else(|| {
@@ -267,7 +269,7 @@ async fn handle_bedrock_request(
 
     // Build Converse request (returns mapper for restoring long tool names)
     let (converse_request, tool_name_mapper) =
-        anthropic_bedrock::convert_request(request, bedrock_model, None)
+        anthropic_bedrock::convert_request(request, bedrock_model, default_cache_ttl)
             .map_err(|e| ApiError::from_conversion_error(&e))?;
 
     // Handle streaming vs non-streaming
