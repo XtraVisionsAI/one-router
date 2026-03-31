@@ -527,6 +527,10 @@ pub struct MessageRequest {
     // PTC container for session reuse
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+
+    // Service tier override (request-level, takes priority over API key tier)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>, // "auto" | "flex" | "priority" | "reserved"
 }
 
 fn default_max_tokens() -> i32 {
@@ -551,6 +555,7 @@ impl MessageRequest {
             thinking: None,
             metadata: None,
             container: None,
+            service_tier: None,
         }
     }
 
@@ -918,5 +923,19 @@ mod tests {
     fn test_stop_reason_display() {
         assert_eq!(StopReason::EndTurn.to_string(), "end_turn");
         assert_eq!(StopReason::ToolUse.to_string(), "tool_use");
+    }
+
+    #[test]
+    fn test_message_request_service_tier_deserialization() {
+        let json = r#"{"model":"claude-3-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":100,"service_tier":"flex"}"#;
+        let req: MessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.service_tier, Some("flex".to_string()));
+    }
+
+    #[test]
+    fn test_message_request_service_tier_default_none() {
+        let json = r#"{"model":"claude-3-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":100}"#;
+        let req: MessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.service_tier, None);
     }
 }

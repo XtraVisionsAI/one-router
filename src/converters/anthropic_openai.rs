@@ -708,6 +708,7 @@ impl OpenAIToAnthropicConverter {
             thinking: None,
             metadata: None,
             container: None,
+            service_tier: None,
         })
     }
 
