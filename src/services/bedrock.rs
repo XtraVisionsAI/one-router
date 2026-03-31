@@ -220,7 +220,7 @@ impl BedrockService {
         use aws_sigv4::sign::v4;
 
         // Gather credential info (clone owned data before any async work)
-        let (cred_name, region, access_key_id, secret_access_key, session_token) = {
+        let (cred_name, region, access_key_id, secret_access_key, session_token, has_access_key) = {
             let cred = self
                 .pool
                 .get_next()
@@ -231,6 +231,7 @@ impl BedrockService {
                 cred.access_key_id().map(|s| s.to_string()),
                 cred.secret_access_key().map(|s| s.to_string()),
                 cred.session_token().map(|s| s.to_string()),
+                cred.uses_access_key(),
             )
         };
 
@@ -238,6 +239,22 @@ impl BedrockService {
 
         let body = serde_json::to_vec(openai_request)
             .map_err(|e| BedrockError::Serialization(e.to_string()))?;
+
+        const BEDROCK_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024; // 4MB
+        if body.len() > BEDROCK_MAX_REQUEST_BYTES {
+            return Err(BedrockError::Serialization(format!(
+                "Request body {} bytes exceeds Bedrock 4MB limit",
+                body.len()
+            )));
+        }
+
+        // Warn when credentials lack explicit access keys (profile/default creds will fail SigV4 signing)
+        if !has_access_key {
+            tracing::warn!(
+                credential = %cred_name,
+                "Credential does not have explicit access keys; Bedrock Mantle SigV4 signing may fail. Use access key credentials for non-Claude models."
+            );
+        }
 
         // Build AWS Identity for signing
         let aws_creds = AwsCreds::new(
