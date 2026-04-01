@@ -259,6 +259,53 @@ async fn handle_bedrock_request(
 
     let bedrock_model = target_model_id;
 
+    // Non-Claude models → Bedrock OpenAI Compat endpoint (Bedrock Mantle)
+    if !crate::services::BedrockService::is_claude_model(target_model_id) {
+        tracing::debug!(
+            request_id = %request_id,
+            target_model = %target_model_id,
+            stream = request.stream,
+            "Routing to Bedrock OpenAI Compat endpoint (non-Claude model)"
+        );
+
+        let converter = crate::converters::AnthropicToOpenAIConverter::new();
+        let openai_req = converter
+            .convert_request(request, target_model_id)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let openai_json = serde_json::to_value(&openai_req)
+            .map_err(|e| ApiError::internal_error(e.to_string()))?;
+
+        if request.stream {
+            let sse_stream = bedrock
+                .chat_completions_stream(&openai_json, target_model_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Bedrock Mantle streaming failed");
+                    ApiError::from_bedrock_error(&e)
+                })?;
+            return Ok(MessageApiResponse::Stream(Sse::new(Box::pin(sse_stream))));
+        }
+
+        let openai_resp_json = bedrock
+            .chat_completions(&openai_json, target_model_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Bedrock Mantle API call failed");
+                ApiError::from_bedrock_error(&e)
+            })?;
+
+        let openai_resp: crate::schemas::openai::ChatCompletionResponse =
+            serde_json::from_value(openai_resp_json).map_err(|e| {
+                ApiError::internal_error(format!("Failed to parse Mantle response: {e}"))
+            })?;
+
+        let response = converter
+            .convert_response(&openai_resp, &request.model)
+            .map_err(|e| ApiError::internal_error(e.to_string()))?;
+
+        return Ok(MessageApiResponse::Json(Json(response)));
+    }
+
     tracing::debug!(
         request_id = %request_id,
         bedrock_model = %bedrock_model,
@@ -1504,5 +1551,20 @@ mod tests {
             },
         };
         let _sse = response_to_sse_stream(response);
+    }
+
+    #[test]
+    fn test_handle_bedrock_routes_non_claude_to_mantle() {
+        // Verify routing logic: non-Claude target models should use OpenAI compat
+        assert!(!crate::services::BedrockService::is_claude_model(
+            "us.amazon.qwen3-235b-instruct-v1:0"
+        ));
+        assert!(!crate::services::BedrockService::is_claude_model(
+            "deepseek-r1"
+        ));
+        // Claude models should use Converse API
+        assert!(crate::services::BedrockService::is_claude_model(
+            "us.anthropic.claude-sonnet-4-6-v1:0"
+        ));
     }
 }
