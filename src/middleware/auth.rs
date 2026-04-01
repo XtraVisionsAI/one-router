@@ -32,6 +32,7 @@ pub struct ApiKeyInfo {
     pub monthly_budget: Option<f64>,
     pub budget_used_mtd: f64,
     pub budget_mtd_month: Option<String>,
+    pub cache_ttl: Option<String>,
 }
 
 impl ApiKeyInfo {
@@ -45,6 +46,7 @@ impl ApiKeyInfo {
             monthly_budget: None,
             budget_used_mtd: 0.0,
             budget_mtd_month: None,
+            cache_ttl: None,
         }
     }
 
@@ -62,6 +64,7 @@ impl ApiKeyInfo {
             monthly_budget: record.monthly_budget,
             budget_used_mtd: record.budget_used_mtd,
             budget_mtd_month: record.budget_mtd_month.clone(),
+            cache_ttl: record.cache_ttl.clone(),
         }
     }
 
@@ -217,6 +220,7 @@ pub async fn require_api_key(
                 monthly_budget: None,
                 budget_used_mtd: 0.0,
                 budget_mtd_month: None,
+                cache_ttl: None,
             });
             return Ok(next.run(request).await);
         }

@@ -81,7 +81,7 @@ impl ApiKeyStore for PostgresBackend {
         let row = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at \
+             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = $1",
         )
         .bind(api_key)
@@ -103,6 +103,7 @@ impl ApiKeyStore for PostgresBackend {
                 deactivated_reason: r.get("deactivated_reason"),
                 budget_history: r.get("budget_history"),
                 tpm_limit: r.get("tpm_limit"),
+                cache_ttl: r.get("cache_ttl"),
                 metadata: r.get("metadata"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
@@ -116,8 +117,8 @@ impl ApiKeyStore for PostgresBackend {
             "INSERT INTO api_keys \
              (api_key, user_id, name, is_active, rate_limit, service_tier, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-              deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         )
         .bind(&record.api_key)
         .bind(&record.user_id)
@@ -132,6 +133,7 @@ impl ApiKeyStore for PostgresBackend {
         .bind(&record.deactivated_reason)
         .bind(&record.budget_history)
         .bind(record.tpm_limit)
+        .bind(&record.cache_ttl)
         .bind(&record.metadata)
         .bind(record.created_at)
         .bind(record.updated_at)
@@ -147,8 +149,8 @@ impl ApiKeyStore for PostgresBackend {
             "UPDATE api_keys SET \
              user_id = $1, name = $2, is_active = $3, rate_limit = $4, service_tier = $5, \
              monthly_budget = $6, budget_used = $7, budget_used_mtd = $8, budget_mtd_month = $9, \
-             deactivated_reason = $10, budget_history = $11, tpm_limit = $12, metadata = $13, updated_at = $14 \
-             WHERE api_key = $15",
+             deactivated_reason = $10, budget_history = $11, tpm_limit = $12, cache_ttl = $13, metadata = $14, updated_at = $15 \
+             WHERE api_key = $16",
         )
         .bind(&record.user_id)
         .bind(&record.name)
@@ -162,6 +164,7 @@ impl ApiKeyStore for PostgresBackend {
         .bind(&record.deactivated_reason)
         .bind(&record.budget_history)
         .bind(record.tpm_limit)
+        .bind(&record.cache_ttl)
         .bind(&record.metadata)
         .bind(now)
         .bind(&record.api_key)
@@ -288,7 +291,7 @@ impl ApiKeyStore for PostgresBackend {
         let rows = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at \
+             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -310,6 +313,7 @@ impl ApiKeyStore for PostgresBackend {
                 deactivated_reason: r.get("deactivated_reason"),
                 budget_history: r.get("budget_history"),
                 tpm_limit: r.get("tpm_limit"),
+                cache_ttl: r.get("cache_ttl"),
                 metadata: r.get("metadata"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),

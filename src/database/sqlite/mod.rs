@@ -67,7 +67,9 @@ impl SqliteBackend {
                 budget_used_mtd REAL DEFAULT 0.0,
                 budget_mtd_month TEXT,
                 deactivated_reason TEXT,
+                budget_history TEXT,
                 tpm_limit INTEGER,
+                cache_ttl TEXT,
                 metadata TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER
@@ -75,6 +77,18 @@ impl SqliteBackend {
         )
         .execute(&self.pool)
         .await?;
+
+        // Migration: add budget_history column if upgrading from older schema
+        sqlx::query("ALTER TABLE api_keys ADD COLUMN budget_history TEXT")
+            .execute(&self.pool)
+            .await
+            .ok(); // ignore error if column already exists
+
+        // Migration: add cache_ttl column if upgrading from older schema
+        sqlx::query("ALTER TABLE api_keys ADD COLUMN cache_ttl TEXT")
+            .execute(&self.pool)
+            .await
+            .ok(); // ignore error if column already exists
 
         // --- usage ---
         sqlx::query(
@@ -291,7 +305,7 @@ impl ApiKeyStore for SqliteBackend {
         let row = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at \
+             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = ?",
         )
         .bind(api_key)
@@ -313,6 +327,7 @@ impl ApiKeyStore for SqliteBackend {
                 deactivated_reason: r.get("deactivated_reason"),
                 budget_history: r.get("budget_history"),
                 tpm_limit: r.get("tpm_limit"),
+                cache_ttl: r.get("cache_ttl"),
                 metadata: r.get("metadata"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
@@ -326,8 +341,8 @@ impl ApiKeyStore for SqliteBackend {
             "INSERT INTO api_keys \
              (api_key, user_id, name, is_active, rate_limit, service_tier, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-              deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
         .bind(&record.user_id)
@@ -342,6 +357,7 @@ impl ApiKeyStore for SqliteBackend {
         .bind(&record.deactivated_reason)
         .bind(&record.budget_history)
         .bind(record.tpm_limit)
+        .bind(&record.cache_ttl)
         .bind(&record.metadata)
         .bind(record.created_at)
         .bind(record.updated_at)
@@ -357,7 +373,7 @@ impl ApiKeyStore for SqliteBackend {
             "UPDATE api_keys SET \
              user_id = ?, name = ?, is_active = ?, rate_limit = ?, service_tier = ?, \
              monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
-             deactivated_reason = ?, budget_history = ?, tpm_limit = ?, metadata = ?, updated_at = ? \
+             deactivated_reason = ?, budget_history = ?, tpm_limit = ?, cache_ttl = ?, metadata = ?, updated_at = ? \
              WHERE api_key = ?",
         )
         .bind(&record.user_id)
@@ -372,6 +388,7 @@ impl ApiKeyStore for SqliteBackend {
         .bind(&record.deactivated_reason)
         .bind(&record.budget_history)
         .bind(record.tpm_limit)
+        .bind(&record.cache_ttl)
         .bind(&record.metadata)
         .bind(now)
         .bind(&record.api_key)
@@ -500,7 +517,7 @@ impl ApiKeyStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at \
+             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -522,6 +539,7 @@ impl ApiKeyStore for SqliteBackend {
                 deactivated_reason: r.get("deactivated_reason"),
                 budget_history: r.get("budget_history"),
                 tpm_limit: r.get("tpm_limit"),
+                cache_ttl: r.get("cache_ttl"),
                 metadata: r.get("metadata"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
@@ -1156,6 +1174,7 @@ mod tests {
             deactivated_reason: None,
             budget_history: None,
             tpm_limit: None,
+            cache_ttl: None,
             metadata: None,
             created_at: 0,
             updated_at: None,
@@ -1199,6 +1218,7 @@ mod tests {
             deactivated_reason: Some("budget_exceeded".into()),
             budget_history: None,
             tpm_limit: None,
+            cache_ttl: None,
             metadata: None,
             created_at: 0,
             updated_at: None,
@@ -1235,6 +1255,7 @@ mod tests {
             deactivated_reason: Some("manual_deactivation".into()),
             budget_history: None,
             tpm_limit: None,
+            cache_ttl: None,
             metadata: None,
             created_at: 0,
             updated_at: None,

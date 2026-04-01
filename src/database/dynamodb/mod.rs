@@ -169,6 +169,7 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
         deactivated_reason: get_opt_s(item, "deactivated_reason"),
         budget_history: get_opt_s(item, "budget_history"),
         tpm_limit: get_opt_i32(item, "tpm_limit"),
+        cache_ttl: get_opt_s(item, "cache_ttl"),
         metadata: get_opt_s(item, "metadata"),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
@@ -198,6 +199,7 @@ fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
         item.insert("budget_history".into(), av_s(h));
     }
     item.insert("tpm_limit".into(), av_opt_n_i32(record.tpm_limit));
+    item.insert("cache_ttl".into(), av_opt_s(&record.cache_ttl));
     item.insert("metadata".into(), av_opt_s(&record.metadata));
     item.insert("created_at".into(), av_n(record.created_at));
     item.insert("updated_at".into(), av_opt_n_i64(record.updated_at));

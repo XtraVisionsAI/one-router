@@ -50,6 +50,98 @@ pub enum ConversionError {
 }
 
 // ============================================================================
+// Cache TTL Helpers
+// ============================================================================
+
+/// Find the first TTL string in the request's cache_control markers.
+///
+/// Checks (in order): system messages → message content blocks → tool definitions.
+fn find_cache_ttl_in_request(request: &MessageRequest) -> Option<String> {
+    // Check system prompt
+    if let Some(ref system) = request.system {
+        for msg in system.clone().into_messages() {
+            if let Some(ref cc) = msg.cache_control {
+                if cc.ttl.is_some() {
+                    return cc.ttl.clone();
+                }
+            }
+        }
+    }
+    // Check message content blocks
+    for msg in &request.messages {
+        if let MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                let ttl = match block {
+                    ContentBlock::Text { cache_control, .. } => {
+                        cache_control.as_ref().and_then(|cc| cc.ttl.clone())
+                    }
+                    ContentBlock::Image { cache_control, .. } => {
+                        cache_control.as_ref().and_then(|cc| cc.ttl.clone())
+                    }
+                    ContentBlock::Document { cache_control, .. } => {
+                        cache_control.as_ref().and_then(|cc| cc.ttl.clone())
+                    }
+                    ContentBlock::ToolResult { cache_control, .. } => {
+                        cache_control.as_ref().and_then(|cc| cc.ttl.clone())
+                    }
+                    _ => None,
+                };
+                if ttl.is_some() {
+                    return ttl;
+                }
+            }
+        }
+    }
+    // Check tool definitions
+    if let Some(ref tools) = request.tools {
+        for tool in tools {
+            if let Some(ttl) = tool
+                .get("cache_control")
+                .and_then(|cc| cc.get("ttl"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(ttl.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Convert a TTL string ("5m" | "1h") to seconds.
+fn ttl_str_to_seconds(ttl: &str) -> Option<u32> {
+    match ttl {
+        "1h" => Some(3600),
+        "5m" => Some(300),
+        _ => None,
+    }
+}
+
+/// Merge a `cache_configuration.ttl_seconds` entry into an existing
+/// `additionalModelRequestFields` Document (or create one from scratch).
+fn merge_cache_ttl_into_document(
+    existing: Option<aws_smithy_types::Document>,
+    ttl_seconds: u32,
+) -> aws_smithy_types::Document {
+    use aws_smithy_types::{Document, Number};
+    use std::collections::HashMap;
+
+    let mut map = match existing {
+        Some(Document::Object(m)) => m,
+        _ => HashMap::new(),
+    };
+    let mut cache_cfg = HashMap::new();
+    cache_cfg.insert(
+        "ttl_seconds".to_string(),
+        Document::Number(Number::PosInt(ttl_seconds as u64)),
+    );
+    map.insert(
+        "cache_configuration".to_string(),
+        Document::Object(cache_cfg),
+    );
+    Document::Object(map)
+}
+
+// ============================================================================
 // Request Conversion (Anthropic → Bedrock)
 // ============================================================================
 
@@ -60,6 +152,7 @@ pub fn convert_request(
     request: &MessageRequest,
     bedrock_model: &str,
     tier: Option<&str>,
+    default_cache_ttl: Option<&str>,
 ) -> Result<(ConverseRequest, ToolNameMapper), ConversionError> {
     let model_id = bedrock_model.to_string();
 
@@ -138,6 +231,18 @@ pub fn convert_request(
 
         // Suppress unused import warning for Number (only used in thinking block above)
         let _ = Number::PosInt(0);
+    }
+
+    // Inject cache TTL into additionalModelRequestFields
+    let effective_ttl =
+        find_cache_ttl_in_request(request).or_else(|| default_cache_ttl.map(|s| s.to_string()));
+
+    if let Some(ttl_str) = effective_ttl {
+        if let Some(ttl_seconds) = ttl_str_to_seconds(&ttl_str) {
+            let existing = converse_req.additional_model_request_fields.clone();
+            let merged = merge_cache_ttl_into_document(existing, ttl_seconds);
+            converse_req.additional_model_request_fields = Some(merged);
+        }
     }
 
     Ok((converse_req, tool_name_mapper))
@@ -562,8 +667,13 @@ mod tests {
     #[test]
     fn test_convert_request_flex_tier_non_claude() {
         let request = MessageRequest::new("qwen3-235b-instruct", vec![Message::user("hello")], 100);
-        let (converse_req, _) =
-            convert_request(&request, "us.amazon.qwen3-235b-instruct-v1:0", Some("flex")).unwrap();
+        let (converse_req, _) = convert_request(
+            &request,
+            "us.amazon.qwen3-235b-instruct-v1:0",
+            Some("flex"),
+            None,
+        )
+        .unwrap();
         // serviceTier "flex" should be injected into additionalModelRequestFields
         if let Some(aws_smithy_types::Document::Object(ref outer)) =
             converse_req.additional_model_request_fields
@@ -589,6 +699,7 @@ mod tests {
             &request,
             "us.anthropic.claude-sonnet-4-6-v1:0",
             Some("flex"),
+            None,
         )
         .unwrap();
         // Claude + flex => no serviceTier injected
@@ -602,6 +713,7 @@ mod tests {
             &request,
             "us.amazon.qwen3-235b-instruct-v1:0",
             Some("priority"),
+            None,
         )
         .unwrap();
         // serviceTier "priority" should be injected
@@ -626,7 +738,7 @@ mod tests {
     fn test_convert_request_no_tier() {
         let request = MessageRequest::new("claude-sonnet-4-6", vec![Message::user("hello")], 100);
         let (converse_req, _) =
-            convert_request(&request, "us.anthropic.claude-sonnet-4-6-v1:0", None).unwrap();
+            convert_request(&request, "us.anthropic.claude-sonnet-4-6-v1:0", None, None).unwrap();
         assert!(converse_req.additional_model_request_fields.is_none());
     }
 
@@ -704,5 +816,120 @@ mod tests {
             .unwrap();
         assert_eq!(usage.cache_read_input_tokens(), Some(30));
         assert_eq!(usage.cache_write_input_tokens(), Some(10));
+    }
+
+    #[test]
+    fn test_ttl_str_to_seconds_1h() {
+        assert_eq!(ttl_str_to_seconds("1h"), Some(3600u32));
+    }
+
+    #[test]
+    fn test_ttl_str_to_seconds_5m() {
+        assert_eq!(ttl_str_to_seconds("5m"), Some(300u32));
+    }
+
+    #[test]
+    fn test_ttl_str_to_seconds_unknown() {
+        assert_eq!(ttl_str_to_seconds("unknown"), None);
+    }
+
+    #[test]
+    fn test_find_cache_ttl_system_msg() {
+        use crate::schemas::anthropic::SystemMessage;
+        let mut msg = SystemMessage::new("You are helpful.");
+        msg.cache_control = Some(CacheControl::with_ttl("1h"));
+        let request = MessageRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: 100,
+            system: Some(SystemContent::Messages(vec![msg])),
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            container: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            service_tier: None,
+        };
+    }
+
+    #[test]
+    fn test_find_cache_ttl_none_when_absent() {
+        use crate::schemas::anthropic::Message;
+        let request = MessageRequest::new("m", vec![Message::user("hi")], 100);
+        assert_eq!(find_cache_ttl_in_request(&request), None);
+    }
+
+    #[test]
+    fn test_convert_request_injects_ttl_from_default() {
+        use crate::schemas::anthropic::Message;
+        let request = MessageRequest::new("claude-sonnet-4-6", vec![Message::user("hello")], 100);
+        let (converse_req, _) = convert_request(
+            &request,
+            "us.anthropic.claude-sonnet-4-6-v1:0",
+            None,
+            Some("1h"),
+        )
+        .unwrap();
+        let additional = converse_req
+            .additional_model_request_fields
+            .expect("should have additional fields");
+        if let aws_smithy_types::Document::Object(map) = additional {
+            if let Some(aws_smithy_types::Document::Object(cache_cfg)) =
+                map.get("cache_configuration")
+            {
+                if let Some(aws_smithy_types::Document::Number(n)) = cache_cfg.get("ttl_seconds") {
+                    assert_eq!(n.to_f64_lossy(), 3600.0);
+                    return;
+                }
+            }
+        }
+        panic!("cache_configuration.ttl_seconds not found");
+    }
+
+    #[test]
+    fn test_convert_request_no_ttl_no_cache_config() {
+        use crate::schemas::anthropic::Message;
+        let request = MessageRequest::new("claude-sonnet-4-6", vec![Message::user("hello")], 100);
+        let (converse_req, _) =
+            convert_request(&request, "us.anthropic.claude-sonnet-4-6-v1:0", None, None).unwrap();
+        // No thinking, no TTL → no additional_model_request_fields
+        assert!(converse_req.additional_model_request_fields.is_none());
+    }
+
+    #[test]
+    fn test_api_key_ttl_overrides_default() {
+        // When key_cache_ttl is passed as effective_default_ttl, it takes effect
+        use crate::schemas::anthropic::Message;
+        let request = MessageRequest::new("claude-sonnet-4-6", vec![Message::user("hello")], 100);
+        // key_cache_ttl = "1h" (simulated via effective_default_ttl)
+        let (converse_req, _) = convert_request(
+            &request,
+            "us.anthropic.claude-sonnet-4-6-v1:0",
+            None,
+            Some("1h"),
+        )
+        .unwrap();
+        let additional = converse_req
+            .additional_model_request_fields
+            .expect("should have additional fields");
+        if let aws_smithy_types::Document::Object(map) = additional {
+            assert!(map.contains_key("cache_configuration"));
+            if let Some(aws_smithy_types::Document::Object(cache_cfg)) =
+                map.get("cache_configuration")
+            {
+                if let Some(aws_smithy_types::Document::Number(n)) = cache_cfg.get("ttl_seconds") {
+                    assert_eq!(n.to_f64_lossy(), 3600.0);
+                    return;
+                }
+            }
+            panic!("cache_configuration.ttl_seconds not found");
+        } else {
+            panic!("Expected Object document");
+        }
     }
 }
