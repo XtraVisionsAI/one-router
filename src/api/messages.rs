@@ -264,6 +264,7 @@ async fn handle_bedrock_request(
         tracing::debug!(
             request_id = %request_id,
             target_model = %target_model_id,
+            stream = request.stream,
             "Routing to Bedrock OpenAI Compat endpoint (non-Claude model)"
         );
 
@@ -273,6 +274,17 @@ async fn handle_bedrock_request(
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         let openai_json = serde_json::to_value(&openai_req)
             .map_err(|e| ApiError::internal_error(e.to_string()))?;
+
+        if request.stream {
+            let sse_stream = bedrock
+                .chat_completions_stream(&openai_json, target_model_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Bedrock Mantle streaming failed");
+                    ApiError::from_bedrock_error(&e)
+                })?;
+            return Ok(MessageApiResponse::Stream(Sse::new(Box::pin(sse_stream))));
+        }
 
         let openai_resp_json = bedrock
             .chat_completions(&openai_json, target_model_id)

@@ -342,6 +342,126 @@ impl BedrockService {
 
         Ok(json)
     }
+
+    /// Call Bedrock OpenAI-compatible endpoint with streaming for non-Claude models.
+    /// Returns a stream of Anthropic SSE events converted from OpenAI SSE chunks.
+    pub async fn chat_completions_stream(
+        &self,
+        openai_request: &serde_json::Value,
+        _target_model_id: &str,
+    ) -> Result<
+        impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send,
+        BedrockError,
+    > {
+        use aws_credential_types::Credentials as AwsCreds;
+        use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+        use aws_sigv4::sign::v4;
+
+        // Gather credential info (same as chat_completions)
+        let (cred_name, region, access_key_id, secret_access_key, session_token, has_access_key) = {
+            let cred = self
+                .pool
+                .get_next()
+                .ok_or_else(|| BedrockError::Unknown("No available credentials".to_string()))?;
+            (
+                cred.name().to_string(),
+                cred.region().to_string(),
+                cred.access_key_id().map(|s| s.to_string()),
+                cred.secret_access_key().map(|s| s.to_string()),
+                cred.session_token().map(|s| s.to_string()),
+                cred.uses_access_key(),
+            )
+        };
+
+        // Force stream: true in the request
+        let mut streaming_request = openai_request.clone();
+        streaming_request["stream"] = serde_json::json!(true);
+
+        let url = format!("https://bedrock-runtime.{region}.amazonaws.com/v1/chat/completions");
+        let body = serde_json::to_vec(&streaming_request)
+            .map_err(|e| BedrockError::Serialization(e.to_string()))?;
+
+        if !has_access_key {
+            tracing::warn!(
+                credential = %cred_name,
+                "Credential does not have explicit access keys; Bedrock Mantle SigV4 signing may fail."
+            );
+        }
+
+        // SigV4 sign (same pattern as chat_completions)
+        let aws_creds = AwsCreds::new(
+            access_key_id.as_deref().unwrap_or(""),
+            secret_access_key.as_deref().unwrap_or(""),
+            session_token.clone(),
+            None,
+            "one-router",
+        );
+        let identity: aws_smithy_runtime_api::client::identity::Identity = aws_creds.into();
+        let host = format!("bedrock-runtime.{region}.amazonaws.com");
+        let signing_settings = SigningSettings::default();
+        let signing_params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(region.as_str())
+            .name("bedrock")
+            .time(std::time::SystemTime::now())
+            .settings(signing_settings)
+            .build()
+            .map_err(|e| BedrockError::Unknown(e.to_string()))?
+            .into();
+
+        let headers_to_sign = [
+            ("host", host.as_str()),
+            ("content-type", "application/json"),
+        ];
+        let signable = SignableRequest::new(
+            "POST",
+            url.as_str(),
+            headers_to_sign.iter().map(|(k, v)| (*k, *v)),
+            SignableBody::Bytes(&body),
+        )
+        .map_err(|e| BedrockError::Unknown(e.to_string()))?;
+
+        let (signing_instructions, _) = sign(signable, &signing_params)
+            .map_err(|e| BedrockError::Unknown(e.to_string()))?
+            .into_parts();
+
+        let client = reqwest::Client::new();
+        let mut req_builder = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("host", &host)
+            .body(body);
+        for (name, value) in signing_instructions.headers() {
+            req_builder = req_builder.header(name, value);
+        }
+
+        tracing::debug!(
+            credential = %cred_name,
+            region = %region,
+            url = %url,
+            "Calling Bedrock OpenAI Compat endpoint (Mantle) streaming"
+        );
+
+        let response = req_builder.send().await.map_err(|e| {
+            self.record_failure(&cred_name);
+            BedrockError::Unknown(e.to_string())
+        })?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            self.record_failure(&cred_name);
+            let text = response.text().await.unwrap_or_default();
+            return Err(BedrockError::Unknown(format!(
+                "Bedrock Mantle stream error {status}: {text}"
+            )));
+        }
+        self.record_success(&cred_name);
+
+        // Convert OpenAI SSE byte stream → Anthropic SSE events
+        let byte_stream = response.bytes_stream();
+        let sse_stream = openai_sse_to_anthropic_sse(byte_stream, cred_name);
+        Ok(sse_stream)
+    }
 }
 
 // ============================================================================
@@ -440,6 +560,194 @@ pub enum BedrockStreamError {
 
     #[error("Event parse error: {0}")]
     ParseError(String),
+}
+
+// ============================================================================
+// OpenAI SSE → Anthropic SSE converter (for Bedrock Mantle)
+// ============================================================================
+
+/// Convert an OpenAI SSE byte stream from Bedrock Mantle into Anthropic SSE events.
+fn openai_sse_to_anthropic_sse(
+    byte_stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    cred_name: String,
+) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send
+{
+    use axum::response::sse::Event;
+    use futures::StreamExt;
+
+    async_stream::stream! {
+        let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let mut buffer = String::new();
+        let mut text_block_started = false;
+        // tool_block_ids: ordered list of tool call IDs seen so far (index = block_index - 1)
+        let mut tool_block_ids: Vec<String> = Vec::new();
+        let mut input_tokens: i32 = 0;
+        let mut output_tokens: i32 = 0;
+        let mut stop_reason = "end_turn".to_string();
+
+        // Emit message_start
+        yield Ok(Event::default().event("message_start").data(
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }).to_string()
+        ));
+        yield Ok(Event::default().event("ping").data(r#"{"type":"ping"}"#));
+
+        let mut pinned = std::pin::pin!(byte_stream);
+        'outer: while let Some(chunk_result) = pinned.next().await {
+            let chunk = match chunk_result {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, credential = %cred_name, "Mantle stream chunk error");
+                    break;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete lines from buffer
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
+                buffer = buffer[newline_pos + 1..].to_string();
+
+                if line.is_empty() || !line.starts_with("data: ") {
+                    continue;
+                }
+
+                let data = &line["data: ".len()..];
+                if data == "[DONE]" {
+                    break 'outer;
+                }
+
+                let chunk_json: serde_json::Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                // Extract usage if present (typically in the last chunk)
+                if let Some(usage) = chunk_json.get("usage") {
+                    input_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0) as i32;
+                    output_tokens = usage["completion_tokens"].as_i64().unwrap_or(0) as i32;
+                }
+
+                let choices = match chunk_json["choices"].as_array() {
+                    Some(c) if !c.is_empty() => c,
+                    _ => continue,
+                };
+                let choice = &choices[0];
+                let delta = &choice["delta"];
+
+                // finish_reason
+                if let Some(fr) = choice["finish_reason"].as_str() {
+                    stop_reason = match fr {
+                        "tool_calls" => "tool_use".to_string(),
+                        "length" => "max_tokens".to_string(),
+                        _ => "end_turn".to_string(),
+                    };
+                }
+
+                // text content
+                if let Some(text) = delta["content"].as_str() {
+                    if !text.is_empty() {
+                        if !text_block_started {
+                            text_block_started = true;
+                            yield Ok(Event::default().event("content_block_start").data(
+                                serde_json::json!({
+                                    "type": "content_block_start",
+                                    "index": 0,
+                                    "content_block": {"type": "text", "text": ""}
+                                })
+                                .to_string(),
+                            ));
+                        }
+                        yield Ok(Event::default().event("content_block_delta").data(
+                            serde_json::json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": text}
+                            })
+                            .to_string(),
+                        ));
+                    }
+                }
+
+                // tool calls
+                if let Some(tool_calls) = delta["tool_calls"].as_array() {
+                    for tc in tool_calls {
+                        let tc_index = tc["index"].as_u64().unwrap_or(0) as usize;
+                        // block_index: text block is 0, tool blocks start at 1
+                        let block_index = tc_index + 1;
+
+                        if let Some(id) = tc["id"].as_str() {
+                            // New tool call — open a content block
+                            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                            tool_block_ids.push(id.to_string());
+                            yield Ok(Event::default().event("content_block_start").data(
+                                serde_json::json!({
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": id,
+                                        "name": name,
+                                        "input": {}
+                                    }
+                                })
+                                .to_string(),
+                            ));
+                        }
+                        if let Some(args) = tc["function"]["arguments"].as_str() {
+                            if !args.is_empty() {
+                                yield Ok(Event::default().event("content_block_delta").data(
+                                    serde_json::json!({
+                                        "type": "content_block_delta",
+                                        "index": block_index,
+                                        "delta": {"type": "input_json_delta", "partial_json": args}
+                                    })
+                                    .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Close open content blocks
+        if text_block_started {
+            yield Ok(Event::default().event("content_block_stop").data(
+                serde_json::json!({"type": "content_block_stop", "index": 0}).to_string()
+            ));
+        }
+        for (i, _id) in tool_block_ids.iter().enumerate() {
+            yield Ok(Event::default().event("content_block_stop").data(
+                serde_json::json!({"type": "content_block_stop", "index": i + 1}).to_string()
+            ));
+        }
+
+        // message_delta
+        yield Ok(Event::default().event("message_delta").data(
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "usage": {"output_tokens": output_tokens}
+            }).to_string()
+        ));
+
+        // message_stop
+        yield Ok(Event::default().event("message_stop").data(r#"{"type":"message_stop"}"#));
+
+        let _ = input_tokens; // suppress unused warning — available for future usage tracking
+    }
 }
 
 // ============================================================================
@@ -678,5 +986,18 @@ mod tests {
         ));
         assert!(!BedrockService::is_claude_model("deepseek-r1"));
         assert!(!BedrockService::is_claude_model("amazon.nova-pro-v1:0"));
+    }
+
+    #[test]
+    fn test_is_claude_model_determines_mantle_routing() {
+        // Non-Claude models should use Mantle (and now support streaming)
+        assert!(!BedrockService::is_claude_model(
+            "us.amazon.qwen3-235b-instruct-v1:0"
+        ));
+        assert!(!BedrockService::is_claude_model("deepseek-r1"));
+        // Claude models use Converse API
+        assert!(BedrockService::is_claude_model(
+            "us.anthropic.claude-sonnet-4-6-v1:0"
+        ));
     }
 }
