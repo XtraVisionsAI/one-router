@@ -1,3 +1,66 @@
+## v0.9.0 (2026-04-02)
+
+### Feat
+
+- prompt cache TTL extension with API key level override and DEFAULT_CACHE_TTL env var
+- **cache-ttl**: add API key level cache_ttl override (highest priority)
+- **api**: pass default_cache_ttl to Bedrock convert_request
+- **converter**: inject cache TTL into Bedrock additionalModelRequestFields
+- **config**: add default_cache_ttl setting from DEFAULT_CACHE_TTL env var
+- budget auto-deactivation with monthly reset, reactivation, and budget_history archiving
+- **budget**: add budget_history monthly archiving for DynamoDB-friendly history queries
+- **auth**: add soft budget pre-check before request execution
+- **usage**: lazy monthly budget reset and key reactivation
+- **db**: add reset_monthly_budget and reactivate_api_key to all backends
+- Bedrock service tier via serviceTier field with auto-fallback retry
+- **api**: pass effective service_tier to Bedrock performanceConfig
+- **converter**: add tier->performanceConfig mapping in anthropic_bedrock
+- **schema**: add service_tier field to MessageRequest
+- **bedrock**: add performance_config field to ConverseRequest
+- Bedrock OpenAI Compat endpoint (Mantle) for non-Claude models with streaming
+- **mantle**: add streaming support for Bedrock OpenAI Compat endpoint
+- **bedrock**: add OpenAI compat endpoint support for non-Claude models
+- web tool proxy execution (web_search/web_fetch) with streaming support
+- **web-tools**: add streaming response support via synthetic SSE conversion
+- **api**: integrate WebToolExecutor into handle_bedrock_request
+- **web-tools**: wire WebToolExecutor into Settings and AppState
+- **web-tools**: implement WebToolExecutor execution loop
+- **web-tools**: implement TavilySearchProvider and BraveSearchProvider
+- **web-tools**: implement ReqwestFetchProvider with domain filters and HTML stripping
+- **web-tools**: add mod.rs with tool detection and split_tools
+- **admin-ui**: add colored icons to stat cards in dashboard and usage pages
+- **admin-ui**: add mappings, usage, and flags pages
+- **admin-ui**: add KeyModal component and keys page
+- **admin-ui**: add BackendModal component and backends page
+- **admin-ui**: add dashboard page
+- **admin-ui**: add layouts, login page, and root redirect
+- **admin-ui**: add typed API layer for all resources
+- **admin-ui**: add auth store, useApi composable, and route guard
+- **admin-ui**: initialize Vue 3 + Vite project scaffold
+- **admin**: add GET /backends/:name/config decrypted config endpoint
+
+### Fix
+
+- **bedrock**: use serviceTier in additionalModelRequestFields and add tier fallback retry
+- normalize service_tier case and whitespace, add edge case tests
+- **bedrock**: warn on empty credentials and add 4MB body size guard for Mantle
+- **admin-ui**: show api_key as read-only text in edit modal, not editable input
+- **admin-ui**: fix usage filter bar layout — replace NFormItem with inline flex divs
+- **admin-ui**: fix invalid carbon icon name toggle -> toggle-on
+- **admin-ui**: replace custom nav with NMenu for proper dark theme sidebar
+- **admin-ui**: add presetIcons to UnoCSS config for i-carbon-* icons
+- **admin-ui**: apply meta-layouts to router and enable Naive UI dark theme
+- **admin-ui**: add missing useMessage import from naive-ui in login.vue
+- **admin-ui**: use router.push for auth redirect, fix Content-Type on GET, persist version
+- **admin-ui**: fix double-hash in useApi 401/403 redirect
+- **admin**: improve get_backend_config — flatten match, add audit log, fix error logging
+- **deploy**: force start-deployment after update-service to handle latest tag re-deploy
+- **deploy**: trigger ECR PTC sync via docker pull instead of batch-get-image polling
+
+### Refactor
+
+- **admin-ui**: extract format utils, add themeOverrides, unify styles, add delete confirm dialogs and empty states
+
 ## v0.8.0 (2026-03-27)
 
 ### Feat
