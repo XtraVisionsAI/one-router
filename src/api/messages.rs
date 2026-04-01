@@ -307,10 +307,34 @@ async fn handle_bedrock_request(
     }
 
     // Non-streaming response using Converse API
-    let converse_output = bedrock.converse(converse_request).await.map_err(|e| {
-        tracing::error!(error = %e, "Bedrock Converse API call failed");
-        ApiError::from_bedrock_error(&e)
-    })?;
+    let converse_output = match bedrock.converse(converse_request.clone()).await {
+        Ok(output) => output,
+        Err(ref e) => {
+            // If serviceTier not supported, retry without it
+            if is_service_tier_error(e) {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "serviceTier not supported for this model, retrying without it"
+                );
+                let mut fallback_req = converse_request.clone();
+                // Remove serviceTier from additionalModelRequestFields
+                if let Some(aws_smithy_types::Document::Object(ref mut map)) =
+                    fallback_req.additional_model_request_fields
+                {
+                    map.remove("serviceTier");
+                    if map.is_empty() {
+                        fallback_req.additional_model_request_fields = None;
+                    }
+                }
+                bedrock.converse(fallback_req).await.map_err(|e| {
+                    tracing::error!(error = %e, "Bedrock Converse API call failed (after tier fallback)");
+                    ApiError::from_bedrock_error(&e)
+                })?
+            } else {
+                return Err(ApiError::from_bedrock_error(e));
+            }
+        }
+    };
 
     // Convert Converse response to Anthropic format (restore original tool names)
     let response =
@@ -725,6 +749,19 @@ async fn handle_gemini_request(
 // ============================================================================
 // Streaming Response Handler
 // ============================================================================
+
+/// Returns true if the error indicates that serviceTier is not supported for this model.
+fn is_service_tier_error(e: &crate::services::BedrockError) -> bool {
+    match e {
+        crate::services::BedrockError::ValidationError(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("servicetier")
+                || lower.contains("service tier")
+                || lower.contains("performanceconfig")
+        }
+        _ => false,
+    }
+}
 
 /// Create a streaming response using SSE with ConverseStream API
 async fn create_streaming_response(

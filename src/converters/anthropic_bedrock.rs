@@ -119,24 +119,41 @@ pub fn convert_request(
         converse_req = converse_req.with_additional_fields(additional);
     }
 
-    if let Some(perf_config) = resolve_performance_config(bedrock_model, tier) {
-        converse_req = converse_req.with_performance_config(perf_config);
+    // Inject serviceTier into additionalModelRequestFields
+    if let Some(tier_value) = resolve_service_tier(bedrock_model, tier) {
+        use aws_smithy_types::{Document, Number};
+        use std::collections::HashMap;
+
+        let mut tier_map = HashMap::new();
+        tier_map.insert("type".to_string(), Document::String(tier_value));
+
+        // Merge into existing additional fields (preserve "thinking", "cache_configuration", etc.)
+        let existing = converse_req.additional_model_request_fields.clone();
+        let mut outer_map = match existing {
+            Some(Document::Object(m)) => m,
+            _ => HashMap::new(),
+        };
+        outer_map.insert("serviceTier".to_string(), Document::Object(tier_map));
+        converse_req.additional_model_request_fields = Some(Document::Object(outer_map));
+
+        // Suppress unused import warning for Number (only used in thinking block above)
+        let _ = Number::PosInt(0);
     }
 
     Ok((converse_req, tool_name_mapper))
 }
 
-fn resolve_performance_config(model_id: &str, tier: Option<&str>) -> Option<String> {
+fn resolve_service_tier(model_id: &str, tier: Option<&str>) -> Option<String> {
     let tier = tier?;
     match tier {
         "flex" => {
             if model_id.contains("claude") {
                 None
             } else {
-                Some("optimized".to_string())
+                Some("flex".to_string())
             }
         }
-        "priority" | "reserved" => Some("standard".to_string()),
+        "priority" | "reserved" => Some(tier.to_string()),
         _ => None,
     }
 }
@@ -547,10 +564,22 @@ mod tests {
         let request = MessageRequest::new("qwen3-235b-instruct", vec![Message::user("hello")], 100);
         let (converse_req, _) =
             convert_request(&request, "us.amazon.qwen3-235b-instruct-v1:0", Some("flex")).unwrap();
-        assert_eq!(
-            converse_req.performance_config,
-            Some("optimized".to_string())
-        );
+        // serviceTier "flex" should be injected into additionalModelRequestFields
+        if let Some(aws_smithy_types::Document::Object(ref outer)) =
+            converse_req.additional_model_request_fields
+        {
+            if let Some(aws_smithy_types::Document::Object(ref tier_obj)) = outer.get("serviceTier")
+            {
+                assert_eq!(
+                    tier_obj.get("type"),
+                    Some(&aws_smithy_types::Document::String("flex".to_string()))
+                );
+            } else {
+                panic!("serviceTier not found in additionalModelRequestFields");
+            }
+        } else {
+            panic!("additionalModelRequestFields should be set");
+        }
     }
 
     #[test]
@@ -562,7 +591,8 @@ mod tests {
             Some("flex"),
         )
         .unwrap();
-        assert_eq!(converse_req.performance_config, None);
+        // Claude + flex => no serviceTier injected
+        assert!(converse_req.additional_model_request_fields.is_none());
     }
 
     #[test]
@@ -574,10 +604,22 @@ mod tests {
             Some("priority"),
         )
         .unwrap();
-        assert_eq!(
-            converse_req.performance_config,
-            Some("standard".to_string())
-        );
+        // serviceTier "priority" should be injected
+        if let Some(aws_smithy_types::Document::Object(ref outer)) =
+            converse_req.additional_model_request_fields
+        {
+            if let Some(aws_smithy_types::Document::Object(ref tier_obj)) = outer.get("serviceTier")
+            {
+                assert_eq!(
+                    tier_obj.get("type"),
+                    Some(&aws_smithy_types::Document::String("priority".to_string()))
+                );
+            } else {
+                panic!("serviceTier not found in additionalModelRequestFields");
+            }
+        } else {
+            panic!("additionalModelRequestFields should be set");
+        }
     }
 
     #[test]
@@ -585,7 +627,7 @@ mod tests {
         let request = MessageRequest::new("claude-sonnet-4-6", vec![Message::user("hello")], 100);
         let (converse_req, _) =
             convert_request(&request, "us.anthropic.claude-sonnet-4-6-v1:0", None).unwrap();
-        assert_eq!(converse_req.performance_config, None);
+        assert!(converse_req.additional_model_request_fields.is_none());
     }
 
     #[test]
