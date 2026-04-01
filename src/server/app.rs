@@ -5,6 +5,7 @@ use crate::{
     database,
     database::encryption::Encryptor,
     server::{routes, state::AppState},
+    services::web_tools::{executor::WebToolExecutor, search::build_search_provider},
     services::{
         AnthropicBackendConfig, BedrockBackendConfig, BedrockService, GeminiBackendConfig,
         GeminiConfig, GeminiService, ModelMappingService, OpenAIBackendConfig, PassthroughConfig,
@@ -148,6 +149,23 @@ impl App {
             tracing::info!("Credential encryption enabled (AES-256-GCM)");
         }
 
+        // 9. Initialize web tool executor
+        let web_tool_executor = {
+            let search = settings
+                .web_search_provider
+                .as_deref()
+                .zip(settings.web_search_api_key.as_deref())
+                .and_then(|(p, k)| build_search_provider(p, k))
+                .map(|p| {
+                    Arc::from(p) as Arc<dyn crate::services::web_tools::search::SearchProvider>
+                });
+            Some(Arc::new(WebToolExecutor::new(
+                search,
+                settings.web_fetch_max_content_kb,
+                10,
+            )))
+        };
+
         let state = AppState {
             settings: settings_arc,
             database,
@@ -160,6 +178,7 @@ impl App {
             anthropic_service,
             openai_service,
             encryptor,
+            web_tool_executor,
         };
 
         tracing::info!("Application state initialized successfully");

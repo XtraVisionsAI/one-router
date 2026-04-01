@@ -93,6 +93,9 @@ mod tests {
             log_level: "debug".to_string(),
             master_api_key: master.map(|s| s.to_string()),
             encryption_key: None,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_max_content_kb: 512,
             app_version: "0.0.0".to_string(),
             ephemeral_api_key: ephemeral.map(|s| s.to_string()),
         }

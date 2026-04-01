@@ -265,6 +265,26 @@ async fn handle_bedrock_request(
         "Routing to Bedrock backend"
     );
 
+    // Server-side web tool execution loop
+    if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {
+        return match state.web_tool_executor.as_ref() {
+            Some(executor) => {
+                let response = executor
+                    .run(request, bedrock, bedrock_model)
+                    .await
+                    .map_err(|e| ApiError::internal_error(e.to_string()))?;
+                if request.stream {
+                    Ok(MessageApiResponse::Stream(response_to_sse_stream(response)))
+                } else {
+                    Ok(MessageApiResponse::Json(Json(response)))
+                }
+            }
+            None => Err(ApiError::bad_request(
+                "web_search/web_fetch tools require WEB_SEARCH_PROVIDER or WEB_FETCH_MAX_CONTENT_KB to be set",
+            )),
+        };
+    }
+
     // Build Converse request (returns mapper for restoring long tool names)
     let (converse_request, tool_name_mapper) =
         anthropic_bedrock::convert_request(request, bedrock_model)
@@ -1284,6 +1304,122 @@ fn print_request_prompts(request_id: &str, request: &MessageRequest) {
 }
 
 // ============================================================================
+// Synthetic SSE Conversion
+// ============================================================================
+
+/// Convert a complete `MessageResponse` into a synthetic Anthropic SSE stream.
+///
+/// Used when the web-tool execution loop finishes (always non-streaming internally)
+/// but the caller requested `stream: true`.  The complete response is wrapped in
+/// the standard Anthropic SSE event sequence so the client receives a well-formed
+/// streaming response without an extra Bedrock round-trip.
+#[allow(clippy::type_complexity)]
+fn response_to_sse_stream(
+    response: MessageResponse,
+) -> Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+    let stream = async_stream::stream! {
+        let message_id = response.id.clone();
+        let model = response.model.clone();
+
+        // 1. message_start
+        yield Ok(Event::default().event("message_start").data(
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": 0
+                    }
+                }
+            }).to_string()
+        ));
+
+        // 2. ping
+        yield Ok(Event::default().event("ping").data(r#"{"type":"ping"}"#));
+
+        // 3. content blocks
+        for (index, block) in response.content.iter().enumerate() {
+            let block_start_json = match block {
+                ContentBlock::Text { .. } => serde_json::json!({
+                    "type": "text",
+                    "text": ""
+                }),
+                ContentBlock::ToolUse { id, name, .. } => serde_json::json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": {}
+                }),
+                _ => continue,
+            };
+
+            // content_block_start
+            yield Ok(Event::default().event("content_block_start").data(
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": block_start_json
+                }).to_string()
+            ));
+
+            // content_block_delta
+            let delta_data = match block {
+                ContentBlock::Text { text, .. } => serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "text_delta", "text": text}
+                }),
+                ContentBlock::ToolUse { input, .. } => serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": serde_json::to_string(input).unwrap_or_default()
+                    }
+                }),
+                _ => continue,
+            };
+            yield Ok(Event::default().event("content_block_delta").data(delta_data.to_string()));
+
+            // content_block_stop
+            yield Ok(Event::default().event("content_block_stop").data(
+                serde_json::json!({"type": "content_block_stop", "index": index}).to_string()
+            ));
+        }
+
+        // 4. message_delta
+        let stop_reason = response.stop_reason.as_ref()
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "end_turn".to_string());
+
+        yield Ok(Event::default().event("message_delta").data(
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": null
+                },
+                "usage": {"output_tokens": response.usage.output_tokens}
+            }).to_string()
+        ));
+
+        // 5. message_stop
+        yield Ok(Event::default().event("message_stop").data(
+            r#"{"type":"message_stop"}"#
+        ));
+    };
+
+    Sse::new(Box::pin(stream))
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1320,5 +1456,53 @@ mod tests {
         let char_count = 400;
         let estimated_tokens = (char_count / 4).max(1);
         assert_eq!(estimated_tokens, 100);
+    }
+
+    #[test]
+    fn test_web_tools_stream_flag_handled() {
+        // Verify that response_to_sse_stream compiles and creates a valid SSE
+        // for a response with no content blocks.
+        use crate::schemas::anthropic::{StopReason, Usage};
+        let response = MessageResponse {
+            id: "msg_test".into(),
+            response_type: "message".into(),
+            role: "assistant".into(),
+            content: vec![],
+            model: "claude-haiku".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            stop_sequence: None,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let _sse = response_to_sse_stream(response);
+    }
+
+    #[test]
+    fn test_web_tools_stream_with_text_content() {
+        // Verify that response_to_sse_stream handles a text content block.
+        use crate::schemas::anthropic::{StopReason, Usage};
+        let response = MessageResponse {
+            id: "msg_text_test".into(),
+            response_type: "message".into(),
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: "Hello, world!".into(),
+                cache_control: None,
+            }],
+            model: "claude-haiku".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            stop_sequence: None,
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let _sse = response_to_sse_stream(response);
     }
 }
