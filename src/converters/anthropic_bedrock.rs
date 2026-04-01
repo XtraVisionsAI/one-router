@@ -780,4 +780,31 @@ mod tests {
         // No thinking, no TTL → no additional_model_request_fields
         assert!(converse_req.additional_model_request_fields.is_none());
     }
+
+    #[test]
+    fn test_api_key_ttl_overrides_default() {
+        // When key_cache_ttl is passed as effective_default_ttl, it takes effect
+        use crate::schemas::anthropic::Message;
+        let request = MessageRequest::new("claude-sonnet-4-6", vec![Message::user("hello")], 100);
+        // key_cache_ttl = "1h" (simulated via effective_default_ttl)
+        let (converse_req, _) =
+            convert_request(&request, "us.anthropic.claude-sonnet-4-6-v1:0", Some("1h")).unwrap();
+        let additional = converse_req
+            .additional_model_request_fields
+            .expect("should have additional fields");
+        if let aws_smithy_types::Document::Object(map) = additional {
+            assert!(map.contains_key("cache_configuration"));
+            if let Some(aws_smithy_types::Document::Object(cache_cfg)) =
+                map.get("cache_configuration")
+            {
+                if let Some(aws_smithy_types::Document::Number(n)) = cache_cfg.get("ttl_seconds") {
+                    assert_eq!(n.to_f64_lossy(), 3600.0);
+                    return;
+                }
+            }
+            panic!("cache_configuration.ttl_seconds not found");
+        } else {
+            panic!("Expected Object document");
+        }
+    }
 }

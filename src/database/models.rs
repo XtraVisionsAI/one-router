@@ -22,7 +22,8 @@ pub struct ApiKeyRecord {
     pub budget_mtd_month: Option<String>,
     pub deactivated_reason: Option<String>,
     pub tpm_limit: Option<i32>,
-    pub metadata: Option<String>, // JSON
+    pub cache_ttl: Option<String>, // "5m" | "1h" | None
+    pub metadata: Option<String>,  // JSON
     pub created_at: i64,
     pub updated_at: Option<i64>,
 }

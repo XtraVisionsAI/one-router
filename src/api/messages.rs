@@ -12,7 +12,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    Json,
+    Extension, Json,
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -164,6 +164,7 @@ impl IntoResponse for MessageApiResponse {
 /// Supports both streaming and non-streaming responses.
 pub async fn create_message(
     State(state): State<AppState>,
+    Extension(key_info): Extension<crate::middleware::auth::ApiKeyInfo>,
     headers: HeaderMap,
     Json(request): Json<MessageRequest>,
 ) -> Result<MessageApiResponse, ApiError> {
@@ -237,6 +238,7 @@ pub async fn create_message(
                 &resolved.target_model_id,
                 &request_id,
                 state.settings.default_cache_ttl.as_deref(),
+                key_info.cache_ttl.as_deref(),
                 start_time,
             )
             .await
@@ -251,6 +253,7 @@ async fn handle_bedrock_request(
     target_model_id: &str,
     request_id: &str,
     default_cache_ttl: Option<&str>,
+    key_cache_ttl: Option<&str>,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     let bedrock = state.bedrock.as_ref().ok_or_else(|| {
@@ -268,8 +271,10 @@ async fn handle_bedrock_request(
     );
 
     // Build Converse request (returns mapper for restoring long tool names)
+    // API Key TTL overrides default_cache_ttl
+    let effective_default_ttl = key_cache_ttl.or(default_cache_ttl);
     let (converse_request, tool_name_mapper) =
-        anthropic_bedrock::convert_request(request, bedrock_model, default_cache_ttl)
+        anthropic_bedrock::convert_request(request, bedrock_model, effective_default_ttl)
             .map_err(|e| ApiError::from_conversion_error(&e))?;
 
     // Handle streaming vs non-streaming

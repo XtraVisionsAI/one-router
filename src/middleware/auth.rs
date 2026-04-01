@@ -31,6 +31,7 @@ pub struct ApiKeyInfo {
     pub service_tier: String,
     pub monthly_budget: Option<f64>,
     pub budget_used_mtd: f64,
+    pub cache_ttl: Option<String>,
 }
 
 impl ApiKeyInfo {
@@ -43,6 +44,7 @@ impl ApiKeyInfo {
             service_tier: "master".to_string(),
             monthly_budget: None,
             budget_used_mtd: 0.0,
+            cache_ttl: None,
         }
     }
 
@@ -59,6 +61,7 @@ impl ApiKeyInfo {
             service_tier: record.service_tier.clone(),
             monthly_budget: record.monthly_budget,
             budget_used_mtd: record.budget_used_mtd,
+            cache_ttl: record.cache_ttl.clone(),
         }
     }
 
@@ -201,6 +204,7 @@ pub async fn require_api_key(
                 service_tier: "default".to_string(),
                 monthly_budget: None,
                 budget_used_mtd: 0.0,
+                cache_ttl: None,
             });
             return Ok(next.run(request).await);
         }

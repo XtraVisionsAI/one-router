@@ -22,6 +22,7 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             budget_mtd_month TEXT,
             deactivated_reason TEXT,
             tpm_limit INTEGER,
+            cache_ttl TEXT,
             metadata TEXT,
             created_at BIGINT NOT NULL,
             updated_at BIGINT
@@ -78,6 +79,12 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
 
     // Migration: add priority column and update PK if upgrading from old schema
     migrate_model_mappings(pool).await?;
+
+    // Migration: add cache_ttl column to api_keys if upgrading from older schema
+    sqlx::query("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS cache_ttl TEXT")
+        .execute(pool)
+        .await
+        .ok(); // ignore error if column already exists
 
     // --- backends ---
     sqlx::query(
