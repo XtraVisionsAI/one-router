@@ -115,6 +115,9 @@ impl BedrockService {
         if let Some(tool_config) = request.tool_config {
             converse_request = converse_request.tool_config(tool_config);
         }
+        if let Some(additional_fields) = request.additional_model_request_fields {
+            converse_request = converse_request.additional_model_request_fields(additional_fields);
+        }
 
         let result = converse_request.send().await.map_err(|e| {
             self.record_failure(&cred_name);

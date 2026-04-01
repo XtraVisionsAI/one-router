@@ -70,7 +70,7 @@ impl WebToolExecutor {
             modified.stream = false;
 
             let (converse_req, mapper) =
-                anthropic_bedrock::convert_request(&modified, target_model)
+                anthropic_bedrock::convert_request(&modified, target_model, None)
                     .map_err(|e| WebToolError::ConversionError(e.to_string()))?;
 
             let output = bedrock

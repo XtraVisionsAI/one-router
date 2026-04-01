@@ -6,7 +6,7 @@
 
 use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -25,6 +25,7 @@ use crate::converters::{
     anthropic_bedrock, AnthropicToGeminiConverter, AnthropicToOpenAIConverter, ConversionError,
     GeminiToAnthropicConverter,
 };
+use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::{
     ContentBlock, ErrorResponse, MessageContent, MessageRequest, MessageResponse, StopReason,
     SystemContent, ToolResultValue,
@@ -164,6 +165,7 @@ impl IntoResponse for MessageApiResponse {
 /// Supports both streaming and non-streaming responses.
 pub async fn create_message(
     State(state): State<AppState>,
+    Extension(key_info): Extension<ApiKeyInfo>,
     headers: HeaderMap,
     Json(request): Json<MessageRequest>,
 ) -> Result<MessageApiResponse, ApiError> {
@@ -236,10 +238,25 @@ pub async fn create_message(
                 &request,
                 &resolved.target_model_id,
                 &request_id,
+                &key_info.service_tier,
                 start_time,
             )
             .await
         }
+    }
+}
+
+fn resolve_effective_tier(request_tier: Option<&str>, key_tier: &str) -> Option<String> {
+    if let Some(t) = request_tier {
+        let normalized = t.trim().to_lowercase();
+        if !normalized.is_empty() && normalized != "auto" && normalized != "default" {
+            return Some(normalized);
+        }
+    }
+    let normalized_key = key_tier.trim().to_lowercase();
+    match normalized_key.as_str() {
+        "default" | "auto" | "" => None,
+        _ => Some(normalized_key),
     }
 }
 
@@ -249,6 +266,7 @@ async fn handle_bedrock_request(
     request: &MessageRequest,
     target_model_id: &str,
     request_id: &str,
+    key_tier: &str,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     let bedrock = state.bedrock.as_ref().ok_or_else(|| {
@@ -312,6 +330,10 @@ async fn handle_bedrock_request(
         "Routing to Bedrock backend"
     );
 
+    // Resolve effective service tier (request-level overrides key-level)
+    let effective_tier: Option<String> =
+        resolve_effective_tier(request.service_tier.as_deref(), key_tier);
+
     // Server-side web tool execution loop
     if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {
         return match state.web_tool_executor.as_ref() {
@@ -334,7 +356,7 @@ async fn handle_bedrock_request(
 
     // Build Converse request (returns mapper for restoring long tool names)
     let (converse_request, tool_name_mapper) =
-        anthropic_bedrock::convert_request(request, bedrock_model)
+        anthropic_bedrock::convert_request(request, bedrock_model, effective_tier.as_deref())
             .map_err(|e| ApiError::from_conversion_error(&e))?;
 
     // Handle streaming vs non-streaming
@@ -352,10 +374,34 @@ async fn handle_bedrock_request(
     }
 
     // Non-streaming response using Converse API
-    let converse_output = bedrock.converse(converse_request).await.map_err(|e| {
-        tracing::error!(error = %e, "Bedrock Converse API call failed");
-        ApiError::from_bedrock_error(&e)
-    })?;
+    let converse_output = match bedrock.converse(converse_request.clone()).await {
+        Ok(output) => output,
+        Err(ref e) => {
+            // If serviceTier not supported, retry without it
+            if is_service_tier_error(e) {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "serviceTier not supported for this model, retrying without it"
+                );
+                let mut fallback_req = converse_request.clone();
+                // Remove serviceTier from additionalModelRequestFields
+                if let Some(aws_smithy_types::Document::Object(ref mut map)) =
+                    fallback_req.additional_model_request_fields
+                {
+                    map.remove("serviceTier");
+                    if map.is_empty() {
+                        fallback_req.additional_model_request_fields = None;
+                    }
+                }
+                bedrock.converse(fallback_req).await.map_err(|e| {
+                    tracing::error!(error = %e, "Bedrock Converse API call failed (after tier fallback)");
+                    ApiError::from_bedrock_error(&e)
+                })?
+            } else {
+                return Err(ApiError::from_bedrock_error(e));
+            }
+        }
+    };
 
     // Convert Converse response to Anthropic format (restore original tool names)
     let response =
@@ -770,6 +816,19 @@ async fn handle_gemini_request(
 // ============================================================================
 // Streaming Response Handler
 // ============================================================================
+
+/// Returns true if the error indicates that serviceTier is not supported for this model.
+fn is_service_tier_error(e: &crate::services::BedrockError) -> bool {
+    match e {
+        crate::services::BedrockError::ValidationError(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("servicetier")
+                || lower.contains("service tier")
+                || lower.contains("performanceconfig")
+        }
+        _ => false,
+    }
+}
 
 /// Create a streaming response using SSE with ConverseStream API
 async fn create_streaming_response(
@@ -1496,6 +1555,62 @@ mod tests {
             ApiError::service_unavailable("test").status,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn test_resolve_tier_request_overrides_key() {
+        let request_tier = Some("flex".to_string());
+        let key_tier = "priority".to_string();
+        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
+        assert_eq!(resolved, Some("flex".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_falls_back_to_key() {
+        let request_tier: Option<String> = None;
+        let key_tier = "priority".to_string();
+        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
+        assert_eq!(resolved, Some("priority".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_default_is_none() {
+        let request_tier: Option<String> = None;
+        let key_tier = "default".to_string();
+        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
+        assert_eq!(resolved, None::<String>);
+    }
+
+    #[test]
+    fn test_resolve_tier_case_insensitive() {
+        // 大写输入应该被规范化
+        let resolved = resolve_effective_tier(Some("FLEX"), "default");
+        assert_eq!(resolved, Some("flex".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_trims_whitespace() {
+        let resolved = resolve_effective_tier(Some(" flex "), "default");
+        assert_eq!(resolved, Some("flex".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_invalid_value_falls_back_to_key() {
+        // "invalid" 不是 auto/default，所以作为有效 tier 处理
+        let resolved = resolve_effective_tier(Some("invalid"), "priority");
+        assert_eq!(resolved, Some("invalid".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_empty_string_falls_back_to_key() {
+        let resolved = resolve_effective_tier(Some(""), "priority");
+        assert_eq!(resolved, Some("priority".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_tier_whitespace_only_falls_back_to_key() {
+        let resolved = resolve_effective_tier(Some("  "), "priority");
+        assert_eq!(resolved, Some("priority".to_string()));
     }
 
     #[test]
