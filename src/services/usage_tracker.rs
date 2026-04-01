@@ -52,9 +52,11 @@ impl UsageTracker {
 
         let current_month = chrono::Utc::now().format("%Y-%m").to_string();
         if is_new_month(key_info.budget_mtd_month.as_deref(), &current_month) {
+            let prev_month = key_info.budget_mtd_month.as_deref().unwrap_or("");
+            let prev_mtd = key_info.budget_used_mtd;
             self.storage
                 .api_keys()
-                .reset_monthly_budget(&key_info.api_key, &current_month)
+                .reset_monthly_budget(&key_info.api_key, &current_month, prev_month, prev_mtd)
                 .await
                 .map_err(|e| UsageError::Database(e.to_string()))?;
             if key_info.is_budget_exceeded() {

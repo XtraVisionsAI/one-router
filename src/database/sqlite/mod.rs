@@ -155,6 +155,12 @@ impl SqliteBackend {
         .execute(&self.pool)
         .await?;
 
+        // Migration: add budget_history column if it doesn't exist
+        sqlx::query("ALTER TABLE api_keys ADD COLUMN budget_history TEXT")
+            .execute(&self.pool)
+            .await
+            .ok(); // ok() to ignore error when column already exists
+
         Ok(())
     }
 
@@ -285,7 +291,7 @@ impl ApiKeyStore for SqliteBackend {
         let row = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, tpm_limit, metadata, created_at, updated_at \
+             deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = ?",
         )
         .bind(api_key)
@@ -305,6 +311,7 @@ impl ApiKeyStore for SqliteBackend {
                 budget_used_mtd: r.get("budget_used_mtd"),
                 budget_mtd_month: r.get("budget_mtd_month"),
                 deactivated_reason: r.get("deactivated_reason"),
+                budget_history: r.get("budget_history"),
                 tpm_limit: r.get("tpm_limit"),
                 metadata: r.get("metadata"),
                 created_at: r.get("created_at"),
@@ -319,8 +326,8 @@ impl ApiKeyStore for SqliteBackend {
             "INSERT INTO api_keys \
              (api_key, user_id, name, is_active, rate_limit, service_tier, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-              deactivated_reason, tpm_limit, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
         .bind(&record.user_id)
@@ -333,6 +340,7 @@ impl ApiKeyStore for SqliteBackend {
         .bind(record.budget_used_mtd)
         .bind(&record.budget_mtd_month)
         .bind(&record.deactivated_reason)
+        .bind(&record.budget_history)
         .bind(record.tpm_limit)
         .bind(&record.metadata)
         .bind(record.created_at)
@@ -349,7 +357,7 @@ impl ApiKeyStore for SqliteBackend {
             "UPDATE api_keys SET \
              user_id = ?, name = ?, is_active = ?, rate_limit = ?, service_tier = ?, \
              monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
-             deactivated_reason = ?, tpm_limit = ?, metadata = ?, updated_at = ? \
+             deactivated_reason = ?, budget_history = ?, tpm_limit = ?, metadata = ?, updated_at = ? \
              WHERE api_key = ?",
         )
         .bind(&record.user_id)
@@ -362,6 +370,7 @@ impl ApiKeyStore for SqliteBackend {
         .bind(record.budget_used_mtd)
         .bind(&record.budget_mtd_month)
         .bind(&record.deactivated_reason)
+        .bind(&record.budget_history)
         .bind(record.tpm_limit)
         .bind(&record.metadata)
         .bind(now)
@@ -429,12 +438,45 @@ impl ApiKeyStore for SqliteBackend {
         Ok(false)
     }
 
-    async fn reset_monthly_budget(&self, api_key: &str, month: &str) -> Result<()> {
+    async fn reset_monthly_budget(
+        &self,
+        api_key: &str,
+        month: &str,
+        prev_month: &str,
+        prev_mtd: f64,
+    ) -> Result<()> {
         let now = unix_now();
+
+        // Read existing budget_history, append prev month's usage
+        let row = sqlx::query("SELECT budget_history FROM api_keys WHERE api_key = ?")
+            .bind(api_key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let updated_history = if let Some(r) = row {
+            let existing: Option<String> = r.get("budget_history");
+            let mut history: std::collections::HashMap<String, f64> = existing
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            if prev_mtd > 0.0 && !prev_month.is_empty() {
+                history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
+            }
+            serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string())
+        } else {
+            "{}".to_string()
+        };
+
         sqlx::query(
-            "UPDATE api_keys SET budget_used_mtd = 0.0, budget_mtd_month = ?, updated_at = ? WHERE api_key = ?",
+            "UPDATE api_keys SET \
+             budget_used_mtd = 0.0, \
+             budget_mtd_month = ?, \
+             budget_history = ?, \
+             updated_at = ? \
+             WHERE api_key = ?",
         )
         .bind(month)
+        .bind(&updated_history)
         .bind(now)
         .bind(api_key)
         .execute(&self.pool)
@@ -458,7 +500,7 @@ impl ApiKeyStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, tpm_limit, metadata, created_at, updated_at \
+             deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -478,6 +520,7 @@ impl ApiKeyStore for SqliteBackend {
                 budget_used_mtd: r.get("budget_used_mtd"),
                 budget_mtd_month: r.get("budget_mtd_month"),
                 deactivated_reason: r.get("deactivated_reason"),
+                budget_history: r.get("budget_history"),
                 tpm_limit: r.get("tpm_limit"),
                 metadata: r.get("metadata"),
                 created_at: r.get("created_at"),
@@ -1111,6 +1154,7 @@ mod tests {
             budget_used_mtd: 5.0,
             budget_mtd_month: Some("2026-02".into()),
             deactivated_reason: None,
+            budget_history: None,
             tpm_limit: None,
             metadata: None,
             created_at: 0,
@@ -1118,7 +1162,7 @@ mod tests {
         };
         db.api_keys().create_api_key(&record).await.unwrap();
         db.api_keys()
-            .reset_monthly_budget("sk-test-budget", "2026-03")
+            .reset_monthly_budget("sk-test-budget", "2026-03", "2026-02", 5.0)
             .await
             .unwrap();
         let updated = db
@@ -1130,6 +1174,12 @@ mod tests {
         assert_eq!(updated.budget_used_mtd, 0.0);
         assert_eq!(updated.budget_mtd_month, Some("2026-03".into()));
         assert_eq!(updated.budget_used, 5.0); // cumulative NOT reset
+
+        // After reset, budget_history should contain previous month's data
+        let history: std::collections::HashMap<String, f64> =
+            serde_json::from_str(updated.budget_history.as_deref().unwrap_or("{}")).unwrap();
+        assert!(history.contains_key("2026-02"));
+        assert_eq!(*history.get("2026-02").unwrap(), 5.0);
     }
 
     #[tokio::test]
@@ -1147,6 +1197,7 @@ mod tests {
             budget_used_mtd: 10.0,
             budget_mtd_month: Some("2026-02".into()),
             deactivated_reason: Some("budget_exceeded".into()),
+            budget_history: None,
             tpm_limit: None,
             metadata: None,
             created_at: 0,
@@ -1182,6 +1233,7 @@ mod tests {
             budget_used_mtd: 0.0,
             budget_mtd_month: None,
             deactivated_reason: Some("manual_deactivation".into()),
+            budget_history: None,
             tpm_limit: None,
             metadata: None,
             created_at: 0,

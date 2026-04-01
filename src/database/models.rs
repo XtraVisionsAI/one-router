@@ -21,6 +21,8 @@ pub struct ApiKeyRecord {
     pub budget_used_mtd: f64,
     pub budget_mtd_month: Option<String>,
     pub deactivated_reason: Option<String>,
+    /// Monthly budget history as JSON: {"2026-02": 45.67, "2026-01": 32.11}
+    pub budget_history: Option<String>,
     pub tpm_limit: Option<i32>,
     pub metadata: Option<String>, // JSON
     pub created_at: i64,

@@ -19,7 +19,14 @@ pub trait ApiKeyStore: Send + Sync {
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()>;
     async fn deactivate_api_key(&self, api_key: &str, reason: &str) -> Result<()>;
     async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<bool>;
-    async fn reset_monthly_budget(&self, api_key: &str, month: &str) -> Result<()>;
+    /// Reset monthly budget and archive previous month's usage to budget_history.
+    async fn reset_monthly_budget(
+        &self,
+        api_key: &str,
+        month: &str,      // new month "YYYY-MM"
+        prev_month: &str, // previous month "YYYY-MM"
+        prev_mtd: f64,    // previous month's budget_used_mtd to archive
+    ) -> Result<()>;
     async fn reactivate_api_key(&self, api_key: &str) -> Result<()>;
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>>;
 }
