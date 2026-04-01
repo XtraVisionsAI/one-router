@@ -79,6 +79,11 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
     // Migration: add priority column and update PK if upgrading from old schema
     migrate_model_mappings(pool).await?;
 
+    // Migration: add budget_history column if not already present
+    sqlx::query("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS budget_history TEXT")
+        .execute(pool)
+        .await?;
+
     // --- backends ---
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS backends (

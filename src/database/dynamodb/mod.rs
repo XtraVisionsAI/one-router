@@ -167,6 +167,7 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
         budget_used_mtd: get_f64(item, "budget_used_mtd"),
         budget_mtd_month: get_opt_s(item, "budget_mtd_month"),
         deactivated_reason: get_opt_s(item, "deactivated_reason"),
+        budget_history: get_opt_s(item, "budget_history"),
         tpm_limit: get_opt_i32(item, "tpm_limit"),
         metadata: get_opt_s(item, "metadata"),
         created_at: get_i64(item, "created_at"),
@@ -193,6 +194,9 @@ fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
         "deactivated_reason".into(),
         av_opt_s(&record.deactivated_reason),
     );
+    if let Some(ref h) = record.budget_history {
+        item.insert("budget_history".into(), av_s(h));
+    }
     item.insert("tpm_limit".into(), av_opt_n_i32(record.tpm_limit));
     item.insert("metadata".into(), av_opt_s(&record.metadata));
     item.insert("created_at".into(), av_n(record.created_at));
@@ -383,6 +387,85 @@ impl ApiKeyStore for DynamoDbBackend {
         }
 
         Ok(false)
+    }
+
+    async fn reset_monthly_budget(
+        &self,
+        api_key: &str,
+        month: &str,
+        prev_month: &str,
+        prev_mtd: f64,
+    ) -> Result<()> {
+        let now = unix_now();
+
+        // Get current item to read existing budget_history
+        let get_result = self
+            .client
+            .get_item()
+            .table_name(Self::table_name("api_keys"))
+            .key("api_key", av_s(api_key))
+            .send()
+            .await?;
+
+        let updated_history = if let Some(item) = get_result.item() {
+            let existing = get_opt_s(item, "budget_history");
+            let mut history: std::collections::HashMap<String, f64> = existing
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            if prev_mtd > 0.0 && !prev_month.is_empty() {
+                history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
+            }
+            serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string())
+        } else {
+            "{}".to_string()
+        };
+
+        self.client
+            .update_item()
+            .table_name(Self::table_name("api_keys"))
+            .key("api_key", av_s(api_key))
+            .update_expression(
+                "SET budget_used_mtd = :zero, budget_mtd_month = :month, \
+                 budget_history = :history, updated_at = :now",
+            )
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
+            .expression_attribute_values(":month", av_s(month))
+            .expression_attribute_values(":history", av_s(&updated_history))
+            .expression_attribute_values(":now", av_n(now))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("DynamoDB reset_monthly_budget: {e}"))?;
+        Ok(())
+    }
+
+    async fn reactivate_api_key(&self, api_key: &str) -> Result<()> {
+        let now = unix_now();
+        let result = self
+            .client
+            .update_item()
+            .table_name(Self::table_name("api_keys"))
+            .key("api_key", av_s(api_key))
+            .update_expression(
+                "SET is_active = :true_val, updated_at = :now REMOVE deactivated_reason",
+            )
+            .condition_expression("deactivated_reason = :budget_exceeded")
+            .expression_attribute_values(":true_val", av_bool(true))
+            .expression_attribute_values(":now", av_n(now))
+            .expression_attribute_values(":budget_exceeded", av_s("budget_exceeded"))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("ConditionalCheckFailed") {
+                    Ok(()) // key was not budget-deactivated — that's fine
+                } else {
+                    Err(anyhow::anyhow!("DynamoDB reactivate_api_key: {e}"))
+                }
+            }
+        }
     }
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {

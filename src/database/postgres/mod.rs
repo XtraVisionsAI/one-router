@@ -81,7 +81,7 @@ impl ApiKeyStore for PostgresBackend {
         let row = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, tpm_limit, metadata, created_at, updated_at \
+             deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = $1",
         )
         .bind(api_key)
@@ -101,6 +101,7 @@ impl ApiKeyStore for PostgresBackend {
                 budget_used_mtd: r.get("budget_used_mtd"),
                 budget_mtd_month: r.get("budget_mtd_month"),
                 deactivated_reason: r.get("deactivated_reason"),
+                budget_history: r.get("budget_history"),
                 tpm_limit: r.get("tpm_limit"),
                 metadata: r.get("metadata"),
                 created_at: r.get("created_at"),
@@ -115,8 +116,8 @@ impl ApiKeyStore for PostgresBackend {
             "INSERT INTO api_keys \
              (api_key, user_id, name, is_active, rate_limit, service_tier, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-              deactivated_reason, tpm_limit, metadata, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+              deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(&record.api_key)
         .bind(&record.user_id)
@@ -129,6 +130,7 @@ impl ApiKeyStore for PostgresBackend {
         .bind(record.budget_used_mtd)
         .bind(&record.budget_mtd_month)
         .bind(&record.deactivated_reason)
+        .bind(&record.budget_history)
         .bind(record.tpm_limit)
         .bind(&record.metadata)
         .bind(record.created_at)
@@ -145,8 +147,8 @@ impl ApiKeyStore for PostgresBackend {
             "UPDATE api_keys SET \
              user_id = $1, name = $2, is_active = $3, rate_limit = $4, service_tier = $5, \
              monthly_budget = $6, budget_used = $7, budget_used_mtd = $8, budget_mtd_month = $9, \
-             deactivated_reason = $10, tpm_limit = $11, metadata = $12, updated_at = $13 \
-             WHERE api_key = $14",
+             deactivated_reason = $10, budget_history = $11, tpm_limit = $12, metadata = $13, updated_at = $14 \
+             WHERE api_key = $15",
         )
         .bind(&record.user_id)
         .bind(&record.name)
@@ -158,6 +160,7 @@ impl ApiKeyStore for PostgresBackend {
         .bind(record.budget_used_mtd)
         .bind(&record.budget_mtd_month)
         .bind(&record.deactivated_reason)
+        .bind(&record.budget_history)
         .bind(record.tpm_limit)
         .bind(&record.metadata)
         .bind(now)
@@ -223,11 +226,69 @@ impl ApiKeyStore for PostgresBackend {
         Ok(false)
     }
 
+    async fn reset_monthly_budget(
+        &self,
+        api_key: &str,
+        month: &str,
+        prev_month: &str,
+        prev_mtd: f64,
+    ) -> Result<()> {
+        let now = unix_now();
+
+        // Read existing budget_history, append prev month's usage
+        let row = sqlx::query("SELECT budget_history FROM api_keys WHERE api_key = $1")
+            .bind(api_key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let updated_history = if let Some(r) = row {
+            let existing: Option<String> = r.get("budget_history");
+            let mut history: std::collections::HashMap<String, f64> = existing
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            if prev_mtd > 0.0 && !prev_month.is_empty() {
+                history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
+            }
+            serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string())
+        } else {
+            "{}".to_string()
+        };
+
+        sqlx::query(
+            "UPDATE api_keys SET \
+             budget_used_mtd = 0.0, \
+             budget_mtd_month = $1, \
+             budget_history = $2, \
+             updated_at = $3 \
+             WHERE api_key = $4",
+        )
+        .bind(month)
+        .bind(&updated_history)
+        .bind(now)
+        .bind(api_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn reactivate_api_key(&self, api_key: &str) -> Result<()> {
+        let now = unix_now();
+        sqlx::query(
+            "UPDATE api_keys SET is_active = TRUE, deactivated_reason = NULL, updated_at = $1 WHERE api_key = $2 AND deactivated_reason = 'budget_exceeded'",
+        )
+        .bind(now)
+        .bind(api_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows = sqlx::query(
             "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, tpm_limit, metadata, created_at, updated_at \
+             deactivated_reason, budget_history, tpm_limit, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -247,6 +308,7 @@ impl ApiKeyStore for PostgresBackend {
                 budget_used_mtd: r.get("budget_used_mtd"),
                 budget_mtd_month: r.get("budget_mtd_month"),
                 deactivated_reason: r.get("deactivated_reason"),
+                budget_history: r.get("budget_history"),
                 tpm_limit: r.get("tpm_limit"),
                 metadata: r.get("metadata"),
                 created_at: r.get("created_at"),
