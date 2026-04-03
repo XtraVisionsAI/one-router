@@ -2,13 +2,12 @@ import { fileURLToPath, URL } from 'node:url'
 import { createVitePlugins, useEnv } from '@xv-shared/vite'
 import { defineConfig } from 'vite'
 
-export default defineConfig(async ({ mode }) => {
+export default defineConfig(({ mode }) => {
   const env = useEnv(mode, process.cwd())
 
   return {
     base: '/admin/',
-    plugins: await createVitePlugins({
-      topLevelAwait: false,
+    plugins: createVitePlugins({
       autoRouter: {
         dts: 'types/generated/typed-router.d.ts'
       },

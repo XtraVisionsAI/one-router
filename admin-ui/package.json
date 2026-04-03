@@ -26,7 +26,7 @@
     "@xv-shared/eslint-config": "^2.0.0",
     "@xv-shared/stylelint-config": "^2.0.0",
     "@xv-shared/ts-config": "^2.0.0",
-    "@xv-shared/vite": "^2.0.1",
+    "@xv-shared/vite": "^2.1.0",
     "eslint": "^10.1.0",
     "typescript": "^6.0.2",
     "vite": "^8.0.3",
