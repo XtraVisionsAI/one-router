@@ -11,8 +11,7 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS api_keys (
             api_key TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            name TEXT DEFAULT '',
+            name TEXT UNIQUE DEFAULT '',
             is_active BOOLEAN DEFAULT TRUE,
             rate_limit INTEGER DEFAULT 100,
             service_tier TEXT DEFAULT 'default',
@@ -91,6 +90,11 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
         .await
         .ok(); // ignore error if column already exists
 
+    // Migration: add unique index on api_keys.name if upgrading from older schema
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_name ON api_keys(name)")
+        .execute(pool)
+        .await?;
+
     // --- backends ---
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS backends (
@@ -115,6 +119,18 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             enabled BOOLEAN DEFAULT FALSE,
             description TEXT DEFAULT '',
             created_at BIGINT NOT NULL,
+            updated_at BIGINT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // --- system_settings ---
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
             updated_at BIGINT
         )",
     )

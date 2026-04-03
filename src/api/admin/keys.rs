@@ -29,7 +29,6 @@ use crate::server::state::AppState;
 pub struct AdminKeyItem {
     pub api_key: String, // truncated
     pub name: String,
-    pub user_id: String,
     pub is_active: bool,
     pub rate_limit: i32,
     pub tpm_limit: Option<i32>,
@@ -44,7 +43,6 @@ impl AdminKeyItem {
         Self {
             api_key: ApiKeyInfo::truncate_key(&r.api_key),
             name: r.name.clone(),
-            user_id: r.user_id.clone(),
             is_active: r.is_active,
             rate_limit: r.rate_limit,
             tpm_limit: r.tpm_limit,
@@ -67,7 +65,6 @@ pub struct KeyListResponse {
 pub struct CreateKeyResponse {
     pub api_key: String, // full plaintext — show once
     pub name: String,
-    pub user_id: String,
     pub message: &'static str,
 }
 
@@ -83,13 +80,13 @@ pub struct OkResponse {
 #[derive(Debug, Deserialize)]
 pub struct CreateKeyRequest {
     pub name: String,
-    pub user_id: String,
     #[serde(default)]
     pub rate_limit: Option<i32>,
     pub tpm_limit: Option<i32>,
     #[serde(default = "default_service_tier")]
     pub service_tier: String,
     pub monthly_budget: Option<f64>,
+    pub cache_ttl: Option<String>,
 }
 
 fn default_service_tier() -> String {
@@ -119,6 +116,9 @@ pub struct UpdateKeyRequest {
     /// None = don't change, Some(None) = clear, Some(Some(v)) = set to v
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub monthly_budget: Option<Option<f64>>,
+    /// None = don't change, Some(None) = clear, Some(Some(v)) = set to v
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub cache_ttl: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +130,14 @@ pub struct DeleteKeyQuery {
 // ============================================================================
 // Private helpers
 // ============================================================================
+
+/// Returns true if the error is a unique constraint violation on the name column.
+fn is_name_unique_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("unique constraint failed: api_keys.name")
+        || msg.contains("unique constraint failed") && msg.contains("name")
+        || msg.contains("duplicate key value violates unique constraint")
+}
 
 /// Find a single ApiKeyRecord by its truncated key form.
 /// Returns Err(Response) with 404 if not found, 409 if multiple keys share the same prefix.
@@ -222,7 +230,6 @@ pub async fn create_key(
     let now = Utc::now().timestamp();
     let record = ApiKeyRecord {
         api_key: raw_key.clone(),
-        user_id: body.user_id.clone(),
         name: body.name.clone(),
         is_active: true,
         rate_limit: body.rate_limit.unwrap_or(100),
@@ -234,7 +241,7 @@ pub async fn create_key(
         deactivated_reason: None,
         budget_history: None,
         tpm_limit: body.tpm_limit,
-        cache_ttl: None,
+        cache_ttl: body.cache_ttl,
         metadata: None,
         created_at: now,
         updated_at: None,
@@ -246,9 +253,16 @@ pub async fn create_key(
             Json(CreateKeyResponse {
                 api_key: raw_key,
                 name: body.name,
-                user_id: body.user_id,
                 message: "Save this key — it will not be shown again.",
             }),
+        )
+            .into_response(),
+        Err(e) if is_name_unique_error(&e) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "conflict_error",
+                "A key with this name already exists",
+            )),
         )
             .into_response(),
         Err(e) => {
@@ -289,9 +303,20 @@ pub async fn update_key(
     if let Some(budget) = body.monthly_budget {
         record.monthly_budget = budget; // Some(v) sets it, None clears it
     }
+    if let Some(cache_ttl) = body.cache_ttl {
+        record.cache_ttl = cache_ttl; // Some(v) sets it, None clears it
+    }
 
     match state.database.api_keys().update_api_key(&record).await {
         Ok(()) => (StatusCode::OK, Json(AdminKeyItem::from_record(&record))).into_response(),
+        Err(e) if is_name_unique_error(&e) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "conflict_error",
+                "A key with this name already exists",
+            )),
+        )
+            .into_response(),
         Err(e) => {
             tracing::error!(error = %e, "Failed to update API key");
             (
@@ -386,7 +411,6 @@ mod tests {
         let record = ApiKeyRecord {
             api_key: "sk-a1b2c3d4e5f6a1b2".to_string(),
             name: "Test".to_string(),
-            user_id: "u1".to_string(),
             is_active: true,
             rate_limit: 100,
             service_tier: "default".to_string(),
@@ -409,7 +433,7 @@ mod tests {
 
     #[test]
     fn create_request_default_service_tier() {
-        let json = r#"{"name":"Test","user_id":"u1"}"#;
+        let json = r#"{"name":"Test"}"#;
         let req: CreateKeyRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.service_tier, "default");
         assert_eq!(req.rate_limit, None);

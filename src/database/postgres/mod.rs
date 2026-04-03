@@ -56,7 +56,7 @@ impl DatabaseService for PostgresBackend {
     fn backends(&self) -> &dyn BackendConfigStore {
         self
     }
-    fn feature_flags(&self) -> &dyn FeatureFlagStore {
+    fn system_settings(&self) -> &dyn SystemSettingStore {
         self
     }
 
@@ -79,7 +79,7 @@ impl DatabaseService for PostgresBackend {
 impl ApiKeyStore for PostgresBackend {
     async fn get_api_key(&self, api_key: &str) -> Result<Option<ApiKeyRecord>> {
         let row = sqlx::query(
-            "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
+            "SELECT api_key, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = $1",
@@ -91,7 +91,6 @@ impl ApiKeyStore for PostgresBackend {
         match row {
             Some(r) => Ok(Some(ApiKeyRecord {
                 api_key: r.get("api_key"),
-                user_id: r.get("user_id"),
                 name: r.get("name"),
                 is_active: r.get("is_active"),
                 rate_limit: r.get("rate_limit"),
@@ -115,13 +114,12 @@ impl ApiKeyStore for PostgresBackend {
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO api_keys \
-             (api_key, user_id, name, is_active, rate_limit, service_tier, \
+             (api_key, name, is_active, rate_limit, service_tier, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(&record.api_key)
-        .bind(&record.user_id)
         .bind(&record.name)
         .bind(record.is_active)
         .bind(record.rate_limit)
@@ -147,12 +145,11 @@ impl ApiKeyStore for PostgresBackend {
         let now = unix_now();
         sqlx::query(
             "UPDATE api_keys SET \
-             user_id = $1, name = $2, is_active = $3, rate_limit = $4, service_tier = $5, \
-             monthly_budget = $6, budget_used = $7, budget_used_mtd = $8, budget_mtd_month = $9, \
-             deactivated_reason = $10, budget_history = $11, tpm_limit = $12, cache_ttl = $13, metadata = $14, updated_at = $15 \
-             WHERE api_key = $16",
+             name = $1, is_active = $2, rate_limit = $3, service_tier = $4, \
+             monthly_budget = $5, budget_used = $6, budget_used_mtd = $7, budget_mtd_month = $8, \
+             deactivated_reason = $9, budget_history = $10, tpm_limit = $11, cache_ttl = $12, metadata = $13, updated_at = $14 \
+             WHERE api_key = $15",
         )
-        .bind(&record.user_id)
         .bind(&record.name)
         .bind(record.is_active)
         .bind(record.rate_limit)
@@ -289,7 +286,7 @@ impl ApiKeyStore for PostgresBackend {
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows = sqlx::query(
-            "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
+            "SELECT api_key, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
@@ -301,7 +298,6 @@ impl ApiKeyStore for PostgresBackend {
             .iter()
             .map(|r| ApiKeyRecord {
                 api_key: r.get("api_key"),
-                user_id: r.get("user_id"),
                 name: r.get("name"),
                 is_active: r.get("is_active"),
                 rate_limit: r.get("rate_limit"),
@@ -841,84 +837,62 @@ impl BackendConfigStore for PostgresBackend {
 }
 
 // ============================================================================
-// FeatureFlagStore
+// SystemSettingStore
 // ============================================================================
 
 #[async_trait]
-impl FeatureFlagStore for PostgresBackend {
-    async fn get_flag(&self, name: &str) -> Result<Option<FeatureFlagRecord>> {
+impl SystemSettingStore for PostgresBackend {
+    async fn get_setting(&self, key: &str) -> Result<Option<SystemSettingRecord>> {
         let row = sqlx::query(
-            "SELECT name, enabled, description, created_at, updated_at \
-             FROM feature_flags WHERE name = $1",
+            "SELECT key, value, description, updated_at FROM system_settings WHERE key = $1",
         )
-        .bind(name)
+        .bind(key)
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(r) => Ok(Some(FeatureFlagRecord {
-                name: r.get("name"),
-                enabled: r.get("enabled"),
-                description: r.get("description"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })),
-            None => Ok(None),
-        }
+        Ok(row.map(|r| SystemSettingRecord {
+            key: r.get("key"),
+            value: r.get("value"),
+            description: r.get("description"),
+            updated_at: r.get("updated_at"),
+        }))
     }
 
-    async fn is_enabled(&self, name: &str) -> Result<bool> {
-        let row = sqlx::query("SELECT enabled FROM feature_flags WHERE name = $1")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        match row {
-            Some(r) => Ok(r.get("enabled")),
-            None => Ok(false),
-        }
-    }
-
-    async fn list_flags(&self) -> Result<Vec<FeatureFlagRecord>> {
-        let rows = sqlx::query(
-            "SELECT name, enabled, description, created_at, updated_at \
-             FROM feature_flags ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let records = rows
-            .iter()
-            .map(|r| FeatureFlagRecord {
-                name: r.get("name"),
-                enabled: r.get("enabled"),
-                description: r.get("description"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect();
-
-        Ok(records)
-    }
-
-    async fn upsert_flag(&self, record: &FeatureFlagRecord) -> Result<()> {
+    async fn upsert_setting(&self, record: &SystemSettingRecord) -> Result<()> {
         let now = unix_now();
         sqlx::query(
-            "INSERT INTO feature_flags (name, enabled, description, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT(name) DO UPDATE SET \
-             enabled = EXCLUDED.enabled, \
+            "INSERT INTO system_settings (key, value, description, updated_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT(key) DO UPDATE SET \
+             value = EXCLUDED.value, \
              description = EXCLUDED.description, \
              updated_at = EXCLUDED.updated_at",
         )
-        .bind(&record.name)
-        .bind(record.enabled)
+        .bind(&record.key)
+        .bind(&record.value)
         .bind(&record.description)
-        .bind(record.created_at)
         .bind(now)
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    async fn list_settings(&self) -> Result<Vec<SystemSettingRecord>> {
+        let rows = sqlx::query(
+            "SELECT key, value, description, updated_at FROM system_settings ORDER BY key",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| SystemSettingRecord {
+                key: r.get("key"),
+                value: r.get("value"),
+                description: r.get("description"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
     }
 }

@@ -25,7 +25,6 @@ use crate::utils::truncate_str;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyInfo {
     pub api_key: String,
-    pub user_id: String,
     pub is_master: bool,
     pub rate_limit: Option<u32>,
     pub service_tier: String,
@@ -39,7 +38,6 @@ impl ApiKeyInfo {
     pub fn master(api_key: &str) -> Self {
         Self {
             api_key: Self::truncate_key(api_key),
-            user_id: "master".to_string(),
             is_master: true,
             rate_limit: None,
             service_tier: "master".to_string(),
@@ -53,7 +51,6 @@ impl ApiKeyInfo {
     pub fn from_db_record(record: &crate::database::models::ApiKeyRecord) -> Self {
         Self {
             api_key: Self::truncate_key(&record.api_key),
-            user_id: record.user_id.clone(),
             is_master: false,
             rate_limit: if record.rate_limit > 0 {
                 Some(record.rate_limit as u32)
@@ -213,7 +210,6 @@ pub async fn require_api_key(
         if api_key == *ephemeral_key {
             request.extensions_mut().insert(ApiKeyInfo {
                 api_key: ApiKeyInfo::truncate_key(&api_key),
-                user_id: "ephemeral".to_string(),
                 is_master: false,
                 rate_limit: None,
                 service_tier: "default".to_string(),
@@ -277,7 +273,6 @@ mod tests {
     fn test_api_key_info_master() {
         let info = ApiKeyInfo::master("sk-ant-master-key-12345");
         assert!(info.is_master);
-        assert_eq!(info.user_id, "master");
         assert!(info.bypass_rate_limit());
     }
 

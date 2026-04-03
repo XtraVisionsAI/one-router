@@ -57,8 +57,7 @@ impl SqliteBackend {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS api_keys (
                 api_key TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                name TEXT DEFAULT '',
+                name TEXT UNIQUE DEFAULT '',
                 is_active INTEGER DEFAULT 1,
                 rate_limit INTEGER DEFAULT 100,
                 service_tier TEXT DEFAULT 'default',
@@ -89,6 +88,12 @@ impl SqliteBackend {
             .execute(&self.pool)
             .await
             .ok(); // ignore error if column already exists
+
+        // Migration: add unique index on api_keys.name if upgrading from older schema
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_name ON api_keys(name)")
+            .execute(&self.pool)
+            .await
+            .ok(); // ignore error if index already exists
 
         // --- usage ---
         sqlx::query(
@@ -163,6 +168,18 @@ impl SqliteBackend {
                 enabled INTEGER DEFAULT 0,
                 description TEXT DEFAULT '',
                 created_at INTEGER NOT NULL,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // --- system_settings ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER
             )",
         )
@@ -280,7 +297,7 @@ impl DatabaseService for SqliteBackend {
         self
     }
 
-    fn feature_flags(&self) -> &dyn FeatureFlagStore {
+    fn system_settings(&self) -> &dyn SystemSettingStore {
         self
     }
 
@@ -303,7 +320,7 @@ impl DatabaseService for SqliteBackend {
 impl ApiKeyStore for SqliteBackend {
     async fn get_api_key(&self, api_key: &str) -> Result<Option<ApiKeyRecord>> {
         let row = sqlx::query(
-            "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
+            "SELECT api_key, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = ?",
@@ -315,7 +332,6 @@ impl ApiKeyStore for SqliteBackend {
         match row {
             Some(r) => Ok(Some(ApiKeyRecord {
                 api_key: r.get("api_key"),
-                user_id: r.get("user_id"),
                 name: r.get("name"),
                 is_active: r.get::<i32, _>("is_active") != 0,
                 rate_limit: r.get("rate_limit"),
@@ -339,13 +355,12 @@ impl ApiKeyStore for SqliteBackend {
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO api_keys \
-             (api_key, user_id, name, is_active, rate_limit, service_tier, \
+             (api_key, name, is_active, rate_limit, service_tier, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
-        .bind(&record.user_id)
         .bind(&record.name)
         .bind(record.is_active as i32)
         .bind(record.rate_limit)
@@ -371,12 +386,11 @@ impl ApiKeyStore for SqliteBackend {
         let now = unix_now();
         sqlx::query(
             "UPDATE api_keys SET \
-             user_id = ?, name = ?, is_active = ?, rate_limit = ?, service_tier = ?, \
+             name = ?, is_active = ?, rate_limit = ?, service_tier = ?, \
              monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
              deactivated_reason = ?, budget_history = ?, tpm_limit = ?, cache_ttl = ?, metadata = ?, updated_at = ? \
              WHERE api_key = ?",
         )
-        .bind(&record.user_id)
         .bind(&record.name)
         .bind(record.is_active as i32)
         .bind(record.rate_limit)
@@ -515,7 +529,7 @@ impl ApiKeyStore for SqliteBackend {
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows = sqlx::query(
-            "SELECT api_key, user_id, name, is_active, rate_limit, service_tier, \
+            "SELECT api_key, name, is_active, rate_limit, service_tier, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
@@ -527,7 +541,6 @@ impl ApiKeyStore for SqliteBackend {
             .iter()
             .map(|r| ApiKeyRecord {
                 api_key: r.get("api_key"),
-                user_id: r.get("user_id"),
                 name: r.get("name"),
                 is_active: r.get::<i32, _>("is_active") != 0,
                 rate_limit: r.get("rate_limit"),
@@ -1055,85 +1068,63 @@ impl BackendConfigStore for SqliteBackend {
 }
 
 // ============================================================================
-// FeatureFlagStore
+// SystemSettingStore
 // ============================================================================
 
 #[async_trait]
-impl FeatureFlagStore for SqliteBackend {
-    async fn get_flag(&self, name: &str) -> Result<Option<FeatureFlagRecord>> {
+impl SystemSettingStore for SqliteBackend {
+    async fn get_setting(&self, key: &str) -> Result<Option<SystemSettingRecord>> {
         let row = sqlx::query(
-            "SELECT name, enabled, description, created_at, updated_at \
-             FROM feature_flags WHERE name = ?",
+            "SELECT key, value, description, updated_at FROM system_settings WHERE key = ?",
         )
-        .bind(name)
+        .bind(key)
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(r) => Ok(Some(FeatureFlagRecord {
-                name: r.get("name"),
-                enabled: r.get::<i32, _>("enabled") != 0,
-                description: r.get("description"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })),
-            None => Ok(None),
-        }
+        Ok(row.map(|r| SystemSettingRecord {
+            key: r.get("key"),
+            value: r.get("value"),
+            description: r.get("description"),
+            updated_at: r.get("updated_at"),
+        }))
     }
 
-    async fn is_enabled(&self, name: &str) -> Result<bool> {
-        let row = sqlx::query("SELECT enabled FROM feature_flags WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        match row {
-            Some(r) => Ok(r.get::<i32, _>("enabled") != 0),
-            None => Ok(false),
-        }
-    }
-
-    async fn list_flags(&self) -> Result<Vec<FeatureFlagRecord>> {
-        let rows = sqlx::query(
-            "SELECT name, enabled, description, created_at, updated_at \
-             FROM feature_flags ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let records = rows
-            .iter()
-            .map(|r| FeatureFlagRecord {
-                name: r.get("name"),
-                enabled: r.get::<i32, _>("enabled") != 0,
-                description: r.get("description"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect();
-
-        Ok(records)
-    }
-
-    async fn upsert_flag(&self, record: &FeatureFlagRecord) -> Result<()> {
+    async fn upsert_setting(&self, record: &SystemSettingRecord) -> Result<()> {
         let now = unix_now();
         sqlx::query(
-            "INSERT INTO feature_flags (name, enabled, description, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT(name) DO UPDATE SET \
-             enabled = excluded.enabled, \
+            "INSERT INTO system_settings (key, value, description, updated_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(key) DO UPDATE SET \
+             value = excluded.value, \
              description = excluded.description, \
              updated_at = excluded.updated_at",
         )
-        .bind(&record.name)
-        .bind(record.enabled as i32)
+        .bind(&record.key)
+        .bind(&record.value)
         .bind(&record.description)
-        .bind(record.created_at)
         .bind(now)
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    async fn list_settings(&self) -> Result<Vec<SystemSettingRecord>> {
+        let rows = sqlx::query(
+            "SELECT key, value, description, updated_at FROM system_settings ORDER BY key",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| SystemSettingRecord {
+                key: r.get("key"),
+                value: r.get("value"),
+                description: r.get("description"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
     }
 }
 
@@ -1162,7 +1153,6 @@ mod tests {
         let db = in_memory_db().await;
         let record = ApiKeyRecord {
             api_key: "sk-test-budget".into(),
-            user_id: "user1".into(),
             name: "test".into(),
             is_active: true,
             rate_limit: 0,
@@ -1206,7 +1196,6 @@ mod tests {
         let db = in_memory_db().await;
         let record = ApiKeyRecord {
             api_key: "sk-test-reactivate".into(),
-            user_id: "user1".into(),
             name: "test".into(),
             is_active: false,
             rate_limit: 0,
@@ -1243,7 +1232,6 @@ mod tests {
         let db = in_memory_db().await;
         let record = ApiKeyRecord {
             api_key: "sk-test-manual".into(),
-            user_id: "user1".into(),
             name: "test".into(),
             is_active: false,
             rate_limit: 0,

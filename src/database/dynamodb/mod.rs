@@ -157,7 +157,6 @@ fn get_bool(item: &HashMap<String, AttributeValue>, key: &str) -> bool {
 fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
     ApiKeyRecord {
         api_key: get_s(item, "api_key"),
-        user_id: get_s(item, "user_id"),
         name: get_s(item, "name"),
         is_active: get_bool(item, "is_active"),
         rate_limit: get_i32(item, "rate_limit"),
@@ -179,7 +178,6 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
 fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();
     item.insert("api_key".into(), av_s(&record.api_key));
-    item.insert("user_id".into(), av_s(&record.user_id));
     item.insert("name".into(), av_s(&record.name));
     item.insert("is_active".into(), av_bool(record.is_active));
     item.insert("rate_limit".into(), av_n(record.rate_limit as i64));
@@ -255,16 +253,6 @@ fn backend_from_item(item: &HashMap<String, AttributeValue>) -> BackendRecord {
     }
 }
 
-fn feature_flag_from_item(item: &HashMap<String, AttributeValue>) -> FeatureFlagRecord {
-    FeatureFlagRecord {
-        name: get_s(item, "name"),
-        enabled: get_bool(item, "enabled"),
-        description: get_s(item, "description"),
-        created_at: get_i64(item, "created_at"),
-        updated_at: get_opt_i64(item, "updated_at"),
-    }
-}
-
 // ============================================================================
 // DatabaseService
 // ============================================================================
@@ -283,7 +271,7 @@ impl DatabaseService for DynamoDbBackend {
     fn backends(&self) -> &dyn BackendConfigStore {
         self
     }
-    fn feature_flags(&self) -> &dyn FeatureFlagStore {
+    fn system_settings(&self) -> &dyn SystemSettingStore {
         self
     }
 
@@ -322,6 +310,11 @@ impl ApiKeyStore for DynamoDbBackend {
     }
 
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
+        // Application-level unique check on name (DynamoDB has no UNIQUE constraints)
+        let existing = self.list_api_keys().await?;
+        if existing.iter().any(|r| r.name == record.name) {
+            return Err(anyhow::anyhow!("UNIQUE constraint failed: api_keys.name"));
+        }
         self.client
             .put_item()
             .table_name(Self::table_name("api_keys"))
@@ -332,6 +325,14 @@ impl ApiKeyStore for DynamoDbBackend {
     }
 
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
+        // Application-level unique check on name (DynamoDB has no UNIQUE constraints)
+        let existing = self.list_api_keys().await?;
+        if existing
+            .iter()
+            .any(|r| r.api_key != record.api_key && r.name == record.name)
+        {
+            return Err(anyhow::anyhow!("UNIQUE constraint failed: api_keys.name"));
+        }
         let mut item = api_key_to_item(record);
         item.insert("updated_at".into(), av_n(unix_now()));
         self.client
@@ -865,58 +866,67 @@ impl BackendConfigStore for DynamoDbBackend {
 // FeatureFlagStore
 // ============================================================================
 
+// ============================================================================
+// SystemSettingStore
+// ============================================================================
+
 #[async_trait]
-impl FeatureFlagStore for DynamoDbBackend {
-    async fn get_flag(&self, name: &str) -> Result<Option<FeatureFlagRecord>> {
+impl SystemSettingStore for DynamoDbBackend {
+    async fn get_setting(&self, key: &str) -> Result<Option<SystemSettingRecord>> {
         let result = self
             .client
             .get_item()
-            .table_name(Self::table_name("feature_flags"))
-            .key("name", av_s(name))
+            .table_name(Self::table_name("system_settings"))
+            .key("key", av_s(key))
             .send()
             .await?;
 
-        Ok(result.item().map(feature_flag_from_item))
+        Ok(result.item().map(|item| SystemSettingRecord {
+            key: get_s(item, "key"),
+            value: get_s(item, "value"),
+            description: get_s(item, "description"),
+            updated_at: get_opt_i64(item, "updated_at"),
+        }))
     }
 
-    async fn is_enabled(&self, name: &str) -> Result<bool> {
-        match self.get_flag(name).await? {
-            Some(flag) => Ok(flag.enabled),
-            None => Ok(false),
-        }
-    }
-
-    async fn list_flags(&self) -> Result<Vec<FeatureFlagRecord>> {
-        let result = self
-            .client
-            .scan()
-            .table_name(Self::table_name("feature_flags"))
-            .send()
-            .await?;
-
-        let mut records: Vec<FeatureFlagRecord> =
-            result.items().iter().map(feature_flag_from_item).collect();
-
-        records.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(records)
-    }
-
-    async fn upsert_flag(&self, record: &FeatureFlagRecord) -> Result<()> {
+    async fn upsert_setting(&self, record: &SystemSettingRecord) -> Result<()> {
         let now = unix_now();
         let mut item = HashMap::new();
-        item.insert("name".into(), av_s(&record.name));
-        item.insert("enabled".into(), av_bool(record.enabled));
+        item.insert("key".into(), av_s(&record.key));
+        item.insert("value".into(), av_s(&record.value));
         item.insert("description".into(), av_s(&record.description));
-        item.insert("created_at".into(), av_n(record.created_at));
         item.insert("updated_at".into(), av_n(now));
 
         self.client
             .put_item()
-            .table_name(Self::table_name("feature_flags"))
+            .table_name(Self::table_name("system_settings"))
             .set_item(Some(item))
             .send()
             .await?;
 
         Ok(())
+    }
+
+    async fn list_settings(&self) -> Result<Vec<SystemSettingRecord>> {
+        let result = self
+            .client
+            .scan()
+            .table_name(Self::table_name("system_settings"))
+            .send()
+            .await?;
+
+        let mut records: Vec<SystemSettingRecord> = result
+            .items()
+            .iter()
+            .map(|item| SystemSettingRecord {
+                key: get_s(item, "key"),
+                value: get_s(item, "value"),
+                description: get_s(item, "description"),
+                updated_at: get_opt_i64(item, "updated_at"),
+            })
+            .collect();
+
+        records.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(records)
     }
 }

@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
     pub api_key: String,
-    pub user_id: String,
     pub name: String,
     pub is_active: bool,
     pub rate_limit: i32,
@@ -99,15 +98,14 @@ pub struct BackendRecord {
 }
 
 // ============================================================================
-// feature_flags
+// system_settings
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FeatureFlagRecord {
-    pub name: String,
-    pub enabled: bool,
+pub struct SystemSettingRecord {
+    pub key: String,
+    pub value: String,
     pub description: String,
-    pub created_at: i64,
     pub updated_at: Option<i64>,
 }
 
