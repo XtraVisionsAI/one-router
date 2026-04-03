@@ -131,12 +131,14 @@
             />
 
             <!-- Select -->
-            <div v-else-if="s.type === 'select'" class="flex items-center gap-2 shrink-0">
-              <NSelect v-model:value="values[s.key]" :options="s.options" style="width: 160px" />
-              <NButton size="small" type="primary" :loading="saving === s.key" @click="saveKey(s.key, s.description)">
-                Save
-              </NButton>
-            </div>
+            <NSelect
+              v-else-if="s.type === 'select'"
+              v-model:value="values[s.key]"
+              :options="s.options"
+              :loading="saving === s.key"
+              style="width: 160px"
+              @update:value="() => saveKey(s.key, s.description)"
+            />
           </div>
         </NCard>
       </div>
