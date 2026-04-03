@@ -109,8 +109,11 @@ pub fn create_router(state: AppState) -> Router {
             delete(admin::mappings::delete_mapping),
         )
         // Feature Flags
-        .route("/flags", get(admin::flags::list_flags))
-        .route("/flags/:name", put(admin::flags::update_flag))
+        .route("/settings", get(admin::system_settings::list_settings))
+        .route(
+            "/settings/:key",
+            put(admin::system_settings::upsert_setting),
+        )
         // Usage (admin — no unbounded query guard)
         .route("/usage/summary", get(admin::admin_usage::get_usage_summary))
         .route("/usage/records", get(admin::admin_usage::get_usage_records))
@@ -141,6 +144,12 @@ pub fn create_router(state: AppState) -> Router {
 fn fallback_handler<B>(request: Request<B>) -> Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    // Browser auto-requests — return 404 without triggering auth errors
+    let path = request.uri().path();
+    if path == "/favicon.ico" || path == "/robots.txt" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
     if extract_api_key(&request).is_none() {
         (

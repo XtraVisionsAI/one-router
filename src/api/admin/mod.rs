@@ -17,10 +17,10 @@ use rust_embed::Embed;
 
 pub mod admin_usage;
 pub mod backends;
-pub mod flags;
 pub mod keys;
 pub mod mappings;
 pub mod status;
+pub mod system_settings;
 
 /// Embedded static files from `static/admin/`
 #[derive(Embed)]
@@ -33,11 +33,11 @@ pub async fn serve_index() -> impl IntoResponse {
 }
 
 /// Serve a static asset by path under /admin/assets/*
-/// e.g. GET /admin/assets/app.js → serve "app.js" from embedded files
+/// e.g. GET /admin/assets/app.js → serve "assets/app.js" from embedded files
 pub async fn serve_asset(
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    serve_file(&path)
+    serve_file(&format!("assets/{path}"))
 }
 
 fn serve_file(path: &str) -> Response<Body> {
