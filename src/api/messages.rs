@@ -233,13 +233,22 @@ pub async fn create_message(
             .await
         }
         _ => {
+            let default_cache_ttl = state
+                .database
+                .system_settings()
+                .get_setting("default_cache_ttl")
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.value)
+                .filter(|v| !v.is_empty());
             handle_bedrock_request(
                 &state,
                 &request,
                 &resolved.target_model_id,
                 &request_id,
                 &key_info.service_tier,
-                state.settings.default_cache_ttl.as_deref(),
+                default_cache_ttl.as_deref(),
                 key_info.cache_ttl.as_deref(),
                 start_time,
             )

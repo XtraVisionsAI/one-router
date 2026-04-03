@@ -69,6 +69,15 @@ pub async fn create_tables(backend: &DynamoDbBackend) -> Result<()> {
     )
     .await?;
 
+    // --- system_settings (PK: key) ---
+    create_table_if_not_exists(
+        backend,
+        "system_settings",
+        vec![attr_def("key", ScalarAttributeType::S)],
+        vec![key_schema("key", KeyType::Hash)],
+    )
+    .await?;
+
     Ok(())
 }
 

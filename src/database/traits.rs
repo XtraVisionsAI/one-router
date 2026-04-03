@@ -1,7 +1,7 @@
 //! Database trait definitions
 //!
 //! All database backends must implement `DatabaseService` which composes
-//! the five sub-store traits.
+//! the sub-store traits.
 
 use super::models::*;
 use super::seed;
@@ -79,11 +79,10 @@ pub trait BackendConfigStore: Send + Sync {
 }
 
 #[async_trait]
-pub trait FeatureFlagStore: Send + Sync {
-    async fn get_flag(&self, name: &str) -> Result<Option<FeatureFlagRecord>>;
-    async fn is_enabled(&self, name: &str) -> Result<bool>;
-    async fn list_flags(&self) -> Result<Vec<FeatureFlagRecord>>;
-    async fn upsert_flag(&self, record: &FeatureFlagRecord) -> Result<()>;
+pub trait SystemSettingStore: Send + Sync {
+    async fn get_setting(&self, key: &str) -> Result<Option<SystemSettingRecord>>;
+    async fn upsert_setting(&self, record: &SystemSettingRecord) -> Result<()>;
+    async fn list_settings(&self) -> Result<Vec<SystemSettingRecord>>;
 }
 
 // ============================================================================
@@ -96,7 +95,7 @@ pub trait DatabaseService: Send + Sync {
     fn usage(&self) -> &dyn UsageStore;
     fn model_mapping(&self) -> &dyn ModelMappingStore;
     fn backends(&self) -> &dyn BackendConfigStore;
-    fn feature_flags(&self) -> &dyn FeatureFlagStore;
+    fn system_settings(&self) -> &dyn SystemSettingStore;
 
     /// Initialize storage: create tables + insert default seed data.
     async fn initialize(&self) -> Result<()>;
@@ -104,10 +103,9 @@ pub trait DatabaseService: Send + Sync {
     /// Quick health check (e.g., SELECT 1).
     async fn health_check(&self) -> bool;
 
-    /// Seed default model mappings and feature flags (insert-if-not-exists).
+    /// Seed default model mappings and system settings (insert-if-not-exists).
     ///
-    /// Called by `initialize()` after schema migration. Each backend's
-    /// sub-store upsert/insert logic handles conflict resolution.
+    /// Called by `initialize()` after schema migration.
     async fn seed_defaults(&self) -> Result<()> {
         for mapping in seed::default_model_mappings() {
             if self
@@ -119,9 +117,14 @@ pub trait DatabaseService: Send + Sync {
                 self.model_mapping().upsert_mapping(&mapping).await?;
             }
         }
-        for flag in seed::default_feature_flags() {
-            if self.feature_flags().get_flag(&flag.name).await?.is_none() {
-                self.feature_flags().upsert_flag(&flag).await?;
+        for setting in seed::default_system_settings() {
+            if self
+                .system_settings()
+                .get_setting(&setting.key)
+                .await?
+                .is_none()
+            {
+                self.system_settings().upsert_setting(&setting).await?;
             }
         }
         tracing::info!("Seed data applied");

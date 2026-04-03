@@ -45,9 +45,6 @@ pub struct Settings {
 
     /// Ephemeral API key generated at startup for dev convenience
     pub ephemeral_api_key: Option<String>,
-
-    /// Default cache TTL for Bedrock prompt caching ("5m" | "1h").
-    pub default_cache_ttl: Option<String>,
 }
 
 impl Settings {
@@ -89,10 +86,6 @@ impl Settings {
             );
         }
 
-        let default_cache_ttl = env::var("DEFAULT_CACHE_TTL")
-            .ok()
-            .filter(|v| v == "5m" || v == "1h");
-
         Ok(Self {
             database,
             port,
@@ -105,7 +98,6 @@ impl Settings {
             web_fetch_max_content_kb,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             ephemeral_api_key: None,
-            default_cache_ttl,
         })
     }
 
@@ -140,7 +132,6 @@ mod tests {
             web_fetch_max_content_kb: 512,
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
-            default_cache_ttl: None,
         };
         assert_eq!(settings.server_addr(), "127.0.0.1:9000");
     }
@@ -159,29 +150,9 @@ mod tests {
             web_fetch_max_content_kb: 512,
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
-            default_cache_ttl: None,
         };
         let key = settings.generate_ephemeral_key();
         assert!(key.starts_with("sk-"));
         assert_eq!(settings.ephemeral_api_key, Some(key));
-    }
-
-    #[test]
-    fn test_default_cache_ttl_field_exists() {
-        let settings = Settings {
-            database: "sqlite://./test.db".into(),
-            port: 8000,
-            host: "0.0.0.0".into(),
-            log_level: "info".into(),
-            master_api_key: None,
-            encryption_key: None,
-            web_search_provider: None,
-            web_search_api_key: None,
-            web_fetch_max_content_kb: 512,
-            app_version: "0.1.0".into(),
-            ephemeral_api_key: None,
-            default_cache_ttl: Some("1h".to_string()),
-        };
-        assert_eq!(settings.default_cache_ttl, Some("1h".to_string()));
     }
 }

@@ -721,50 +721,51 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
     ]
 }
 
-/// Default feature flags.
-pub fn default_feature_flags() -> Vec<FeatureFlagRecord> {
-    let now = unix_now();
+/// Default system settings (insert-if-not-exists on startup).
+pub fn default_system_settings() -> Vec<SystemSettingRecord> {
     vec![
-        FeatureFlagRecord {
-            name: "enable_tool_use".into(),
-            enabled: true,
-            description: "".into(),
-            created_at: now,
+        SystemSettingRecord {
+            key: "default_cache_ttl".into(),
+            value: "".into(),
+            description:
+                "Default prompt cache TTL for Bedrock requests. Values: '' (disabled), '5m', '1h'."
+                    .into(),
             updated_at: None,
         },
-        FeatureFlagRecord {
-            name: "enable_ptc".into(),
-            enabled: false,
-            description: "".into(),
-            created_at: now,
+        SystemSettingRecord {
+            key: "enable_tool_use".into(),
+            value: "true".into(),
+            description: "Enable tool use / function calling support.".into(),
             updated_at: None,
         },
-        FeatureFlagRecord {
-            name: "enable_extended_thinking".into(),
-            enabled: true,
-            description: "".into(),
-            created_at: now,
+        SystemSettingRecord {
+            key: "enable_ptc".into(),
+            value: "false".into(),
+            description: "Enable Programmatic Tool Calling (PTC) sandbox execution.".into(),
             updated_at: None,
         },
-        FeatureFlagRecord {
-            name: "enable_document_support".into(),
-            enabled: true,
-            description: "".into(),
-            created_at: now,
+        SystemSettingRecord {
+            key: "enable_extended_thinking".into(),
+            value: "true".into(),
+            description: "Enable extended thinking (Claude budget_tokens support).".into(),
             updated_at: None,
         },
-        FeatureFlagRecord {
-            name: "prompt_caching_enabled".into(),
-            enabled: false,
-            description: "".into(),
-            created_at: now,
+        SystemSettingRecord {
+            key: "enable_document_support".into(),
+            value: "true".into(),
+            description: "Enable document content blocks in requests.".into(),
             updated_at: None,
         },
-        FeatureFlagRecord {
-            name: "rate_limit_enabled".into(),
-            enabled: true,
-            description: "default RPM: 100".into(),
-            created_at: now,
+        SystemSettingRecord {
+            key: "prompt_caching_enabled".into(),
+            value: "false".into(),
+            description: "Enable prompt caching headers in Bedrock/Anthropic requests.".into(),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "rate_limit_enabled".into(),
+            value: "true".into(),
+            description: "Enable per-key request rate limiting (RPM).".into(),
             updated_at: None,
         },
     ]
