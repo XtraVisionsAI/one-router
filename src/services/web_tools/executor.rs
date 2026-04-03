@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::converters::anthropic_bedrock;
 use crate::schemas::anthropic::{
     ContentBlock, Message, MessageContent, MessageRequest, MessageResponse, ToolResultValue,
 };
@@ -69,17 +68,10 @@ impl WebToolExecutor {
             };
             modified.stream = false;
 
-            let (converse_req, mapper) =
-                anthropic_bedrock::convert_request(&modified, target_model, None, None)
-                    .map_err(|e| WebToolError::ConversionError(e.to_string()))?;
-
-            let output = bedrock
-                .converse(converse_req)
+            let response = bedrock
+                .invoke_model_messages(&modified, target_model)
                 .await
                 .map_err(|e| WebToolError::BedrockError(e.to_string()))?;
-
-            let response = anthropic_bedrock::convert_response(output, &request.model, &mapper)
-                .map_err(|e| WebToolError::ConversionError(e.to_string()))?;
 
             let server_calls = extract_server_calls(&response.content, &server_names);
 

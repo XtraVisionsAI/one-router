@@ -13,12 +13,13 @@
   // Known settings definition — drives the UI
   const knownSettings = [
     {
-      key: 'default_cache_ttl',
-      label: 'Default Cache TTL',
-      description: 'Default prompt cache TTL for Bedrock requests. Applies to all keys unless overridden per-key.',
+      key: 'prompt_cache',
+      label: 'Prompt Cache',
+      description: 'Controls prompt caching for Bedrock (Claude) requests. Disable: strip all cache_control. Passthrough: preserve as-is. 5m/1h: override TTL on all cache_control blocks.',
       type: 'select' as const,
       options: [
-        { label: 'Disabled', value: '' },
+        { label: 'Passthrough (default)', value: 'passthrough' },
+        { label: 'Disabled', value: 'disable' },
         { label: '5 minutes', value: '5m' },
         { label: '1 hour', value: '1h' }
       ]
@@ -45,12 +46,6 @@
       key: 'enable_document_support',
       label: 'Enable Document Support',
       description: 'Enable document content blocks in requests.',
-      type: 'bool' as const
-    },
-    {
-      key: 'prompt_caching_enabled',
-      label: 'Prompt Caching',
-      description: 'Enable prompt caching headers in Bedrock/Anthropic requests.',
       type: 'bool' as const
     },
     {

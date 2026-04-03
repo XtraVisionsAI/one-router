@@ -7,6 +7,7 @@ use aws_sdk_bedrockruntime::{
     operation::converse::{ConverseError, ConverseOutput},
     operation::converse_stream::ConverseStreamError,
     operation::invoke_model::InvokeModelError,
+    operation::invoke_model_with_response_stream::InvokeModelWithResponseStreamError,
     primitives::Blob,
     types::{
         ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage,
@@ -20,6 +21,7 @@ use std::pin::Pin;
 
 use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
+use aws_sdk_bedrockruntime::types::{PayloadPart, ResponseStream};
 
 use super::backend_pool::{AwsCredential, Credential, CredentialPool};
 
@@ -202,6 +204,84 @@ impl BedrockService {
 
         self.record_success(&cred_name);
         Ok(result.body().as_ref().to_vec())
+    }
+
+    /// Invoke a Claude model using InvokeModel API with native Anthropic JSON format.
+    ///
+    /// The `request` is serialized directly to Anthropic Messages API JSON format.
+    /// `model_id` is the resolved Bedrock model ID (e.g. `us.anthropic.claude-sonnet-4-6-v1:0`).
+    pub async fn invoke_model_messages(
+        &self,
+        request: &crate::schemas::anthropic::MessageRequest,
+        model_id: &str,
+    ) -> Result<crate::schemas::anthropic::MessageResponse, BedrockError> {
+        let (cred_name, client) = self.get_client();
+        let cred_name = cred_name.to_string();
+
+        tracing::debug!(
+            model_id = %model_id,
+            credential = %cred_name,
+            "Calling Bedrock InvokeModel API (Anthropic native format)"
+        );
+
+        let body = build_invoke_model_body(request, model_id, false)?;
+
+        let result = client
+            .invoke_model()
+            .model_id(model_id)
+            .body(Blob::new(body))
+            .content_type("application/json")
+            .accept("application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                self.record_failure(&cred_name);
+                BedrockError::from_invoke_model_error(e)
+            })?;
+
+        self.record_success(&cred_name);
+
+        let response_bytes = result.body().as_ref();
+        serde_json::from_slice::<crate::schemas::anthropic::MessageResponse>(response_bytes)
+            .map_err(|e| {
+                BedrockError::Deserialization(format!("Failed to parse InvokeModel response: {e}"))
+            })
+    }
+
+    /// Invoke a Claude model using InvokeModelWithResponseStream API with native Anthropic SSE.
+    pub async fn invoke_model_messages_stream(
+        &self,
+        request: &crate::schemas::anthropic::MessageRequest,
+        model_id: &str,
+    ) -> Result<InvokeModelStreamResponse, BedrockError> {
+        let (cred_name, client) = self.get_client();
+        let cred_name = cred_name.to_string();
+
+        tracing::debug!(
+            model_id = %model_id,
+            credential = %cred_name,
+            "Calling Bedrock InvokeModelWithResponseStream API (Anthropic native format)"
+        );
+
+        let body = build_invoke_model_body(request, model_id, true)?;
+
+        let result = client
+            .invoke_model_with_response_stream()
+            .model_id(model_id)
+            .body(Blob::new(body))
+            .content_type("application/json")
+            .accept("application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                self.record_failure(&cred_name);
+                BedrockError::from_invoke_model_stream_error(e)
+            })?;
+
+        Ok(InvokeModelStreamResponse {
+            inner: result.body,
+            credential_name: cred_name,
+        })
     }
 
     /// Determine if a target model ID should use Converse API (true) or OpenAI Compat (false).
@@ -520,7 +600,114 @@ impl ConverseRequest {
 }
 
 // ============================================================================
-// Streaming Response Types
+// InvokeModel Stream Response (native Anthropic SSE)
+// ============================================================================
+
+/// Streaming response from Bedrock InvokeModelWithResponseStream.
+/// The inner stream yields native Anthropic SSE events.
+pub struct InvokeModelStreamResponse {
+    inner: EventReceiver<ResponseStream, aws_sdk_bedrockruntime::types::error::ResponseStreamError>,
+    pub credential_name: String,
+}
+
+impl InvokeModelStreamResponse {
+    /// Convert into an SSE event stream compatible with Axum's `Sse`.
+    ///
+    /// Bedrock yields `PayloadPart` chunks whose bytes contain raw Anthropic SSE text
+    /// (lines like `event: content_block_delta\ndata: {...}\n\n`).
+    /// We buffer across chunks, parse complete SSE events, and forward them.
+    pub fn into_sse_stream(
+        self,
+    ) -> Pin<
+        Box<dyn Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>,
+    > {
+        use axum::response::sse::Event;
+
+        Box::pin(async_stream::stream! {
+            let mut receiver = self.inner;
+            let cred_name = self.credential_name;
+            let mut buffer = String::new();
+
+            loop {
+                match receiver.recv().await {
+                    Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: Some(blob), .. }))) => {
+                        buffer.push_str(&String::from_utf8_lossy(blob.as_ref()));
+
+                        // Emit complete SSE events (delimited by \n\n)
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let event_str = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+
+                            let mut event_type: Option<String> = None;
+                            let mut data: Option<String> = None;
+
+                            for line in event_str.lines() {
+                                if let Some(v) = line.strip_prefix("event: ") {
+                                    event_type = Some(v.to_string());
+                                } else if let Some(v) = line.strip_prefix("data: ") {
+                                    data = Some(v.to_string());
+                                }
+                            }
+
+                            if let Some(data_str) = data {
+                                let mut ev = Event::default().data(data_str);
+                                if let Some(et) = event_type {
+                                    ev = ev.event(et);
+                                }
+                                yield Ok(ev);
+                            }
+                        }
+                    }
+                    Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: None, .. }))) => {
+                        // Empty chunk, skip
+                    }
+                    Ok(Some(_)) | Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            credential = %cred_name,
+                            "InvokeModel stream error"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+    }
+}
+
+// ============================================================================
+// InvokeModel body builder
+// ============================================================================
+
+/// Serialize a `MessageRequest` to Anthropic-native JSON for Bedrock InvokeModel.
+///
+/// - Replaces `model` with the resolved Bedrock `model_id`.
+/// - Removes `stream` (InvokeModel doesn't accept this field).
+/// - Removes `container` (PTC field, not recognized by Bedrock).
+/// - Removes `service_tier` (handled separately via Bedrock SDK options).
+fn build_invoke_model_body(
+    request: &crate::schemas::anthropic::MessageRequest,
+    model_id: &str,
+    _streaming: bool,
+) -> Result<Vec<u8>, BedrockError> {
+    let mut body =
+        serde_json::to_value(request).map_err(|e| BedrockError::Serialization(e.to_string()))?;
+
+    if let Some(obj) = body.as_object_mut() {
+        // Replace model with the resolved Bedrock model ID
+        obj.insert("model".to_string(), serde_json::json!(model_id));
+        // Remove fields that Bedrock InvokeModel does not recognize
+        obj.remove("stream");
+        obj.remove("container");
+        obj.remove("service_tier");
+    }
+
+    serde_json::to_vec(&body).map_err(|e| BedrockError::Serialization(e.to_string()))
+}
+
+// ============================================================================
+// Streaming Response Types (Converse API)
 // ============================================================================
 
 pub struct ConverseStreamResponse {
@@ -876,6 +1063,68 @@ impl BedrockError {
                         error_type: BedrockErrorType::Server,
                         is_retryable: true,
                     },
+                    _ => BedrockError::Unknown(format!("{error:?}")),
+                }
+            }
+            _ => BedrockError::Unknown(format!("{err:?}")),
+        }
+    }
+
+    pub fn from_invoke_model_stream_error<R>(
+        err: SdkError<InvokeModelWithResponseStreamError, R>,
+    ) -> Self
+    where
+        R: std::fmt::Debug,
+    {
+        match &err {
+            SdkError::ServiceError(service_err) => {
+                let error = service_err.err();
+                match error {
+                    InvokeModelWithResponseStreamError::ThrottlingException(e) => {
+                        BedrockError::Throttled(e.message().unwrap_or("Rate limited").to_string())
+                    }
+                    InvokeModelWithResponseStreamError::ValidationException(e) => {
+                        BedrockError::ValidationError(
+                            e.message().unwrap_or("Validation failed").to_string(),
+                        )
+                    }
+                    InvokeModelWithResponseStreamError::ModelNotReadyException(e) => {
+                        BedrockError::ServiceUnavailable(
+                            e.message().unwrap_or("Model not ready").to_string(),
+                        )
+                    }
+                    InvokeModelWithResponseStreamError::ModelTimeoutException(e) => {
+                        BedrockError::ServiceUnavailable(
+                            e.message().unwrap_or("Model timeout").to_string(),
+                        )
+                    }
+                    InvokeModelWithResponseStreamError::InternalServerException(e) => {
+                        BedrockError::InternalError(
+                            e.message().unwrap_or("Internal server error").to_string(),
+                        )
+                    }
+                    InvokeModelWithResponseStreamError::AccessDeniedException(e) => {
+                        BedrockError::AccessDenied(
+                            e.message().unwrap_or("Access denied").to_string(),
+                        )
+                    }
+                    InvokeModelWithResponseStreamError::ResourceNotFoundException(e) => {
+                        BedrockError::ModelNotFound(
+                            e.message().unwrap_or("Resource not found").to_string(),
+                        )
+                    }
+                    InvokeModelWithResponseStreamError::ServiceUnavailableException(e) => {
+                        BedrockError::ServiceUnavailable(
+                            e.message().unwrap_or("Service unavailable").to_string(),
+                        )
+                    }
+                    InvokeModelWithResponseStreamError::ModelErrorException(e) => {
+                        BedrockError::ApiError {
+                            message: e.message().unwrap_or("Model error").to_string(),
+                            error_type: BedrockErrorType::Server,
+                            is_retryable: true,
+                        }
+                    }
                     _ => BedrockError::Unknown(format!("{error:?}")),
                 }
             }

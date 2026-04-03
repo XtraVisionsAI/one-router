@@ -40,11 +40,11 @@ pub struct UpsertSettingRequest {
 /// if validation fails, Ok(()) otherwise.
 fn validate_setting(key: &str, value: &str) -> Result<(), &'static str> {
     match key {
-        "default_cache_ttl" => {
-            if value.is_empty() || value == "5m" || value == "1h" {
+        "prompt_cache" => {
+            if matches!(value, "" | "disable" | "passthrough" | "5m" | "1h") {
                 Ok(())
             } else {
-                Err("default_cache_ttl must be '', '5m', or '1h'")
+                Err("prompt_cache must be 'disable', 'passthrough', '5m', or '1h'")
             }
         }
         _ => Ok(()), // unknown keys are accepted as-is
@@ -130,16 +130,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_cache_ttl_valid_values() {
-        assert!(validate_setting("default_cache_ttl", "").is_ok());
-        assert!(validate_setting("default_cache_ttl", "5m").is_ok());
-        assert!(validate_setting("default_cache_ttl", "1h").is_ok());
+    fn validate_prompt_cache_valid_values() {
+        assert!(validate_setting("prompt_cache", "").is_ok());
+        assert!(validate_setting("prompt_cache", "disable").is_ok());
+        assert!(validate_setting("prompt_cache", "passthrough").is_ok());
+        assert!(validate_setting("prompt_cache", "5m").is_ok());
+        assert!(validate_setting("prompt_cache", "1h").is_ok());
     }
 
     #[test]
-    fn validate_cache_ttl_invalid_values() {
-        assert!(validate_setting("default_cache_ttl", "2h").is_err());
-        assert!(validate_setting("default_cache_ttl", "30m").is_err());
+    fn validate_prompt_cache_invalid_values() {
+        assert!(validate_setting("prompt_cache", "2h").is_err());
+        assert!(validate_setting("prompt_cache", "enable").is_err());
     }
 
     #[test]

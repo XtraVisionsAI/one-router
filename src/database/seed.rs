@@ -759,7 +759,16 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
         SystemSettingRecord {
             key: "prompt_caching_enabled".into(),
             value: "false".into(),
-            description: "Enable prompt caching headers in Bedrock/Anthropic requests.".into(),
+            description: "Deprecated: use prompt_cache instead.".into(),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "prompt_cache".into(),
+            value: "passthrough".into(),
+            description: "Prompt cache behavior for Bedrock InvokeModel (Claude) requests. \
+                          'disable' strips all cache_control, 'passthrough' preserves as-is, \
+                          '5m'/'1h' overrides TTL on all cache_control blocks."
+                .into(),
             updated_at: None,
         },
         SystemSettingRecord {

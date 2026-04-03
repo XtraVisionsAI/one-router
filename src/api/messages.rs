@@ -1,10 +1,8 @@
 //! Messages API endpoint
 //!
 //! This module implements the POST /v1/messages endpoint for the Anthropic Messages API.
-//! It handles request conversion, Bedrock/Gemini API calls, and response conversion.
-//! Supports both streaming and non-streaming responses using the Converse API or Gemini API.
+//! Supports Bedrock InvokeModel (Claude), Bedrock Mantle (non-Claude), Gemini, Anthropic passthrough, and OpenAI backend.
 
-use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
 use axum::{
     extract::{Extension, State},
     http::{HeaderMap, StatusCode},
@@ -22,8 +20,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::converters::{
-    anthropic_bedrock, AnthropicToGeminiConverter, AnthropicToOpenAIConverter, ConversionError,
-    GeminiToAnthropicConverter,
+    AnthropicToGeminiConverter, AnthropicToOpenAIConverter, GeminiToAnthropicConverter,
 };
 use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::{
@@ -31,8 +28,8 @@ use crate::schemas::anthropic::{
     SystemContent, ToolResultValue,
 };
 use crate::server::state::AppState;
-use crate::services::{BedrockError, BedrockService, ConverseRequest};
-use crate::utils::{truncate_str, ToolNameMapper};
+use crate::services::BedrockError;
+use crate::utils::truncate_str;
 
 // ============================================================================
 // Error Types
@@ -105,23 +102,6 @@ impl ApiError {
             }
             BedrockError::ApiError { message, .. } => Self::internal_error(message),
             BedrockError::Unknown(msg) => Self::internal_error(msg),
-        }
-    }
-
-    pub fn from_conversion_error(err: &ConversionError) -> Self {
-        match err {
-            ConversionError::InvalidContentBlock(msg) => Self::bad_request(msg),
-            ConversionError::InvalidMessage(msg) => Self::bad_request(msg),
-            ConversionError::InvalidTool(msg) => Self::bad_request(msg),
-            ConversionError::Base64DecodeError(msg) => {
-                Self::bad_request(format!("Invalid base64: {msg}"))
-            }
-            ConversionError::MissingField(field) => {
-                Self::bad_request(format!("Missing required field: {field}"))
-            }
-            ConversionError::UnsupportedFeature(msg) => {
-                Self::bad_request(format!("Unsupported feature: {msg}"))
-            }
         }
     }
 }
@@ -233,22 +213,21 @@ pub async fn create_message(
             .await
         }
         _ => {
-            let default_cache_ttl = state
+            let prompt_cache_setting = state
                 .database
                 .system_settings()
-                .get_setting("default_cache_ttl")
+                .get_setting("prompt_cache")
                 .await
                 .ok()
                 .flatten()
                 .map(|s| s.value)
-                .filter(|v| !v.is_empty());
+                .unwrap_or_default();
             handle_bedrock_request(
                 &state,
                 &request,
                 &resolved.target_model_id,
                 &request_id,
-                &key_info.service_tier,
-                default_cache_ttl.as_deref(),
+                &prompt_cache_setting,
                 key_info.cache_ttl.as_deref(),
                 start_time,
             )
@@ -257,29 +236,13 @@ pub async fn create_message(
     }
 }
 
-fn resolve_effective_tier(request_tier: Option<&str>, key_tier: &str) -> Option<String> {
-    if let Some(t) = request_tier {
-        let normalized = t.trim().to_lowercase();
-        if !normalized.is_empty() && normalized != "auto" && normalized != "default" {
-            return Some(normalized);
-        }
-    }
-    let normalized_key = key_tier.trim().to_lowercase();
-    match normalized_key.as_str() {
-        "default" | "auto" | "" => None,
-        _ => Some(normalized_key),
-    }
-}
-
 /// Handle request using Bedrock backend
-#[allow(clippy::too_many_arguments)]
 async fn handle_bedrock_request(
     state: &AppState,
     request: &MessageRequest,
     target_model_id: &str,
     request_id: &str,
-    key_tier: &str,
-    default_cache_ttl: Option<&str>,
+    prompt_cache_setting: &str,
     key_cache_ttl: Option<&str>,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
@@ -341,12 +304,17 @@ async fn handle_bedrock_request(
     tracing::debug!(
         request_id = %request_id,
         bedrock_model = %bedrock_model,
-        "Routing to Bedrock backend"
+        "Routing to Bedrock InvokeModel (Claude native)"
     );
 
-    // Resolve effective service tier (request-level overrides key-level)
-    let effective_tier: Option<String> =
-        resolve_effective_tier(request.service_tier.as_deref(), key_tier);
+    // Resolve effective cache mode: per-key TTL takes priority over system setting
+    let cache_mode = if let Some(ttl) = key_cache_ttl {
+        crate::converters::cache_transform::PromptCacheMode::Ttl(ttl.to_string())
+    } else {
+        crate::converters::cache_transform::PromptCacheMode::from_setting(prompt_cache_setting)
+    };
+    let transformed_request =
+        crate::converters::cache_transform::apply_to_request(request, &cache_mode);
 
     // Server-side web tool execution loop
     if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {
@@ -368,65 +336,29 @@ async fn handle_bedrock_request(
         };
     }
 
-    // Build Converse request (returns mapper for restoring long tool names)
-    // API Key TTL overrides default_cache_ttl
-    let effective_default_ttl = key_cache_ttl.or(default_cache_ttl);
-    let (converse_request, tool_name_mapper) = anthropic_bedrock::convert_request(
-        request,
-        bedrock_model,
-        effective_tier.as_deref(),
-        effective_default_ttl,
-    )
-    .map_err(|e| ApiError::from_conversion_error(&e))?;
-
-    // Handle streaming vs non-streaming
+    // Streaming via InvokeModelWithResponseStream
     if request.stream {
-        let sse_stream = create_streaming_response(
-            bedrock.clone(),
-            converse_request,
-            request_id,
-            &request.model,
-            bedrock_model,
-            tool_name_mapper,
-        )
-        .await?;
-        return Ok(MessageApiResponse::Stream(sse_stream));
+        let stream_response = bedrock
+            .invoke_model_messages_stream(&transformed_request, bedrock_model)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Bedrock InvokeModel streaming failed");
+                ApiError::from_bedrock_error(&e)
+            })?;
+        let cred_name = stream_response.credential_name.clone();
+        let sse_stream = stream_response.into_sse_stream();
+        bedrock.record_success(&cred_name);
+        return Ok(MessageApiResponse::Stream(Sse::new(sse_stream)));
     }
 
-    // Non-streaming response using Converse API
-    let converse_output = match bedrock.converse(converse_request.clone()).await {
-        Ok(output) => output,
-        Err(ref e) => {
-            // If serviceTier not supported, retry without it
-            if is_service_tier_error(e) {
-                tracing::warn!(
-                    request_id = %request_id,
-                    "serviceTier not supported for this model, retrying without it"
-                );
-                let mut fallback_req = converse_request.clone();
-                // Remove serviceTier from additionalModelRequestFields
-                if let Some(aws_smithy_types::Document::Object(ref mut map)) =
-                    fallback_req.additional_model_request_fields
-                {
-                    map.remove("serviceTier");
-                    if map.is_empty() {
-                        fallback_req.additional_model_request_fields = None;
-                    }
-                }
-                bedrock.converse(fallback_req).await.map_err(|e| {
-                    tracing::error!(error = %e, "Bedrock Converse API call failed (after tier fallback)");
-                    ApiError::from_bedrock_error(&e)
-                })?
-            } else {
-                return Err(ApiError::from_bedrock_error(e));
-            }
-        }
-    };
-
-    // Convert Converse response to Anthropic format (restore original tool names)
-    let response =
-        anthropic_bedrock::convert_response(converse_output, &request.model, &tool_name_mapper)
-            .map_err(|e| ApiError::from_conversion_error(&e))?;
+    // Non-streaming via InvokeModel
+    let response = bedrock
+        .invoke_model_messages(&transformed_request, bedrock_model)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Bedrock InvokeModel API call failed");
+            ApiError::from_bedrock_error(&e)
+        })?;
 
     let duration_ms = start_time.elapsed().as_millis();
 
@@ -831,231 +763,6 @@ async fn handle_gemini_request(
     );
 
     Ok(MessageApiResponse::Json(Json(response)))
-}
-
-// ============================================================================
-// Streaming Response Handler
-// ============================================================================
-
-/// Returns true if the error indicates that serviceTier is not supported for this model.
-fn is_service_tier_error(e: &crate::services::BedrockError) -> bool {
-    match e {
-        crate::services::BedrockError::ValidationError(msg) => {
-            let lower = msg.to_lowercase();
-            lower.contains("servicetier")
-                || lower.contains("service tier")
-                || lower.contains("performanceconfig")
-        }
-        _ => false,
-    }
-}
-
-/// Create a streaming response using SSE with ConverseStream API
-async fn create_streaming_response(
-    bedrock: Arc<BedrockService>,
-    request: ConverseRequest,
-    request_id: &str,
-    original_model: &str,
-    bedrock_model: &str,
-    tool_name_mapper: ToolNameMapper,
-) -> Result<Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, ApiError>
-{
-    // Get streaming response from Bedrock
-    let mut stream_response = bedrock.converse_stream(request).await.map_err(|e| {
-        tracing::error!(error = %e, "Bedrock ConverseStream API call failed");
-        ApiError::from_bedrock_error(&e)
-    })?;
-
-    let cred_name = stream_response.credential_name.clone();
-    let model_id = original_model.to_string();
-    let bedrock_model_id = bedrock_model.to_string();
-    let req_id = request_id.to_string();
-    // Clone mapper for use in the async stream
-    let mapper = tool_name_mapper;
-    let bedrock_clone = bedrock.clone();
-
-    // Create the SSE stream
-    let stream = async_stream::stream! {
-        let message_id = format!("msg_{}", Uuid::new_v4().to_string().replace("-", ""));
-        let mut total_input_tokens: i32 = 0;
-        let mut total_output_tokens: i32 = 0;
-        let mut stop_reason = "end_turn".to_string();
-
-        tracing::debug!(request_id = %req_id, "Starting SSE stream");
-
-        // Emit message_start event first
-        let message_start_data = serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": model_id,
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0
-                }
-            }
-        });
-        yield Ok(Event::default().event("message_start").data(message_start_data.to_string()));
-
-        // Process Bedrock ConverseStream events
-        loop {
-            match stream_response.recv().await {
-                Ok(Some(event)) => {
-                    match event {
-                        ConverseStreamOutput::MessageStart(start_event) => {
-                            // Capture role info if needed
-                            tracing::debug!(request_id = %req_id, role = ?start_event.role(), "Message start");
-                        }
-
-                        ConverseStreamOutput::ContentBlockStart(block_start) => {
-                            let index = block_start.content_block_index();
-
-                            // Determine content block type
-                            let content_block = if let Some(start) = block_start.start() {
-                                match start {
-                                    aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(tool_start) => {
-                                        // Restore original tool name if it was shortened
-                                        let original_name = mapper.restore_original_name(tool_start.name());
-                                        serde_json::json!({
-                                            "type": "tool_use",
-                                            "id": tool_start.tool_use_id(),
-                                            "name": original_name,
-                                            "input": {}
-                                        })
-                                    }
-                                    _ => serde_json::json!({"type": "text", "text": ""})
-                                }
-                            } else {
-                                serde_json::json!({"type": "text", "text": ""})
-                            };
-
-                            let data = serde_json::json!({
-                                "type": "content_block_start",
-                                "index": index,
-                                "content_block": content_block
-                            });
-                            yield Ok(Event::default().event("content_block_start").data(data.to_string()));
-                        }
-
-                        ConverseStreamOutput::ContentBlockDelta(block_delta) => {
-                            let index = block_delta.content_block_index();
-
-                            if let Some(delta) = block_delta.delta() {
-                                let delta_json = match delta {
-                                    aws_sdk_bedrockruntime::types::ContentBlockDelta::Text(text) => {
-                                        serde_json::json!({"type": "text_delta", "text": text})
-                                    }
-                                    aws_sdk_bedrockruntime::types::ContentBlockDelta::ToolUse(tool_delta) => {
-                                        serde_json::json!({
-                                            "type": "input_json_delta",
-                                            "partial_json": tool_delta.input()
-                                        })
-                                    }
-                                    _ => continue,
-                                };
-
-                                let data = serde_json::json!({
-                                    "type": "content_block_delta",
-                                    "index": index,
-                                    "delta": delta_json
-                                });
-                                yield Ok(Event::default().event("content_block_delta").data(data.to_string()));
-                            }
-                        }
-
-                        ConverseStreamOutput::ContentBlockStop(block_stop) => {
-                            let index = block_stop.content_block_index();
-                            let data = serde_json::json!({
-                                "type": "content_block_stop",
-                                "index": index
-                            });
-                            yield Ok(Event::default().event("content_block_stop").data(data.to_string()));
-                        }
-
-                        ConverseStreamOutput::MessageStop(stop_event) => {
-                            // stop_reason() returns &StopReason directly (not an Option)
-                            stop_reason = match stop_event.stop_reason() {
-                                aws_sdk_bedrockruntime::types::StopReason::EndTurn => "end_turn".to_string(),
-                                aws_sdk_bedrockruntime::types::StopReason::MaxTokens => "max_tokens".to_string(),
-                                aws_sdk_bedrockruntime::types::StopReason::StopSequence => "stop_sequence".to_string(),
-                                aws_sdk_bedrockruntime::types::StopReason::ToolUse => "tool_use".to_string(),
-                                _ => "end_turn".to_string(),
-                            };
-                        }
-
-                        ConverseStreamOutput::Metadata(metadata_event) => {
-                            if let Some(usage) = metadata_event.usage() {
-                                total_input_tokens = usage.input_tokens();
-                                total_output_tokens = usage.output_tokens();
-                            }
-                        }
-
-                        _ => {
-                            tracing::debug!(request_id = %req_id, "Unknown stream event");
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // Stream ended
-                    tracing::debug!(request_id = %req_id, "Stream ended");
-                    break;
-                }
-                Err(e) => {
-                    tracing::error!(request_id = %req_id, error = %e, "Stream error");
-                    let error_data = serde_json::json!({
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": e.to_string()
-                        }
-                    });
-                    yield Ok(Event::default()
-                        .event("error")
-                        .data(error_data.to_string()));
-                    bedrock_clone.record_failure(&cred_name);
-                    break;
-                }
-            }
-        }
-
-        // Emit message_delta with final usage
-        let message_delta_data = serde_json::json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": stop_reason,
-                "stop_sequence": null
-            },
-            "usage": {
-                "output_tokens": total_output_tokens
-            }
-        });
-        yield Ok(Event::default().event("message_delta").data(message_delta_data.to_string()));
-
-        // Emit message_stop event
-        let message_stop_data = serde_json::json!({
-            "type": "message_stop"
-        });
-        yield Ok(Event::default().event("message_stop").data(message_stop_data.to_string()));
-
-        bedrock_clone.record_success(&cred_name);
-
-        tracing::info!(
-            request_id = %req_id,
-            model = %model_id,
-            bedrock_model = %bedrock_model_id,
-            input_tokens = total_input_tokens,
-            output_tokens = total_output_tokens,
-            stop_reason = %stop_reason,
-            "Streaming response completed"
-        );
-    };
-
-    Ok(Sse::new(Box::pin(stream)))
 }
 
 /// Create a streaming response using SSE with Gemini API
@@ -1575,62 +1282,6 @@ mod tests {
             ApiError::service_unavailable("test").status,
             StatusCode::SERVICE_UNAVAILABLE
         );
-    }
-
-    #[test]
-    fn test_resolve_tier_request_overrides_key() {
-        let request_tier = Some("flex".to_string());
-        let key_tier = "priority".to_string();
-        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
-        assert_eq!(resolved, Some("flex".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_tier_falls_back_to_key() {
-        let request_tier: Option<String> = None;
-        let key_tier = "priority".to_string();
-        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
-        assert_eq!(resolved, Some("priority".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_tier_default_is_none() {
-        let request_tier: Option<String> = None;
-        let key_tier = "default".to_string();
-        let resolved = resolve_effective_tier(request_tier.as_deref(), &key_tier);
-        assert_eq!(resolved, None::<String>);
-    }
-
-    #[test]
-    fn test_resolve_tier_case_insensitive() {
-        // 大写输入应该被规范化
-        let resolved = resolve_effective_tier(Some("FLEX"), "default");
-        assert_eq!(resolved, Some("flex".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_tier_trims_whitespace() {
-        let resolved = resolve_effective_tier(Some(" flex "), "default");
-        assert_eq!(resolved, Some("flex".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_tier_invalid_value_falls_back_to_key() {
-        // "invalid" 不是 auto/default，所以作为有效 tier 处理
-        let resolved = resolve_effective_tier(Some("invalid"), "priority");
-        assert_eq!(resolved, Some("invalid".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_tier_empty_string_falls_back_to_key() {
-        let resolved = resolve_effective_tier(Some(""), "priority");
-        assert_eq!(resolved, Some("priority".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_tier_whitespace_only_falls_back_to_key() {
-        let resolved = resolve_effective_tier(Some("  "), "priority");
-        assert_eq!(resolved, Some("priority".to_string()));
     }
 
     #[test]
