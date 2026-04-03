@@ -300,6 +300,17 @@ case "$MODE" in
         # Trigger PTC sync via docker pull — this forces ECR to fetch the latest
         # image from DockerHub. batch-get-image alone does NOT trigger a refresh.
         PTC_REPO="${PTC_PREFIX}/${DOCKERHUB_IMAGE}"
+
+        # Delete cached image from ECR first to force a fresh pull from DockerHub.
+        # Without this, ECR may serve a stale cached version even for :latest.
+        echo "  Purging ECR PTC cache for: ${DEPLOY_IMAGE}..."
+        PTC_ECR_REPO="${PTC_PREFIX}/${DOCKERHUB_IMAGE}"
+        awscli ecr batch-delete-image \
+            --repository-name "${PTC_ECR_REPO}" \
+            --image-ids imageTag="${TAG}" \
+            --output json > /dev/null 2>&1 || true
+        ok "ECR cache cleared (or image was not cached yet)"
+
         echo "  Pulling via PTC to trigger sync: ${DEPLOY_IMAGE}..."
         docker pull "${DEPLOY_IMAGE}"
         ok "Image cached in ECR: ${DEPLOY_IMAGE}"
