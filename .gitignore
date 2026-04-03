@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 admin-ui/stats.html
+static/admin/
 
 # Environment
 .env
