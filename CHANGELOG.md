@@ -1,3 +1,15 @@
+## v0.10.0 (2026-04-03)
+
+### Feat
+
+- **admin-ui**: overhaul admin UI — settings page, key management, usage filters, lint config
+- replace feature_flags with system_settings key-value store, migrate default_cache_ttl to DB
+- remove user_id from api_keys, enforce name uniqueness, add tpm_limit/cache_ttl to admin API
+
+### Fix
+
+- static asset path prefix and favicon 401 in fallback handler
+
 ## v0.9.0 (2026-04-02)
 
 ### Feat
