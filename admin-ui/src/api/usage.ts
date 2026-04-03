@@ -1,5 +1,5 @@
-import { useApi } from '@/composables/useApi'
 import type { UsageSummaryResponse } from './types'
+import { useApi } from '@/composables/useApi'
 
 export interface UsageSummaryParams {
   group_by: 'hour' | 'model'
@@ -18,6 +18,6 @@ export function useUsageApi() {
       if (params.start_time) qs.set('start_time', params.start_time)
       if (params.end_time) qs.set('end_time', params.end_time)
       return request<UsageSummaryResponse>('GET', `/usage/summary?${qs.toString()}`)
-    },
+    }
   }
 }

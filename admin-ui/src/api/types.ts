@@ -20,10 +20,11 @@ export interface UpsertBackendBody {
 export interface ApiKey {
   api_key: string
   name: string
-  user_id: string
   rate_limit: number
   monthly_budget: number | null
   budget_used_mtd: number | null
+  tpm_limit: number | null
+  cache_ttl: string | null
   service_tier: string
   is_active: boolean
   created_at: number
@@ -31,17 +32,20 @@ export interface ApiKey {
 
 export interface CreateKeyBody {
   name: string
-  user_id: string
   rate_limit: number
   monthly_budget: number | null
+  tpm_limit?: number | null
+  cache_ttl?: string | null
   service_tier: string
 }
 
 export interface UpdateKeyBody {
-  name: string
-  rate_limit: number
-  monthly_budget: number | null
-  service_tier: string
+  name?: string
+  rate_limit?: number
+  monthly_budget?: number | null
+  tpm_limit?: number | null
+  cache_ttl?: string | null
+  service_tier?: string
 }
 
 // ── Model Mappings ────────────────────────────────────────────
@@ -54,6 +58,8 @@ export interface ModelMapping {
   status: string
   input_price: number
   output_price: number
+  cache_read_price: number
+  cache_write_price: number
 }
 
 export interface UpsertMappingBody {
@@ -65,13 +71,21 @@ export interface UpsertMappingBody {
   status: string
   input_price: number
   output_price: number
+  cache_read_price: number
+  cache_write_price: number
 }
 
-// ── Feature Flags ─────────────────────────────────────────────
-export interface FeatureFlag {
-  name: string
-  enabled: boolean
+// ── System Settings ───────────────────────────────────────────
+export interface SystemSetting {
+  key: string
+  value: string
   description: string
+  updated_at: number | null
+}
+
+export interface UpsertSettingBody {
+  value: string
+  description?: string
 }
 
 // ── Usage ─────────────────────────────────────────────────────

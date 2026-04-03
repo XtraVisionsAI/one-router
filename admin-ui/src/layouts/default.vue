@@ -1,31 +1,31 @@
 <script setup lang="ts">
-import { h } from 'vue'
-import type { MenuOption } from 'naive-ui'
-import { useAuthStore } from '@/stores/auth'
+  import type { MenuOption } from 'naive-ui'
+  import { h } from 'vue'
+  import { useAuthStore } from '@/stores/auth'
 
-const auth = useAuthStore()
-const router = useRouter()
-const route = useRoute()
+  const auth = useAuthStore()
+  const router = useRouter()
+  const route = useRoute()
 
-const menuOptions: MenuOption[] = [
-  { key: '/dashboard', label: 'Dashboard', icon: () => h('span', { class: 'i-carbon-dashboard text-base' }) },
-  { key: '/keys', label: 'API Keys', icon: () => h('span', { class: 'i-carbon-api text-base' }) },
-  { key: '/backends', label: 'Backends', icon: () => h('span', { class: 'i-carbon-server-dns text-base' }) },
-  { key: '/mappings', label: 'Model Maps', icon: () => h('span', { class: 'i-carbon-arrows-horizontal text-base' }) },
-  { key: '/usage', label: 'Usage', icon: () => h('span', { class: 'i-carbon-chart-bar text-base' }) },
-  { key: '/flags', label: 'Flags', icon: () => h('span', { class: 'i-carbon-toggle-on text-base' }) },
-]
+  const menuOptions: MenuOption[] = [
+    { key: '/dashboard', label: 'Dashboard', icon: () => h('span', { class: 'i-carbon-dashboard text-base' }) },
+    { key: '/keys', label: 'API Keys', icon: () => h('span', { class: 'i-carbon-api text-base' }) },
+    { key: '/backends', label: 'Backends', icon: () => h('span', { class: 'i-carbon-server-dns text-base' }) },
+    { key: '/mappings', label: 'Model Maps', icon: () => h('span', { class: 'i-carbon-arrows-horizontal text-base' }) },
+    { key: '/usage', label: 'Usage', icon: () => h('span', { class: 'i-carbon-chart-bar text-base' }) },
+    { key: '/settings', label: 'Settings', icon: () => h('span', { class: 'i-carbon-settings text-base' }) }
+  ]
 
-const activeKey = computed(() => route.path)
+  const activeKey = computed(() => route.path)
 
-function onMenuSelect(key: string) {
-  router.push(key)
-}
+  function onMenuSelect(key: string) {
+    router.push(key)
+  }
 
-function logout() {
-  auth.logout()
-  router.push('/login')
-}
+  function logout() {
+    auth.logout()
+    router.push('/login')
+  }
 </script>
 
 <template>
@@ -39,13 +39,7 @@ function logout() {
       </div>
 
       <!-- Nav -->
-      <NMenu
-        :options="menuOptions"
-        :value="activeKey"
-        :indent="16"
-        class="flex-1 pt-2"
-        @update:value="onMenuSelect"
-      />
+      <NMenu :options="menuOptions" :value="activeKey" :indent="16" class="flex-1 pt-2" @update:value="onMenuSelect" />
 
       <!-- Footer -->
       <div class="px-4 py-3 border-t border-slate-700/60 flex items-center justify-between">

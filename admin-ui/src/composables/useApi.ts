@@ -1,18 +1,18 @@
-import { useAuthStore } from '@/stores/auth'
 import { useRouter } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
 
 export function useApi() {
   const auth = useAuthStore()
   const router = useRouter()
 
   async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch('/admin/api' + path, {
+    const res = await fetch(`/admin/api${path}`, {
       method,
       headers: {
         'x-api-key': auth.apiKey,
-        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
       },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined
     })
 
     if (res.status === 401 || res.status === 403) {

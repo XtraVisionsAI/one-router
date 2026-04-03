@@ -13,8 +13,8 @@
   "dependencies": {
     "naive-ui": "^2.41.0",
     "pinia": "^3.0.0",
-    "vue": "^3.5.0",
-    "vue-router": "^4.5.0"
+    "vue": "^3.5.32",
+    "vue-router": "^5.0.4"
   },
   "pnpm": {
     "onlyBuiltDependencies": ["@swc/core", "esbuild", "unrs-resolver"]
@@ -23,12 +23,13 @@
     "@iconify-json/carbon": "^1.2.0",
     "@types/node": "^22.0.0",
     "@vueuse/core": "^13.0.0",
-    "@xv-shared/eslint-config": "^1.0.0",
-    "@xv-shared/stylelint-config": "^1.0.0",
-    "@xv-shared/ts-config": "^1.0.0",
-    "@xv-shared/vite": "^1.0.0",
-    "typescript": "^5.8.0",
-    "vite": "^6.2.0",
+    "@xv-shared/eslint-config": "^2.0.0",
+    "@xv-shared/stylelint-config": "^2.0.0",
+    "@xv-shared/ts-config": "^2.0.0",
+    "@xv-shared/vite": "^2.0.1",
+    "eslint": "^10.1.0",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.3",
     "vue-tsc": "^2.2.0"
   }
 }
