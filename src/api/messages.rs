@@ -189,12 +189,19 @@ pub async fn create_message(
         .map(|s| s.to_string());
 
     // Route to appropriate backend based on resolved provider
+    let effective_caps = resolved
+        .capabilities
+        .as_ref()
+        .unwrap_or(&state.default_capabilities);
+    let filtered_request =
+        crate::converters::capability_filter::apply_capabilities(&request, effective_caps);
+
     match resolved.provider.as_str() {
-        "gemini" => handle_gemini_request(&state, &request, &request_id, start_time).await,
+        "gemini" => handle_gemini_request(&state, &filtered_request, &request_id, start_time).await,
         "anthropic" => {
             handle_anthropic_passthrough(
                 &state,
-                &request,
+                &filtered_request,
                 &resolved.target_model_id,
                 &request_id,
                 &headers,
@@ -205,7 +212,7 @@ pub async fn create_message(
         "openai" => {
             handle_openai_backend(
                 &state,
-                &request,
+                &filtered_request,
                 &resolved.target_model_id,
                 &request_id,
                 start_time,
@@ -215,11 +222,10 @@ pub async fn create_message(
         _ => {
             handle_bedrock_request(
                 &state,
-                &request,
+                &filtered_request,
                 &resolved.target_model_id,
                 &request_id,
                 &state.prompt_cache_mode,
-                &resolved.capabilities,
                 key_info.cache_ttl.as_deref(),
                 start_time,
             )
@@ -236,7 +242,6 @@ async fn handle_bedrock_request(
     target_model_id: &str,
     request_id: &str,
     cache_mode: &crate::converters::cache_transform::PromptCacheMode,
-    caps: &Option<crate::services::ModelCapabilities>,
     key_cache_ttl: Option<&str>,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
@@ -312,14 +317,6 @@ async fn handle_bedrock_request(
     };
     let transformed_request =
         crate::converters::cache_transform::apply_to_request(request, cache_mode_ref);
-
-    // Apply model capability filtering.
-    // Per-model capabilities take priority; fall back to AppState::default_capabilities.
-    let effective_caps = caps.as_ref().unwrap_or(&state.default_capabilities);
-    let transformed_request = crate::converters::capability_filter::apply_capabilities(
-        &transformed_request,
-        effective_caps,
-    );
 
     // Server-side web tool execution loop
     if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {
