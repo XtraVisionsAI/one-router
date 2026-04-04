@@ -118,7 +118,7 @@
     <h1 class="text-xl font-semibold text-slate-100 mb-6">Settings</h1>
 
     <NSpin :show="loading">
-      <div class="space-y-3 max-w-3xl">
+      <div class="space-y-3 max-w-full">
         <NCard v-for="s in knownSettings" :key="s.key" size="small">
           <div class="flex items-center justify-between gap-4">
             <div class="min-w-0">
