@@ -41,26 +41,30 @@
     },
     {
       key: 'enable_tool_use',
-      label: 'Enable Tool Use',
-      description: 'Global policy: enable tool use / function calling support. Takes effect on restart.',
+      label: 'Tool Use (default)',
+      description:
+        'Default capability: enable tool use for model mappings without explicit capabilities. Takes effect on restart.',
       type: 'bool' as const
     },
     {
       key: 'enable_ptc',
-      label: 'Enable PTC',
-      description: 'Global policy: enable Programmatic Tool Calling (PTC) sandbox execution. Takes effect on restart.',
+      label: 'PTC (default)',
+      description:
+        'Default capability: enable Programmatic Tool Calling for model mappings without explicit capabilities. Takes effect on restart.',
       type: 'bool' as const
     },
     {
       key: 'enable_extended_thinking',
-      label: 'Enable Extended Thinking',
-      description: 'Global policy: enable extended thinking (Claude budget_tokens support). Takes effect on restart.',
+      label: 'Extended Thinking (default)',
+      description:
+        'Default capability: enable extended thinking for model mappings without explicit capabilities. Takes effect on restart.',
       type: 'bool' as const
     },
     {
       key: 'enable_document_support',
-      label: 'Enable Document Support',
-      description: 'Global policy: enable document content blocks in requests. Takes effect on restart.',
+      label: 'Document Support (default)',
+      description:
+        'Default capability: enable document content blocks for model mappings without explicit capabilities. Takes effect on restart.',
       type: 'bool' as const
     }
   ]

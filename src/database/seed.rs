@@ -45,7 +45,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             source_model_id: "claude-3-5-sonnet-latest".into(),
             target_model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0".into(),
             provider: "bedrock".into(),
-            display_name: "".into(),
+            display_name: "Claude 3.5 Sonnet Latest".into(),
             input_price: 0.0,
             output_price: 0.0,
             cache_read_price: 0.0,
@@ -60,7 +60,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             source_model_id: "claude-3-sonnet-20240229".into(),
             target_model_id: "anthropic.claude-3-sonnet-20240229-v1:0".into(),
             provider: "bedrock".into(),
-            display_name: "".into(),
+            display_name: "Claude 3 Sonnet".into(),
             input_price: 0.0,
             output_price: 0.0,
             cache_read_price: 0.0,
@@ -105,7 +105,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             source_model_id: "claude-3-haiku-20240307".into(),
             target_model_id: "anthropic.claude-3-haiku-20240307-v1:0".into(),
             provider: "bedrock".into(),
-            display_name: "".into(),
+            display_name: "Claude 3 Haiku".into(),
             input_price: 0.0,
             output_price: 0.0,
             cache_read_price: 0.0,
@@ -780,41 +780,43 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
 pub fn default_system_settings() -> Vec<SystemSettingRecord> {
     vec![
         SystemSettingRecord {
-            key: "default_cache_ttl".into(),
-            value: "".into(),
-            description:
-                "Default prompt cache TTL for Bedrock requests. Values: '' (disabled), '5m', '1h'."
-                    .into(),
-            updated_at: None,
-        },
-        SystemSettingRecord {
             key: "enable_tool_use".into(),
             value: "true".into(),
-            description: "Enable tool use / function calling support.".into(),
-            updated_at: None,
-        },
-        SystemSettingRecord {
-            key: "enable_ptc".into(),
-            value: "false".into(),
-            description: "Enable Programmatic Tool Calling (PTC) sandbox execution.".into(),
+            description:
+                "Default capability: enable tool use / function calling. \
+                 Applies to model mappings without explicit capabilities. \
+                 Takes effect on restart."
+                    .into(),
             updated_at: None,
         },
         SystemSettingRecord {
             key: "enable_extended_thinking".into(),
             value: "true".into(),
-            description: "Enable extended thinking (Claude budget_tokens support).".into(),
+            description:
+                "Default capability: enable extended thinking (Claude budget_tokens). \
+                 Applies to model mappings without explicit capabilities. \
+                 Takes effect on restart."
+                    .into(),
             updated_at: None,
         },
         SystemSettingRecord {
             key: "enable_document_support".into(),
             value: "true".into(),
-            description: "Enable document content blocks in requests.".into(),
+            description:
+                "Default capability: enable document content blocks. \
+                 Applies to model mappings without explicit capabilities. \
+                 Takes effect on restart."
+                    .into(),
             updated_at: None,
         },
         SystemSettingRecord {
-            key: "prompt_caching_enabled".into(),
+            key: "enable_ptc".into(),
             value: "false".into(),
-            description: "Deprecated: use prompt_cache instead.".into(),
+            description:
+                "Default capability: enable Programmatic Tool Calling (PTC). \
+                 Applies to model mappings without explicit capabilities. \
+                 Takes effect on restart."
+                    .into(),
             updated_at: None,
         },
         SystemSettingRecord {
