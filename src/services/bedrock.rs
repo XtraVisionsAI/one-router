@@ -674,10 +674,56 @@ impl InvokeModelStreamResponse {
             }
         })
     }
-}
 
-// ============================================================================
-// InvokeModel body builder
+    /// Variant of `into_sse_stream` that yields raw `(event_type, data)` pairs
+    /// instead of `axum::sse::Event`. Useful when the caller needs to re-process
+    /// the Anthropic SSE events (e.g. convert to OpenAI SSE format).
+    pub fn into_event_pairs(self) -> Pin<Box<dyn Stream<Item = (String, String)> + Send>> {
+        Box::pin(async_stream::stream! {
+            let mut receiver = self.inner;
+            let cred_name = self.credential_name;
+            let mut buffer = String::new();
+
+            loop {
+                match receiver.recv().await {
+                    Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: Some(blob), .. }))) => {
+                        buffer.push_str(&String::from_utf8_lossy(blob.as_ref()));
+
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let event_str = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+
+                            let mut event_type = String::new();
+                            let mut data = String::new();
+
+                            for line in event_str.lines() {
+                                if let Some(v) = line.strip_prefix("event: ") {
+                                    event_type = v.to_string();
+                                } else if let Some(v) = line.strip_prefix("data: ") {
+                                    data = v.to_string();
+                                }
+                            }
+
+                            if !data.is_empty() {
+                                yield (event_type, data);
+                            }
+                        }
+                    }
+                    Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: None, .. }))) => {}
+                    Ok(Some(_)) | Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            credential = %cred_name,
+                            "InvokeModel stream error"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+    }
+}
 // ============================================================================
 
 /// Serialize a `MessageRequest` to Anthropic-native JSON for Bedrock InvokeModel.

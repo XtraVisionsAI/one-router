@@ -1,8 +1,9 @@
 //! OpenAI Chat Completions API endpoint
 //!
-//! This module implements the POST /v1/chat/completions endpoint for OpenAI API compatibility.
-//! It handles request conversion from OpenAI format to Bedrock, calls the Converse API,
-//! and converts responses back to OpenAI format.
+//! Routes OpenAI Chat Completions requests to the appropriate backend:
+//! - Bedrock Claude → OpenAI→Anthropic conversion + InvokeModel (native format)
+//! - Bedrock non-Claude → OpenAI→Bedrock conversion + Converse API
+//! - Gemini, Anthropic, OpenAI → respective passthrough/conversion handlers
 
 use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
 use axum::{
@@ -202,6 +203,7 @@ pub async fn chat_completions(
         &state,
         &request,
         &resolved.target_model_id,
+        &resolved.capabilities,
         &request_id,
         start_time,
     )
@@ -212,11 +214,16 @@ pub async fn chat_completions(
 // Bedrock Backend Handler (OpenAI → Bedrock)
 // ============================================================================
 
-/// Handle request using Bedrock backend, converting OpenAI → Bedrock format
+/// Handle request using Bedrock backend.
+///
+/// - Claude models: OpenAI → Anthropic conversion → InvokeModel (native format)
+/// - Non-Claude models: OpenAI → Bedrock conversion → Converse API
+#[allow(clippy::too_many_arguments)]
 async fn handle_bedrock_request(
     state: &AppState,
     request: &ChatCompletionRequest,
     target_model_id: &str,
+    caps: &Option<crate::services::ModelCapabilities>,
     request_id: &str,
     start_time: Instant,
 ) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
@@ -226,30 +233,110 @@ async fn handle_bedrock_request(
         )
     })?;
 
-    let bedrock_model = target_model_id;
-
     tracing::info!(
         request_id = %request_id,
         openai_model = %request.model,
-        bedrock_model = %bedrock_model,
+        bedrock_model = %target_model_id,
         message_count = request.messages.len(),
-        max_tokens = request.max_tokens.or(request.max_completion_tokens),
         stream = request.stream,
         "Routing OpenAI request to Bedrock backend"
     );
 
-    // Check for unsupported features
     if request.n.map(|n| n > 1).unwrap_or(false) {
         return Err(OpenAIApiError::bad_request(
             "Only n=1 is supported. Multiple completions are not available.",
         ));
     }
 
-    // Build Converse request
-    let converse_request = openai_bedrock::convert_request(request, bedrock_model)
+    // ── Claude path: OpenAI → Anthropic → InvokeModel ──────────────────────
+    if crate::services::BedrockService::is_claude_model(target_model_id) {
+        use crate::converters::anthropic_openai::OpenAIToAnthropicConverter;
+
+        let converter = OpenAIToAnthropicConverter::new();
+        let mut anthropic_req = converter
+            .convert_request(request, target_model_id)
+            .map_err(|e| OpenAIApiError::bad_request(format!("Conversion error: {e}")))?;
+
+        // Apply capability filter
+        let effective_caps = caps.as_ref().unwrap_or(&state.default_capabilities);
+        anthropic_req = crate::converters::capability_filter::apply_capabilities(
+            &anthropic_req,
+            effective_caps,
+        );
+
+        if request.stream {
+            let stream_response = bedrock
+                .invoke_model_messages_stream(&anthropic_req, target_model_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Bedrock InvokeModel streaming failed");
+                    OpenAIApiError::from_bedrock_error(&e)
+                })?;
+            let cred_name = stream_response.credential_name.clone();
+            let event_pairs = stream_response.into_event_pairs();
+            let original_model = request.model.clone();
+            let include_usage = request
+                .stream_options
+                .as_ref()
+                .map(|o| o.include_usage)
+                .unwrap_or(false);
+            let bedrock_clone = bedrock.clone();
+
+            // Convert Anthropic SSE events → OpenAI SSE chunks
+            let stream = async_stream::stream! {
+                use crate::converters::anthropic_openai::AnthropicToOpenAIStreamState;
+                let mut conv_state = AnthropicToOpenAIStreamState {
+                    model: original_model.clone(),
+                    include_usage,
+                    ..Default::default()
+                };
+                let converter = crate::converters::anthropic_openai::OpenAIToAnthropicConverter::new();
+                futures::pin_mut!(event_pairs);
+                use futures::StreamExt;
+                while let Some((event_type, data)) = event_pairs.next().await {
+                    for chunk_json in converter.convert_stream_chunk_to_openai(
+                        &event_type, &data, &mut conv_state,
+                    ) {
+                        yield Ok(Event::default().data(format!("data: {chunk_json}\n\n")));
+                    }
+                }
+                yield Ok(Event::default().data("data: [DONE]\n\n"));
+                bedrock_clone.record_success(&cred_name);
+            };
+
+            return Ok(ChatCompletionApiResponse::Stream(Sse::new(Box::pin(
+                stream,
+            ))));
+        }
+
+        // Non-streaming
+        let response = bedrock
+            .invoke_model_messages(&anthropic_req, target_model_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Bedrock InvokeModel call failed");
+                OpenAIApiError::from_bedrock_error(&e)
+            })?;
+
+        let oai_converter = crate::converters::anthropic_openai::OpenAIToAnthropicConverter::new();
+        let openai_resp = oai_converter
+            .convert_response(&response, &request.model)
+            .map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
+
+        let duration_ms = start_time.elapsed().as_millis();
+        tracing::info!(
+            request_id = %request_id,
+            bedrock_model = %target_model_id,
+            duration_ms = duration_ms,
+            "Bedrock Claude InvokeModel chat completion completed"
+        );
+        return Ok(ChatCompletionApiResponse::Json(Json(openai_resp)));
+    }
+
+    // ── Non-Claude path: OpenAI → Bedrock Converse ─────────────────────────
+    let converse_request = openai_bedrock::convert_request(request, target_model_id)
         .map_err(|e| OpenAIApiError::from_conversion_error(&e))?;
 
-    // Handle streaming vs non-streaming
     if request.stream {
         let include_usage = request
             .stream_options
@@ -269,27 +356,20 @@ async fn handle_bedrock_request(
         return Ok(ChatCompletionApiResponse::Stream(sse_stream));
     }
 
-    // Non-streaming response
     let converse_output = bedrock.converse(converse_request).await.map_err(|e| {
         tracing::error!(error = %e, "Bedrock Converse API call failed");
         OpenAIApiError::from_bedrock_error(&e)
     })?;
 
-    // Convert response to OpenAI format
     let response = openai_bedrock::convert_response(converse_output, &request.model)
         .map_err(|e| OpenAIApiError::from_conversion_error(&e))?;
 
     let duration_ms = start_time.elapsed().as_millis();
-
     tracing::info!(
         request_id = %request_id,
-        model = %response.model,
-        bedrock_model = %bedrock_model,
-        prompt_tokens = response.usage.prompt_tokens,
-        completion_tokens = response.usage.completion_tokens,
-        finish_reason = ?response.choices.first().and_then(|c| c.finish_reason.as_ref()),
+        bedrock_model = %target_model_id,
         duration_ms = duration_ms,
-        "OpenAI chat completion request completed"
+        "Bedrock Converse chat completion completed"
     );
 
     Ok(ChatCompletionApiResponse::Json(Json(response)))
