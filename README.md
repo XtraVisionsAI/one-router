@@ -31,12 +31,12 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
 - **API Key Management** — issue API keys with per-key rate limits, budget caps, and service tiers
 - **Streaming Support** — full SSE streaming for both OpenAI and Anthropic protocols
-- **Extended Thinking** — pass-through support for Anthropic extended thinking
+- **Extended Thinking** — per-model extended thinking support with style hints (Claude, Nova 2, Kimi)
 - **Tool Use & PTC** — tool calling support including Programmatic Tool Calling with sandboxed code execution
-- **Admin Web UI** — built-in browser UI at `/admin` for managing API keys, backends, model mappings, feature flags, and usage stats — no external tools needed
+- **Per-Model Capabilities** — declare per-model capabilities (thinking, document, tool use, PTC) in model mappings; global defaults configurable via settings
+- **Admin Web UI** — built-in browser UI at `/admin` for managing API keys, backends, model mappings, settings, and usage stats — no external tools needed
 - **AES-256-GCM Encryption** — encrypt backend credentials at rest; the Admin UI handles plaintext input and encrypts automatically on save
 - **Prometheus Metrics** — built-in `/health`, `/ready`, `/liveness` endpoints
-- **Feature Flags** — toggle capabilities (tool use, PTC, caching, rate limiting) via database
 - **Multi-Arch Docker** — ships `linux/amd64` and `linux/arm64` images
 - **Deploy Anywhere** — Docker, AWS App Runner, or bare metal
 
@@ -69,7 +69,7 @@ On startup, One Router prints an **ephemeral API key** for immediate use:
 
 ```
 ============================================================
-  One Router v0.1.0
+  One Router v0.10.0
 ============================================================
   Database:  sqlite://./data/gateway.db
   Listen:    0.0.0.0:8000
@@ -292,9 +292,9 @@ One Router includes a built-in admin UI at **`/admin`**. Open it in a browser an
 | **Dashboard** | Overview: backend health, API key count, uptime |
 | **API Keys** | Create keys (plaintext shown once), edit rate limits / budgets, deactivate / reactivate |
 | **Backends** | Add / edit backends (Gemini, Anthropic, OpenAI, Bedrock) — credentials entered in plaintext, encrypted before saving |
-| **Model Maps** | Manage source → target model mappings, priorities, and pricing |
+| **Model Maps** | Manage source → target model mappings, priorities, pricing, and per-model capabilities |
 | **Usage** | Query usage statistics by API key, time range, and grouping |
-| **Flags** | Toggle feature flags (tool use, PTC, caching, etc.) |
+| **Settings** | Configure default capabilities (tool use, thinking, document, PTC), rate limiting, and prompt cache behavior |
 
 The UI is embedded directly in the binary (no separate deployment). It requires **no build step** — it's plain HTML + CSS + vanilla JS.
 
@@ -463,6 +463,22 @@ Bedrock and Gemini return `b64_json` only. OpenAI passthrough supports both `url
 
 Wildcard catch-alls (`claude-*`, `gpt-*`, `gemini-*`, `o1-*`) ensure unknown model variants are still routed.
 
+### Model Capabilities
+
+Each mapping declares what features the target model supports. This controls what gets forwarded in requests.
+
+| Field | Default | Description |
+|---|---|---|
+| `thinking.enabled` | false | Whether extended thinking / reasoning is forwarded |
+| `thinking.style` | `claude` | How thinking is expressed: `claude` (native), `nova2`, or `kimi` |
+| `document.enabled` | false | Whether document content blocks are forwarded |
+| `tool_use.enabled` | false | Whether tool definitions are forwarded |
+| `ptc.enabled` | false | Whether Programmatic Tool Calling is enabled |
+
+Pre-configured mappings ship with sensible defaults: Claude models have full capabilities, Gemini models have thinking disabled, and embedding/rerank models have all capabilities disabled.
+
+For model mappings with no explicit capabilities, the **Settings → default capabilities** values are used as fallback (configurable, take effect on restart).
+
 ## Project Structure
 
 ```
@@ -481,7 +497,7 @@ src/
 ├── services/            # Business logic
 │   ├── backend_pool/    # Credential pool & load balancing
 │   ├── ptc/             # Programmatic Tool Calling (sandboxed execution)
-│   ├── bedrock.rs       # AWS Bedrock service (Converse + InvokeModel)
+│   ├── bedrock.rs       # AWS Bedrock service (InvokeModel for Claude, Converse for non-Claude)
 │   ├── gemini.rs        # Google Gemini service
 │   ├── passthrough.rs   # Anthropic & OpenAI passthrough service
 │   ├── model_mapping.rs # Model resolution with caching
