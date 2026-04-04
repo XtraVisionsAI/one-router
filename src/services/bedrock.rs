@@ -701,6 +701,24 @@ fn build_invoke_model_body(
         obj.remove("stream");
         obj.remove("container");
         obj.remove("service_tier");
+
+        // Bedrock requires tool description to be non-empty (min length 1).
+        // Fill empty descriptions with a placeholder to avoid validation errors.
+        if let Some(serde_json::Value::Array(tools)) = obj.get_mut("tools") {
+            for tool in tools.iter_mut() {
+                if let Some(tool_obj) = tool.as_object_mut() {
+                    match tool_obj.get("description") {
+                        Some(serde_json::Value::String(s)) if s.is_empty() => {
+                            tool_obj.insert("description".to_string(), serde_json::json!("-"));
+                        }
+                        None => {
+                            tool_obj.insert("description".to_string(), serde_json::json!("-"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     serde_json::to_vec(&body).map_err(|e| BedrockError::Serialization(e.to_string()))
