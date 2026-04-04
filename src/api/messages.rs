@@ -236,7 +236,7 @@ async fn handle_bedrock_request(
     target_model_id: &str,
     request_id: &str,
     cache_mode: &crate::converters::cache_transform::PromptCacheMode,
-    caps: &crate::services::ModelCapabilities,
+    caps: &Option<crate::services::ModelCapabilities>,
     key_cache_ttl: Option<&str>,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
@@ -313,13 +313,12 @@ async fn handle_bedrock_request(
     let transformed_request =
         crate::converters::cache_transform::apply_to_request(request, cache_mode_ref);
 
-    // Apply model capability + global policy filtering
+    // Apply model capability filtering.
+    // Per-model capabilities take priority; fall back to AppState::default_capabilities.
+    let effective_caps = caps.as_ref().unwrap_or(&state.default_capabilities);
     let transformed_request = crate::converters::capability_filter::apply_capabilities(
         &transformed_request,
-        caps,
-        state.global_tool_use,
-        state.global_extended_thinking,
-        state.global_document_support,
+        effective_caps,
     );
 
     // Server-side web tool execution loop

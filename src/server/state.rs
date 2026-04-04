@@ -6,6 +6,7 @@ use crate::config::Settings;
 use crate::converters::cache_transform::PromptCacheMode;
 use crate::database::encryption::Encryptor;
 use crate::database::traits::DatabaseService;
+use crate::services::capabilities::ModelCapabilities;
 use crate::services::web_tools::executor::WebToolExecutor;
 use crate::services::{
     BedrockService, GeminiService, ModelMappingService, PassthroughService, PtcService,
@@ -60,21 +61,15 @@ pub struct AppState {
     pub prompt_cache_mode: PromptCacheMode,
 
     /// Default rate limit in RPM loaded at startup from `rate_limit` system setting.
-    /// None means rate limiting is globally disabled (option A: per-key settings also ignored).
+    /// None means rate limiting is globally disabled.
     /// Requires restart to take effect.
     pub rate_limit_rpm: Option<u32>,
 
-    /// Global policy: allow tool use. Requires restart.
-    pub global_tool_use: bool,
-
-    /// Global policy: allow extended thinking. Requires restart.
-    pub global_extended_thinking: bool,
-
-    /// Global policy: allow document content blocks. Requires restart.
-    pub global_document_support: bool,
-
-    /// Global policy: allow PTC (Programmatic Tool Calling). Requires restart.
-    pub global_ptc: bool,
+    /// Default capabilities used when a model mapping has no explicit `capabilities` JSON.
+    /// Assembled from `enable_tool_use` / `enable_extended_thinking` /
+    /// `enable_document_support` / `enable_ptc` system settings at startup.
+    /// Requires restart to take effect.
+    pub default_capabilities: ModelCapabilities,
 }
 
 impl AppState {

@@ -166,23 +166,18 @@ impl App {
             )))
         };
 
-        // 10. Load startup settings from DB (rate_limit, prompt_cache, feature flags)
+        // 10. Load startup settings from DB (rate_limit, prompt_cache, default capabilities)
         let prompt_cache_mode = load_prompt_cache_mode(&database).await;
         let rate_limit_rpm = load_rate_limit_rpm(&database).await;
-        let global_tool_use = load_bool_setting(&database, "enable_tool_use", true).await;
-        let global_extended_thinking =
-            load_bool_setting(&database, "enable_extended_thinking", true).await;
-        let global_document_support =
-            load_bool_setting(&database, "enable_document_support", true).await;
-        let global_ptc = load_bool_setting(&database, "enable_ptc", false).await;
+        let default_capabilities = load_default_capabilities(&database).await;
 
         tracing::info!(
             prompt_cache = ?prompt_cache_mode,
             rate_limit_rpm = ?rate_limit_rpm,
-            global_tool_use,
-            global_extended_thinking,
-            global_document_support,
-            global_ptc,
+            tool_use = default_capabilities.tool_use.enabled,
+            extended_thinking = default_capabilities.thinking.enabled,
+            document_support = default_capabilities.document.enabled,
+            ptc = default_capabilities.ptc.enabled,
             "Startup settings loaded"
         );
 
@@ -201,10 +196,7 @@ impl App {
             web_tool_executor,
             prompt_cache_mode,
             rate_limit_rpm,
-            global_tool_use,
-            global_extended_thinking,
-            global_document_support,
-            global_ptc,
+            default_capabilities,
         };
 
         tracing::info!("Application state initialized successfully");
@@ -528,6 +520,31 @@ async fn load_bool_setting(
         .flatten()
         .map(|s| s.value != "false")
         .unwrap_or(default)
+}
+
+/// Load default capabilities from system settings at startup.
+/// These are used for model mappings that have no explicit `capabilities` JSON.
+async fn load_default_capabilities(
+    database: &Arc<dyn crate::database::traits::DatabaseService>,
+) -> crate::services::capabilities::ModelCapabilities {
+    use crate::services::capabilities::{
+        ModelCapabilities, SimpleCapability, ThinkingCapability, ThinkingStyle,
+    };
+    ModelCapabilities {
+        thinking: ThinkingCapability {
+            enabled: load_bool_setting(database, "enable_extended_thinking", true).await,
+            style: ThinkingStyle::Claude,
+        },
+        document: SimpleCapability {
+            enabled: load_bool_setting(database, "enable_document_support", true).await,
+        },
+        tool_use: SimpleCapability {
+            enabled: load_bool_setting(database, "enable_tool_use", true).await,
+        },
+        ptc: SimpleCapability {
+            enabled: load_bool_setting(database, "enable_ptc", false).await,
+        },
+    }
 }
 
 /// Create a future that completes when a shutdown signal is received

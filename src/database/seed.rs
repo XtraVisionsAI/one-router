@@ -16,6 +16,12 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+/// Capabilities JSON for Claude models on Bedrock (full capabilities).
+const CLAUDE_CAPS: &str = r#"{"thinking":{"enabled":true,"style":"claude"},"document":{"enabled":true},"tool_use":{"enabled":true},"ptc":{"enabled":false}}"#;
+
+/// Capabilities JSON for Gemini models (no thinking support).
+const GEMINI_CAPS: &str = r#"{"thinking":{"enabled":false,"style":"claude"},"document":{"enabled":true},"tool_use":{"enabled":true},"ptc":{"enabled":false}}"#;
+
 /// Default model mappings (source model ID -> target provider model ID).
 pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
     let now = unix_now();
@@ -33,7 +39,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-5-sonnet-latest".into(),
@@ -48,7 +54,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-sonnet-20240229".into(),
@@ -63,7 +69,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4-20250514".into(),
@@ -78,7 +84,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-5-haiku-20241022".into(),
@@ -93,7 +99,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-haiku-20240307".into(),
@@ -108,7 +114,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-opus-20240229".into(),
@@ -123,7 +129,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-5-20251101".into(),
@@ -138,7 +144,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4-6-20260313".into(),
@@ -153,7 +159,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-6-20260313".into(),
@@ -168,7 +174,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-haiku-4-5-20251001".into(),
@@ -183,7 +189,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         // -latest aliases (Claude)
         ModelMappingRecord {
@@ -199,7 +205,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-latest".into(),
@@ -214,7 +220,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-haiku-4-latest".into(),
@@ -229,7 +235,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-5-haiku-latest".into(),
@@ -244,7 +250,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-opus-latest".into(),
@@ -259,7 +265,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         // Gemini exact mappings (passthrough: target = source)
         ModelMappingRecord {
@@ -275,7 +281,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(GEMINI_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gemini-2.5-pro".into(),
@@ -290,7 +296,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(GEMINI_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gemini-2.0-flash".into(),
@@ -305,7 +311,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(GEMINI_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gemini-2.0-flash-lite".into(),
@@ -320,7 +326,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(GEMINI_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gemini-1.5-pro".into(),
@@ -335,7 +341,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(GEMINI_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gemini-1.5-flash".into(),
@@ -350,7 +356,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(GEMINI_CAPS.to_string()),
         },
         // OpenAI-compatible exact mappings (GPT → Bedrock Claude)
         ModelMappingRecord {
@@ -366,7 +372,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-2024-05-13".into(),
@@ -381,7 +387,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-2024-08-06".into(),
@@ -396,7 +402,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-mini".into(),
@@ -411,7 +417,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-mini-2024-07-18".into(),
@@ -426,7 +432,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4".into(),
@@ -441,7 +447,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4-turbo".into(),
@@ -456,7 +462,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4-turbo-preview".into(),
@@ -471,7 +477,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-3.5-turbo".into(),
@@ -486,7 +492,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "gpt-3.5-turbo-16k".into(),
@@ -501,7 +507,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "o1".into(),
@@ -516,7 +522,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "o1-preview".into(),
@@ -531,7 +537,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
             source_model_id: "o1-mini".into(),
@@ -546,7 +552,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         // ── Embedding models (Bedrock InvokeModel) ──────────────────────────
         // Cohere Embed v3
@@ -717,7 +723,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         // Wildcard catch-all: any gemini-* model not matched above
         ModelMappingRecord {
@@ -733,7 +739,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(GEMINI_CAPS.to_string()),
         },
         // Wildcard catch-all: any gpt-* model not matched above
         ModelMappingRecord {
@@ -749,7 +755,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         // Wildcard catch-all: any o1-* model not matched above
         ModelMappingRecord {
@@ -765,7 +771,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             status: "active".into(),
             created_at: now,
             updated_at: None,
-            capabilities: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
         },
     ]
 }

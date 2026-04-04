@@ -1,14 +1,18 @@
 //! Model capability declarations.
 //!
 //! Stored as JSON in the `capabilities` column of `model_mappings`.
-//! Deserialized at model resolution time; missing or null fields default to enabled.
+//! When a mapping has no `capabilities` set (None), the gateway falls back
+//! to `AppState::default_capabilities` which is loaded from system settings
+//! at startup.
 
 use serde::{Deserialize, Serialize};
 
 /// Per-model capability declarations.
 ///
-/// All capabilities default to enabled for backward compatibility with
-/// existing mappings that have no `capabilities` column.
+/// All fields default to **disabled** so that unconfigured models fail safely.
+/// The typical source of truth for a model's capabilities is the `capabilities`
+/// JSON column in `model_mappings`; if that column is NULL the gateway uses
+/// `AppState::default_capabilities` instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelCapabilities {
@@ -22,8 +26,8 @@ impl Default for ModelCapabilities {
     fn default() -> Self {
         Self {
             thinking: ThinkingCapability::default(),
-            document: SimpleCapability { enabled: true },
-            tool_use: SimpleCapability { enabled: true },
+            document: SimpleCapability { enabled: false },
+            tool_use: SimpleCapability { enabled: false },
             ptc: SimpleCapability { enabled: false },
         }
     }
@@ -40,7 +44,7 @@ pub struct ThinkingCapability {
 impl Default for ThinkingCapability {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             style: ThinkingStyle::Claude,
         }
     }
@@ -81,36 +85,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_all_standard_caps_enabled() {
+    fn default_all_caps_disabled() {
         let caps = ModelCapabilities::default();
-        assert!(caps.thinking.enabled);
-        assert!(caps.document.enabled);
-        assert!(caps.tool_use.enabled);
-        assert!(!caps.ptc.enabled); // PTC off by default
+        assert!(!caps.thinking.enabled);
+        assert!(!caps.document.enabled);
+        assert!(!caps.tool_use.enabled);
+        assert!(!caps.ptc.enabled);
     }
 
     #[test]
     fn from_json_none_returns_default() {
         let caps = ModelCapabilities::from_json(None);
-        assert!(caps.thinking.enabled);
+        assert!(!caps.thinking.enabled);
+        assert!(!caps.document.enabled);
     }
 
     #[test]
     fn from_json_empty_returns_default() {
         let caps = ModelCapabilities::from_json(Some(""));
-        assert!(caps.thinking.enabled);
+        assert!(!caps.thinking.enabled);
     }
 
     #[test]
     fn from_json_partial_merges_defaults() {
-        // Only thinking specified — document/tool_use/ptc use defaults
+        // Only thinking specified — document/tool_use/ptc fall back to default (false)
         let caps = ModelCapabilities::from_json(Some(
-            r#"{"thinking": {"enabled": false, "style": "nova2"}}"#,
+            r#"{"thinking": {"enabled": true, "style": "nova2"}}"#,
         ));
-        assert!(!caps.thinking.enabled);
+        assert!(caps.thinking.enabled);
         assert_eq!(caps.thinking.style, ThinkingStyle::Nova2);
-        assert!(caps.document.enabled);
-        assert!(caps.tool_use.enabled);
+        assert!(!caps.document.enabled);
+        assert!(!caps.tool_use.enabled);
     }
 
     #[test]
@@ -133,6 +138,6 @@ mod tests {
     #[test]
     fn from_json_invalid_returns_default() {
         let caps = ModelCapabilities::from_json(Some("not json"));
-        assert!(caps.thinking.enabled);
+        assert!(!caps.thinking.enabled);
     }
 }

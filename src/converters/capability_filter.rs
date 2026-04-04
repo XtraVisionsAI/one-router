@@ -1,45 +1,35 @@
 //! Capability-based request filtering.
 //!
-//! Applies model capability constraints and global policy flags to a request,
-//! stripping fields/blocks that are not supported or are globally disabled.
+//! Strips request fields that the target model does not support according to
+//! its `ModelCapabilities`. The effective capabilities are either the per-model
+//! value from `model_mappings.capabilities` or `AppState::default_capabilities`
+//! when the mapping has no explicit configuration.
 
-use crate::schemas::anthropic::{ContentBlock, MessageContent, MessageRequest, SystemContent};
+use crate::schemas::anthropic::{ContentBlock, MessageContent, MessageRequest};
 use crate::services::capabilities::ModelCapabilities;
 
-/// Apply capability constraints to a request.
+/// Apply capability constraints to a request, returning a filtered clone.
 ///
-/// Logic: a feature is active only when the global policy allows it AND the
-/// model declares support for it. When disabled, the relevant parts of the
-/// request are stripped so the downstream InvokeModel call is clean.
-pub fn apply_capabilities(
-    request: &MessageRequest,
-    caps: &ModelCapabilities,
-    global_tool_use: bool,
-    global_extended_thinking: bool,
-    global_document_support: bool,
-) -> MessageRequest {
+/// Fields/blocks are stripped when the corresponding capability is disabled:
+/// - `thinking` when `caps.thinking.enabled` is false
+/// - `tools` + `tool_choice` when `caps.tool_use.enabled` is false
+/// - `document` content blocks when `caps.document.enabled` is false
+pub fn apply_capabilities(request: &MessageRequest, caps: &ModelCapabilities) -> MessageRequest {
     let mut req = request.clone();
 
     // ---- thinking ----
-    if req.thinking.is_some() {
-        let allowed = global_extended_thinking && caps.thinking.enabled;
-        if !allowed {
-            req.thinking = None;
-        }
+    if req.thinking.is_some() && !caps.thinking.enabled {
+        req.thinking = None;
     }
 
     // ---- tools ----
-    if req.tools.is_some() {
-        let allowed = global_tool_use && caps.tool_use.enabled;
-        if !allowed {
-            req.tools = None;
-            req.tool_choice = None;
-        }
+    if req.tools.is_some() && !caps.tool_use.enabled {
+        req.tools = None;
+        req.tool_choice = None;
     }
 
     // ---- document blocks ----
-    let document_allowed = global_document_support && caps.document.enabled;
-    if !document_allowed {
+    if !caps.document.enabled {
         req.messages = req
             .messages
             .iter()
@@ -57,12 +47,8 @@ pub fn apply_capabilities(
             })
             .collect();
 
-        // Also strip document blocks from system messages
-        if let Some(SystemContent::Messages(ref msgs)) = req.system {
-            // System messages don't carry document blocks in the Anthropic schema,
-            // so no change needed here.
-            let _ = msgs;
-        }
+        // System messages don't carry document blocks in the Anthropic schema.
+        let _ = &req.system;
     }
 
     req
@@ -77,7 +63,15 @@ mod tests {
     };
 
     fn caps_all_enabled() -> ModelCapabilities {
-        ModelCapabilities::default()
+        ModelCapabilities {
+            thinking: ThinkingCapability {
+                enabled: true,
+                style: ThinkingStyle::Claude,
+            },
+            document: SimpleCapability { enabled: true },
+            tool_use: SimpleCapability { enabled: true },
+            ptc: SimpleCapability { enabled: false },
+        }
     }
 
     fn caps_no_thinking() -> ModelCapabilities {
@@ -86,21 +80,21 @@ mod tests {
                 enabled: false,
                 style: ThinkingStyle::Claude,
             },
-            ..ModelCapabilities::default()
+            ..caps_all_enabled()
         }
     }
 
     fn caps_no_tools() -> ModelCapabilities {
         ModelCapabilities {
             tool_use: SimpleCapability { enabled: false },
-            ..ModelCapabilities::default()
+            ..caps_all_enabled()
         }
     }
 
     fn caps_no_document() -> ModelCapabilities {
         ModelCapabilities {
             document: SimpleCapability { enabled: false },
-            ..ModelCapabilities::default()
+            ..caps_all_enabled()
         }
     }
 
@@ -136,55 +130,41 @@ mod tests {
     // ---- thinking ----
 
     #[test]
-    fn thinking_kept_when_both_allowed() {
+    fn thinking_kept_when_enabled() {
         let req = make_request_with_thinking();
-        let result = apply_capabilities(&req, &caps_all_enabled(), true, true, true);
+        let result = apply_capabilities(&req, &caps_all_enabled());
         assert!(result.thinking.is_some());
     }
 
     #[test]
-    fn thinking_stripped_when_global_disabled() {
+    fn thinking_stripped_when_caps_disabled() {
         let req = make_request_with_thinking();
-        let result = apply_capabilities(&req, &caps_all_enabled(), true, false, true);
-        assert!(result.thinking.is_none());
-    }
-
-    #[test]
-    fn thinking_stripped_when_model_disabled() {
-        let req = make_request_with_thinking();
-        let result = apply_capabilities(&req, &caps_no_thinking(), true, true, true);
+        let result = apply_capabilities(&req, &caps_no_thinking());
         assert!(result.thinking.is_none());
     }
 
     // ---- tools ----
 
     #[test]
-    fn tools_kept_when_both_allowed() {
+    fn tools_kept_when_enabled() {
         let req = make_request_with_tools();
-        let result = apply_capabilities(&req, &caps_all_enabled(), true, true, true);
+        let result = apply_capabilities(&req, &caps_all_enabled());
         assert!(result.tools.is_some());
     }
 
     #[test]
-    fn tools_stripped_when_global_disabled() {
+    fn tools_stripped_when_caps_disabled() {
         let req = make_request_with_tools();
-        let result = apply_capabilities(&req, &caps_all_enabled(), false, true, true);
-        assert!(result.tools.is_none());
-    }
-
-    #[test]
-    fn tools_stripped_when_model_disabled() {
-        let req = make_request_with_tools();
-        let result = apply_capabilities(&req, &caps_no_tools(), true, true, true);
+        let result = apply_capabilities(&req, &caps_no_tools());
         assert!(result.tools.is_none());
     }
 
     // ---- document ----
 
     #[test]
-    fn document_kept_when_both_allowed() {
+    fn document_kept_when_enabled() {
         let req = make_request_with_document();
-        let result = apply_capabilities(&req, &caps_all_enabled(), true, true, true);
+        let result = apply_capabilities(&req, &caps_all_enabled());
         if let MessageContent::Blocks(blocks) = &result.messages[0].content {
             assert!(blocks
                 .iter()
@@ -193,20 +173,9 @@ mod tests {
     }
 
     #[test]
-    fn document_stripped_when_global_disabled() {
+    fn document_stripped_when_caps_disabled() {
         let req = make_request_with_document();
-        let result = apply_capabilities(&req, &caps_all_enabled(), true, true, false);
-        if let MessageContent::Blocks(blocks) = &result.messages[0].content {
-            assert!(!blocks
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Document { .. })));
-        }
-    }
-
-    #[test]
-    fn document_stripped_when_model_disabled() {
-        let req = make_request_with_document();
-        let result = apply_capabilities(&req, &caps_no_document(), true, true, true);
+        let result = apply_capabilities(&req, &caps_no_document());
         if let MessageContent::Blocks(blocks) = &result.messages[0].content {
             assert!(!blocks
                 .iter()

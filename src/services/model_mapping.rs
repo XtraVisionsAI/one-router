@@ -30,7 +30,8 @@ impl std::error::Error for ModelNotFoundError {}
 pub struct ResolvedModel {
     pub target_model_id: String,
     pub provider: String, // "bedrock" / "gemini" / ""
-    pub capabilities: ModelCapabilities,
+    /// Explicit per-model capabilities. None means "use AppState::default_capabilities".
+    pub capabilities: Option<ModelCapabilities>,
 }
 
 /// Simple glob matching: only supports `*` as a wildcard (equivalent to `.*` in regex).
@@ -140,7 +141,11 @@ impl ModelMappingService {
                 let resolved = ResolvedModel {
                     target_model_id: mapping.target_model_id.clone(),
                     provider: mapping.provider.clone(),
-                    capabilities: ModelCapabilities::from_json(mapping.capabilities.as_deref()),
+                    capabilities: mapping
+                        .capabilities
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| serde_json::from_str(s).unwrap_or_default()),
                 };
                 self.cache.insert(key, Some(resolved.clone())).await;
                 return Ok(resolved);
@@ -159,7 +164,11 @@ impl ModelMappingService {
                 let resolved = ResolvedModel {
                     target_model_id: mapping.target_model_id.clone(),
                     provider: mapping.provider.clone(),
-                    capabilities: ModelCapabilities::from_json(mapping.capabilities.as_deref()),
+                    capabilities: mapping
+                        .capabilities
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| serde_json::from_str(s).unwrap_or_default()),
                 };
                 self.cache.insert(key, Some(resolved.clone())).await;
                 Ok(resolved)
