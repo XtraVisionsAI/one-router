@@ -1,3 +1,25 @@
+## v0.11.0 (2026-04-04)
+
+### Feat
+
+- **chat_completions**: route Claude models to InvokeModel, apply capability filter
+- **capabilities**: add per-model capabilities + global policy flags
+- **settings**: add rate_limit select setting, load prompt_cache+rate_limit at startup
+- **bedrock**: migrate Claude to InvokeModel API, add prompt_cache setting
+- **admin-ui**: auto-save select settings on change, remove Save button
+
+### Fix
+
+- **bedrock**: fill empty tool descriptions in Converse path (openai_bedrock.rs)
+- **bedrock**: fill empty tool descriptions to satisfy Bedrock min-length constraint
+- **admin-ui**: settings page full width layout
+- **admin-ui**: widen settings page and NSelect width
+- **deploy**: purge ECR PTC cache before pulling to ensure latest image is fetched
+
+### Refactor
+
+- **capabilities**: default all-disabled, use AppState::default_capabilities as fallback
+
 ## v0.10.0 (2026-04-03)
 
 ### Feat
