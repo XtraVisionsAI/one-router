@@ -497,7 +497,7 @@ src/
 ├── services/            # Business logic
 │   ├── backend_pool/    # Credential pool & load balancing
 │   ├── ptc/             # Programmatic Tool Calling (sandboxed execution)
-│   ├── bedrock.rs       # AWS Bedrock service (InvokeModel for /v1/messages→Claude; Converse for /v1/chat/completions→Bedrock; Bedrock Mantle for /v1/messages→non-Claude)
+│   ├── bedrock.rs       # AWS Bedrock service (InvokeModel for Claude; Converse for non-Claude /v1/chat/completions; Bedrock Mantle for non-Claude /v1/messages)
 │   ├── gemini.rs        # Google Gemini service
 │   ├── passthrough.rs   # Anthropic & OpenAI passthrough service
 │   ├── model_mapping.rs # Model resolution with caching
