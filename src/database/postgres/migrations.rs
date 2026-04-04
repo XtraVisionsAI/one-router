@@ -70,6 +70,7 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             status TEXT DEFAULT 'active',
             created_at BIGINT NOT NULL,
             updated_at BIGINT,
+            capabilities TEXT,
             PRIMARY KEY (source_model_id, provider)
         )",
     )
@@ -78,6 +79,11 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
 
     // Migration: add priority column and update PK if upgrading from old schema
     migrate_model_mappings(pool).await?;
+
+    // Migration: add capabilities column if not already present
+    sqlx::query("ALTER TABLE model_mappings ADD COLUMN IF NOT EXISTS capabilities TEXT")
+        .execute(pool)
+        .await?;
 
     // Migration: add budget_history column if not already present
     sqlx::query("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS budget_history TEXT")

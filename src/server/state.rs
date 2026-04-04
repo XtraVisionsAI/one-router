@@ -63,6 +63,18 @@ pub struct AppState {
     /// None means rate limiting is globally disabled (option A: per-key settings also ignored).
     /// Requires restart to take effect.
     pub rate_limit_rpm: Option<u32>,
+
+    /// Global policy: allow tool use. Requires restart.
+    pub global_tool_use: bool,
+
+    /// Global policy: allow extended thinking. Requires restart.
+    pub global_extended_thinking: bool,
+
+    /// Global policy: allow document content blocks. Requires restart.
+    pub global_document_support: bool,
+
+    /// Global policy: allow PTC (Programmatic Tool Calling). Requires restart.
+    pub global_ptc: bool,
 }
 
 impl AppState {

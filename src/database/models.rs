@@ -78,6 +78,8 @@ pub struct ModelMappingRecord {
     pub status: String,
     pub created_at: i64,
     pub updated_at: Option<i64>,
+    /// JSON-encoded ModelCapabilities. None means use defaults (all enabled).
+    pub capabilities: Option<String>,
 }
 
 // ============================================================================

@@ -236,6 +236,7 @@ fn model_mapping_from_item(item: &HashMap<String, AttributeValue>) -> ModelMappi
         status: get_s(item, "status"),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
+        capabilities: get_opt_s(item, "capabilities"),
     }
 }
 
@@ -714,6 +715,7 @@ impl ModelMappingStore for DynamoDbBackend {
         item.insert("status".into(), av_s(&record.status));
         item.insert("created_at".into(), av_n(record.created_at));
         item.insert("updated_at".into(), av_n(now));
+        item.insert("capabilities".into(), av_opt_s(&record.capabilities));
 
         self.client
             .put_item()

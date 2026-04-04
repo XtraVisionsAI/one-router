@@ -52,6 +52,9 @@ pub struct UpsertMappingRequest {
     pub priority: i32,
     #[serde(default = "default_status")]
     pub status: String,
+    /// JSON-encoded ModelCapabilities. None means use defaults.
+    #[serde(default)]
+    pub capabilities: Option<String>,
 }
 
 fn default_priority() -> i32 {
@@ -116,6 +119,7 @@ pub async fn create_mapping(
         status: body.status,
         created_at: now,
         updated_at: None,
+        capabilities: body.capabilities,
     };
 
     match state.database.model_mapping().upsert_mapping(&record).await {
@@ -185,6 +189,7 @@ pub async fn update_mapping(
         status: body.status,
         created_at: existing.created_at,
         updated_at: Some(now),
+        capabilities: body.capabilities,
     };
 
     match state.database.model_mapping().upsert_mapping(&record).await {

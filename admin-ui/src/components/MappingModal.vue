@@ -1,5 +1,6 @@
 <script setup lang="ts">
-  import type { ModelMapping, UpsertMappingBody } from '@/api/types'
+  import type { ModelMapping, UpsertMappingBody, ModelCapabilities } from '@/api/types'
+  import { defaultCapabilities } from '@/api/types'
   import { useMessage } from 'naive-ui'
   import { useMappingsApi } from '@/api/mappings'
 
@@ -19,7 +20,10 @@
   const isEdit = computed(() => !!props.existing)
   const title = computed(() => (isEdit.value ? 'Edit Mapping' : 'Add Mapping'))
 
-  const form = ref<UpsertMappingBody>({
+  // Separate reactive caps object for the UI checkboxes
+  const caps = ref<ModelCapabilities>(defaultCapabilities())
+
+  const form = ref<Omit<UpsertMappingBody, 'capabilities'>>({
     source_model_id: '',
     target_model_id: '',
     provider: 'bedrock',
@@ -29,7 +33,7 @@
     input_price: 0,
     output_price: 0,
     cache_read_price: 0,
-    cache_write_price: 0
+    cache_write_price: 0,
   })
   const saving = ref(false)
 
@@ -47,8 +51,11 @@
           input_price: props.existing?.input_price ?? 0,
           output_price: props.existing?.output_price ?? 0,
           cache_read_price: props.existing?.cache_read_price ?? 0,
-          cache_write_price: props.existing?.cache_write_price ?? 0
+          cache_write_price: props.existing?.cache_write_price ?? 0,
         }
+        caps.value = props.existing?.capabilities
+          ? { ...defaultCapabilities(), ...props.existing.capabilities }
+          : defaultCapabilities()
       }
     }
   )
@@ -65,10 +72,14 @@
 
     saving.value = true
     try {
+      const body: UpsertMappingBody = {
+        ...form.value,
+        capabilities: JSON.stringify(caps.value),
+      }
       if (isEdit.value) {
-        await api.update(props.existing!.source_model_id, props.existing!.provider, form.value)
+        await api.update(props.existing!.source_model_id, props.existing!.provider, body)
       } else {
-        await api.create(form.value)
+        await api.create(body)
       }
       message.success(isEdit.value ? 'Mapping updated' : 'Mapping created')
       emit('update:show', false)
@@ -82,7 +93,7 @@
 </script>
 
 <template>
-  <NModal :show="show" :title="title" preset="card" style="width: 520px" @update:show="emit('update:show', $event)">
+  <NModal :show="show" :title="title" preset="card" style="width: 560px" @update:show="emit('update:show', $event)">
     <div class="space-y-1">
       <div class="flex gap-4">
         <NFormItem label="Source Model ID" required class="flex-1">
@@ -136,6 +147,33 @@
         <NFormItem label="Cache Write Price (per 1K)" class="flex-1">
           <NInputNumber v-model:value="form.cache_write_price" :precision="4" :min="0" class="w-full" />
         </NFormItem>
+      </div>
+
+      <!-- Capabilities -->
+      <NDivider title-placement="left">
+        <span class="text-xs text-slate-500">Capabilities</span>
+      </NDivider>
+
+      <div class="space-y-2">
+        <!-- Extended Thinking -->
+        <div class="flex items-center gap-3">
+          <NCheckbox v-model:checked="caps.thinking.enabled">Extended Thinking</NCheckbox>
+          <NSelect
+            v-if="caps.thinking.enabled"
+            v-model:value="caps.thinking.style"
+            size="small"
+            style="width: 110px"
+            :options="[
+              { label: 'Claude', value: 'claude' },
+              { label: 'Nova 2', value: 'nova2' },
+              { label: 'Kimi', value: 'kimi' }
+            ]"
+          />
+        </div>
+
+        <NCheckbox v-model:checked="caps.document.enabled">Document Support</NCheckbox>
+        <NCheckbox v-model:checked="caps.tool_use.enabled">Tool Use</NCheckbox>
+        <NCheckbox v-model:checked="caps.ptc.enabled">PTC (Programmatic Tool Calling)</NCheckbox>
       </div>
     </div>
 

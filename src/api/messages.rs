@@ -219,6 +219,7 @@ pub async fn create_message(
                 &resolved.target_model_id,
                 &request_id,
                 &state.prompt_cache_mode,
+                &resolved.capabilities,
                 key_info.cache_ttl.as_deref(),
                 start_time,
             )
@@ -228,12 +229,14 @@ pub async fn create_message(
 }
 
 /// Handle request using Bedrock backend
+#[allow(clippy::too_many_arguments)]
 async fn handle_bedrock_request(
     state: &AppState,
     request: &MessageRequest,
     target_model_id: &str,
     request_id: &str,
     cache_mode: &crate::converters::cache_transform::PromptCacheMode,
+    caps: &crate::services::ModelCapabilities,
     key_cache_ttl: Option<&str>,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
@@ -309,6 +312,15 @@ async fn handle_bedrock_request(
     };
     let transformed_request =
         crate::converters::cache_transform::apply_to_request(request, cache_mode_ref);
+
+    // Apply model capability + global policy filtering
+    let transformed_request = crate::converters::capability_filter::apply_capabilities(
+        &transformed_request,
+        caps,
+        state.global_tool_use,
+        state.global_extended_thinking,
+        state.global_document_support,
+    );
 
     // Server-side web tool execution loop
     if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {

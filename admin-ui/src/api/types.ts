@@ -49,6 +49,21 @@ export interface UpdateKeyBody {
 }
 
 // ── Model Mappings ────────────────────────────────────────────
+
+export interface ModelCapabilities {
+  thinking: { enabled: boolean; style: 'claude' | 'nova2' | 'kimi' }
+  document: { enabled: boolean }
+  tool_use: { enabled: boolean }
+  ptc: { enabled: boolean }
+}
+
+export const defaultCapabilities = (): ModelCapabilities => ({
+  thinking: { enabled: true, style: 'claude' },
+  document: { enabled: true },
+  tool_use: { enabled: true },
+  ptc: { enabled: false },
+})
+
 export interface ModelMapping {
   source_model_id: string
   target_model_id: string
@@ -60,6 +75,7 @@ export interface ModelMapping {
   output_price: number
   cache_read_price: number
   cache_write_price: number
+  capabilities?: ModelCapabilities | null
 }
 
 export interface UpsertMappingBody {
@@ -73,6 +89,7 @@ export interface UpsertMappingBody {
   output_price: number
   cache_read_price: number
   cache_write_price: number
+  capabilities?: string | null
 }
 
 // ── System Settings ───────────────────────────────────────────

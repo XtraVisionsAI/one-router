@@ -2,6 +2,7 @@
 
 pub mod backend_pool;
 pub mod bedrock;
+pub mod capabilities;
 pub mod gemini;
 pub mod model_mapping;
 pub mod passthrough;
@@ -16,6 +17,7 @@ pub use backend_pool::{
 pub use bedrock::{
     BedrockError, BedrockService, BedrockStreamError, ConverseRequest, ConverseStreamResponse,
 };
+pub use capabilities::{ModelCapabilities, SimpleCapability, ThinkingCapability, ThinkingStyle};
 pub use gemini::{GeminiConfig, GeminiService, GeminiServiceError, GeminiStream};
 pub use model_mapping::{ModelMappingService, ModelNotFoundError, ResolvedModel};
 pub use passthrough::{PassthroughConfig, PassthroughError, PassthroughService, PassthroughTarget};

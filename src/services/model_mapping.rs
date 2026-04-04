@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::database::models::ModelMappingRecord;
 use crate::database::traits::DatabaseService;
+use crate::services::capabilities::ModelCapabilities;
 
 /// Error returned when no model mapping matches the requested model.
 #[derive(Debug, Clone)]
@@ -24,11 +25,12 @@ impl std::fmt::Display for ModelNotFoundError {
 
 impl std::error::Error for ModelNotFoundError {}
 
-/// Resolved model information including routing provider.
+/// Resolved model information including routing provider and capabilities.
 #[derive(Debug, Clone)]
 pub struct ResolvedModel {
     pub target_model_id: String,
     pub provider: String, // "bedrock" / "gemini" / ""
+    pub capabilities: ModelCapabilities,
 }
 
 /// Simple glob matching: only supports `*` as a wildcard (equivalent to `.*` in regex).
@@ -138,6 +140,7 @@ impl ModelMappingService {
                 let resolved = ResolvedModel {
                     target_model_id: mapping.target_model_id.clone(),
                     provider: mapping.provider.clone(),
+                    capabilities: ModelCapabilities::from_json(mapping.capabilities.as_deref()),
                 };
                 self.cache.insert(key, Some(resolved.clone())).await;
                 return Ok(resolved);
@@ -156,6 +159,7 @@ impl ModelMappingService {
                 let resolved = ResolvedModel {
                     target_model_id: mapping.target_model_id.clone(),
                     provider: mapping.provider.clone(),
+                    capabilities: ModelCapabilities::from_json(mapping.capabilities.as_deref()),
                 };
                 self.cache.insert(key, Some(resolved.clone())).await;
                 Ok(resolved)

@@ -166,13 +166,23 @@ impl App {
             )))
         };
 
-        // 10. Load startup settings from DB (rate_limit, prompt_cache)
+        // 10. Load startup settings from DB (rate_limit, prompt_cache, feature flags)
         let prompt_cache_mode = load_prompt_cache_mode(&database).await;
         let rate_limit_rpm = load_rate_limit_rpm(&database).await;
+        let global_tool_use = load_bool_setting(&database, "enable_tool_use", true).await;
+        let global_extended_thinking =
+            load_bool_setting(&database, "enable_extended_thinking", true).await;
+        let global_document_support =
+            load_bool_setting(&database, "enable_document_support", true).await;
+        let global_ptc = load_bool_setting(&database, "enable_ptc", false).await;
 
         tracing::info!(
             prompt_cache = ?prompt_cache_mode,
             rate_limit_rpm = ?rate_limit_rpm,
+            global_tool_use,
+            global_extended_thinking,
+            global_document_support,
+            global_ptc,
             "Startup settings loaded"
         );
 
@@ -191,6 +201,10 @@ impl App {
             web_tool_executor,
             prompt_cache_mode,
             rate_limit_rpm,
+            global_tool_use,
+            global_extended_thinking,
+            global_document_support,
+            global_ptc,
         };
 
         tracing::info!("Application state initialized successfully");
@@ -496,6 +510,24 @@ async fn load_rate_limit_rpm(
         "disable" | "" => None,
         v => v.parse::<u32>().ok(),
     }
+}
+
+/// Load a bool system setting at startup.
+/// Returns `default` on any error or missing value.
+/// The value is `false` only when explicitly set to the string `"false"`.
+async fn load_bool_setting(
+    database: &Arc<dyn crate::database::traits::DatabaseService>,
+    key: &str,
+    default: bool,
+) -> bool {
+    database
+        .system_settings()
+        .get_setting(key)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.value != "false")
+        .unwrap_or(default)
 }
 
 /// Create a future that completes when a shutdown signal is received

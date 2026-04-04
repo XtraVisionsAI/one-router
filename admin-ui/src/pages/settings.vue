@@ -42,25 +42,25 @@
     {
       key: 'enable_tool_use',
       label: 'Enable Tool Use',
-      description: 'Enable tool use / function calling support.',
+      description: 'Global policy: enable tool use / function calling support. Takes effect on restart.',
       type: 'bool' as const
     },
     {
       key: 'enable_ptc',
       label: 'Enable PTC',
-      description: 'Enable Programmatic Tool Calling (PTC) sandbox execution.',
+      description: 'Global policy: enable Programmatic Tool Calling (PTC) sandbox execution. Takes effect on restart.',
       type: 'bool' as const
     },
     {
       key: 'enable_extended_thinking',
       label: 'Enable Extended Thinking',
-      description: 'Enable extended thinking (Claude budget_tokens support).',
+      description: 'Global policy: enable extended thinking (Claude budget_tokens support). Takes effect on restart.',
       type: 'bool' as const
     },
     {
       key: 'enable_document_support',
       label: 'Enable Document Support',
-      description: 'Enable document content blocks in requests.',
+      description: 'Global policy: enable document content blocks in requests. Takes effect on restart.',
       type: 'bool' as const
     }
   ]

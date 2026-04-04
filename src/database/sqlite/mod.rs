@@ -135,6 +135,7 @@ impl SqliteBackend {
                 status TEXT DEFAULT 'active',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER,
+                capabilities TEXT,
                 PRIMARY KEY (source_model_id, provider)
             )",
         )
@@ -143,6 +144,12 @@ impl SqliteBackend {
 
         // Migration: handle old table with single-column PK
         self.migrate_model_mappings().await?;
+
+        // Migration: add capabilities column if not already present
+        sqlx::query("ALTER TABLE model_mappings ADD COLUMN capabilities TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // --- backends ---
         sqlx::query(
@@ -232,6 +239,7 @@ impl SqliteBackend {
                     status TEXT DEFAULT 'active',
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER,
+                    capabilities TEXT,
                     PRIMARY KEY (source_model_id, provider)
                 )",
             )
@@ -750,7 +758,7 @@ impl ModelMappingStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at \
+             priority, status, created_at, updated_at, capabilities \
              FROM model_mappings WHERE source_model_id = ? ORDER BY priority DESC",
         )
         .bind(source_model_id)
@@ -772,6 +780,7 @@ impl ModelMappingStore for SqliteBackend {
                 status: r.get("status"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
+                capabilities: r.get("capabilities"),
             })
             .collect();
 
@@ -786,7 +795,7 @@ impl ModelMappingStore for SqliteBackend {
         let row = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at \
+             priority, status, created_at, updated_at, capabilities \
              FROM model_mappings WHERE source_model_id = ? AND provider = ?",
         )
         .bind(source_model_id)
@@ -808,6 +817,7 @@ impl ModelMappingStore for SqliteBackend {
                 status: r.get("status"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
+                capabilities: r.get("capabilities"),
             })),
             None => Ok(None),
         }
@@ -817,7 +827,7 @@ impl ModelMappingStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at \
+             priority, status, created_at, updated_at, capabilities \
              FROM model_mappings ORDER BY provider, priority DESC, source_model_id",
         )
         .fetch_all(&self.pool)
@@ -838,6 +848,7 @@ impl ModelMappingStore for SqliteBackend {
                 status: r.get("status"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
+                capabilities: r.get("capabilities"),
             })
             .collect();
 
@@ -850,8 +861,8 @@ impl ModelMappingStore for SqliteBackend {
             "INSERT INTO model_mappings \
              (source_model_id, target_model_id, provider, display_name, \
               input_price, output_price, cache_read_price, cache_write_price, \
-              priority, status, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+              priority, status, created_at, updated_at, capabilities) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(source_model_id, provider) DO UPDATE SET \
              target_model_id = excluded.target_model_id, \
              display_name = excluded.display_name, \
@@ -861,7 +872,8 @@ impl ModelMappingStore for SqliteBackend {
              cache_write_price = excluded.cache_write_price, \
              priority = excluded.priority, \
              status = excluded.status, \
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at, \
+             capabilities = excluded.capabilities",
         )
         .bind(&record.source_model_id)
         .bind(&record.target_model_id)
@@ -875,6 +887,7 @@ impl ModelMappingStore for SqliteBackend {
         .bind(&record.status)
         .bind(record.created_at)
         .bind(now)
+        .bind(&record.capabilities)
         .execute(&self.pool)
         .await?;
 
@@ -895,7 +908,7 @@ impl ModelMappingStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at \
+             priority, status, created_at, updated_at, capabilities \
              FROM model_mappings WHERE source_model_id LIKE '%*%' AND status = 'active' \
              ORDER BY priority DESC",
         )
@@ -917,6 +930,7 @@ impl ModelMappingStore for SqliteBackend {
                 status: r.get("status"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
+                capabilities: r.get("capabilities"),
             })
             .collect();
 

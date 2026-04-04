@@ -11,6 +11,7 @@
 pub mod anthropic_gemini;
 pub mod anthropic_openai;
 pub mod cache_transform;
+pub mod capability_filter;
 pub mod openai_bedrock;
 pub mod openai_gemini;
 pub mod sdk_utils;
