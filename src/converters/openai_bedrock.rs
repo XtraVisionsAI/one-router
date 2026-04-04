@@ -337,7 +337,19 @@ fn convert_openai_tools_to_sdk_with_cache(
 
         let tool_spec = ToolSpecification::builder()
             .name(&tool.function.name)
-            .description(tool.function.description.as_deref().unwrap_or(""))
+            .description(
+                if tool
+                    .function
+                    .description
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    "-"
+                } else {
+                    tool.function.description.as_deref().unwrap()
+                },
+            )
             .input_schema(SdkToolInputSchema::Json(json_to_document(&input_schema)))
             .build()
             .map_err(|e| {
