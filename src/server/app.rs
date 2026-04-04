@@ -166,6 +166,16 @@ impl App {
             )))
         };
 
+        // 10. Load startup settings from DB (rate_limit, prompt_cache)
+        let prompt_cache_mode = load_prompt_cache_mode(&database).await;
+        let rate_limit_rpm = load_rate_limit_rpm(&database).await;
+
+        tracing::info!(
+            prompt_cache = ?prompt_cache_mode,
+            rate_limit_rpm = ?rate_limit_rpm,
+            "Startup settings loaded"
+        );
+
         let state = AppState {
             settings: settings_arc,
             database,
@@ -179,6 +189,8 @@ impl App {
             openai_service,
             encryptor,
             web_tool_executor,
+            prompt_cache_mode,
+            rate_limit_rpm,
         };
 
         tracing::info!("Application state initialized successfully");
@@ -447,6 +459,43 @@ async fn init_passthrough_from_backends(
         config,
         pool_config,
     )?))
+}
+
+/// Load prompt_cache mode from system settings at startup.
+/// Falls back to Passthrough on any error or missing value.
+async fn load_prompt_cache_mode(
+    database: &Arc<dyn crate::database::traits::DatabaseService>,
+) -> crate::converters::cache_transform::PromptCacheMode {
+    use crate::converters::cache_transform::PromptCacheMode;
+    let value = database
+        .system_settings()
+        .get_setting("prompt_cache")
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.value)
+        .unwrap_or_default();
+    PromptCacheMode::from_setting(&value)
+}
+
+/// Load rate_limit RPM from system settings at startup.
+/// Returns None (disabled) when set to "disable" or on error.
+/// Returns Some(rpm) for numeric values like "60", "100", "200", "500".
+async fn load_rate_limit_rpm(
+    database: &Arc<dyn crate::database::traits::DatabaseService>,
+) -> Option<u32> {
+    let value = database
+        .system_settings()
+        .get_setting("rate_limit")
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.value)
+        .unwrap_or_default();
+    match value.as_str() {
+        "disable" | "" => None,
+        v => v.parse::<u32>().ok(),
+    }
 }
 
 /// Create a future that completes when a shutdown signal is received

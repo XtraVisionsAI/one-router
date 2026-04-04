@@ -1,6 +1,4 @@
 //! Rate limiting middleware
-//!
-//! Modified to use feature flags from storage instead of Settings.
 
 use axum::{
     body::Body,
@@ -27,12 +25,13 @@ type KeyedRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 #[derive(Clone)]
 pub struct RateLimitState {
-    pub default_rpm: u32,
+    /// None means rate limiting is globally disabled (per-key limits also ignored).
+    pub default_rpm: Option<u32>,
     pub limiters: Cache<String, Arc<KeyedRateLimiter>>,
 }
 
 impl RateLimitState {
-    pub fn new(default_rpm: u32) -> Self {
+    pub fn new(default_rpm: Option<u32>) -> Self {
         let limiters = Cache::builder()
             .max_capacity(10_000)
             .time_to_idle(Duration::from_secs(600))
@@ -51,7 +50,8 @@ impl RateLimitState {
             return limiter;
         }
 
-        let rate_limit = key_info.effective_rate_limit(self.default_rpm);
+        let rpm = self.default_rpm.unwrap_or(100);
+        let rate_limit = key_info.effective_rate_limit(rpm);
         let limiter = Arc::new(self.create_limiter(rate_limit));
         self.limiters.insert(cache_key, limiter.clone()).await;
         limiter
@@ -99,6 +99,11 @@ pub async fn rate_limit(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, RateLimitError> {
+    // Globally disabled — bypass completely, including per-key limits
+    if rate_state.default_rpm.is_none() {
+        return Ok(next.run(request).await);
+    }
+
     let key_info = request.extensions().get::<ApiKeyInfo>().cloned();
 
     let Some(key_info) = key_info else {

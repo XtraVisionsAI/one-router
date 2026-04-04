@@ -3,6 +3,7 @@
 //! Holds all shared resources that handlers need access to.
 
 use crate::config::Settings;
+use crate::converters::cache_transform::PromptCacheMode;
 use crate::database::encryption::Encryptor;
 use crate::database::traits::DatabaseService;
 use crate::services::web_tools::executor::WebToolExecutor;
@@ -53,6 +54,15 @@ pub struct AppState {
 
     /// Web tool executor for server-side web_search/web_fetch tools (optional)
     pub web_tool_executor: Option<Arc<WebToolExecutor>>,
+
+    /// Prompt cache mode loaded at startup from `prompt_cache` system setting.
+    /// Requires restart to take effect.
+    pub prompt_cache_mode: PromptCacheMode,
+
+    /// Default rate limit in RPM loaded at startup from `rate_limit` system setting.
+    /// None means rate limiting is globally disabled (option A: per-key settings also ignored).
+    /// Requires restart to take effect.
+    pub rate_limit_rpm: Option<u32>,
 }
 
 impl AppState {

@@ -213,21 +213,12 @@ pub async fn create_message(
             .await
         }
         _ => {
-            let prompt_cache_setting = state
-                .database
-                .system_settings()
-                .get_setting("prompt_cache")
-                .await
-                .ok()
-                .flatten()
-                .map(|s| s.value)
-                .unwrap_or_default();
             handle_bedrock_request(
                 &state,
                 &request,
                 &resolved.target_model_id,
                 &request_id,
-                &prompt_cache_setting,
+                &state.prompt_cache_mode,
                 key_info.cache_ttl.as_deref(),
                 start_time,
             )
@@ -242,7 +233,7 @@ async fn handle_bedrock_request(
     request: &MessageRequest,
     target_model_id: &str,
     request_id: &str,
-    prompt_cache_setting: &str,
+    cache_mode: &crate::converters::cache_transform::PromptCacheMode,
     key_cache_ttl: Option<&str>,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
@@ -308,13 +299,16 @@ async fn handle_bedrock_request(
     );
 
     // Resolve effective cache mode: per-key TTL takes priority over system setting
-    let cache_mode = if let Some(ttl) = key_cache_ttl {
-        crate::converters::cache_transform::PromptCacheMode::Ttl(ttl.to_string())
+    let effective_cache_mode;
+    let cache_mode_ref = if let Some(ttl) = key_cache_ttl {
+        effective_cache_mode =
+            crate::converters::cache_transform::PromptCacheMode::Ttl(ttl.to_string());
+        &effective_cache_mode
     } else {
-        crate::converters::cache_transform::PromptCacheMode::from_setting(prompt_cache_setting)
+        cache_mode
     };
     let transformed_request =
-        crate::converters::cache_transform::apply_to_request(request, &cache_mode);
+        crate::converters::cache_transform::apply_to_request(request, cache_mode_ref);
 
     // Server-side web tool execution loop
     if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {

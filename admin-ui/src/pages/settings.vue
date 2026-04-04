@@ -15,13 +15,28 @@
     {
       key: 'prompt_cache',
       label: 'Prompt Cache',
-      description: 'Controls prompt caching for Bedrock (Claude) requests. Disable: strip all cache_control. Passthrough: preserve as-is. 5m/1h: override TTL on all cache_control blocks.',
+      description:
+        'Prompt caching behavior for Bedrock (Claude) requests. Disable: strip all cache_control. Passthrough: preserve as-is. 5m/1h: override TTL on all cache_control blocks. Takes effect on restart.',
       type: 'select' as const,
       options: [
         { label: 'Passthrough (default)', value: 'passthrough' },
         { label: 'Disabled', value: 'disable' },
         { label: '5 minutes', value: '5m' },
         { label: '1 hour', value: '1h' }
+      ]
+    },
+    {
+      key: 'rate_limit',
+      label: 'Rate Limit',
+      description:
+        'Default rate limit for API keys (requests per minute). Disable turns off rate limiting globally — per-key limits are also ignored. Takes effect on restart.',
+      type: 'select' as const,
+      options: [
+        { label: 'Disabled', value: 'disable' },
+        { label: '60 RPM', value: '60' },
+        { label: '100 RPM (default)', value: '100' },
+        { label: '200 RPM', value: '200' },
+        { label: '500 RPM', value: '500' }
       ]
     },
     {
@@ -46,12 +61,6 @@
       key: 'enable_document_support',
       label: 'Enable Document Support',
       description: 'Enable document content blocks in requests.',
-      type: 'bool' as const
-    },
-    {
-      key: 'rate_limit_enabled',
-      label: 'Rate Limiting',
-      description: 'Enable per-key request rate limiting (RPM).',
       type: 'bool' as const
     }
   ]

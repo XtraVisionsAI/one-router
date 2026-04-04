@@ -47,6 +47,13 @@ fn validate_setting(key: &str, value: &str) -> Result<(), &'static str> {
                 Err("prompt_cache must be 'disable', 'passthrough', '5m', or '1h'")
             }
         }
+        "rate_limit" => {
+            if value == "disable" || value.parse::<u32>().is_ok() {
+                Ok(())
+            } else {
+                Err("rate_limit must be 'disable' or a positive integer (RPM)")
+            }
+        }
         _ => Ok(()), // unknown keys are accepted as-is
     }
 }
@@ -142,6 +149,21 @@ mod tests {
     fn validate_prompt_cache_invalid_values() {
         assert!(validate_setting("prompt_cache", "2h").is_err());
         assert!(validate_setting("prompt_cache", "enable").is_err());
+    }
+
+    #[test]
+    fn validate_rate_limit_valid_values() {
+        assert!(validate_setting("rate_limit", "disable").is_ok());
+        assert!(validate_setting("rate_limit", "60").is_ok());
+        assert!(validate_setting("rate_limit", "100").is_ok());
+        assert!(validate_setting("rate_limit", "500").is_ok());
+    }
+
+    #[test]
+    fn validate_rate_limit_invalid_values() {
+        assert!(validate_setting("rate_limit", "true").is_err());
+        assert!(validate_setting("rate_limit", "fast").is_err());
+        assert!(validate_setting("rate_limit", "").is_err());
     }
 
     #[test]

@@ -32,9 +32,8 @@ pub fn create_router(state: AppState) -> Router {
     let auth_state = AuthState::new(state.settings.clone(), state.database.clone());
     let auth_state_clone = auth_state.clone();
 
-    // Get default RPM from feature flags (loaded at startup) or use 100
-    let default_rpm = 100u32;
-    let rate_limit_state = RateLimitState::new(default_rpm);
+    // Rate limit state from startup settings (None = globally disabled)
+    let rate_limit_state = RateLimitState::new(state.rate_limit_rpm);
     let rate_limit_state_clone = rate_limit_state.clone();
 
     // Anthropic API routes (POST /v1/messages)

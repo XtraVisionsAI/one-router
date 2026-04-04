@@ -767,14 +767,19 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             value: "passthrough".into(),
             description: "Prompt cache behavior for Bedrock InvokeModel (Claude) requests. \
                           'disable' strips all cache_control, 'passthrough' preserves as-is, \
-                          '5m'/'1h' overrides TTL on all cache_control blocks."
+                          '5m'/'1h' overrides TTL on all cache_control blocks. \
+                          Takes effect on restart."
                 .into(),
             updated_at: None,
         },
         SystemSettingRecord {
-            key: "rate_limit_enabled".into(),
-            value: "true".into(),
-            description: "Enable per-key request rate limiting (RPM).".into(),
+            key: "rate_limit".into(),
+            value: "100".into(),
+            description: "Default rate limit for API keys (requests per minute). \
+                          'disable' turns off rate limiting globally (per-key limits also ignored). \
+                          Numeric values (60/100/200/500) set the default RPM. \
+                          Takes effect on restart."
+                .into(),
             updated_at: None,
         },
     ]
