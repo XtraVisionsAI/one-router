@@ -247,6 +247,9 @@ fn backend_from_item(item: &HashMap<String, AttributeValue>) -> BackendRecord {
         config: get_s(item, "config"),
         enabled: get_bool(item, "enabled"),
         priority: get_i32(item, "priority"),
+        strategy: get_s(item, "strategy"),
+        max_failures: get_i32(item, "max_failures"),
+        retry_after_secs: get_i64(item, "retry_after_secs"),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
     }
@@ -815,6 +818,9 @@ impl BackendConfigStore for DynamoDbBackend {
         item.insert("config".into(), av_s(&record.config));
         item.insert("enabled".into(), av_bool(record.enabled));
         item.insert("priority".into(), av_n(record.priority as i64));
+        item.insert("strategy".into(), av_s(&record.strategy));
+        item.insert("max_failures".into(), av_n(record.max_failures as i64));
+        item.insert("retry_after_secs".into(), av_n(record.retry_after_secs));
         item.insert("created_at".into(), av_n(record.created_at));
         item.insert("updated_at".into(), av_n(now));
 

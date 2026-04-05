@@ -32,6 +32,9 @@ pub struct BackendSummary {
     pub backend_type: String,
     pub enabled: bool,
     pub priority: i32,
+    pub strategy: String,
+    pub max_failures: i32,
+    pub retry_after_secs: i64,
     pub health_status: String,
     pub config_summary: Value,
 }
@@ -43,6 +46,9 @@ impl BackendSummary {
             backend_type: r.backend_type.clone(),
             enabled: r.enabled,
             priority: r.priority,
+            strategy: r.strategy.clone(),
+            max_failures: r.max_failures,
+            retry_after_secs: r.retry_after_secs,
             health_status: health.to_string(),
             config_summary: make_config_summary(&r.backend_type, &r.config),
         }
@@ -147,12 +153,27 @@ pub struct UpsertBackendRequest {
     pub enabled: bool,
     #[serde(default)]
     pub priority: i32,
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
+    #[serde(default = "default_max_failures")]
+    pub max_failures: i32,
+    #[serde(default = "default_retry_after_secs")]
+    pub retry_after_secs: i64,
     /// Full config as a JSON object. If omitted on PUT, existing config is kept.
     pub config: Option<Value>,
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_strategy() -> String {
+    "round_robin".to_string()
+}
+fn default_max_failures() -> i32 {
+    3
+}
+fn default_retry_after_secs() -> i64 {
+    300
 }
 
 // ============================================================================
@@ -233,6 +254,9 @@ pub async fn create_backend(
         config: encrypted_config,
         enabled: body.enabled,
         priority: body.priority,
+        strategy: body.strategy.clone(),
+        max_failures: body.max_failures,
+        retry_after_secs: body.retry_after_secs,
         created_at: now,
         updated_at: None,
     };
@@ -313,6 +337,9 @@ pub async fn update_backend(
         config,
         enabled: body.enabled,
         priority: body.priority,
+        strategy: body.strategy.clone(),
+        max_failures: body.max_failures,
+        retry_after_secs: body.retry_after_secs,
         created_at: existing.created_at,
         updated_at: Some(now),
     };

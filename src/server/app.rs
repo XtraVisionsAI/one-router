@@ -257,7 +257,11 @@ async fn init_bedrock_from_backends(
 
         // Use pool settings from the first backend
         if i == 0 {
-            pool_config = PoolConfig::from(&cfg.pool);
+            pool_config = PoolConfig {
+                strategy: crate::services::LoadBalanceStrategy::parse_str(&backend.strategy),
+                max_failures: backend.max_failures as u32,
+                retry_after_secs: backend.retry_after_secs as u64,
+            };
         }
 
         let cred_name = backend.name.clone();
@@ -343,7 +347,11 @@ async fn init_gemini_from_backends(
         if all_api_keys.is_empty() {
             base_url = cfg.base_url.clone();
             timeout_seconds = cfg.timeout_seconds;
-            pool_config = PoolConfig::from(&cfg.pool);
+            pool_config = PoolConfig {
+                strategy: crate::services::LoadBalanceStrategy::parse_str(&backend.strategy),
+                max_failures: backend.max_failures as u32,
+                retry_after_secs: backend.retry_after_secs as u64,
+            };
         }
 
         tracing::info!(
@@ -421,7 +429,13 @@ async fn init_passthrough_from_backends(
                 if all_api_keys.is_empty() {
                     base_url = cfg.base_url.clone();
                     timeout_seconds = cfg.timeout_seconds;
-                    pool_config = PoolConfig::from(&cfg.pool);
+                    pool_config = PoolConfig {
+                        strategy: crate::services::LoadBalanceStrategy::parse_str(
+                            &backend.strategy,
+                        ),
+                        max_failures: backend.max_failures as u32,
+                        retry_after_secs: backend.retry_after_secs as u64,
+                    };
                 }
                 tracing::info!(
                     name = %backend.name,
@@ -449,7 +463,13 @@ async fn init_passthrough_from_backends(
                     base_url = cfg.base_url.clone();
                     organization = cfg.organization.clone();
                     timeout_seconds = cfg.timeout_seconds;
-                    pool_config = PoolConfig::from(&cfg.pool);
+                    pool_config = PoolConfig {
+                        strategy: crate::services::LoadBalanceStrategy::parse_str(
+                            &backend.strategy,
+                        ),
+                        max_failures: backend.max_failures as u32,
+                        retry_after_secs: backend.retry_after_secs as u64,
+                    };
                 }
                 tracing::info!(
                     name = %backend.name,

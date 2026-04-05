@@ -60,8 +60,6 @@ pub struct BedrockBackendConfig {
     pub session_token: Option<String>,
     #[serde(default = "default_weight")]
     pub weight: u32,
-    #[serde(flatten)]
-    pub pool: PoolSettings,
 }
 
 // ============================================================================
@@ -76,8 +74,6 @@ pub struct GeminiBackendConfig {
     pub base_url: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
-    #[serde(flatten)]
-    pub pool: PoolSettings,
 }
 
 // ============================================================================
@@ -92,8 +88,6 @@ pub struct AnthropicBackendConfig {
     pub base_url: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
-    #[serde(flatten)]
-    pub pool: PoolSettings,
 }
 
 // ============================================================================
@@ -110,8 +104,6 @@ pub struct OpenAIBackendConfig {
     pub organization: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
-    #[serde(flatten)]
-    pub pool: PoolSettings,
 }
 
 // ============================================================================
@@ -146,7 +138,6 @@ mod tests {
         assert_eq!(cfg.weight, 1);
         assert!(cfg.profile.is_none());
         assert!(cfg.access_key_id.is_none());
-        assert_eq!(cfg.pool.max_failures, 3);
     }
 
     #[test]
@@ -154,16 +145,11 @@ mod tests {
         let json = r#"{
             "region": "us-west-2",
             "profile": "prod",
-            "weight": 5,
-            "strategy": "weighted",
-            "max_failures": 5,
-            "retry_after_secs": 600
+            "weight": 5
         }"#;
         let cfg: BedrockBackendConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.profile.as_deref(), Some("prod"));
         assert_eq!(cfg.weight, 5);
-        assert_eq!(cfg.pool.strategy, LoadBalanceStrategy::Weighted);
-        assert_eq!(cfg.pool.max_failures, 5);
     }
 
     #[test]
@@ -187,7 +173,6 @@ mod tests {
         assert_eq!(cfg.api_keys, vec!["k1"]);
         assert_eq!(cfg.timeout_seconds, 120);
         assert!(cfg.base_url.is_none());
-        assert_eq!(cfg.pool.strategy, LoadBalanceStrategy::RoundRobin);
     }
 
     #[test]
@@ -195,15 +180,11 @@ mod tests {
         let json = r#"{
             "api_keys": ["k1", "k2"],
             "base_url": "https://custom.api",
-            "timeout_seconds": 60,
-            "strategy": "random",
-            "max_failures": 10
+            "timeout_seconds": 60
         }"#;
         let cfg: GeminiBackendConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.api_keys.len(), 2);
         assert_eq!(cfg.base_url.as_deref(), Some("https://custom.api"));
         assert_eq!(cfg.timeout_seconds, 60);
-        assert_eq!(cfg.pool.strategy, LoadBalanceStrategy::Random);
-        assert_eq!(cfg.pool.max_failures, 10);
     }
 }

@@ -71,6 +71,15 @@
           priority: props.existing?.priority ?? 0
         }
         resetConfigFields()
+        // Pool settings are stored as separate DB fields (not encrypted),
+        // so we can populate them directly from the existing record.
+        if (props.existing) {
+          pool.value = {
+            strategy: props.existing.strategy || 'round_robin',
+            max_failures: props.existing.max_failures ?? 3,
+            retry_after_secs: props.existing.retry_after_secs ?? 300
+          }
+        }
         configLoaded.value = false
       }
     }
@@ -99,9 +108,7 @@
   }
 
   function populateFromConfig(cfg: Record<string, unknown>) {
-    pool.value.strategy = (cfg.strategy as string) ?? 'round_robin'
-    pool.value.max_failures = (cfg.max_failures as number) ?? 3
-    pool.value.retry_after_secs = (cfg.retry_after_secs as number) ?? 300
+    // Pool settings are loaded from record fields (not from config JSON)
 
     if (form.value.backend_type === 'bedrock') {
       bedrock.value.region = (cfg.region as string) ?? 'us-east-1'
@@ -156,9 +163,6 @@
       cfg.timeout_seconds = apiKeyConfig.value.timeout_seconds
     }
 
-    cfg.strategy = pool.value.strategy
-    cfg.max_failures = pool.value.max_failures
-    cfg.retry_after_secs = pool.value.retry_after_secs
     return cfg
   }
 
@@ -178,7 +182,10 @@
       name: form.value.name,
       backend_type: form.value.backend_type,
       priority: form.value.priority,
-      enabled: props.existing?.enabled ?? true
+      enabled: props.existing?.enabled ?? true,
+      strategy: pool.value.strategy,
+      max_failures: pool.value.max_failures,
+      retry_after_secs: pool.value.retry_after_secs,
     }
 
     // Only include config if we have loaded/entered it
@@ -288,22 +295,20 @@
       </NFormItem>
     </template>
 
-    <!-- Pool settings (all types) -->
-    <template v-if="!isEdit || configLoaded">
-      <NDivider title-placement="left"><span class="text-xs text-slate-500">Pool Settings</span></NDivider>
+    <!-- Pool settings (always editable — stored as plain DB fields, not encrypted) -->
+    <NDivider title-placement="left"><span class="text-xs text-slate-500">Pool Settings</span></NDivider>
 
-      <div class="flex gap-4">
-        <NFormItem label="Strategy" class="flex-1">
-          <NSelect v-model:value="pool.strategy" :options="strategyOptions" />
-        </NFormItem>
-        <NFormItem label="Max Failures" class="w-28">
-          <NInputNumber v-model:value="pool.max_failures" :min="1" :max="100" />
-        </NFormItem>
-        <NFormItem label="Retry After (s)" class="w-32">
-          <NInputNumber v-model:value="pool.retry_after_secs" :min="0" :max="3600" />
-        </NFormItem>
-      </div>
-    </template>
+    <div class="flex gap-4">
+      <NFormItem label="Strategy" class="flex-1">
+        <NSelect v-model:value="pool.strategy" :options="strategyOptions" />
+      </NFormItem>
+      <NFormItem label="Max Failures" class="w-28">
+        <NInputNumber v-model:value="pool.max_failures" :min="1" :max="100" />
+      </NFormItem>
+      <NFormItem label="Retry After (s)" class="w-32">
+        <NInputNumber v-model:value="pool.retry_after_secs" :min="0" :max="3600" />
+      </NFormItem>
+    </div>
 
     <template #footer>
       <div class="flex justify-end gap-2">

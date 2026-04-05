@@ -109,9 +109,27 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             config TEXT NOT NULL,
             enabled BOOLEAN DEFAULT TRUE,
             priority INTEGER DEFAULT 0,
+            strategy TEXT DEFAULT 'round_robin',
+            max_failures INTEGER DEFAULT 3,
+            retry_after_secs BIGINT DEFAULT 300,
             created_at BIGINT NOT NULL,
             updated_at BIGINT
         )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Migration: add strategy/max_failures/retry_after_secs columns if upgrading
+    sqlx::query(
+        "ALTER TABLE backends ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'round_robin'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("ALTER TABLE backends ADD COLUMN IF NOT EXISTS max_failures INTEGER DEFAULT 3")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE backends ADD COLUMN IF NOT EXISTS retry_after_secs BIGINT DEFAULT 300",
     )
     .execute(pool)
     .await?;

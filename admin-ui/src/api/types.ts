@@ -4,6 +4,9 @@ export interface BackendSummary {
   backend_type: string
   enabled: boolean
   priority: number
+  strategy: string
+  max_failures: number
+  retry_after_secs: number
   health_status: string
   config_summary: Record<string, unknown>
 }
@@ -13,6 +16,9 @@ export interface UpsertBackendBody {
   backend_type: string
   priority: number
   enabled: boolean
+  strategy?: string
+  max_failures?: number
+  retry_after_secs?: number
   config?: Record<string, unknown>
 }
 

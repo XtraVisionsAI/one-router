@@ -93,6 +93,9 @@ pub struct BackendRecord {
     pub config: String,       // JSON (possibly encrypted fields)
     pub enabled: bool,
     pub priority: i32,
+    pub strategy: String,  // "round_robin" | "weighted" | "random" | "failover"
+    pub max_failures: i32, // default 3
+    pub retry_after_secs: i64, // default 300
     pub created_at: i64,
     pub updated_at: Option<i64>,
 }
