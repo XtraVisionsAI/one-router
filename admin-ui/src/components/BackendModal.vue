@@ -239,33 +239,35 @@
     <template v-if="form.backend_type === 'bedrock' && (!isEdit || configLoaded)">
       <NDivider title-placement="left"><span class="text-xs text-slate-500">AWS Credentials</span></NDivider>
 
-      <NFormItem label="Region">
-        <NInput v-model:value="bedrock.region" placeholder="us-east-1" />
-      </NFormItem>
+      <div class="flex gap-4">
+        <NFormItem label="Region" class="flex-1">
+          <NInput v-model:value="bedrock.region" placeholder="us-east-1" />
+        </NFormItem>
+        <NFormItem label="Weight" class="w-24">
+          <NInputNumber v-model:value="bedrock.weight" :min="0" :max="100" class="w-full" />
+        </NFormItem>
+      </div>
 
       <NFormItem label="Profile">
         <NInput v-model:value="bedrock.profile" placeholder="(optional) AWS named profile" />
       </NFormItem>
 
-      <NFormItem label="Access Key ID">
-        <NInput v-model:value="bedrock.access_key_id" placeholder="(optional) AKIA..." />
-      </NFormItem>
-
-      <NFormItem label="Secret Access Key">
-        <NInput
-          v-model:value="bedrock.secret_access_key"
-          type="password"
-          show-password-on="click"
-          placeholder="(optional)"
-        />
-      </NFormItem>
+      <div class="flex gap-4">
+        <NFormItem label="Access Key ID" class="flex-1">
+          <NInput v-model:value="bedrock.access_key_id" placeholder="(optional) AKIA..." />
+        </NFormItem>
+        <NFormItem label="Secret Access Key" class="flex-1">
+          <NInput
+            v-model:value="bedrock.secret_access_key"
+            type="password"
+            show-password-on="click"
+            placeholder="(optional)"
+          />
+        </NFormItem>
+      </div>
 
       <NFormItem label="Session Token">
         <NInput v-model:value="bedrock.session_token" placeholder="(optional) temporary credentials" />
-      </NFormItem>
-
-      <NFormItem label="Weight">
-        <NInputNumber v-model:value="bedrock.weight" :min="0" :max="100" />
       </NFormItem>
     </template>
 
@@ -282,16 +284,17 @@
         />
       </NFormItem>
 
-      <NFormItem label="Base URL">
-        <NInput v-model:value="apiKeyConfig.base_url" placeholder="(optional) override default endpoint" />
-      </NFormItem>
+      <div class="flex gap-4">
+        <NFormItem label="Base URL" class="flex-1">
+          <NInput v-model:value="apiKeyConfig.base_url" placeholder="(optional) override endpoint" />
+        </NFormItem>
+        <NFormItem label="Timeout (s)" class="w-28">
+          <NInputNumber v-model:value="apiKeyConfig.timeout_seconds" :min="10" :max="600" class="w-full" />
+        </NFormItem>
+      </div>
 
       <NFormItem v-if="form.backend_type === 'openai'" label="Organization">
         <NInput v-model:value="apiKeyConfig.organization" placeholder="(optional) org-..." />
-      </NFormItem>
-
-      <NFormItem label="Timeout (seconds)">
-        <NInputNumber v-model:value="apiKeyConfig.timeout_seconds" :min="10" :max="600" />
       </NFormItem>
     </template>
 
