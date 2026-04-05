@@ -288,22 +288,20 @@
       </NFormItem>
     </template>
 
-    <!-- Pool settings (all types) -->
-    <template v-if="!isEdit || configLoaded">
-      <NDivider title-placement="left"><span class="text-xs text-slate-500">Pool Settings</span></NDivider>
+    <!-- Pool settings (always visible, no sensitive data) -->
+    <NDivider title-placement="left"><span class="text-xs text-slate-500">Pool Settings</span></NDivider>
 
-      <div class="flex gap-4">
-        <NFormItem label="Strategy" class="flex-1">
-          <NSelect v-model:value="pool.strategy" :options="strategyOptions" />
-        </NFormItem>
-        <NFormItem label="Max Failures" class="w-28">
-          <NInputNumber v-model:value="pool.max_failures" :min="1" :max="100" />
-        </NFormItem>
-        <NFormItem label="Retry After (s)" class="w-32">
-          <NInputNumber v-model:value="pool.retry_after_secs" :min="0" :max="3600" />
-        </NFormItem>
-      </div>
-    </template>
+    <div class="flex gap-4">
+      <NFormItem label="Strategy" class="flex-1">
+        <NSelect v-model:value="pool.strategy" :options="strategyOptions" />
+      </NFormItem>
+      <NFormItem label="Max Failures" class="w-28">
+        <NInputNumber v-model:value="pool.max_failures" :min="1" :max="100" />
+      </NFormItem>
+      <NFormItem label="Retry After (s)" class="w-32">
+        <NInputNumber v-model:value="pool.retry_after_secs" :min="0" :max="3600" />
+      </NFormItem>
+    </div>
 
     <template #footer>
       <div class="flex justify-end gap-2">
