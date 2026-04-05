@@ -1,3 +1,27 @@
+## v0.12.0 (2026-04-05)
+
+### Feat
+
+- implement usage tracking for all API handlers (streaming + non-streaming)
+- backend service_tier with provider mapping + rename API key service_tier to cost_rate
+- unified Service/Pool/BackendInstance architecture
+- **admin-ui**: structured backend config form by type
+- **admin**: return live health_status from in-memory pool stats
+- **admin-ui**: show restart-required hint after settings and backends changes
+
+### Fix
+
+- **admin-ui**: compact backend form layout — group related fields horizontally
+- **admin-ui**: pool settings always visible in backend edit form
+- **admin**: show per-credential health status instead of per-service aggregate
+- **bedrock**: always use CredentialPool even for single backend, preserving real credential info
+
+### Refactor
+
+- **backends**: extract pool settings from encrypted config to separate DB fields
+- remove unused health_status and last_health_check from backends
+- **bedrock**: remove unused BedrockService::new() single-client constructor
+
 ## v0.11.1 (2026-04-05)
 
 ### Fix
