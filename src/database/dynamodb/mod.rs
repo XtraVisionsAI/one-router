@@ -38,7 +38,47 @@ impl DynamoDbBackend {
     }
 
     /// Check if a key with the given name exists, optionally excluding a specific api_key.
+    /// Uses the GSI `name-index` for O(1) lookup; falls back to filtered scan if GSI is
+    /// not yet available (e.g. still building after migration).
     async fn name_exists(&self, name: &str, exclude_api_key: Option<&str>) -> Result<bool> {
+        // Try GSI Query first (O(1) — GSI partition key is `name`)
+        let query_result = self
+            .client
+            .query()
+            .table_name(Self::table_name("api_keys"))
+            .index_name("name-index")
+            .key_condition_expression("#n = :name")
+            .expression_attribute_names("#n", "name")
+            .expression_attribute_values(":name", av_s(name))
+            .limit(2)
+            .send()
+            .await;
+
+        match query_result {
+            Ok(output) => {
+                let items = output.items();
+                if let Some(exclude) = exclude_api_key {
+                    // Exclude the current key from the results
+                    Ok(items.iter().any(|item| {
+                        item.get("api_key")
+                            .and_then(|v| v.as_s().ok())
+                            .map(|s| s.as_str())
+                            != Some(exclude)
+                    }))
+                } else {
+                    Ok(!items.is_empty())
+                }
+            }
+            Err(e) => {
+                // GSI may not exist yet (still building) — fall back to filtered scan
+                tracing::debug!(error = %e, "GSI name-index query failed, falling back to scan");
+                self.name_exists_scan(name, exclude_api_key).await
+            }
+        }
+    }
+
+    /// Fallback: filtered scan for name uniqueness check.
+    async fn name_exists_scan(&self, name: &str, exclude_api_key: Option<&str>) -> Result<bool> {
         let mut scan = self
             .client
             .scan()
@@ -46,8 +86,7 @@ impl DynamoDbBackend {
             .filter_expression("#n = :name")
             .expression_attribute_names("#n", "name")
             .expression_attribute_values(":name", av_s(name))
-            .projection_expression("api_key")
-            .limit(2); // Only need to find one (or two if excluding)
+            .projection_expression("api_key");
 
         if let Some(exclude) = exclude_api_key {
             scan = scan

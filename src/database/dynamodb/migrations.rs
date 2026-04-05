@@ -5,7 +5,8 @@
 
 use anyhow::Result;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+    AttributeDefinition, BillingMode, CreateGlobalSecondaryIndexAction, GlobalSecondaryIndexUpdate,
+    KeySchemaElement, KeyType, Projection, ProjectionType, ScalarAttributeType,
 };
 
 use super::DynamoDbBackend;
@@ -77,6 +78,91 @@ pub async fn create_tables(backend: &DynamoDbBackend) -> Result<()> {
         vec![key_schema("key", KeyType::Hash)],
     )
     .await?;
+
+    // --- GSI: api_keys name-index (for unique name lookups) ---
+    ensure_name_gsi(backend).await?;
+
+    Ok(())
+}
+
+/// Add a GSI on `name` to the api_keys table so we can Query by name in O(1)
+/// instead of scanning the whole table.
+async fn ensure_name_gsi(backend: &DynamoDbBackend) -> Result<()> {
+    let table_name = DynamoDbBackend::table_name("api_keys");
+
+    // First, check if the GSI already exists by describing the table
+    let desc = backend
+        .client
+        .describe_table()
+        .table_name(&table_name)
+        .send()
+        .await;
+
+    if let Ok(output) = desc {
+        if let Some(table) = output.table() {
+            let gsi_exists = table
+                .global_secondary_indexes()
+                .iter()
+                .any(|gsi| gsi.index_name() == Some("name-index"));
+            if gsi_exists {
+                tracing::debug!(table = %table_name, "GSI name-index already exists");
+                return Ok(());
+            }
+        }
+    }
+
+    // Create the GSI
+    let result = backend
+        .client
+        .update_table()
+        .table_name(&table_name)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("name")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .expect("valid attr def"),
+        )
+        .global_secondary_index_updates(
+            GlobalSecondaryIndexUpdate::builder()
+                .create(
+                    CreateGlobalSecondaryIndexAction::builder()
+                        .index_name("name-index")
+                        .key_schema(
+                            KeySchemaElement::builder()
+                                .attribute_name("name")
+                                .key_type(KeyType::Hash)
+                                .build()
+                                .expect("valid key schema"),
+                        )
+                        .projection(
+                            Projection::builder()
+                                .projection_type(ProjectionType::KeysOnly)
+                                .build(),
+                        )
+                        .build()
+                        .expect("valid GSI action"),
+                )
+                .build(),
+        )
+        .send()
+        .await;
+
+    match result {
+        Ok(_) => {
+            tracing::info!(table = %table_name, "GSI name-index created (building in background)");
+        }
+        Err(err) => {
+            let svc_err = err.into_service_error();
+            // If the error is because the index already exists or table is being updated, ignore
+            let msg = svc_err.to_string();
+            if msg.contains("already exists") || msg.contains("already being") {
+                tracing::debug!(table = %table_name, "GSI name-index already exists or in progress");
+            } else {
+                tracing::warn!(table = %table_name, error = %msg, "Failed to create GSI name-index, falling back to scan");
+            }
+        }
+    }
 
     Ok(())
 }
