@@ -463,6 +463,7 @@ mod response {
                 stop_reason: Some(stop_reason),
                 stop_sequence: None,
                 usage,
+                container: None,
             })
         }
 

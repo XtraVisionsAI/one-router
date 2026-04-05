@@ -639,6 +639,16 @@ pub struct MessageResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
     pub usage: Usage,
+    /// PTC container info for session reuse
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerResponse>,
+}
+
+/// PTC container info returned in response for session reuse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerResponse {
+    pub id: String,
+    pub expires_at: String,
 }
 
 impl MessageResponse {
@@ -658,6 +668,7 @@ impl MessageResponse {
             stop_reason: Some(StopReason::EndTurn),
             stop_sequence: None,
             usage,
+            container: None,
         }
     }
 

@@ -381,6 +381,235 @@ impl PtcService {
     }
 
     // ========================================================================
+    // IPC: Read/Write files in container
+    // ========================================================================
+
+    /// Read a JSON file from the container. Returns None if file doesn't exist.
+    pub async fn read_container_json(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> PtcResult<Option<serde_json::Value>> {
+        let result = self
+            .sandbox
+            .exec_command(container_id, vec!["cat", path])
+            .await?;
+
+        if result.exit_code != 0 {
+            // File doesn't exist or can't be read
+            return Ok(None);
+        }
+
+        let trimmed = result.stdout.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        serde_json::from_str(trimmed)
+            .map(Some)
+            .map_err(|e| PtcError::IpcError(format!("Invalid JSON in {path}: {e}")))
+    }
+
+    /// Write a JSON file to the container.
+    pub async fn write_container_json(
+        &self,
+        container_id: &str,
+        path: &str,
+        value: &serde_json::Value,
+    ) -> PtcResult<()> {
+        let json_bytes = serde_json::to_vec(value)
+            .map_err(|e| PtcError::IpcError(format!("Failed to serialize JSON: {e}")))?;
+        self.sandbox
+            .copy_file_to_container(container_id, &json_bytes, path)
+            .await
+    }
+
+    /// Remove a file from the container (best-effort).
+    pub async fn remove_container_file(&self, container_id: &str, path: &str) {
+        let _ = self
+            .sandbox
+            .exec_command(container_id, vec!["rm", "-f", path])
+            .await;
+    }
+
+    /// Set up runner script and tool definitions in a session container.
+    pub async fn setup_runner(&self, session_id: &str, tool_names: &[String]) -> PtcResult<()> {
+        let container_id = self.get_session(session_id).await?.container.id;
+
+        // Copy runner script
+        self.sandbox
+            .copy_file_to_container(
+                &container_id,
+                &super::runner::get_runner_script_bytes(),
+                "/tmp/runner.py",
+            )
+            .await?;
+
+        // Set PTC_TOOLS env var via a wrapper script
+        let tools_csv = tool_names.join(",");
+        let wrapper =
+            format!("#!/bin/sh\nexport PTC_TOOLS=\"{tools_csv}\"\npython /tmp/runner.py \"$@\"\n");
+        self.sandbox
+            .copy_file_to_container(&container_id, wrapper.as_bytes(), "/tmp/run.sh")
+            .await?;
+
+        Ok(())
+    }
+
+    /// Execute code via the runner script (supports tool calls via IPC).
+    ///
+    /// 1. Writes code to /tmp/code.py
+    /// 2. Runs the runner script
+    /// 3. Returns execution result
+    pub async fn run_code_with_tools(
+        &self,
+        session_id: &str,
+        code: &str,
+    ) -> PtcResult<ExecutionResult> {
+        let container_id = {
+            self.with_session(session_id, |session| {
+                session.state = SessionState::Executing;
+                session.iteration_count += 1;
+                if session.iteration_count > self.max_iterations {
+                    return Err(PtcError::MaxIterationsExceeded(self.max_iterations));
+                }
+                Ok(session.container.id.clone())
+            })
+            .await?
+        };
+
+        // Clean up previous IPC files
+        self.remove_container_file(&container_id, "/tmp/tool_calls.json")
+            .await;
+        self.remove_container_file(&container_id, "/tmp/tool_results.json")
+            .await;
+        self.remove_container_file(&container_id, "/tmp/status.json")
+            .await;
+
+        // Write code
+        self.sandbox
+            .copy_file_to_container(&container_id, code.as_bytes(), "/tmp/code.py")
+            .await?;
+
+        // Execute via runner
+        let result = self
+            .sandbox
+            .exec_command(&container_id, vec!["sh", "/tmp/run.sh", "/tmp/code.py"])
+            .await?;
+
+        // Update session state
+        self.with_session(session_id, |session| {
+            session.state = SessionState::Active;
+            Ok(())
+        })
+        .await?;
+
+        Ok(result)
+    }
+
+    /// Read pending tool calls from container (file-based IPC).
+    /// Returns None if no tool calls are pending.
+    pub async fn read_tool_calls(
+        &self,
+        session_id: &str,
+    ) -> PtcResult<Option<Vec<PendingToolCall>>> {
+        let container_id = self.get_session(session_id).await?.container.id;
+
+        let data = self
+            .read_container_json(&container_id, "/tmp/tool_calls.json")
+            .await?;
+
+        let Some(data) = data else {
+            return Ok(None);
+        };
+
+        if data.get("type").and_then(|t| t.as_str()) != Some("tool_calls") {
+            return Ok(None);
+        }
+
+        let calls: Vec<PendingToolCall> = data
+            .get("calls")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|call| {
+                        let tool_use_id = call.get("tool_use_id")?.as_str()?.to_string();
+                        let name = call.get("name")?.as_str()?.to_string();
+                        let input = call.get("input").cloned().unwrap_or(serde_json::json!({}));
+                        Some(PendingToolCall {
+                            tool_use_id,
+                            name,
+                            input,
+                            server_tool_use_id: None,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if calls.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(calls))
+        }
+    }
+
+    /// Inject tool results into container (file-based IPC).
+    pub async fn inject_tool_results(
+        &self,
+        session_id: &str,
+        results: &[(String, serde_json::Value, bool)], // (tool_use_id, content, is_error)
+    ) -> PtcResult<()> {
+        let container_id = self.get_session(session_id).await?.container.id;
+
+        let results_json = serde_json::json!({
+            "type": "tool_results",
+            "results": results.iter().map(|(id, content, is_error)| {
+                serde_json::json!({
+                    "tool_use_id": id,
+                    "content": content,
+                    "is_error": is_error,
+                })
+            }).collect::<Vec<_>>()
+        });
+
+        self.write_container_json(&container_id, "/tmp/tool_results.json", &results_json)
+            .await?;
+
+        // Clear tool_calls file so runner can proceed
+        self.remove_container_file(&container_id, "/tmp/tool_calls.json")
+            .await;
+
+        Ok(())
+    }
+
+    /// Read execution status from container.
+    pub async fn read_status(&self, session_id: &str) -> PtcResult<Option<serde_json::Value>> {
+        let container_id = self.get_session(session_id).await?.container.id;
+        self.read_container_json(&container_id, "/tmp/status.json")
+            .await
+    }
+
+    /// Set session pending tool calls and transition to WaitingForToolResults.
+    pub async fn set_pending_tool_calls(
+        &self,
+        session_id: &str,
+        calls: Vec<PendingToolCall>,
+    ) -> PtcResult<()> {
+        self.with_session(session_id, |session| {
+            session.pending_tool_calls = calls;
+            session.state = SessionState::WaitingForToolResults;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Get the sandbox executor (for direct container access).
+    pub fn sandbox(&self) -> &SandboxExecutor {
+        &self.sandbox
+    }
+
+    // ========================================================================
     // Health Check
     // ========================================================================
 

@@ -121,6 +121,7 @@ impl IntoResponse for ApiError {
 type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 /// Enum to represent either a JSON response or an SSE stream
+#[allow(clippy::large_enum_variant)]
 pub enum MessageApiResponse {
     Json(Json<MessageResponse>),
     Stream(SseStream),
@@ -185,10 +186,52 @@ pub async fn create_message(
     }
 
     // Extract beta headers for feature flags
-    let _beta_header = headers
+    let beta_header = headers
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+
+    // PTC detection: check before normal routing
+    if let Some(ref ptc_svc) = state.ptc_service {
+        if ptc_svc.is_ptc_request(&request, beta_header.as_deref()) {
+            tracing::info!(request_id, "Detected PTC request");
+
+            let ptc_result = if let Some(ref container_id) = request.container {
+                crate::api::ptc_handler::handle_ptc_continuation(
+                    &state,
+                    &request,
+                    &resolved.target_model_id,
+                    &request_id,
+                    container_id,
+                )
+                .await
+            } else {
+                crate::api::ptc_handler::handle_ptc_request(
+                    &state,
+                    &request,
+                    &resolved.target_model_id,
+                    &request_id,
+                )
+                .await
+            };
+
+            let response = ptc_result?;
+
+            // Record usage
+            let usage = response.usage.clone();
+            let tracker = state.usage_tracker.clone();
+            let key = key_info.clone();
+            let model = request.model.clone();
+            let rid = request_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = tracker.record_usage(&key, &rid, &model, &usage, true).await {
+                    tracing::warn!(error = %e, "Failed to record PTC usage");
+                }
+            });
+
+            return Ok(MessageApiResponse::Json(Json(response)));
+        }
+    }
 
     // Route to appropriate backend based on resolved provider
     let effective_caps = resolved
@@ -1566,6 +1609,7 @@ mod tests {
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
             },
+            container: None,
         };
         let _sse = response_to_sse_stream(response);
     }
@@ -1591,6 +1635,7 @@ mod tests {
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
             },
+            container: None,
         };
         let _sse = response_to_sse_stream(response);
     }

@@ -7,5 +7,6 @@ pub mod health;
 pub mod images;
 pub mod messages;
 pub mod models;
+pub mod ptc_handler;
 pub mod rerank;
 pub mod usage;
