@@ -82,6 +82,19 @@ impl BedrockService {
         self.pool.stats()
     }
 
+    /// Get health status string for a specific credential by name.
+    pub fn credential_health(&self, name: &str) -> Option<String> {
+        self.pool.get_by_name(name).map(|c| {
+            if !c.is_enabled() {
+                "unhealthy".to_string()
+            } else if c.failure_count() > 0 {
+                format!("degraded (failures: {})", c.failure_count())
+            } else {
+                "healthy".to_string()
+            }
+        })
+    }
+
     pub async fn converse(&self, request: ConverseRequest) -> Result<ConverseOutput, BedrockError> {
         let (cred_name, client) = self.get_client();
         let cred_name = cred_name.to_string();
