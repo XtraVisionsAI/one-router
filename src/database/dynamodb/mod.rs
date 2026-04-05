@@ -247,8 +247,6 @@ fn backend_from_item(item: &HashMap<String, AttributeValue>) -> BackendRecord {
         config: get_s(item, "config"),
         enabled: get_bool(item, "enabled"),
         priority: get_i32(item, "priority"),
-        health_status: get_s(item, "health_status"),
-        last_health_check: get_opt_i64(item, "last_health_check"),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
     }
@@ -817,11 +815,6 @@ impl BackendConfigStore for DynamoDbBackend {
         item.insert("config".into(), av_s(&record.config));
         item.insert("enabled".into(), av_bool(record.enabled));
         item.insert("priority".into(), av_n(record.priority as i64));
-        item.insert("health_status".into(), av_s(&record.health_status));
-        item.insert(
-            "last_health_check".into(),
-            av_opt_n_i64(record.last_health_check),
-        );
         item.insert("created_at".into(), av_n(record.created_at));
         item.insert("updated_at".into(), av_n(now));
 
@@ -840,23 +833,6 @@ impl BackendConfigStore for DynamoDbBackend {
             .delete_item()
             .table_name(Self::table_name("backends"))
             .key("name", av_s(name))
-            .send()
-            .await?;
-
-        Ok(())
-    }
-
-    async fn update_health_status(&self, name: &str, status: &str) -> Result<()> {
-        let now = unix_now();
-        self.client
-            .update_item()
-            .table_name(Self::table_name("backends"))
-            .key("name", av_s(name))
-            .update_expression(
-                "SET health_status = :status, last_health_check = :now, updated_at = :now",
-            )
-            .expression_attribute_values(":status", av_s(status))
-            .expression_attribute_values(":now", av_n(now))
             .send()
             .await?;
 

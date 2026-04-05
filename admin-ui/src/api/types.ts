@@ -4,7 +4,6 @@ export interface BackendSummary {
   backend_type: string
   enabled: boolean
   priority: number
-  health_status: string
   config_summary: Record<string, unknown>
 }
 

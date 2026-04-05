@@ -159,8 +159,6 @@ impl SqliteBackend {
                 config TEXT NOT NULL,
                 enabled INTEGER DEFAULT 1,
                 priority INTEGER DEFAULT 0,
-                health_status TEXT DEFAULT 'unknown',
-                last_health_check INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER
             )",
@@ -947,7 +945,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
         let row = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, \
-             health_status, last_health_check, created_at, updated_at \
+             created_at, updated_at \
              FROM backends WHERE name = ?",
         )
         .bind(name)
@@ -961,8 +959,6 @@ impl BackendConfigStore for SqliteBackend {
                 config: r.get("config"),
                 enabled: r.get::<i32, _>("enabled") != 0,
                 priority: r.get("priority"),
-                health_status: r.get("health_status"),
-                last_health_check: r.get("last_health_check"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })),
@@ -973,7 +969,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, \
-             health_status, last_health_check, created_at, updated_at \
+             created_at, updated_at \
              FROM backends WHERE enabled = 1 ORDER BY priority DESC",
         )
         .fetch_all(&self.pool)
@@ -987,8 +983,6 @@ impl BackendConfigStore for SqliteBackend {
                 config: r.get("config"),
                 enabled: true,
                 priority: r.get("priority"),
-                health_status: r.get("health_status"),
-                last_health_check: r.get("last_health_check"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -1000,7 +994,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, \
-             health_status, last_health_check, created_at, updated_at \
+             created_at, updated_at \
              FROM backends ORDER BY priority DESC",
         )
         .fetch_all(&self.pool)
@@ -1014,8 +1008,6 @@ impl BackendConfigStore for SqliteBackend {
                 config: r.get("config"),
                 enabled: r.get::<i32, _>("enabled") != 0,
                 priority: r.get("priority"),
-                health_status: r.get("health_status"),
-                last_health_check: r.get("last_health_check"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -1028,16 +1020,13 @@ impl BackendConfigStore for SqliteBackend {
         let now = unix_now();
         sqlx::query(
             "INSERT INTO backends \
-             (name, backend_type, config, enabled, priority, \
-              health_status, last_health_check, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             (name, backend_type, config, enabled, priority, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(name) DO UPDATE SET \
              backend_type = excluded.backend_type, \
              config = excluded.config, \
              enabled = excluded.enabled, \
              priority = excluded.priority, \
-             health_status = excluded.health_status, \
-             last_health_check = excluded.last_health_check, \
              updated_at = excluded.updated_at",
         )
         .bind(&record.name)
@@ -1045,8 +1034,6 @@ impl BackendConfigStore for SqliteBackend {
         .bind(&record.config)
         .bind(record.enabled as i32)
         .bind(record.priority)
-        .bind(&record.health_status)
-        .bind(record.last_health_check)
         .bind(record.created_at)
         .bind(now)
         .execute(&self.pool)
@@ -1060,22 +1047,6 @@ impl BackendConfigStore for SqliteBackend {
             .bind(name)
             .execute(&self.pool)
             .await?;
-
-        Ok(())
-    }
-
-    async fn update_health_status(&self, name: &str, status: &str) -> Result<()> {
-        let now = unix_now();
-        sqlx::query(
-            "UPDATE backends SET health_status = ?, last_health_check = ?, updated_at = ? \
-             WHERE name = ?",
-        )
-        .bind(status)
-        .bind(now)
-        .bind(now)
-        .bind(name)
-        .execute(&self.pool)
-        .await?;
 
         Ok(())
     }

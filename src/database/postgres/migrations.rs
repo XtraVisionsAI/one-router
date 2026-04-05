@@ -109,8 +109,6 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             config TEXT NOT NULL,
             enabled BOOLEAN DEFAULT TRUE,
             priority INTEGER DEFAULT 0,
-            health_status TEXT DEFAULT 'unknown',
-            last_health_check BIGINT,
             created_at BIGINT NOT NULL,
             updated_at BIGINT
         )",

@@ -708,7 +708,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
         let row = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, \
-             health_status, last_health_check, created_at, updated_at \
+             created_at, updated_at \
              FROM backends WHERE name = $1",
         )
         .bind(name)
@@ -722,8 +722,6 @@ impl BackendConfigStore for PostgresBackend {
                 config: r.get("config"),
                 enabled: r.get("enabled"),
                 priority: r.get("priority"),
-                health_status: r.get("health_status"),
-                last_health_check: r.get("last_health_check"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })),
@@ -734,7 +732,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, \
-             health_status, last_health_check, created_at, updated_at \
+             created_at, updated_at \
              FROM backends WHERE enabled = TRUE ORDER BY priority DESC",
         )
         .fetch_all(&self.pool)
@@ -748,8 +746,6 @@ impl BackendConfigStore for PostgresBackend {
                 config: r.get("config"),
                 enabled: true,
                 priority: r.get("priority"),
-                health_status: r.get("health_status"),
-                last_health_check: r.get("last_health_check"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -761,7 +757,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, \
-             health_status, last_health_check, created_at, updated_at \
+             created_at, updated_at \
              FROM backends ORDER BY priority DESC",
         )
         .fetch_all(&self.pool)
@@ -775,8 +771,6 @@ impl BackendConfigStore for PostgresBackend {
                 config: r.get("config"),
                 enabled: r.get("enabled"),
                 priority: r.get("priority"),
-                health_status: r.get("health_status"),
-                last_health_check: r.get("last_health_check"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -789,16 +783,13 @@ impl BackendConfigStore for PostgresBackend {
         let now = unix_now();
         sqlx::query(
             "INSERT INTO backends \
-             (name, backend_type, config, enabled, priority, \
-              health_status, last_health_check, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             (name, backend_type, config, enabled, priority, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT(name) DO UPDATE SET \
              backend_type = EXCLUDED.backend_type, \
              config = EXCLUDED.config, \
              enabled = EXCLUDED.enabled, \
              priority = EXCLUDED.priority, \
-             health_status = EXCLUDED.health_status, \
-             last_health_check = EXCLUDED.last_health_check, \
              updated_at = EXCLUDED.updated_at",
         )
         .bind(&record.name)
@@ -806,8 +797,6 @@ impl BackendConfigStore for PostgresBackend {
         .bind(&record.config)
         .bind(record.enabled)
         .bind(record.priority)
-        .bind(&record.health_status)
-        .bind(record.last_health_check)
         .bind(record.created_at)
         .bind(now)
         .execute(&self.pool)
@@ -821,22 +810,6 @@ impl BackendConfigStore for PostgresBackend {
             .bind(name)
             .execute(&self.pool)
             .await?;
-
-        Ok(())
-    }
-
-    async fn update_health_status(&self, name: &str, status: &str) -> Result<()> {
-        let now = unix_now();
-        sqlx::query(
-            "UPDATE backends SET health_status = $1, last_health_check = $2, updated_at = $3 \
-             WHERE name = $4",
-        )
-        .bind(status)
-        .bind(now)
-        .bind(now)
-        .bind(name)
-        .execute(&self.pool)
-        .await?;
 
         Ok(())
     }

@@ -5,7 +5,7 @@
   import { useBackendsApi } from '@/api/backends'
   import { useKeysApi } from '@/api/keys'
   import { useApi } from '@/composables/useApi'
-  import { fmtUptime, healthType } from '@/utils/format'
+  import { fmtUptime } from '@/utils/format'
 
   const message = useMessage()
   const backendsApi = useBackendsApi()
@@ -38,12 +38,6 @@
     { title: 'Name', key: 'name' },
     { title: 'Type', key: 'backend_type' },
     { title: 'Priority', key: 'priority' },
-    {
-      title: 'Health',
-      key: 'health_status',
-      render: (row: BackendSummary) =>
-        h(NTag, { type: healthType(row.health_status), size: 'small' }, { default: () => row.health_status })
-    },
     {
       title: 'Enabled',
       key: 'enabled',

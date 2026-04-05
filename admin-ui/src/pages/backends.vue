@@ -4,7 +4,6 @@
   import { h } from 'vue'
   import { useBackendsApi } from '@/api/backends'
   import BackendModal from '@/components/BackendModal.vue'
-  import { healthType } from '@/utils/format'
 
   const message = useMessage()
   const dialog = useDialog()
@@ -73,12 +72,6 @@
       render: (row: BackendSummary) => h(NTag, { size: 'small' }, { default: () => row.backend_type })
     },
     { title: 'Priority', key: 'priority' },
-    {
-      title: 'Health',
-      key: 'health_status',
-      render: (row: BackendSummary) =>
-        h(NTag, { type: healthType(row.health_status), size: 'small' }, { default: () => row.health_status })
-    },
     {
       title: 'Enabled',
       key: 'enabled',

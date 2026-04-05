@@ -32,7 +32,6 @@ pub struct BackendSummary {
     pub backend_type: String,
     pub enabled: bool,
     pub priority: i32,
-    pub health_status: String,
     pub config_summary: Value,
 }
 
@@ -43,7 +42,6 @@ impl BackendSummary {
             backend_type: r.backend_type.clone(),
             enabled: r.enabled,
             priority: r.priority,
-            health_status: r.health_status.clone(),
             config_summary: make_config_summary(&r.backend_type, &r.config),
         }
     }
@@ -199,8 +197,6 @@ pub async fn create_backend(
         config: encrypted_config,
         enabled: body.enabled,
         priority: body.priority,
-        health_status: "unknown".to_string(),
-        last_health_check: None,
         created_at: now,
         updated_at: None,
     };
@@ -278,8 +274,6 @@ pub async fn update_backend(
         config,
         enabled: body.enabled,
         priority: body.priority,
-        health_status: existing.health_status.clone(),
-        last_health_check: existing.last_health_check,
         created_at: existing.created_at,
         updated_at: Some(now),
     };

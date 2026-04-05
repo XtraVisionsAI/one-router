@@ -75,7 +75,6 @@ pub trait BackendConfigStore: Send + Sync {
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>>;
     async fn upsert_backend(&self, record: &BackendRecord) -> Result<()>;
     async fn delete_backend(&self, name: &str) -> Result<()>;
-    async fn update_health_status(&self, name: &str, status: &str) -> Result<()>;
 }
 
 #[async_trait]

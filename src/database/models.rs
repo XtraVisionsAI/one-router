@@ -93,8 +93,6 @@ pub struct BackendRecord {
     pub config: String,       // JSON (possibly encrypted fields)
     pub enabled: bool,
     pub priority: i32,
-    pub health_status: String,
-    pub last_health_check: Option<i64>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
 }
