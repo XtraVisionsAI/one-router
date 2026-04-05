@@ -114,8 +114,8 @@ impl SearchProvider for BraveSearchProvider {
     async fn search(
         &self,
         query: &str,
-        _: Option<&[String]>,
-        _: Option<&[String]>,
+        allowed_domains: Option<&[String]>,
+        blocked_domains: Option<&[String]>,
         max_results: usize,
     ) -> Result<Vec<SearchResult>, WebToolError> {
         let resp = self
@@ -136,7 +136,7 @@ impl SearchProvider for BraveSearchProvider {
             .json()
             .await
             .map_err(|e| WebToolError::SearchApiError(e.to_string()))?;
-        Ok(data["web"]["results"]
+        let mut results: Vec<SearchResult> = data["web"]["results"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -147,8 +147,50 @@ impl SearchProvider for BraveSearchProvider {
                     })
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+
+        // Client-side domain filtering (Brave API does not support domain filters natively)
+        if let Some(allowed) = allowed_domains {
+            if !allowed.is_empty() {
+                results.retain(|r| {
+                    let domain = extract_domain(&r.url);
+                    allowed.iter().any(|d| domain_matches(&domain, d))
+                });
+            }
+        }
+        if let Some(blocked) = blocked_domains {
+            if !blocked.is_empty() {
+                results.retain(|r| {
+                    let domain = extract_domain(&r.url);
+                    !blocked.iter().any(|d| domain_matches(&domain, d))
+                });
+            }
+        }
+
+        Ok(results)
     }
+}
+
+/// Extract the domain (host) from a URL string.
+/// Falls back to returning the full URL if parsing fails.
+fn extract_domain(url: &str) -> String {
+    // Try to parse as a URL; extract the host portion
+    if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        rest.split('/').next().unwrap_or(rest).to_lowercase()
+    } else {
+        url.to_lowercase()
+    }
+}
+
+/// Check whether a URL domain matches a filter domain.
+/// Matches if the domain equals the filter or ends with `.{filter}`.
+/// For example, domain "docs.example.com" matches filter "example.com".
+fn domain_matches(domain: &str, filter: &str) -> bool {
+    let filter_lower = filter.to_lowercase();
+    domain == filter_lower || domain.ends_with(&format!(".{filter_lower}"))
 }
 
 pub fn build_search_provider(provider: &str, api_key: &str) -> Option<Box<dyn SearchProvider>> {
@@ -181,5 +223,24 @@ mod tests {
     #[test]
     fn test_build_empty_key() {
         assert!(build_search_provider("tavily", "").is_none());
+    }
+    #[test]
+    fn test_extract_domain() {
+        assert_eq!(extract_domain("https://example.com/path"), "example.com");
+        assert_eq!(
+            extract_domain("http://sub.example.com/page"),
+            "sub.example.com"
+        );
+        assert_eq!(extract_domain("https://EXAMPLE.COM"), "example.com");
+    }
+    #[test]
+    fn test_domain_matches_exact() {
+        assert!(domain_matches("example.com", "example.com"));
+        assert!(!domain_matches("example.com", "other.com"));
+    }
+    #[test]
+    fn test_domain_matches_subdomain() {
+        assert!(domain_matches("docs.example.com", "example.com"));
+        assert!(!domain_matches("example.com", "docs.example.com"));
     }
 }

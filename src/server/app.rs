@@ -150,7 +150,7 @@ impl App {
 
         // 7. Initialize services
         let model_mapping = Arc::new(ModelMappingService::new(database.clone()));
-        let usage_tracker = Arc::new(UsageTracker::new(database.clone()));
+        let usage_tracker = Arc::new(UsageTracker::new(database.clone(), model_mapping.clone()));
 
         // 8. Initialize web tool executor
         let web_tool_executor = {

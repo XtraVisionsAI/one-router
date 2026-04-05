@@ -81,69 +81,6 @@ impl RoundRobinState {
     }
 }
 
-/// State for weighted selection
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct WeightedState {
-    /// Current position in the weighted cycle
-    position: AtomicUsize,
-    /// Precomputed weighted indices
-    weighted_indices: Vec<usize>,
-}
-
-#[allow(dead_code)]
-impl WeightedState {
-    /// Create a new weighted state from weights
-    pub fn new(weights: &[u32]) -> Self {
-        let mut weighted_indices = Vec::new();
-        for (idx, &weight) in weights.iter().enumerate() {
-            for _ in 0..weight {
-                weighted_indices.push(idx);
-            }
-        }
-        // If no weights, add at least one entry per credential
-        if weighted_indices.is_empty() {
-            weighted_indices = (0..weights.len()).collect();
-        }
-        Self {
-            position: AtomicUsize::new(0),
-            weighted_indices,
-        }
-    }
-
-    /// Get next index based on weights
-    pub fn next(&self) -> usize {
-        if self.weighted_indices.is_empty() {
-            return 0;
-        }
-        let pos = self.position.fetch_add(1, Ordering::SeqCst) % self.weighted_indices.len();
-        self.weighted_indices[pos]
-    }
-
-    /// Rebuild weighted indices with new weights
-    pub fn rebuild(&mut self, weights: &[u32]) {
-        self.weighted_indices.clear();
-        for (idx, &weight) in weights.iter().enumerate() {
-            for _ in 0..weight {
-                self.weighted_indices.push(idx);
-            }
-        }
-        if self.weighted_indices.is_empty() {
-            self.weighted_indices = (0..weights.len()).collect();
-        }
-        self.position.store(0, Ordering::SeqCst);
-    }
-}
-
-impl Default for WeightedState {
-    fn default() -> Self {
-        Self {
-            position: AtomicUsize::new(0),
-            weighted_indices: Vec::new(),
-        }
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -183,19 +120,5 @@ mod tests {
         assert_eq!(state.next(3), 1);
         assert_eq!(state.next(3), 2);
         assert_eq!(state.next(3), 0);
-    }
-
-    #[test]
-    fn test_weighted_state() {
-        // Weights: [2, 1] means credential 0 should be selected twice as often
-        let state = WeightedState::new(&[2, 1]);
-        let mut counts = [0, 0];
-        for _ in 0..6 {
-            let idx = state.next();
-            counts[idx] += 1;
-        }
-        // After 6 selections: credential 0 should have ~4, credential 1 should have ~2
-        assert_eq!(counts[0], 4);
-        assert_eq!(counts[1], 2);
     }
 }

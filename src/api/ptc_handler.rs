@@ -14,6 +14,9 @@ use crate::server::state::AppState;
 use crate::services::ptc::PtcService;
 use std::sync::Arc;
 
+/// Maximum recursion depth for PTC execute_code loops
+const MAX_PTC_DEPTH: u32 = 10;
+
 /// Internal execute_code tool definition sent to Claude.
 const EXECUTE_CODE_TOOL: &str = r#"{
     "name": "execute_code",
@@ -77,7 +80,16 @@ pub async fn handle_ptc_request(
         .map_err(|e| ApiError::internal_error(format!("Bedrock call failed: {e}")))?;
 
     // 5. Process response
-    process_claude_response(state, ptc, &session_id, &response, request, target_model_id).await
+    process_claude_response(
+        state,
+        ptc,
+        &session_id,
+        &response,
+        request,
+        target_model_id,
+        0,
+    )
+    .await
 }
 
 /// Handle a PTC continuation (client sent back tool_result with container ID).
@@ -125,7 +137,7 @@ pub async fn handle_ptc_continuation(
     //
     // For now, treat this as: the sandbox already finished, finalize with Claude.
     // Build finalization request: original messages + tool_result + code output
-    finalize_with_claude(state, ptc, &session_id, request, target_model_id).await
+    finalize_with_claude(state, ptc, &session_id, request, target_model_id, 0).await
 }
 
 // ============================================================================
@@ -259,7 +271,13 @@ async fn process_claude_response(
     response: &MessageResponse,
     original_request: &MessageRequest,
     target_model_id: &str,
+    depth: u32,
 ) -> Result<MessageResponse, ApiError> {
+    if depth >= MAX_PTC_DEPTH {
+        return Err(ApiError::bad_request(format!(
+            "Maximum PTC recursion depth ({MAX_PTC_DEPTH}) exceeded"
+        )));
+    }
     // Look for execute_code tool_use in response
     let execute_code_call = response.content.iter().find_map(|block| {
         if let ContentBlock::ToolUse {
@@ -353,6 +371,7 @@ async fn process_claude_response(
         &tool_use_id,
         &code_output,
         target_model_id,
+        depth,
     )
     .await
 }
@@ -368,6 +387,7 @@ async fn call_claude_with_code_result(
     tool_use_id: &str,
     code_output: &str,
     target_model_id: &str,
+    _depth: u32,
 ) -> Result<MessageResponse, ApiError> {
     use crate::schemas::anthropic::{Message, MessageContent, ToolResultValue};
 
@@ -430,6 +450,7 @@ async fn finalize_with_claude(
     session_id: &str,
     request: &MessageRequest,
     target_model_id: &str,
+    depth: u32,
 ) -> Result<MessageResponse, ApiError> {
     let bedrock = state
         .bedrock
@@ -460,6 +481,7 @@ async fn finalize_with_claude(
             &response,
             request,
             target_model_id,
+            depth + 1,
         )
         .await;
     }

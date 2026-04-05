@@ -330,7 +330,7 @@ impl SandboxExecutor {
                 .set_path(filename)
                 .map_err(|e| PtcError::FileCopyFailed(format!("Failed to set tar path: {e}")))?;
             header.set_size(content.len() as u64);
-            header.set_mode(0o755);
+            header.set_mode(0o644);
             header.set_cksum();
 
             // Add file to archive

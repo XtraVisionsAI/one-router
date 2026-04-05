@@ -5,8 +5,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
 use thiserror::Error;
+
+use crate::schemas::anthropic::ErrorResponse;
 
 #[derive(Error, Debug)]
 pub enum ApiError {
@@ -54,28 +55,8 @@ impl IntoResponse for ApiError {
             ),
         };
 
-        let body = Json(ErrorResponse {
-            type_: "error".to_string(),
-            error: ErrorDetail {
-                type_: error_type.to_string(),
-                message,
-            },
-        });
+        let body = Json(ErrorResponse::new(error_type, message));
 
         (status, body).into_response()
     }
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    #[serde(rename = "type")]
-    type_: String,
-    error: ErrorDetail,
-}
-
-#[derive(Serialize)]
-struct ErrorDetail {
-    #[serde(rename = "type")]
-    type_: String,
-    message: String,
 }

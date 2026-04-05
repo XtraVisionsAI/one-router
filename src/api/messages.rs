@@ -333,11 +333,11 @@ pub async fn create_message(
 
 /// Shared state for streaming usage — handlers write, entry wrapper reads.
 #[derive(Debug, Default, Clone)]
-struct StreamUsage {
-    input_tokens: i32,
-    output_tokens: i32,
-    cache_creation_input_tokens: Option<i32>,
-    cache_read_input_tokens: Option<i32>,
+pub struct StreamUsage {
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub cache_creation_input_tokens: Option<i32>,
+    pub cache_read_input_tokens: Option<i32>,
 }
 
 /// Context for recording usage, passed to handlers for streaming usage tracking.
@@ -423,7 +423,11 @@ async fn handle_bedrock_request(
 
         if request.stream {
             let sse_stream = bedrock
-                .chat_completions_stream(&openai_json, target_model_id)
+                .chat_completions_stream(
+                    &openai_json,
+                    target_model_id,
+                    Some(usage_ctx.stream_usage.clone()),
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Bedrock Mantle streaming failed");
@@ -1308,90 +1312,67 @@ pub async fn count_tokens(
 // Debug Utilities
 // ============================================================================
 
-/// Print request prompts to stdout for debugging
+/// Log request prompts via tracing for debugging (truncated to 2000 chars)
 fn print_request_prompts(request_id: &str, request: &MessageRequest) {
-    use std::io::Write;
-
-    let mut stdout = std::io::stdout().lock();
+    let mut output = String::new();
 
     // Header
-    writeln!(stdout, "\n{}", "=".repeat(80)).ok();
-    writeln!(stdout, "REQUEST [{request_id}]").ok();
-    writeln!(stdout, "{}", "=".repeat(80)).ok();
-    writeln!(stdout, "Model: {}", request.model).ok();
-    writeln!(stdout, "Max tokens: {}", request.max_tokens).ok();
+    output.push_str(&format!("Model: {}", request.model));
+    output.push_str(&format!(", Max tokens: {}", request.max_tokens));
     if let Some(temp) = request.temperature {
-        writeln!(stdout, "Temperature: {temp}").ok();
+        output.push_str(&format!(", Temperature: {temp}"));
     }
-    writeln!(stdout, "Stream: {}", request.stream).ok();
-    writeln!(stdout, "{}", "-".repeat(80)).ok();
+    output.push_str(&format!(", Stream: {}", request.stream));
 
     // System prompt
     if let Some(ref system) = request.system {
-        writeln!(stdout, "SYSTEM:").ok();
+        output.push_str(" | SYSTEM: ");
         match system {
             SystemContent::Text(text) => {
-                writeln!(stdout, "{text}").ok();
+                output.push_str(truncate_str(text, 2000));
             }
             SystemContent::Messages(messages) => {
                 for msg in messages {
-                    writeln!(stdout, "{}", msg.text).ok();
+                    output.push_str(truncate_str(&msg.text, 2000));
+                    output.push(' ');
                 }
             }
         }
-        writeln!(stdout, "{}", "-".repeat(80)).ok();
     }
 
     // Messages
-    writeln!(stdout, "MESSAGES ({} total):", request.messages.len()).ok();
+    output.push_str(&format!(" | MESSAGES ({} total):", request.messages.len()));
     for (i, msg) in request.messages.iter().enumerate() {
         let role_icon = match msg.role.as_str() {
             "user" => "U",
             "assistant" => "A",
             _ => "?",
         };
-        writeln!(stdout, "\n[{i}] {role_icon} {}", msg.role.to_uppercase()).ok();
+        output.push_str(&format!(" [{i}] {role_icon}:"));
 
         match &msg.content {
             MessageContent::Text(text) => {
-                let char_count = text.chars().count();
-                let display_text = if char_count > 2000 {
-                    format!(
-                        "{}... [truncated, {} chars total]",
-                        truncate_str(text, 2000),
-                        char_count
-                    )
-                } else {
-                    text.clone()
-                };
-                writeln!(stdout, "{display_text}").ok();
+                output.push_str(truncate_str(text, 2000));
             }
             MessageContent::Blocks(blocks) => {
                 for content in blocks {
                     match content {
                         ContentBlock::Text { text, .. } => {
-                            let display_text = if text.chars().count() > 2000 {
-                                format!("{}... [truncated]", truncate_str(text, 2000))
-                            } else {
-                                text.clone()
-                            };
-                            writeln!(stdout, "{display_text}").ok();
+                            output.push_str(truncate_str(text, 2000));
                         }
                         ContentBlock::Image { source, .. } => {
-                            writeln!(
-                                stdout,
+                            output.push_str(&format!(
                                 "[Image: {} bytes, type: {}]",
                                 source.data.len(),
                                 source.media_type
-                            )
-                            .ok();
+                            ));
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
-                            writeln!(stdout, "[Tool Use: {name} (id: {id})]").ok();
+                            output.push_str(&format!("[Tool Use: {name} (id: {id})]"));
                             if let Ok(json) = serde_json::to_string_pretty(&input) {
-                                writeln!(stdout, "  Input: {json}").ok();
+                                output.push_str(&format!(" Input: {}", truncate_str(&json, 2000)));
                             }
                         }
                         ContentBlock::ToolResult {
@@ -1399,23 +1380,19 @@ fn print_request_prompts(request_id: &str, request: &MessageRequest) {
                             content,
                             ..
                         } => {
-                            writeln!(stdout, "[Tool Result for: {tool_use_id}]").ok();
+                            output.push_str(&format!("[Tool Result for: {tool_use_id}]"));
                             match content {
                                 ToolResultValue::Text(text) => {
-                                    let display = if text.chars().count() > 500 {
-                                        format!("{}... [truncated]", truncate_str(text, 500))
-                                    } else {
-                                        text.clone()
-                                    };
-                                    writeln!(stdout, "  Result: {display}").ok();
+                                    output
+                                        .push_str(&format!(" Result: {}", truncate_str(text, 500)));
                                 }
                                 ToolResultValue::Blocks(blocks) => {
-                                    writeln!(stdout, "  Result: [{} blocks]", blocks.len()).ok();
+                                    output.push_str(&format!(" Result: [{} blocks]", blocks.len()));
                                 }
                             }
                         }
                         _ => {
-                            writeln!(stdout, "[Other content block]").ok();
+                            output.push_str("[Other content block]");
                         }
                     }
                 }
@@ -1425,17 +1402,15 @@ fn print_request_prompts(request_id: &str, request: &MessageRequest) {
 
     // Tools
     if let Some(ref tools) = request.tools {
-        writeln!(stdout, "\n{}", "-".repeat(80)).ok();
-        writeln!(stdout, "TOOLS ({} defined):", tools.len()).ok();
+        output.push_str(&format!(" | TOOLS ({} defined):", tools.len()));
         for tool in tools {
             if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
-                writeln!(stdout, "  - {name}").ok();
+                output.push_str(&format!(" {name}"));
             }
         }
     }
 
-    writeln!(stdout, "{}\n", "=".repeat(80)).ok();
-    stdout.flush().ok();
+    tracing::debug!(request_id = %request_id, "{}", truncate_str(&output, 2000));
 }
 
 // ============================================================================

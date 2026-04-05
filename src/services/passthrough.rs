@@ -200,9 +200,12 @@ impl PassthroughService {
             }
         }
 
-        // Forward safe extra headers from client
+        // Forward safe extra headers from client (block sensitive headers)
+        const BLOCKED_HEADERS: &[&str] = &["authorization", "x-api-key", "host", "content-length"];
         for (name, value) in extra_headers {
-            req_builder = req_builder.header(name.as_str(), value.as_str());
+            if !BLOCKED_HEADERS.contains(&name.to_lowercase().as_str()) {
+                req_builder = req_builder.header(name.as_str(), value.as_str());
+            }
         }
 
         let response = req_builder.body(body_bytes).send().await;
@@ -210,7 +213,7 @@ impl PassthroughService {
         match response {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                if status == 429 || status >= 500 {
+                if status == 401 || status == 403 || status == 429 || status >= 500 {
                     let disabled = self.record_failure(&credential_name);
                     if disabled {
                         tracing::warn!(

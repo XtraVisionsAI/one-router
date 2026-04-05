@@ -36,6 +36,28 @@ impl DynamoDbBackend {
     pub fn table_name(name: &str) -> String {
         format!("{TABLE_PREFIX}{name}")
     }
+
+    /// Check if a key with the given name exists, optionally excluding a specific api_key.
+    async fn name_exists(&self, name: &str, exclude_api_key: Option<&str>) -> Result<bool> {
+        let mut scan = self
+            .client
+            .scan()
+            .table_name(Self::table_name("api_keys"))
+            .filter_expression("#n = :name")
+            .expression_attribute_names("#n", "name")
+            .expression_attribute_values(":name", av_s(name))
+            .projection_expression("api_key")
+            .limit(2); // Only need to find one (or two if excluding)
+
+        if let Some(exclude) = exclude_api_key {
+            scan = scan
+                .filter_expression("#n = :name AND api_key <> :exclude")
+                .expression_attribute_values(":exclude", av_s(exclude));
+        }
+
+        let result = scan.send().await?;
+        Ok(!result.items().is_empty())
+    }
 }
 
 fn unix_now() -> i64 {
@@ -329,9 +351,8 @@ impl ApiKeyStore for DynamoDbBackend {
     }
 
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
-        // Application-level unique check on name (DynamoDB has no UNIQUE constraints)
-        let existing = self.list_api_keys().await?;
-        if existing.iter().any(|r| r.name == record.name) {
+        // Check name uniqueness via filtered scan (avoids loading all keys into memory)
+        if self.name_exists(&record.name, None).await? {
             return Err(anyhow::anyhow!("UNIQUE constraint failed: api_keys.name"));
         }
         self.client
@@ -344,11 +365,10 @@ impl ApiKeyStore for DynamoDbBackend {
     }
 
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
-        // Application-level unique check on name (DynamoDB has no UNIQUE constraints)
-        let existing = self.list_api_keys().await?;
-        if existing
-            .iter()
-            .any(|r| r.api_key != record.api_key && r.name == record.name)
+        // Check name uniqueness, excluding the current key
+        if self
+            .name_exists(&record.name, Some(&record.api_key))
+            .await?
         {
             return Err(anyhow::anyhow!("UNIQUE constraint failed: api_keys.name"));
         }

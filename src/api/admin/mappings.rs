@@ -100,11 +100,58 @@ pub async fn list_mappings(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// Validate fields shared by create and update.
+fn validate_mapping_fields(
+    body: &UpsertMappingRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if body.source_model_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "source_model_id cannot be empty",
+            )),
+        ));
+    }
+    if body.target_model_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "target_model_id cannot be empty",
+            )),
+        ));
+    }
+    if body.provider.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "provider cannot be empty",
+            )),
+        ));
+    }
+    if body.status != "active" && body.status != "inactive" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "status must be 'active' or 'inactive'",
+            )),
+        ));
+    }
+    Ok(())
+}
+
 /// POST /admin/api/mappings
 pub async fn create_mapping(
     State(state): State<AppState>,
     Json(body): Json<UpsertMappingRequest>,
 ) -> impl IntoResponse {
+    if let Err(resp) = validate_mapping_fields(&body) {
+        return resp.into_response();
+    }
+
     let now = Utc::now().timestamp();
     let record = ModelMappingRecord {
         source_model_id: body.source_model_id,
@@ -174,6 +221,10 @@ pub async fn update_mapping(
                 .into_response();
         }
     };
+
+    if let Err(resp) = validate_mapping_fields(&body) {
+        return resp.into_response();
+    }
 
     let now = Utc::now().timestamp();
     let record = ModelMappingRecord {

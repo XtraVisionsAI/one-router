@@ -259,6 +259,18 @@ pub async fn create_backend(
     State(state): State<AppState>,
     Json(body): Json<UpsertBackendRequest>,
 ) -> impl IntoResponse {
+    const VALID_BACKEND_TYPES: &[&str] = &["bedrock", "gemini", "anthropic", "openai"];
+    if !VALID_BACKEND_TYPES.contains(&body.backend_type.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "backend_type must be one of: bedrock, gemini, anthropic, openai",
+            )),
+        )
+            .into_response();
+    }
+
     let Some(config_val) = body.config else {
         return (
             StatusCode::BAD_REQUEST,

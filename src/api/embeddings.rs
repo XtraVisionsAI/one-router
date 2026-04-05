@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub use crate::schemas::embeddings::EmbeddingRequest;
 use crate::schemas::embeddings::{EmbeddingObject, EmbeddingResponse, EmbeddingUsage};
 use crate::server::state::AppState;
+use crate::utils::tokens::estimate_tokens;
 
 use super::chat_completions::OpenAIApiError;
 
@@ -289,13 +290,4 @@ async fn embed_nova(
 
     let total_tokens: u32 = texts.iter().map(|t| estimate_tokens(t)).sum();
     Ok((embeddings, total_tokens))
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Rough token count estimate: split on whitespace.
-fn estimate_tokens(text: &str) -> u32 {
-    text.split_whitespace().count() as u32
 }

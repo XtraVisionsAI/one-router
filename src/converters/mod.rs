@@ -24,3 +24,7 @@ pub use anthropic_openai::{
 };
 pub use openai_bedrock::OpenAIConversionError;
 pub use openai_gemini::{GeminiToOpenAIConverter, OpenAIGeminiError, OpenAIToGeminiConverter};
+
+/// Fallback description used when a tool has no description.
+/// Some backends (e.g. Bedrock Converse, Gemini) require a non-empty description.
+pub const FALLBACK_TOOL_DESCRIPTION: &str = "-";

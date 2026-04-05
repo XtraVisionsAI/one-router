@@ -438,7 +438,7 @@ impl UsageStore for PostgresBackend {
             "to_char(date_trunc('hour', timestamp::timestamptz), 'YYYY-MM-DD\"T\"HH24')".to_string()
         };
 
-        // Postgres 使用 $1, $2… 占位符，参数顺序动态调整
+        // Postgres uses $1, $2... placeholders, parameter order adjusted dynamically
         // Empty api_key means "all keys" (admin query with no key filter)
         let filter_by_key = !api_key.is_empty();
 
@@ -476,7 +476,7 @@ impl UsageStore for PostgresBackend {
              GROUP BY {group_expr} \
              ORDER BY group_key DESC",
         );
-        // 注意：Postgres 不允许 GROUP BY 引用列别名，必须重复原始表达式。
+        // Note: Postgres does not allow GROUP BY to reference column aliases; the original expression must be repeated.
 
         let mut q = sqlx::query(&sql);
         if filter_by_key {

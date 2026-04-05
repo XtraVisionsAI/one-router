@@ -145,7 +145,10 @@ impl ModelMappingService {
                         .capabilities
                         .as_deref()
                         .filter(|s| !s.is_empty())
-                        .map(|s| serde_json::from_str(s).unwrap_or_default()),
+                        .map(|s| serde_json::from_str(s).unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, json = %s, "Failed to parse capabilities JSON, using defaults");
+                        ModelCapabilities::default()
+                    })),
                 };
                 self.cache.insert(key, Some(resolved.clone())).await;
                 return Ok(resolved);
@@ -168,7 +171,10 @@ impl ModelMappingService {
                         .capabilities
                         .as_deref()
                         .filter(|s| !s.is_empty())
-                        .map(|s| serde_json::from_str(s).unwrap_or_default()),
+                        .map(|s| serde_json::from_str(s).unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, json = %s, "Failed to parse capabilities JSON, using defaults");
+                        ModelCapabilities::default()
+                    })),
                 };
                 self.cache.insert(key, Some(resolved.clone())).await;
                 Ok(resolved)

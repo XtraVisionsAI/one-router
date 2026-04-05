@@ -41,17 +41,19 @@ pub struct UpsertSettingRequest {
 fn validate_setting(key: &str, value: &str) -> Result<(), &'static str> {
     match key {
         "prompt_cache" => {
-            if matches!(value, "" | "disable" | "passthrough" | "5m" | "1h") {
+            if matches!(value, "disable" | "passthrough" | "5m" | "1h") {
                 Ok(())
             } else {
                 Err("prompt_cache must be 'disable', 'passthrough', '5m', or '1h'")
             }
         }
         "rate_limit" => {
-            if value == "disable" || value.parse::<u32>().is_ok() {
-                Ok(())
-            } else {
-                Err("rate_limit must be 'disable' or a positive integer (RPM)")
+            if value == "disable" {
+                return Ok(());
+            }
+            match value.parse::<u32>() {
+                Ok(n) if n > 0 => Ok(()),
+                _ => Err("rate_limit must be 'disable' or a positive integer (RPM)"),
             }
         }
         _ => Ok(()), // unknown keys are accepted as-is
@@ -138,7 +140,6 @@ mod tests {
 
     #[test]
     fn validate_prompt_cache_valid_values() {
-        assert!(validate_setting("prompt_cache", "").is_ok());
         assert!(validate_setting("prompt_cache", "disable").is_ok());
         assert!(validate_setting("prompt_cache", "passthrough").is_ok());
         assert!(validate_setting("prompt_cache", "5m").is_ok());
@@ -147,6 +148,7 @@ mod tests {
 
     #[test]
     fn validate_prompt_cache_invalid_values() {
+        assert!(validate_setting("prompt_cache", "").is_err());
         assert!(validate_setting("prompt_cache", "2h").is_err());
         assert!(validate_setting("prompt_cache", "enable").is_err());
     }
@@ -161,6 +163,7 @@ mod tests {
 
     #[test]
     fn validate_rate_limit_invalid_values() {
+        assert!(validate_setting("rate_limit", "0").is_err());
         assert!(validate_setting("rate_limit", "true").is_err());
         assert!(validate_setting("rate_limit", "fast").is_err());
         assert!(validate_setting("rate_limit", "").is_err());

@@ -18,6 +18,7 @@ use aws_sdk_bedrockruntime::{
 use aws_smithy_runtime_api::client::result::SdkError;
 use futures::Stream;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
@@ -454,6 +455,7 @@ impl BedrockService {
         &self,
         openai_request: &serde_json::Value,
         _target_model_id: &str,
+        stream_usage: Option<Arc<tokio::sync::Mutex<crate::api::messages::StreamUsage>>>,
     ) -> Result<
         impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send,
         BedrockError,
@@ -564,7 +566,7 @@ impl BedrockService {
 
         // Convert OpenAI SSE byte stream → Anthropic SSE events
         let byte_stream = response.bytes_stream();
-        let sse_stream = openai_sse_to_anthropic_sse(byte_stream, cred_name);
+        let sse_stream = openai_sse_to_anthropic_sse(byte_stream, cred_name, stream_usage);
         Ok(sse_stream)
     }
 }
@@ -853,6 +855,7 @@ pub enum BedrockStreamError {
 fn openai_sse_to_anthropic_sse(
     byte_stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     cred_name: String,
+    stream_usage: Option<Arc<tokio::sync::Mutex<crate::api::messages::StreamUsage>>>,
 ) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send
 {
     use axum::response::sse::Event;
@@ -1029,7 +1032,12 @@ fn openai_sse_to_anthropic_sse(
         // message_stop
         yield Ok(Event::default().event("message_stop").data(r#"{"type":"message_stop"}"#));
 
-        let _ = input_tokens; // suppress unused warning — available for future usage tracking
+        // Populate stream_usage so the outer wrapper can record usage
+        if let Some(ref su) = stream_usage {
+            let mut u = su.lock().await;
+            u.input_tokens = input_tokens;
+            u.output_tokens = output_tokens;
+        }
     }
 }
 

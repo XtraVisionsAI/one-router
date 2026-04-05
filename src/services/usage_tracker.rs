@@ -6,6 +6,7 @@ use crate::database::models::UsageRecord;
 use crate::database::traits::DatabaseService;
 use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::Usage;
+use crate::services::model_mapping::ModelMappingService;
 use chrono::Utc;
 use std::sync::Arc;
 
@@ -13,15 +14,25 @@ fn is_new_month(stored_month: Option<&str>, current_month: &str) -> bool {
     stored_month.map(|m| m != current_month).unwrap_or(true)
 }
 
+/// Default pricing fallback (per million tokens) when model pricing is not configured.
+const DEFAULT_INPUT_PRICE: f64 = 3.0;
+const DEFAULT_OUTPUT_PRICE: f64 = 15.0;
+const DEFAULT_CACHE_READ_PRICE: f64 = 0.30;
+const DEFAULT_CACHE_WRITE_PRICE: f64 = 3.75;
+
 /// Service for tracking API usage statistics.
 #[derive(Clone)]
 pub struct UsageTracker {
     storage: Arc<dyn DatabaseService>,
+    model_mapping: Arc<ModelMappingService>,
 }
 
 impl UsageTracker {
-    pub fn new(storage: Arc<dyn DatabaseService>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<dyn DatabaseService>, model_mapping: Arc<ModelMappingService>) -> Self {
+        Self {
+            storage,
+            model_mapping,
+        }
     }
 
     /// Record usage for a completed request.
@@ -85,7 +96,7 @@ impl UsageTracker {
             .await
             .map_err(|e| UsageError::Database(e.to_string()))?;
 
-        let cost = self.calculate_cost(model, usage, key_info.cost_rate);
+        let cost = self.calculate_cost(model, usage, key_info.cost_rate).await;
 
         if cost > 0.0 {
             let budget_exceeded = self
@@ -109,23 +120,29 @@ impl UsageTracker {
         Ok(false)
     }
 
-    fn calculate_cost(&self, _model: &str, usage: &Usage, cost_rate: f64) -> f64 {
-        const INPUT_PRICE_PER_MILLION: f64 = 3.0;
-        const OUTPUT_PRICE_PER_MILLION: f64 = 15.0;
-        const CACHE_READ_PRICE_PER_MILLION: f64 = 0.30;
-        const CACHE_WRITE_PRICE_PER_MILLION: f64 = 3.75;
+    async fn calculate_cost(&self, model: &str, usage: &Usage, cost_rate: f64) -> f64 {
+        let (input_price, output_price, cache_read_price, cache_write_price) =
+            match self.model_mapping.get_pricing(model).await {
+                Some(prices) if prices.0 > 0.0 || prices.1 > 0.0 => prices,
+                _ => (
+                    DEFAULT_INPUT_PRICE,
+                    DEFAULT_OUTPUT_PRICE,
+                    DEFAULT_CACHE_READ_PRICE,
+                    DEFAULT_CACHE_WRITE_PRICE,
+                ),
+            };
 
-        let input_cost = (usage.input_tokens as f64) * INPUT_PRICE_PER_MILLION / 1_000_000.0;
-        let output_cost = (usage.output_tokens as f64) * OUTPUT_PRICE_PER_MILLION / 1_000_000.0;
+        let input_cost = (usage.input_tokens as f64) * input_price / 1_000_000.0;
+        let output_cost = (usage.output_tokens as f64) * output_price / 1_000_000.0;
 
         let cache_read_cost = usage
             .cache_read_input_tokens
-            .map(|t| (t as f64) * CACHE_READ_PRICE_PER_MILLION / 1_000_000.0)
+            .map(|t| (t as f64) * cache_read_price / 1_000_000.0)
             .unwrap_or(0.0);
 
         let cache_write_cost = usage
             .cache_creation_input_tokens
-            .map(|t| (t as f64) * CACHE_WRITE_PRICE_PER_MILLION / 1_000_000.0)
+            .map(|t| (t as f64) * cache_write_price / 1_000_000.0)
             .unwrap_or(0.0);
 
         let base_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;

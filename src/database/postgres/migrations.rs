@@ -85,6 +85,13 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await?;
 
+    // Index for efficient wildcard (prefix) matching on source_model_id
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_model_mappings_source ON model_mappings (source_model_id text_pattern_ops)",
+    )
+    .execute(pool)
+    .await?;
+
     // Migration: add budget_history column if not already present
     sqlx::query("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS budget_history TEXT")
         .execute(pool)

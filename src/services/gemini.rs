@@ -410,7 +410,13 @@ impl GeminiService {
 
                     // Record failure for rate limit or server errors
                     if status.as_u16() == 429 || status.as_u16() >= 500 {
-                        self.record_failure(&credential_name);
+                        let disabled = self.record_failure(&credential_name);
+                        if disabled {
+                            tracing::warn!(
+                                credential = %credential_name,
+                                "Credential disabled due to repeated failures"
+                            );
+                        }
                     }
 
                     if let Ok(gemini_error) = serde_json::from_str::<GeminiError>(&error_text) {

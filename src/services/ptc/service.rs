@@ -123,28 +123,24 @@ pub enum PtcResponse {
 /// Main PTC service for handling Programmatic Tool Calling
 pub struct PtcService {
     /// Sandbox executor
-    sandbox: SandboxExecutor,
+    sandbox: Arc<SandboxExecutor>,
     /// Active sessions
     sessions: Arc<RwLock<HashMap<String, PtcSession>>>,
     /// Session timeout in seconds
     session_timeout: u64,
     /// Max iterations per session
     max_iterations: u32,
-    /// Tool call batch window (reserved for future use)
-    #[allow(dead_code)]
-    batch_window_ms: u64,
 }
 
 impl PtcService {
     /// Create a new PTC service
     pub async fn new() -> PtcResult<Self> {
-        let sandbox = SandboxExecutor::new().await?;
+        let sandbox = Arc::new(SandboxExecutor::new().await?);
         Ok(Self {
             sandbox,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             session_timeout: DEFAULT_SESSION_TIMEOUT_SECS,
             max_iterations: DEFAULT_MAX_ITERATIONS,
-            batch_window_ms: TOOL_CALL_BATCH_WINDOW_MS,
         })
     }
 
@@ -154,13 +150,12 @@ impl PtcService {
         session_timeout: u64,
         max_iterations: u32,
     ) -> PtcResult<Self> {
-        let sandbox = SandboxExecutor::with_config(sandbox_config).await?;
+        let sandbox = Arc::new(SandboxExecutor::with_config(sandbox_config).await?);
         Ok(Self {
             sandbox,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             session_timeout,
             max_iterations,
-            batch_window_ms: TOOL_CALL_BATCH_WINDOW_MS,
         })
     }
 
@@ -286,9 +281,14 @@ impl PtcService {
             .get_mut(session_id)
             .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))?;
 
-        // Check if session has expired
+        // Check if session has expired — remove it and clean up the container
         if session.is_expired(self.session_timeout) {
-            session.state = SessionState::Expired;
+            let session = sessions.remove(session_id).expect("session was just found");
+            let sandbox = Arc::clone(&self.sandbox);
+            let container_id = session.container.id.clone();
+            tokio::spawn(async move {
+                let _ = sandbox.stop_and_remove(&container_id).await;
+            });
             return Err(PtcError::SessionExpired(session_id.to_string()));
         }
 
@@ -320,7 +320,7 @@ impl PtcService {
         for session_id in expired {
             if let Some(session) = sessions.remove(&session_id) {
                 // Clean up container in background
-                let sandbox = self.sandbox.clone();
+                let sandbox = Arc::clone(&self.sandbox);
                 let container_id = session.container.id.clone();
                 tokio::spawn(async move {
                     let _ = sandbox.stop_and_remove(&container_id).await;
@@ -605,7 +605,7 @@ impl PtcService {
     }
 
     /// Get the sandbox executor (for direct container access).
-    pub fn sandbox(&self) -> &SandboxExecutor {
+    pub fn sandbox(&self) -> &Arc<SandboxExecutor> {
         &self.sandbox
     }
 
@@ -630,19 +630,6 @@ impl PtcService {
             docker_version,
             active_sessions,
         }
-    }
-}
-
-// We need to implement Clone for PtcService to use it in spawned tasks
-impl Clone for SandboxExecutor {
-    fn clone(&self) -> Self {
-        // Note: This creates a new Docker connection
-        // In production, you might want to share the connection
-        tokio::runtime::Handle::current().block_on(async {
-            SandboxExecutor::new()
-                .await
-                .expect("Failed to clone sandbox executor")
-        })
     }
 }
 

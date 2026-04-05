@@ -74,7 +74,10 @@ impl ModelCapabilities {
     /// Returns `Default` on any error or when the string is empty/None.
     pub fn from_json(json: Option<&str>) -> Self {
         match json {
-            Some(s) if !s.is_empty() => serde_json::from_str(s).unwrap_or_default(),
+            Some(s) if !s.is_empty() => serde_json::from_str(s).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, json = %s, "Failed to parse capabilities JSON, using defaults");
+            ModelCapabilities::default()
+        }),
             _ => Self::default(),
         }
     }

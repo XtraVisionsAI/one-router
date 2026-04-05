@@ -87,8 +87,14 @@ impl BedrockStopReason {
             BedrockStopReason::MaxTokens => "max_tokens",
             BedrockStopReason::StopSequence => "stop_sequence",
             BedrockStopReason::ToolUse => "tool_use",
-            BedrockStopReason::ContentFiltered => "end_turn",
-            BedrockStopReason::Unknown(_) => "end_turn",
+            BedrockStopReason::ContentFiltered => {
+                tracing::warn!("Bedrock response was content-filtered, mapping to end_turn");
+                "end_turn"
+            }
+            BedrockStopReason::Unknown(s) => {
+                tracing::warn!(stop_reason = %s, "Unknown Bedrock stop reason, mapping to end_turn");
+                "end_turn"
+            }
         }
     }
 }
@@ -112,6 +118,7 @@ mod tests {
             BedrockStopReason::ToolUse
         );
         assert_eq!(BedrockStopReason::EndTurn.to_anthropic_string(), "end_turn");
+        // ContentFiltered and Unknown map to "end_turn" (with logged warnings)
         assert_eq!(
             BedrockStopReason::ContentFiltered.to_anthropic_string(),
             "end_turn"

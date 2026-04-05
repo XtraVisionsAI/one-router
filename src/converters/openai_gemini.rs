@@ -358,7 +358,11 @@ impl OpenAIToGeminiConverter {
 
                     function_declarations.push(FunctionDeclaration {
                         name: tool.function.name.clone(),
-                        description: tool.function.description.clone().unwrap_or_default(),
+                        description: tool
+                            .function
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| super::FALLBACK_TOOL_DESCRIPTION.to_string()),
                         parameters: tool.function.parameters.clone(),
                     });
                 }

@@ -345,7 +345,7 @@ fn convert_openai_tools_to_sdk_with_cache(
                     .unwrap_or("")
                     .is_empty()
                 {
-                    "-"
+                    super::FALLBACK_TOOL_DESCRIPTION
                 } else {
                     tool.function.description.as_deref().unwrap()
                 },

@@ -1,5 +1,5 @@
-//! GET /v1/usage       — 用量汇总（按 hour 或 model 分组）
-//! GET /v1/usage/records — 原始请求记录（分页）
+//! GET /v1/usage       — Usage summary (grouped by hour or model)
+//! GET /v1/usage/records — Raw request records (paginated)
 
 use axum::{
     extract::{Query, State},
@@ -19,11 +19,11 @@ use crate::server::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct UsageQueryParams {
-    /// RFC3339，如 "2026-03-01T00:00:00Z"
+    /// RFC3339, e.g. "2026-03-01T00:00:00Z"
     pub start_time: Option<String>,
     /// RFC3339
     pub end_time: Option<String>,
-    /// "hour"（默认）或 "model"
+    /// "hour" (default) or "model"
     pub group_by: Option<String>,
 }
 
@@ -31,7 +31,7 @@ pub struct UsageQueryParams {
 pub struct RecordsQueryParams {
     pub start_time: Option<String>,
     pub limit: Option<i64>,
-    /// 分页游标：上一页最后一条记录的 id（倒序翻页）
+    /// Pagination cursor: id of the last record on the previous page (reverse order)
     pub before_id: Option<i64>,
 }
 
@@ -48,7 +48,7 @@ pub struct UsageSummaryResponse {
 
 #[derive(Debug, Serialize)]
 pub struct UsageBucket {
-    /// 分组键：hour 模式为 "2026-03-24T15"，model 模式为模型名
+    /// Group key: "2026-03-24T15" in hour mode, model name in model mode
     pub group_key: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -103,7 +103,7 @@ pub async fn get_usage_summary(
 ) -> impl IntoResponse {
     let group_by = params.group_by.as_deref().unwrap_or("hour");
 
-    // 校验 group_by 参数
+    // Validate group_by parameter
     if group_by != "hour" && group_by != "model" {
         return (
             StatusCode::BAD_REQUEST,
@@ -140,8 +140,8 @@ pub async fn get_usage_summary(
         }
     };
 
-    // key_info 中已含预算信息（auth 中间件从数据库取出后存入 Extension）
-    // api_key 在 ApiKeyInfo 中是截断后的字符串，直接使用 key_info 中已有的字段。
+    // key_info already contains budget info (loaded from DB by auth middleware into Extension).
+    // api_key in ApiKeyInfo is the truncated string; use the fields already in key_info.
     let monthly_budget = key_info.monthly_budget;
     let budget_used_mtd = key_info.budget_used_mtd;
 
@@ -191,8 +191,8 @@ pub async fn get_usage_records(
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(100).min(1000);
 
-    // 安全防护：不允许无界查询（既无 start_time 也无 before_id）。
-    // 无限制拉取所有记录可能导致 OOM，强制要求至少提供一个时间或游标边界。
+    // Safety guard: disallow unbounded queries (neither start_time nor before_id).
+    // Pulling all records without limits could cause OOM; require at least one time or cursor boundary.
     if params.start_time.is_none() && params.before_id.is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -204,10 +204,10 @@ pub async fn get_usage_records(
             .into_response();
     }
 
-    // 拉取 start_time 之后的全部记录（不预设行数限制）。
-    // before_id 游标必须在应用层过滤后才能正确判断 has_more。
-    // 注意：DynamoDB 后端的 before_id 游标不生效（id 字段为 None），
-    // 此时仍需配合 start_time 使用。
+    // Fetch all records after start_time (no row limit preset).
+    // The before_id cursor must be filtered at the application layer to correctly determine has_more.
+    // Note: The before_id cursor does not work with DynamoDB backend (id field is None);
+    // in that case start_time must be used instead.
     let all_records = match state
         .database
         .usage()
@@ -228,7 +228,7 @@ pub async fn get_usage_records(
         }
     };
 
-    // before_id 游标过滤（records 按 timestamp DESC，id 单调递增）
+    // before_id cursor filtering (records ordered by timestamp DESC, id monotonically increasing)
     let mut records: Vec<_> = if let Some(before) = params.before_id {
         all_records
             .into_iter()

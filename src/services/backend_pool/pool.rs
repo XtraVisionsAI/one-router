@@ -4,9 +4,8 @@
 //! credentials with load balancing and health checking.
 
 use super::credential::Credential;
-use super::strategy::{LoadBalanceStrategy, RoundRobinState, WeightedState};
+use super::strategy::{LoadBalanceStrategy, RoundRobinState};
 use rand::prelude::*;
-use std::sync::RwLock;
 
 // ============================================================================
 // Pool Configuration
@@ -79,20 +78,15 @@ pub struct CredentialPool<C: Credential> {
     config: PoolConfig,
     /// State for round-robin selection
     rr_state: RoundRobinState,
-    /// State for weighted selection
-    #[allow(dead_code)]
-    weighted_state: RwLock<WeightedState>,
 }
 
 impl<C: Credential> CredentialPool<C> {
     /// Create a new credential pool
     pub fn new(credentials: Vec<C>, config: PoolConfig) -> Self {
-        let weights: Vec<u32> = credentials.iter().map(|c| c.weight()).collect();
         Self {
             credentials,
             config,
             rr_state: RoundRobinState::new(),
-            weighted_state: RwLock::new(WeightedState::new(&weights)),
         }
     }
 
@@ -290,6 +284,7 @@ impl<C: Credential> CredentialPool<C> {
                     "Attempting to recover disabled credential"
                 );
                 cred.enable();
+                cred.reset_health();
                 return Some(cred);
             }
         }

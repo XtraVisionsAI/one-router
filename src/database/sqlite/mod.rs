@@ -235,12 +235,6 @@ impl SqliteBackend {
         .execute(&self.pool)
         .await?;
 
-        // Migration: add budget_history column if it doesn't exist
-        sqlx::query("ALTER TABLE api_keys ADD COLUMN budget_history TEXT")
-            .execute(&self.pool)
-            .await
-            .ok(); // ok() to ignore error when column already exists
-
         Ok(())
     }
 
@@ -480,8 +474,9 @@ impl ApiKeyStore for SqliteBackend {
     async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<bool> {
         let now = unix_now();
 
-        // Atomically increment budget_used and budget_used_mtd, then check if
-        // the new total exceeds monthly_budget (if one is set).
+        // Use a transaction to atomically increment budget and check limit
+        let mut tx = self.pool.begin().await?;
+
         let result = sqlx::query(
             "UPDATE api_keys SET \
              budget_used = budget_used + ?, \
@@ -493,18 +488,20 @@ impl ApiKeyStore for SqliteBackend {
         .bind(amount)
         .bind(now)
         .bind(api_key)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
+            tx.rollback().await?;
             anyhow::bail!("api_key not found: {api_key}");
         }
 
-        // Check if budget is now exceeded
         let row = sqlx::query("SELECT monthly_budget, budget_used FROM api_keys WHERE api_key = ?")
             .bind(api_key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+
+        tx.commit().await?;
 
         if let Some(r) = row {
             let budget: Option<f64> = r.get("monthly_budget");
@@ -715,15 +712,15 @@ impl UsageStore for SqliteBackend {
         end: Option<&str>,
         group_by: &str,
     ) -> Result<Vec<UsageSummaryRow>> {
-        // SQLite strftime: 按小时截断 → "2026-03-24T15"
-        // 按模型 → 直接取 model 字段
+        // SQLite strftime: truncate by hour -> "2026-03-24T15"
+        // By model -> use the model field directly
         let group_expr = if group_by == "model" {
             "model"
         } else {
             "strftime('%Y-%m-%dT%H', timestamp)"
         };
 
-        // 构建动态 SQL（group_expr 是内部常量，无注入风险）
+        // Build dynamic SQL (group_expr is an internal constant, no injection risk)
         // Empty api_key means "all keys" (admin query with no key filter)
         let filter_by_key = !api_key.is_empty();
         let key_clause = if filter_by_key {

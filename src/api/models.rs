@@ -77,10 +77,38 @@ fn get_available_models() -> Vec<Model> {
     ]
 }
 
-pub async fn list_models(State(_state): State<AppState>) -> Json<ModelsResponse> {
+pub async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
+    // Try to load models from database model_mappings; fall back to hardcoded list on failure
+    let models = match state.database.model_mapping().list_mappings().await {
+        Ok(mappings) if !mappings.is_empty() => {
+            let created = current_timestamp();
+            let mut seen = std::collections::HashSet::new();
+            mappings
+                .into_iter()
+                .filter(|m| m.status == "active" && !m.source_model_id.contains('*'))
+                .filter(|m| seen.insert(m.source_model_id.clone()))
+                .map(|m| {
+                    let owned_by = match m.provider.as_str() {
+                        "bedrock" | "anthropic" => "anthropic",
+                        "gemini" => "google",
+                        "openai" => "openai",
+                        _ => "unknown",
+                    };
+                    Model {
+                        id: m.source_model_id,
+                        object: "model".into(),
+                        created,
+                        owned_by: owned_by.into(),
+                    }
+                })
+                .collect()
+        }
+        _ => get_available_models(),
+    };
+
     Json(ModelsResponse {
         object: "list".to_string(),
-        data: get_available_models(),
+        data: models,
     })
 }
 

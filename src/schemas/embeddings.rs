@@ -67,3 +67,83 @@ pub struct EmbeddingResponse {
     pub model: String,
     pub usage: EmbeddingUsage,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embedding_request_serialization() {
+        let req = EmbeddingRequest {
+            model: "text-embedding-3-small".to_string(),
+            input: EmbeddingInput::Single("hello world".to_string()),
+            encoding_format: None,
+            dimensions: Some(256),
+            user: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["model"], "text-embedding-3-small");
+        assert_eq!(json["input"], "hello world");
+        assert_eq!(json["dimensions"], 256);
+        assert!(json.get("encoding_format").is_none());
+        assert!(json.get("user").is_none());
+    }
+
+    #[test]
+    fn test_embedding_request_deserialization_single() {
+        let json = r#"{"model":"text-embedding-3-small","input":"hello"}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, "text-embedding-3-small");
+        match req.input {
+            EmbeddingInput::Single(s) => assert_eq!(s, "hello"),
+            _ => panic!("Expected Single variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_request_deserialization_batch() {
+        let json = r#"{"model":"m","input":["a","b","c"]}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        match req.input {
+            EmbeddingInput::Batch(v) => assert_eq!(v, vec!["a", "b", "c"]),
+            _ => panic!("Expected Batch variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_into_texts_single() {
+        let input = EmbeddingInput::Single("hello".to_string());
+        assert_eq!(input.into_texts(), vec!["hello"]);
+    }
+
+    #[test]
+    fn test_embedding_input_into_texts_batch() {
+        let input = EmbeddingInput::Batch(vec!["a".into(), "b".into()]);
+        assert_eq!(input.into_texts(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_embedding_response_roundtrip() {
+        let resp = EmbeddingResponse {
+            object: "list".to_string(),
+            data: vec![EmbeddingObject {
+                object: "embedding".to_string(),
+                embedding: vec![0.1, 0.2, 0.3],
+                index: 0,
+            }],
+            model: "text-embedding-3-small".to_string(),
+            usage: EmbeddingUsage {
+                prompt_tokens: 5,
+                total_tokens: 5,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: EmbeddingResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.object, "list");
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].embedding, vec![0.1, 0.2, 0.3]);
+        assert_eq!(parsed.data[0].index, 0);
+        assert_eq!(parsed.usage.prompt_tokens, 5);
+        assert_eq!(parsed.usage.total_tokens, 5);
+    }
+}
