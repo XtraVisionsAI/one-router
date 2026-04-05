@@ -296,11 +296,6 @@ async fn init_bedrock_from_backends(
         credentials.push(aws_cred);
     }
 
-    if clients.len() == 1 {
-        let (_, client) = clients.into_iter().next().unwrap();
-        return Ok(Some(BedrockService::new(client)));
-    }
-
     let pool = crate::services::CredentialPool::new(credentials, pool_config);
     tracing::info!(
         count = clients.len(),
