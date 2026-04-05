@@ -117,18 +117,20 @@ impl IntoResponse for ApiError {
 // Streaming Response Type
 // ============================================================================
 
+/// Type alias for SSE event streams used across all handlers.
+type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+
 /// Enum to represent either a JSON response or an SSE stream
 pub enum MessageApiResponse {
     Json(Json<MessageResponse>),
-    #[allow(clippy::type_complexity)]
-    Stream(Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>),
+    Stream(SseStream),
 }
 
 impl IntoResponse for MessageApiResponse {
     fn into_response(self) -> Response {
         match self {
             MessageApiResponse::Json(json) => json.into_response(),
-            MessageApiResponse::Stream(sse) => sse.into_response(),
+            MessageApiResponse::Stream(stream) => Sse::new(stream).into_response(),
         }
     }
 }
@@ -196,8 +198,27 @@ pub async fn create_message(
     let filtered_request =
         crate::converters::capability_filter::apply_capabilities(&request, effective_caps);
 
-    match resolved.provider.as_str() {
-        "gemini" => handle_gemini_request(&state, &filtered_request, &request_id, start_time).await,
+    // Build usage tracking context for handlers
+    let stream_usage = Arc::new(tokio::sync::Mutex::new(StreamUsage::default()));
+    let usage_ctx = UsageContext {
+        tracker: state.usage_tracker.clone(),
+        key_info: key_info.clone(),
+        model: request.model.clone(),
+        request_id: request_id.clone(),
+        stream_usage: stream_usage.clone(),
+    };
+
+    let result = match resolved.provider.as_str() {
+        "gemini" => {
+            handle_gemini_request(
+                &state,
+                &filtered_request,
+                &request_id,
+                &usage_ctx,
+                start_time,
+            )
+            .await
+        }
         "anthropic" => {
             handle_anthropic_passthrough(
                 &state,
@@ -205,6 +226,7 @@ pub async fn create_message(
                 &resolved.target_model_id,
                 &request_id,
                 &headers,
+                &usage_ctx,
                 start_time,
             )
             .await
@@ -215,6 +237,7 @@ pub async fn create_message(
                 &filtered_request,
                 &resolved.target_model_id,
                 &request_id,
+                &usage_ctx,
                 start_time,
             )
             .await
@@ -227,11 +250,96 @@ pub async fn create_message(
                 &request_id,
                 &state.prompt_cache_mode,
                 key_info.cache_ttl.as_deref(),
+                &usage_ctx,
                 start_time,
             )
             .await
         }
+    };
+
+    // Record usage for non-streaming responses; wrap streams for deferred recording
+    match result {
+        Ok(MessageApiResponse::Json(ref json_resp)) => {
+            let usage = json_resp.usage.clone();
+            let ctx = usage_ctx;
+            tokio::spawn(async move {
+                if let Err(e) = ctx
+                    .tracker
+                    .record_usage(&ctx.key_info, &ctx.request_id, &ctx.model, &usage, true)
+                    .await
+                {
+                    tracing::warn!(error = %e, "Failed to record usage");
+                }
+            });
+            result
+        }
+        Ok(MessageApiResponse::Stream(stream)) => {
+            let wrapped = wrap_stream_with_usage_recording(
+                stream,
+                stream_usage,
+                state.usage_tracker.clone(),
+                key_info.clone(),
+                request.model.clone(),
+                request_id,
+            );
+            Ok(MessageApiResponse::Stream(wrapped))
+        }
+        Err(_) => result,
     }
+}
+
+/// Shared state for streaming usage — handlers write, entry wrapper reads.
+#[derive(Debug, Default, Clone)]
+struct StreamUsage {
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_creation_input_tokens: Option<i32>,
+    cache_read_input_tokens: Option<i32>,
+}
+
+/// Context for recording usage, passed to handlers for streaming usage tracking.
+#[derive(Clone)]
+struct UsageContext {
+    tracker: Arc<crate::services::UsageTracker>,
+    key_info: ApiKeyInfo,
+    model: String,
+    request_id: String,
+    /// Shared state for streaming usage — handlers write, entry wrapper reads.
+    stream_usage: Arc<tokio::sync::Mutex<StreamUsage>>,
+}
+
+/// Wrap an SSE stream so that after the inner stream completes, usage is
+/// read from the shared `StreamUsage` state and recorded via the tracker.
+fn wrap_stream_with_usage_recording(
+    inner: SseStream,
+    usage: Arc<tokio::sync::Mutex<StreamUsage>>,
+    tracker: Arc<crate::services::UsageTracker>,
+    key_info: ApiKeyInfo,
+    model: String,
+    request_id: String,
+) -> SseStream {
+    use futures::StreamExt;
+    let stream = async_stream::stream! {
+        let mut inner = inner;
+        while let Some(item) = inner.next().await {
+            yield item;
+        }
+        let u = usage.lock().await;
+        let anthropic_usage = crate::schemas::anthropic::Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+            cache_read_input_tokens: u.cache_read_input_tokens,
+        };
+        drop(u);
+        if let Err(e) = tracker
+            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true)
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to record streaming usage");
+        }
+    };
+    Box::pin(stream)
 }
 
 /// Handle request using Bedrock backend
@@ -243,6 +351,7 @@ async fn handle_bedrock_request(
     request_id: &str,
     cache_mode: &crate::converters::cache_transform::PromptCacheMode,
     key_cache_ttl: Option<&str>,
+    usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     let bedrock = state.bedrock.as_ref().ok_or_else(|| {
@@ -277,7 +386,7 @@ async fn handle_bedrock_request(
                     tracing::error!(error = %e, "Bedrock Mantle streaming failed");
                     ApiError::from_bedrock_error(&e)
                 })?;
-            return Ok(MessageApiResponse::Stream(Sse::new(Box::pin(sse_stream))));
+            return Ok(MessageApiResponse::Stream(Box::pin(sse_stream)));
         }
 
         let openai_resp_json = bedrock
@@ -327,6 +436,15 @@ async fn handle_bedrock_request(
                     .await
                     .map_err(|e| ApiError::internal_error(e.to_string()))?;
                 if request.stream {
+                    {
+                        let mut u = usage_ctx.stream_usage.lock().await;
+                        u.input_tokens = response.usage.input_tokens;
+                        u.output_tokens = response.usage.output_tokens;
+                        u.cache_creation_input_tokens =
+                            response.usage.cache_creation_input_tokens;
+                        u.cache_read_input_tokens =
+                            response.usage.cache_read_input_tokens;
+                    }
                     Ok(MessageApiResponse::Stream(response_to_sse_stream(response)))
                 } else {
                     Ok(MessageApiResponse::Json(Json(response)))
@@ -350,7 +468,7 @@ async fn handle_bedrock_request(
         let cred_name = stream_response.credential_name.clone();
         let sse_stream = stream_response.into_sse_stream();
         bedrock.record_success(&cred_name);
-        return Ok(MessageApiResponse::Stream(Sse::new(sse_stream)));
+        return Ok(MessageApiResponse::Stream(sse_stream));
     }
 
     // Non-streaming via InvokeModel
@@ -385,6 +503,7 @@ async fn handle_anthropic_passthrough(
     target_model_id: &str,
     request_id: &str,
     client_headers: &HeaderMap,
+    usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     let pool = state.anthropic_pool.as_ref().ok_or_else(|| {
@@ -466,8 +585,14 @@ async fn handle_anthropic_passthrough(
     }
 
     if request.stream {
-        let sse_stream =
-            proxy_anthropic_sse_stream(resp, request_id, svc.clone(), credential_name).await?;
+        let sse_stream = proxy_anthropic_sse_stream(
+            resp,
+            request_id,
+            svc.clone(),
+            credential_name,
+            usage_ctx.clone(),
+        )
+        .await?;
         return Ok(MessageApiResponse::Stream(sse_stream));
     }
 
@@ -498,14 +623,18 @@ async fn proxy_anthropic_sse_stream(
     request_id: &str,
     svc: Arc<crate::services::PassthroughService>,
     credential_name: String,
-) -> Result<Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, ApiError>
-{
+    usage_ctx: UsageContext,
+) -> Result<SseStream, ApiError> {
     let req_id = request_id.to_string();
 
     let stream = async_stream::stream! {
         let mut response = upstream;
         let mut buffer = String::new();
         let mut stream_error = false;
+        let mut input_tokens: i32 = 0;
+        let mut output_tokens: i32 = 0;
+        let mut cache_creation: Option<i32> = None;
+        let mut cache_read: Option<i32> = None;
 
         loop {
             match response.chunk().await {
@@ -531,11 +660,39 @@ async fn proxy_anthropic_sse_stream(
                             }
                         }
 
-                        if let Some(data) = data_line {
+                        if let Some(ref data) = data_line {
                             if data == "[DONE]" {
                                 break;
                             }
-                            let mut sse_event = Event::default().data(data);
+
+                            // Extract usage from SSE events
+                            if let Some(ref evt) = event_type {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                                    match evt.as_str() {
+                                        "message_start" => {
+                                            if let Some(usage) = parsed.pointer("/message/usage") {
+                                                if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+                                                    input_tokens = v as i32;
+                                                }
+                                                if let Some(v) = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
+                                                    cache_read = Some(v as i32);
+                                                }
+                                                if let Some(v) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) {
+                                                    cache_creation = Some(v as i32);
+                                                }
+                                            }
+                                        }
+                                        "message_delta" => {
+                                            if let Some(v) = parsed.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
+                                                output_tokens = v as i32;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
+                            let mut sse_event = Event::default().data(data.clone());
                             if let Some(evt) = event_type {
                                 sse_event = sse_event.event(evt);
                             }
@@ -560,9 +717,17 @@ async fn proxy_anthropic_sse_stream(
         } else {
             svc.record_success(&credential_name);
         }
+
+        {
+            let mut u = usage_ctx.stream_usage.lock().await;
+            u.input_tokens = input_tokens;
+            u.output_tokens = output_tokens;
+            u.cache_creation_input_tokens = cache_creation;
+            u.cache_read_input_tokens = cache_read;
+        }
     };
 
-    Ok(Sse::new(Box::pin(stream)))
+    Ok(Box::pin(stream))
 }
 
 /// Handle request using OpenAI backend (converts Anthropic → OpenAI format)
@@ -571,6 +736,7 @@ async fn handle_openai_backend(
     request: &MessageRequest,
     target_model_id: &str,
     request_id: &str,
+    usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     use crate::converters::anthropic_openai::OpenAIToAnthropicStreamState;
@@ -639,6 +805,7 @@ async fn handle_openai_backend(
         let original_model = request.model.clone();
         let svc_clone = svc.clone();
         let cred_name = credential_name.clone();
+        let stream_usage = usage_ctx.stream_usage.clone();
 
         let stream = async_stream::stream! {
             let mut response = resp;
@@ -646,6 +813,10 @@ async fn handle_openai_backend(
             let mut stream_error = false;
             let response_converter = crate::converters::anthropic_openai::AnthropicToOpenAIConverter::new();
             let mut conv_state = OpenAIToAnthropicStreamState::default();
+            let mut input_tokens: i32 = 0;
+            let mut output_tokens: i32 = 0;
+            let mut cache_creation: Option<i32> = None;
+            let mut cache_read: Option<i32> = None;
             // We don't have usage info at stream start for OpenAI→Anthropic path
             let _ = original_model;
 
@@ -668,8 +839,32 @@ async fn handle_openai_backend(
                                 // Parse the OpenAI chunk and convert to Anthropic events
                                 if let Ok(oai_chunk) = serde_json::from_str::<crate::schemas::openai::ChatCompletionChunk>(data) {
                                     let events = response_converter.convert_stream_chunk_to_anthropic(&oai_chunk, &mut conv_state);
-                                    for (evt_type, evt_data) in events {
-                                        yield Ok(Event::default().event(evt_type).data(evt_data));
+                                    for (evt_type, evt_data) in &events {
+                                        // Extract usage from converted Anthropic events
+                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(evt_data) {
+                                            match evt_type.as_str() {
+                                                "message_start" => {
+                                                    if let Some(usage) = parsed.pointer("/message/usage") {
+                                                        if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+                                                            input_tokens = v as i32;
+                                                        }
+                                                        if let Some(v) = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
+                                                            cache_read = Some(v as i32);
+                                                        }
+                                                        if let Some(v) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) {
+                                                            cache_creation = Some(v as i32);
+                                                        }
+                                                    }
+                                                }
+                                                "message_delta" => {
+                                                    if let Some(v) = parsed.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
+                                                        output_tokens = v as i32;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        yield Ok(Event::default().event(evt_type.clone()).data(evt_data.clone()));
                                     }
                                 }
                             }
@@ -692,9 +887,17 @@ async fn handle_openai_backend(
             } else {
                 svc_clone.record_success(&cred_name);
             }
+
+            {
+                let mut u = stream_usage.lock().await;
+                u.input_tokens = input_tokens;
+                u.output_tokens = output_tokens;
+                u.cache_creation_input_tokens = cache_creation;
+                u.cache_read_input_tokens = cache_read;
+            }
         };
 
-        return Ok(MessageApiResponse::Stream(Sse::new(Box::pin(stream))));
+        return Ok(MessageApiResponse::Stream(Box::pin(stream)));
     }
 
     // Non-streaming: read body, convert OpenAI → Anthropic response
@@ -733,6 +936,7 @@ async fn handle_gemini_request(
     state: &AppState,
     request: &MessageRequest,
     request_id: &str,
+    usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     let gemini_pool = state
@@ -768,6 +972,7 @@ async fn handle_gemini_request(
             &request.model,
             pool_clone,
             instance_name,
+            usage_ctx.clone(),
         )
         .await?;
         return Ok(MessageApiResponse::Stream(sse_stream));
@@ -805,6 +1010,7 @@ async fn handle_gemini_request(
 }
 
 /// Create a streaming response using SSE with Gemini API
+#[allow(clippy::too_many_arguments)]
 async fn create_gemini_streaming_response(
     gemini_service: std::sync::Arc<crate::services::GeminiService>,
     gemini_model: &str,
@@ -817,8 +1023,8 @@ async fn create_gemini_streaming_response(
         >,
     >,
     instance_name: String,
-) -> Result<Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, ApiError>
-{
+    usage_ctx: UsageContext,
+) -> Result<SseStream, ApiError> {
     let (mut stream_response, credential_name) = gemini_service
         .generate_content_stream(gemini_model, &gemini_request)
         .await
@@ -983,9 +1189,15 @@ async fn create_gemini_streaming_response(
             stream_error = stream_error,
             "Gemini streaming response completed"
         );
+
+        {
+            let mut u = usage_ctx.stream_usage.lock().await;
+            u.input_tokens = total_input_tokens;
+            u.output_tokens = total_output_tokens;
+        }
     };
 
-    Ok(Sse::new(Box::pin(stream)))
+    Ok(Box::pin(stream))
 }
 
 // ============================================================================
@@ -1193,10 +1405,7 @@ fn print_request_prompts(request_id: &str, request: &MessageRequest) {
 /// but the caller requested `stream: true`.  The complete response is wrapped in
 /// the standard Anthropic SSE event sequence so the client receives a well-formed
 /// streaming response without an extra Bedrock round-trip.
-#[allow(clippy::type_complexity)]
-fn response_to_sse_stream(
-    response: MessageResponse,
-) -> Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+fn response_to_sse_stream(response: MessageResponse) -> SseStream {
     let stream = async_stream::stream! {
         let message_id = response.id.clone();
         let model = response.model.clone();
@@ -1296,7 +1505,7 @@ fn response_to_sse_stream(
         ));
     };
 
-    Sse::new(Box::pin(stream))
+    Box::pin(stream)
 }
 
 // ============================================================================
