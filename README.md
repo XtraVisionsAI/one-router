@@ -27,7 +27,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Image Generation** — OpenAI-compatible `/v1/images/generations` routed to OpenAI DALL-E, AWS Bedrock (Stability AI SDXL, Amazon Nova Canvas, Titan Image Generator), or Google Gemini
 - **Usage Query API** — query your token usage and cost history via `GET /v1/usage` (aggregated, grouped by hour or model) and `GET /v1/usage/records` (paginated raw records)
 - **Smart Model Mapping** — maps model names across providers (e.g. `gpt-4o` -> Claude Sonnet, `claude-*` -> Bedrock), with exact match, wildcard, and configurable priority
-- **Credential Pool & Load Balancing** — manage multiple backend credentials with round-robin, weighted, random, or failover strategies
+- **Backend Pool & Load Balancing** — each backend record is an independent service instance; multiple instances of the same type are load-balanced with round-robin, weighted, random, or failover strategies
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
 - **API Key Management** — issue API keys with per-key rate limits, budget caps, and service tiers
 - **Streaming Support** — full SSE streaming for both OpenAI and Anthropic protocols
@@ -495,7 +495,7 @@ src/
 ├── schemas/             # Request/response schemas (Anthropic, OpenAI, Bedrock, Gemini, Embeddings, Rerank, Images)
 ├── server/              # App bootstrap, routing, state
 ├── services/            # Business logic
-│   ├── backend_pool/    # Credential pool & load balancing
+│   ├── backend_pool/    # Backend instance pool & load balancing
 │   ├── ptc/             # Programmatic Tool Calling (sandboxed execution)
 │   ├── bedrock.rs       # AWS Bedrock service (InvokeModel for Claude; Converse for non-Claude /v1/chat/completions; Bedrock Mantle for non-Claude /v1/messages)
 │   ├── gemini.rs        # Google Gemini service
