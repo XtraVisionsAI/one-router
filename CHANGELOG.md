@@ -1,3 +1,10 @@
+## v0.11.1 (2026-04-05)
+
+### Fix
+
+- **app**: decrypt backend configs at startup before JSON parsing
+- apply capability_filter to all /v1/messages paths, remove dead code
+
 ## v0.11.0 (2026-04-04)
 
 ### Feat
