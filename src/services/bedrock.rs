@@ -78,8 +78,8 @@ impl BedrockService {
         self.pool.record_failure(name);
     }
 
-    pub fn health_check(&self) -> bool {
-        true
+    pub fn pool_stats(&self) -> crate::services::backend_pool::PoolStats {
+        self.pool.stats()
     }
 
     pub async fn converse(&self, request: ConverseRequest) -> Result<ConverseOutput, BedrockError> {

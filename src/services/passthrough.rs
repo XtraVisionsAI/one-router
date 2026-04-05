@@ -141,8 +141,8 @@ impl PassthroughService {
         self.credential_pool.record_failure(credential_name)
     }
 
-    pub fn health_check(&self) -> bool {
-        self.credential_pool.healthy_count() > 0
+    pub fn pool_stats(&self) -> crate::services::backend_pool::PoolStats {
+        self.credential_pool.stats()
     }
 
     /// Forward a request to the upstream API.

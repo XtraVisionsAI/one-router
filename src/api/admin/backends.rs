@@ -32,16 +32,18 @@ pub struct BackendSummary {
     pub backend_type: String,
     pub enabled: bool,
     pub priority: i32,
+    pub health_status: String,
     pub config_summary: Value,
 }
 
 impl BackendSummary {
-    fn from_record(r: &BackendRecord) -> Self {
+    fn from_record(r: &BackendRecord, health: &str) -> Self {
         Self {
             name: r.name.clone(),
             backend_type: r.backend_type.clone(),
             enabled: r.enabled,
             priority: r.priority,
+            health_status: health.to_string(),
             config_summary: make_config_summary(&r.backend_type, &r.config),
         }
     }
@@ -94,6 +96,65 @@ fn make_config_summary(backend_type: &str, config: &str) -> Value {
     }
 }
 
+/// Get the live health status for a backend type from in-memory pool stats.
+fn backend_health_status(state: &AppState, backend_type: &str) -> String {
+    match backend_type {
+        "bedrock" => match &state.bedrock {
+            Some(svc) => {
+                let stats = svc.pool_stats();
+                if stats.healthy == stats.total {
+                    "healthy".to_string()
+                } else if stats.healthy > 0 {
+                    format!("degraded ({}/{})", stats.healthy, stats.total)
+                } else {
+                    "unhealthy".to_string()
+                }
+            }
+            None => "not configured".to_string(),
+        },
+        "gemini" => match &state.gemini_service {
+            Some(svc) => {
+                let stats = svc.pool_stats();
+                if stats.healthy == stats.total {
+                    "healthy".to_string()
+                } else if stats.healthy > 0 {
+                    format!("degraded ({}/{})", stats.healthy, stats.total)
+                } else {
+                    "unhealthy".to_string()
+                }
+            }
+            None => "not configured".to_string(),
+        },
+        "anthropic" => match &state.anthropic_service {
+            Some(svc) => {
+                let stats = svc.pool_stats();
+                if stats.healthy == stats.total {
+                    "healthy".to_string()
+                } else if stats.healthy > 0 {
+                    format!("degraded ({}/{})", stats.healthy, stats.total)
+                } else {
+                    "unhealthy".to_string()
+                }
+            }
+            None => "not configured".to_string(),
+        },
+        "openai" => match &state.openai_service {
+            Some(svc) => {
+                let stats = svc.pool_stats();
+                if stats.healthy == stats.total {
+                    "healthy".to_string()
+                } else if stats.healthy > 0 {
+                    format!("degraded ({}/{})", stats.healthy, stats.total)
+                } else {
+                    "unhealthy".to_string()
+                }
+            }
+            None => "not configured".to_string(),
+        },
+        _ => "unknown".to_string(),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct BackendListResponse {
     pub object: &'static str,
@@ -133,7 +194,13 @@ fn default_true() -> bool {
 pub async fn list_backends(State(state): State<AppState>) -> impl IntoResponse {
     match state.database.backends().list_all_backends().await {
         Ok(records) => {
-            let data = records.iter().map(BackendSummary::from_record).collect();
+            let data = records
+                .iter()
+                .map(|r| {
+                    let health = backend_health_status(&state, &r.backend_type);
+                    BackendSummary::from_record(r, &health)
+                })
+                .collect();
             (
                 StatusCode::OK,
                 Json(BackendListResponse {
@@ -202,11 +269,14 @@ pub async fn create_backend(
     };
 
     match state.database.backends().upsert_backend(&record).await {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(BackendSummary::from_record(&record)),
-        )
-            .into_response(),
+        Ok(()) => {
+            let health = backend_health_status(&state, &record.backend_type);
+            (
+                StatusCode::CREATED,
+                Json(BackendSummary::from_record(&record, &health)),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to create backend");
             (
@@ -279,7 +349,14 @@ pub async fn update_backend(
     };
 
     match state.database.backends().upsert_backend(&record).await {
-        Ok(()) => (StatusCode::OK, Json(BackendSummary::from_record(&record))).into_response(),
+        Ok(()) => {
+            let health = backend_health_status(&state, &record.backend_type);
+            (
+                StatusCode::OK,
+                Json(BackendSummary::from_record(&record, &health)),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to update backend");
             (
@@ -344,7 +421,14 @@ pub async fn toggle_backend(
     };
 
     match state.database.backends().upsert_backend(&record).await {
-        Ok(()) => (StatusCode::OK, Json(BackendSummary::from_record(&record))).into_response(),
+        Ok(()) => {
+            let health = backend_health_status(&state, &record.backend_type);
+            (
+                StatusCode::OK,
+                Json(BackendSummary::from_record(&record, &health)),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to toggle backend");
             (
