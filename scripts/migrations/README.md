@@ -15,6 +15,8 @@ The application auto-applies all migrations on startup. These scripts are for:
 ```
 scripts/migrations/
 ├── run.sh                                      # Batch runner (all backends)
+├── sqlite/
+│   └── 001_model_mapping_index.sql             # source_model_id index
 ├── postgres/
 │   └── 001_model_mapping_pattern_index.sql     # text_pattern_ops index
 └── dynamodb/
@@ -29,6 +31,10 @@ All migrations are **idempotent** — safe to run multiple times.
 ### Run all migrations for a backend
 
 ```bash
+# SQLite
+./scripts/migrations/run.sh --backend sqlite \
+    --database-url ./data/gateway.db
+
 # PostgreSQL
 ./scripts/migrations/run.sh --backend postgres \
     --database-url "postgres://user:pass@host:5432/one_router"
@@ -36,14 +42,14 @@ All migrations are **idempotent** — safe to run multiple times.
 # DynamoDB
 ./scripts/migrations/run.sh --backend dynamodb \
     --region us-east-1 --profile production
-
-# SQLite (no-op — auto-migrates on startup)
-./scripts/migrations/run.sh --backend sqlite
 ```
 
 ### Run a single migration
 
 ```bash
+# SQLite — run one SQL file directly
+sqlite3 ./data/gateway.db < scripts/migrations/sqlite/001_model_mapping_index.sql
+
 # PostgreSQL — run one SQL file directly
 psql "$DATABASE_URL" -f scripts/migrations/postgres/001_model_mapping_pattern_index.sql
 
@@ -63,6 +69,15 @@ psql "$DATABASE_URL" -f scripts/migrations/postgres/001_model_mapping_pattern_in
 
 ## Migration details
 
+### SQLite 001: Model mapping index
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_model_mappings_source
+    ON model_mappings(source_model_id);
+```
+
+Accelerates wildcard model mapping lookups (`LIKE 'claude-%'`).
+
 ### PostgreSQL 001: Model mapping pattern index
 
 ```sql
@@ -70,7 +85,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_model_mappings_source
     ON model_mappings (source_model_id text_pattern_ops);
 ```
 
-Accelerates wildcard model mapping lookups (`LIKE 'claude-*'`). Uses `CONCURRENTLY` to avoid locking the table.
+Same purpose as SQLite 001, with `text_pattern_ops` for PostgreSQL LIKE optimization and `CONCURRENTLY` to avoid locking.
 
 ### DynamoDB 001: API keys name GSI
 
@@ -85,8 +100,9 @@ The GSI builds asynchronously. The script waits for ACTIVE status by default. Th
 ## Adding new migrations
 
 1. Create a new file with the next sequence number:
+   - SQLite: `scripts/migrations/sqlite/NNN_description.sql`
    - PostgreSQL: `scripts/migrations/postgres/NNN_description.sql`
    - DynamoDB: `scripts/migrations/dynamodb/NNN_description.sh`
 2. Ensure the migration is **idempotent** (use `IF NOT EXISTS`, check-before-create, etc.)
-3. Add a matching inline migration in the Rust code (`database/{backend}/migrations.rs`) so new deployments get the change on first startup
+3. Add a matching inline migration in the Rust code (`database/{backend}/mod.rs` or `migrations.rs`) so new deployments get the change on first startup
 4. Update this README

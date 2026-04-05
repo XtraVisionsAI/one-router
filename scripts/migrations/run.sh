@@ -7,11 +7,13 @@ set -euo pipefail
 # Each migration is idempotent and safe to re-run.
 #
 # Usage:
-#   ./scripts/migrations/run.sh --backend <postgres|dynamodb> [OPTIONS]
+#   ./scripts/migrations/run.sh --backend <sqlite|postgres|dynamodb> [OPTIONS]
 #
 # Options:
-#   --backend BACKEND     Required. One of: postgres, dynamodb
-#                         (SQLite migrations run automatically on app startup)
+#   --backend BACKEND     Required. One of: sqlite, postgres, dynamodb
+#
+# SQLite options:
+#   --database-url PATH   SQLite database file path (default: ./data/gateway.db)
 #
 # PostgreSQL options:
 #   --database-url URL    PostgreSQL connection string
@@ -31,6 +33,10 @@ set -euo pipefail
 #   # Run all DynamoDB migrations
 #   ./scripts/migrations/run.sh --backend dynamodb \
 #       --region us-west-2 --profile production
+#
+#   # SQLite
+#   ./scripts/migrations/run.sh --backend sqlite \
+#       --database-url ./data/gateway.db
 #
 #   # Use DATABASE_URL env var
 #   DATABASE_URL="postgres://..." ./scripts/migrations/run.sh --backend postgres
@@ -142,17 +148,54 @@ run_dynamodb() {
     [[ $failed -eq 0 ]] || exit 1
 }
 
+# ─── Run SQLite migrations ────────────────────────────────────────────────
+run_sqlite() {
+    local db_path="${DATABASE_URL:-./data/gateway.db}"
+    # Strip sqlite:// prefix if present
+    db_path="${db_path#sqlite://}"
+
+    if [[ ! -f "$db_path" ]]; then
+        echo "Error: SQLite database not found at ${db_path}" >&2
+        echo "Specify path with --database-url or DATABASE_URL env var." >&2
+        exit 1
+    fi
+
+    local migration_dir="${SCRIPT_DIR}/sqlite"
+    local count=0
+    local failed=0
+
+    echo "=== SQLite Migrations ==="
+    echo "Database: ${db_path}"
+    echo ""
+
+    for sql_file in "$migration_dir"/*.sql; do
+        [[ -f "$sql_file" ]] || continue
+        local name
+        name="$(basename "$sql_file")"
+        echo -n "  Running ${name}... "
+
+        if sqlite3 "$db_path" < "$sql_file" 2>/dev/null; then
+            echo "OK"
+            ((count++))
+        else
+            echo "FAILED"
+            ((failed++))
+            sqlite3 "$db_path" < "$sql_file" 2>&1 | tail -5 || true
+        fi
+    done
+
+    echo ""
+    echo "Completed: ${count} succeeded, ${failed} failed."
+    [[ $failed -eq 0 ]] || exit 1
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────
 case "$BACKEND" in
+    sqlite)    run_sqlite ;;
     postgres)  run_postgres ;;
     dynamodb)  run_dynamodb ;;
-    sqlite)
-        echo "SQLite migrations run automatically on application startup."
-        echo "No manual migration needed."
-        exit 0
-        ;;
     *)
-        echo "Error: Unknown backend '${BACKEND}'. Use: postgres, dynamodb, sqlite" >&2
+        echo "Error: Unknown backend '${BACKEND}'. Use: sqlite, postgres, dynamodb" >&2
         exit 1
         ;;
 esac

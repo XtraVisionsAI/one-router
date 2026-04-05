@@ -159,6 +159,14 @@ impl SqliteBackend {
         // Migration: handle old table with single-column PK
         self.migrate_model_mappings().await?;
 
+        // Index for wildcard model mapping lookups (LIKE queries)
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_model_mappings_source \
+             ON model_mappings(source_model_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Migration: add capabilities column if not already present
         sqlx::query("ALTER TABLE model_mappings ADD COLUMN capabilities TEXT")
             .execute(&self.pool)
