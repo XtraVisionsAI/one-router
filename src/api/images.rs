@@ -84,11 +84,15 @@ async fn handle_openai_images(
     request: &ImageGenerationRequest,
     target_model_id: &str,
 ) -> Result<ImageGenerationResponse, OpenAIApiError> {
-    let svc = state.openai_service.as_ref().ok_or_else(|| {
+    let pool = state.openai_pool.as_ref().ok_or_else(|| {
         OpenAIApiError::internal_error(
             "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
         )
     })?;
+    let instance = pool
+        .get_next()
+        .ok_or_else(|| OpenAIApiError::internal_error("No healthy OpenAI backend available"))?;
+    let svc = &instance.service;
 
     // Replace model with resolved target, forward everything else as-is
     let mut body = serde_json::to_value(request)
@@ -157,11 +161,15 @@ async fn handle_gemini_images(
         ));
     }
 
-    let svc = state.gemini_service.as_ref().ok_or_else(|| {
+    let gemini_pool = state.gemini_pool.as_ref().ok_or_else(|| {
         OpenAIApiError::internal_error(
             "Gemini backend is not configured. Add a 'gemini' entry to the backends table.",
         )
     })?;
+    let gemini_instance = gemini_pool
+        .get_next()
+        .ok_or_else(|| OpenAIApiError::internal_error("No healthy Gemini backend available"))?;
+    let svc = &gemini_instance.service;
 
     let body = json!({
         "contents": [{

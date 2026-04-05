@@ -19,7 +19,7 @@
   const isEdit = computed(() => !!props.existing)
   const title = computed(() => (isEdit.value ? `Edit Backend: ${props.existing!.name}` : 'Add Backend'))
 
-  const form = ref({ name: '', backend_type: 'bedrock', priority: 0 })
+  const form = ref({ name: '', backend_type: 'bedrock', priority: 0, weight: 1 })
   const saving = ref(false)
   const loadingConfig = ref(false)
   const configLoaded = ref(false)
@@ -68,7 +68,8 @@
         form.value = {
           name: props.existing?.name ?? '',
           backend_type: props.existing?.backend_type ?? 'bedrock',
-          priority: props.existing?.priority ?? 0
+          priority: props.existing?.priority ?? 0,
+          weight: props.existing?.weight ?? 1
         }
         resetConfigFields()
         // Pool settings are stored as separate DB fields (not encrypted),
@@ -182,6 +183,7 @@
       name: form.value.name,
       backend_type: form.value.backend_type,
       priority: form.value.priority,
+      weight: form.value.weight,
       enabled: props.existing?.enabled ?? true,
       strategy: pool.value.strategy,
       max_failures: pool.value.max_failures,
@@ -224,6 +226,9 @@
       </NFormItem>
       <NFormItem label="Priority" class="w-28">
         <NInputNumber v-model:value="form.priority" :min="-999" :max="999" />
+      </NFormItem>
+      <NFormItem label="Weight" class="w-24">
+        <NInputNumber v-model:value="form.weight" :min="1" :max="100" class="w-full" />
       </NFormItem>
     </div>
 

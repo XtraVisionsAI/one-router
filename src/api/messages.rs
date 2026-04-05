@@ -28,7 +28,7 @@ use crate::schemas::anthropic::{
     SystemContent, ToolResultValue,
 };
 use crate::server::state::AppState;
-use crate::services::BedrockError;
+use crate::services::{BedrockError, Credential};
 use crate::utils::truncate_str;
 
 // ============================================================================
@@ -387,13 +387,15 @@ async fn handle_anthropic_passthrough(
     client_headers: &HeaderMap,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
-    use crate::services::PassthroughService;
-
-    let svc: &Arc<PassthroughService> = state.anthropic_service.as_ref().ok_or_else(|| {
+    let pool = state.anthropic_pool.as_ref().ok_or_else(|| {
         ApiError::service_unavailable(
             "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
         )
     })?;
+    let instance = pool
+        .get_next()
+        .ok_or_else(|| ApiError::service_unavailable("No healthy Anthropic backend available"))?;
+    let svc = &instance.service;
 
     // Serialize the request and replace model with the resolved target model id
     let mut body_value =
@@ -555,13 +557,16 @@ async fn handle_openai_backend(
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     use crate::converters::anthropic_openai::OpenAIToAnthropicStreamState;
-    use crate::services::PassthroughService;
 
-    let svc: &Arc<PassthroughService> = state.openai_service.as_ref().ok_or_else(|| {
+    let pool = state.openai_pool.as_ref().ok_or_else(|| {
         ApiError::service_unavailable(
             "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
         )
     })?;
+    let instance = pool
+        .get_next()
+        .ok_or_else(|| ApiError::service_unavailable("No healthy OpenAI backend available"))?;
+    let svc = &instance.service;
 
     // Convert Anthropic request to OpenAI format
     let converter = AnthropicToOpenAIConverter::new();
@@ -706,10 +711,14 @@ async fn handle_gemini_request(
     request_id: &str,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
-    let gemini_service = state
-        .gemini_service
+    let gemini_pool = state
+        .gemini_pool
         .as_ref()
         .ok_or_else(|| ApiError::internal_error("Gemini service not available"))?;
+    let gemini_instance = gemini_pool
+        .get_next()
+        .ok_or_else(|| ApiError::service_unavailable("No healthy Gemini backend available"))?;
+    let gemini_service = &gemini_instance.service;
 
     // Convert Anthropic request to Gemini format
     let converter = AnthropicToGeminiConverter::new();
@@ -725,12 +734,16 @@ async fn handle_gemini_request(
 
     // Handle streaming vs non-streaming
     if request.stream {
+        let instance_name = gemini_instance.name().to_string();
+        let pool_clone = gemini_pool.clone();
         let sse_stream = create_gemini_streaming_response(
             gemini_service.clone(),
             &gemini_model,
             gemini_request,
             request_id,
             &request.model,
+            pool_clone,
+            instance_name,
         )
         .await?;
         return Ok(MessageApiResponse::Stream(sse_stream));
@@ -774,6 +787,12 @@ async fn create_gemini_streaming_response(
     gemini_request: crate::schemas::gemini::GeminiRequest,
     request_id: &str,
     original_model: &str,
+    pool: Arc<
+        crate::services::CredentialPool<
+            crate::services::BackendInstance<crate::services::GeminiService>,
+        >,
+    >,
+    instance_name: String,
 ) -> Result<Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, ApiError>
 {
     let (mut stream_response, credential_name) = gemini_service
@@ -920,11 +939,13 @@ async fn create_gemini_streaming_response(
         });
         yield Ok(Event::default().event("message_stop").data(message_stop_data.to_string()));
 
-        // Record success or failure for the credential
+        // Record success or failure for the credential (internal key-level)
         if stream_error {
             gemini_service_clone.record_failure(&cred_name);
+            pool.record_failure(&instance_name);
         } else {
             gemini_service_clone.record_success(&cred_name);
+            pool.record_success(&instance_name);
         }
 
         tracing::info!(

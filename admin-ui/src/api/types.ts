@@ -4,6 +4,7 @@ export interface BackendSummary {
   backend_type: string
   enabled: boolean
   priority: number
+  weight: number
   strategy: string
   max_failures: number
   retry_after_secs: number
@@ -15,6 +16,7 @@ export interface UpsertBackendBody {
   name: string
   backend_type: string
   priority: number
+  weight?: number
   enabled: boolean
   strategy?: string
   max_failures?: number

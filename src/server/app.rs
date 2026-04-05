@@ -7,9 +7,10 @@ use crate::{
     server::{routes, state::AppState},
     services::web_tools::{executor::WebToolExecutor, search::build_search_provider},
     services::{
-        AnthropicBackendConfig, BedrockBackendConfig, BedrockService, GeminiBackendConfig,
-        GeminiConfig, GeminiService, ModelMappingService, OpenAIBackendConfig, PassthroughConfig,
-        PassthroughService, PassthroughTarget, PoolConfig, PtcService, UsageTracker,
+        AnthropicBackendConfig, BackendInstance, BedrockBackendConfig, BedrockService,
+        CredentialPool, GeminiBackendConfig, GeminiConfig, GeminiService, LoadBalanceStrategy,
+        ModelMappingService, OpenAIBackendConfig, PassthroughConfig, PassthroughService,
+        PassthroughTarget, PoolConfig, PtcService, UsageTracker,
     },
 };
 use anyhow::Result;
@@ -70,27 +71,24 @@ impl App {
             }
         };
 
-        // 4. Initialize Gemini service from backends table
-        let gemini_service = match init_gemini_from_backends(&database, &encryptor).await {
-            Ok(Some(service)) => {
-                tracing::info!("Gemini service initialized from backends table");
-                Some(Arc::new(service))
+        // 4. Initialize Gemini pool from backends table
+        let gemini_pool = match init_gemini_from_backends(&database, &encryptor).await {
+            Ok(Some(pool)) => {
+                tracing::info!("Gemini pool initialized from backends table");
+                Some(pool)
             }
             Ok(None) => {
                 tracing::debug!("No Gemini backend configured");
                 None
             }
             Err(e) => {
-                tracing::warn!(
-                    "Failed to initialize Gemini service: {}. Gemini disabled.",
-                    e
-                );
+                tracing::warn!("Failed to initialize Gemini pool: {}. Gemini disabled.", e);
                 None
             }
         };
 
-        // 5a. Initialize Anthropic passthrough service from backends table
-        let anthropic_service = match init_passthrough_from_backends(
+        // 5a. Initialize Anthropic passthrough pool from backends table
+        let anthropic_pool = match init_passthrough_from_backends(
             &database,
             "anthropic",
             PassthroughTarget::Anthropic,
@@ -98,9 +96,9 @@ impl App {
         )
         .await
         {
-            Ok(Some(service)) => {
-                tracing::info!("Anthropic passthrough service initialized from backends table");
-                Some(Arc::new(service))
+            Ok(Some(pool)) => {
+                tracing::info!("Anthropic passthrough pool initialized from backends table");
+                Some(pool)
             }
             Ok(None) => {
                 tracing::debug!("No Anthropic backend configured");
@@ -108,15 +106,15 @@ impl App {
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to initialize Anthropic passthrough service: {}. Anthropic disabled.",
+                    "Failed to initialize Anthropic passthrough pool: {}. Anthropic disabled.",
                     e
                 );
                 None
             }
         };
 
-        // 5b. Initialize OpenAI passthrough service from backends table
-        let openai_service = match init_passthrough_from_backends(
+        // 5b. Initialize OpenAI passthrough pool from backends table
+        let openai_pool = match init_passthrough_from_backends(
             &database,
             "openai",
             PassthroughTarget::OpenAI,
@@ -124,9 +122,9 @@ impl App {
         )
         .await
         {
-            Ok(Some(service)) => {
-                tracing::info!("OpenAI passthrough service initialized from backends table");
-                Some(Arc::new(service))
+            Ok(Some(pool)) => {
+                tracing::info!("OpenAI passthrough pool initialized from backends table");
+                Some(pool)
             }
             Ok(None) => {
                 tracing::debug!("No OpenAI backend configured");
@@ -134,7 +132,7 @@ impl App {
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to initialize OpenAI passthrough service: {}. OpenAI disabled.",
+                    "Failed to initialize OpenAI passthrough pool: {}. OpenAI disabled.",
                     e
                 );
                 None
@@ -194,9 +192,9 @@ impl App {
             model_mapping,
             start_time,
             ptc_service,
-            gemini_service,
-            anthropic_service,
-            openai_service,
+            gemini_pool,
+            anthropic_pool,
+            openai_pool,
             encryptor,
             web_tool_executor,
             prompt_cache_mode,
@@ -271,7 +269,7 @@ async fn init_bedrock_from_backends(
             region = %cfg.region,
             profile = ?cfg.profile,
             access_key = cfg.access_key_id.is_some(),
-            weight = cfg.weight,
+            weight = backend.weight,
             index = i,
             "Creating Bedrock client from backends table"
         );
@@ -279,14 +277,19 @@ async fn init_bedrock_from_backends(
         let client = crate::config::create_bedrock_client_from_config(&cfg).await;
 
         let aws_cred = if let Some(ref p) = cfg.profile {
-            crate::services::AwsCredential::with_profile(p, &cfg.region, &cred_name, cfg.weight)
+            crate::services::AwsCredential::with_profile(
+                p,
+                &cfg.region,
+                &cred_name,
+                backend.weight as u32,
+            )
         } else if let (Some(ref ak), Some(ref sk)) = (&cfg.access_key_id, &cfg.secret_access_key) {
             let mut cred = crate::services::AwsCredential::with_access_key(
                 ak,
                 sk,
                 &cfg.region,
                 &cred_name,
-                cfg.weight,
+                backend.weight as u32,
             );
             if let Some(ref token) = cfg.session_token {
                 cred = cred.with_session_token(token);
@@ -309,13 +312,13 @@ async fn init_bedrock_from_backends(
     Ok(Some(BedrockService::with_pool(clients, pool)))
 }
 
-/// Initialize Gemini service from the backends table.
+/// Initialize Gemini pool from the backends table.
 ///
-/// Merges API keys from all enabled gemini backends into a single credential pool.
+/// Creates one GeminiService per backend record, wrapped in a CredentialPool.
 async fn init_gemini_from_backends(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
     encryptor: &Encryptor,
-) -> Result<Option<GeminiService>> {
+) -> Result<Option<Arc<CredentialPool<BackendInstance<GeminiService>>>>> {
     let backends = database.backends().list_enabled_backends().await?;
 
     let gemini_backends: Vec<_> = backends
@@ -327,9 +330,7 @@ async fn init_gemini_from_backends(
         return Ok(None);
     }
 
-    let mut all_api_keys: Vec<String> = Vec::new();
-    let mut base_url: Option<String> = None;
-    let mut timeout_seconds: u64 = 120;
+    let mut instances: Vec<BackendInstance<GeminiService>> = Vec::new();
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in gemini_backends.iter().enumerate() {
@@ -343,52 +344,62 @@ async fn init_gemini_from_backends(
             continue;
         }
 
-        // Use settings from the first backend with keys
-        if all_api_keys.is_empty() {
-            base_url = cfg.base_url.clone();
-            timeout_seconds = cfg.timeout_seconds;
+        if i == 0 {
             pool_config = PoolConfig {
-                strategy: crate::services::LoadBalanceStrategy::parse_str(&backend.strategy),
+                strategy: LoadBalanceStrategy::parse_str(&backend.strategy),
                 max_failures: backend.max_failures as u32,
                 retry_after_secs: backend.retry_after_secs as u64,
             };
         }
 
-        tracing::info!(
-            name = %backend.name,
-            key_count = cfg.api_keys.len(),
-            index = i,
-            "Loading Gemini API keys from backends table"
-        );
+        let key_count = cfg.api_keys.len();
 
-        all_api_keys.extend(cfg.api_keys);
+        // Create independent GeminiService for this backend
+        let mut gemini_config = GeminiConfig::with_keys(cfg.api_keys);
+        if let Some(url) = cfg.base_url {
+            gemini_config = gemini_config.with_base_url(url);
+        }
+        gemini_config = gemini_config.with_timeout(cfg.timeout_seconds);
+
+        // Use the backend's own pool config for the internal key pool
+        let internal_pool_config = PoolConfig {
+            strategy: LoadBalanceStrategy::parse_str(&backend.strategy),
+            max_failures: backend.max_failures as u32,
+            retry_after_secs: backend.retry_after_secs as u64,
+        };
+
+        match GeminiService::with_pool_config(gemini_config, internal_pool_config) {
+            Ok(svc) => {
+                tracing::info!(name = %backend.name, key_count = key_count, "Created Gemini service instance");
+                instances.push(BackendInstance::new(
+                    &backend.name,
+                    svc,
+                    backend.weight as u32,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(name = %backend.name, error = %e, "Failed to create Gemini service");
+            }
+        }
     }
 
-    if all_api_keys.is_empty() {
+    if instances.is_empty() {
         return Ok(None);
     }
 
-    let mut gemini_config = GeminiConfig::with_keys(all_api_keys);
-    if let Some(url) = base_url {
-        gemini_config = gemini_config.with_base_url(url);
-    }
-    gemini_config = gemini_config.with_timeout(timeout_seconds);
-
-    Ok(Some(GeminiService::with_pool_config(
-        gemini_config,
-        pool_config,
-    )?))
+    let pool = CredentialPool::new(instances, pool_config);
+    Ok(Some(Arc::new(pool)))
 }
 
-/// Initialize a passthrough service from the backends table.
+/// Initialize a passthrough pool from the backends table.
 ///
-/// Merges API keys from all enabled backends of the given type into a single credential pool.
+/// Creates one PassthroughService per backend record, wrapped in a CredentialPool.
 async fn init_passthrough_from_backends(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
     backend_type_name: &str,
     target: PassthroughTarget,
     encryptor: &Encryptor,
-) -> anyhow::Result<Option<PassthroughService>> {
+) -> anyhow::Result<Option<Arc<CredentialPool<BackendInstance<PassthroughService>>>>> {
     let backends = database.backends().list_enabled_backends().await?;
 
     let matching_backends: Vec<_> = backends
@@ -400,16 +411,27 @@ async fn init_passthrough_from_backends(
         return Ok(None);
     }
 
-    let mut all_api_keys: Vec<String> = Vec::new();
-    let mut base_url: Option<String> = None;
-    let mut organization: Option<String> = None;
-    let mut timeout_seconds: u64 = 120;
+    let mut instances: Vec<BackendInstance<PassthroughService>> = Vec::new();
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in matching_backends.iter().enumerate() {
         let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
             anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
         })?;
+
+        if i == 0 {
+            pool_config = PoolConfig {
+                strategy: LoadBalanceStrategy::parse_str(&backend.strategy),
+                max_failures: backend.max_failures as u32,
+                retry_after_secs: backend.retry_after_secs as u64,
+            };
+        }
+
+        let internal_pool_config = PoolConfig {
+            strategy: LoadBalanceStrategy::parse_str(&backend.strategy),
+            max_failures: backend.max_failures as u32,
+            retry_after_secs: backend.retry_after_secs as u64,
+        };
 
         match target {
             PassthroughTarget::Anthropic => {
@@ -426,24 +448,33 @@ async fn init_passthrough_from_backends(
                 if cfg.api_keys.is_empty() {
                     continue;
                 }
-                if all_api_keys.is_empty() {
-                    base_url = cfg.base_url.clone();
-                    timeout_seconds = cfg.timeout_seconds;
-                    pool_config = PoolConfig {
-                        strategy: crate::services::LoadBalanceStrategy::parse_str(
-                            &backend.strategy,
-                        ),
-                        max_failures: backend.max_failures as u32,
-                        retry_after_secs: backend.retry_after_secs as u64,
-                    };
+
+                let key_count = cfg.api_keys.len();
+                let config = PassthroughConfig {
+                    api_keys: cfg.api_keys,
+                    base_url: cfg.base_url,
+                    organization: None,
+                    timeout_seconds: cfg.timeout_seconds,
+                    target: PassthroughTarget::Anthropic,
+                };
+
+                match PassthroughService::with_pool_config(config, internal_pool_config) {
+                    Ok(svc) => {
+                        tracing::info!(
+                            name = %backend.name,
+                            key_count = key_count,
+                            "Created Anthropic passthrough service instance"
+                        );
+                        instances.push(BackendInstance::new(
+                            &backend.name,
+                            svc,
+                            backend.weight as u32,
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %backend.name, error = %e, "Failed to create Anthropic passthrough service");
+                    }
                 }
-                tracing::info!(
-                    name = %backend.name,
-                    key_count = cfg.api_keys.len(),
-                    index = i,
-                    "Loading Anthropic API keys from backends table"
-                );
-                all_api_keys.extend(cfg.api_keys);
             }
             PassthroughTarget::OpenAI => {
                 let cfg: OpenAIBackendConfig =
@@ -459,45 +490,43 @@ async fn init_passthrough_from_backends(
                 if cfg.api_keys.is_empty() {
                     continue;
                 }
-                if all_api_keys.is_empty() {
-                    base_url = cfg.base_url.clone();
-                    organization = cfg.organization.clone();
-                    timeout_seconds = cfg.timeout_seconds;
-                    pool_config = PoolConfig {
-                        strategy: crate::services::LoadBalanceStrategy::parse_str(
-                            &backend.strategy,
-                        ),
-                        max_failures: backend.max_failures as u32,
-                        retry_after_secs: backend.retry_after_secs as u64,
-                    };
+
+                let key_count = cfg.api_keys.len();
+                let config = PassthroughConfig {
+                    api_keys: cfg.api_keys,
+                    base_url: cfg.base_url,
+                    organization: cfg.organization,
+                    timeout_seconds: cfg.timeout_seconds,
+                    target: PassthroughTarget::OpenAI,
+                };
+
+                match PassthroughService::with_pool_config(config, internal_pool_config) {
+                    Ok(svc) => {
+                        tracing::info!(
+                            name = %backend.name,
+                            key_count = key_count,
+                            "Created OpenAI passthrough service instance"
+                        );
+                        instances.push(BackendInstance::new(
+                            &backend.name,
+                            svc,
+                            backend.weight as u32,
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %backend.name, error = %e, "Failed to create OpenAI passthrough service");
+                    }
                 }
-                tracing::info!(
-                    name = %backend.name,
-                    key_count = cfg.api_keys.len(),
-                    index = i,
-                    "Loading OpenAI API keys from backends table"
-                );
-                all_api_keys.extend(cfg.api_keys);
             }
         }
     }
 
-    if all_api_keys.is_empty() {
+    if instances.is_empty() {
         return Ok(None);
     }
 
-    let config = PassthroughConfig {
-        api_keys: all_api_keys,
-        base_url,
-        organization,
-        timeout_seconds,
-        target,
-    };
-
-    Ok(Some(PassthroughService::with_pool_config(
-        config,
-        pool_config,
-    )?))
+    let pool = CredentialPool::new(instances, pool_config);
+    Ok(Some(Arc::new(pool)))
 }
 
 /// Load prompt_cache mode from system settings at startup.

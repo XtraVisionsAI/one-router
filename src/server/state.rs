@@ -9,8 +9,8 @@ use crate::database::traits::DatabaseService;
 use crate::services::capabilities::ModelCapabilities;
 use crate::services::web_tools::executor::WebToolExecutor;
 use crate::services::{
-    BedrockService, GeminiService, ModelMappingService, PassthroughService, PtcService,
-    UsageTracker,
+    BackendInstance, BedrockService, CredentialPool, GeminiService, ModelMappingService,
+    PassthroughService, PtcService, UsageTracker,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -44,14 +44,14 @@ pub struct AppState {
     /// PTC service for Programmatic Tool Calling (optional)
     pub ptc_service: Option<Arc<PtcService>>,
 
-    /// Gemini service for Google Gemini API (optional)
-    pub gemini_service: Option<Arc<GeminiService>>,
+    /// Gemini backend pool (each backend record = one GeminiService instance)
+    pub gemini_pool: Option<Arc<CredentialPool<BackendInstance<GeminiService>>>>,
 
-    /// Anthropic passthrough service (optional)
-    pub anthropic_service: Option<Arc<PassthroughService>>,
+    /// Anthropic passthrough backend pool
+    pub anthropic_pool: Option<Arc<CredentialPool<BackendInstance<PassthroughService>>>>,
 
-    /// OpenAI passthrough service (optional)
-    pub openai_service: Option<Arc<PassthroughService>>,
+    /// OpenAI passthrough backend pool
+    pub openai_pool: Option<Arc<CredentialPool<BackendInstance<PassthroughService>>>>,
 
     /// Web tool executor for server-side web_search/web_fetch tools (optional)
     pub web_tool_executor: Option<Arc<WebToolExecutor>>,

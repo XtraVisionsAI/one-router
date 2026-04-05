@@ -30,6 +30,7 @@
 
 pub mod config;
 mod credential;
+mod instance;
 mod pool;
 mod strategy;
 
@@ -38,5 +39,6 @@ pub use config::{
     PoolSettings,
 };
 pub use credential::{ApiKeyCredential, AwsCredential, Credential, CredentialHealth};
+pub use instance::BackendInstance;
 pub use pool::{CredentialPool, PoolConfig, PoolStats};
 pub use strategy::LoadBalanceStrategy;

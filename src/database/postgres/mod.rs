@@ -707,7 +707,7 @@ impl ModelMappingStore for PostgresBackend {
 impl BackendConfigStore for PostgresBackend {
     async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
         let row = sqlx::query(
-            "SELECT name, backend_type, config, enabled, priority, \
+            "SELECT name, backend_type, config, enabled, priority, weight, \
              strategy, max_failures, retry_after_secs, \
              created_at, updated_at \
              FROM backends WHERE name = $1",
@@ -723,6 +723,7 @@ impl BackendConfigStore for PostgresBackend {
                 config: r.get("config"),
                 enabled: r.get("enabled"),
                 priority: r.get("priority"),
+                weight: r.get("weight"),
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
@@ -735,7 +736,7 @@ impl BackendConfigStore for PostgresBackend {
 
     async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
-            "SELECT name, backend_type, config, enabled, priority, \
+            "SELECT name, backend_type, config, enabled, priority, weight, \
              strategy, max_failures, retry_after_secs, \
              created_at, updated_at \
              FROM backends WHERE enabled = TRUE ORDER BY priority DESC",
@@ -751,6 +752,7 @@ impl BackendConfigStore for PostgresBackend {
                 config: r.get("config"),
                 enabled: true,
                 priority: r.get("priority"),
+                weight: r.get("weight"),
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
@@ -764,7 +766,7 @@ impl BackendConfigStore for PostgresBackend {
 
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
-            "SELECT name, backend_type, config, enabled, priority, \
+            "SELECT name, backend_type, config, enabled, priority, weight, \
              strategy, max_failures, retry_after_secs, \
              created_at, updated_at \
              FROM backends ORDER BY priority DESC",
@@ -780,6 +782,7 @@ impl BackendConfigStore for PostgresBackend {
                 config: r.get("config"),
                 enabled: r.get("enabled"),
                 priority: r.get("priority"),
+                weight: r.get("weight"),
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
@@ -795,15 +798,16 @@ impl BackendConfigStore for PostgresBackend {
         let now = unix_now();
         sqlx::query(
             "INSERT INTO backends \
-             (name, backend_type, config, enabled, priority, \
+             (name, backend_type, config, enabled, priority, weight, \
               strategy, max_failures, retry_after_secs, \
               created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT(name) DO UPDATE SET \
              backend_type = EXCLUDED.backend_type, \
              config = EXCLUDED.config, \
              enabled = EXCLUDED.enabled, \
              priority = EXCLUDED.priority, \
+             weight = EXCLUDED.weight, \
              strategy = EXCLUDED.strategy, \
              max_failures = EXCLUDED.max_failures, \
              retry_after_secs = EXCLUDED.retry_after_secs, \
@@ -814,6 +818,7 @@ impl BackendConfigStore for PostgresBackend {
         .bind(&record.config)
         .bind(record.enabled)
         .bind(record.priority)
+        .bind(record.weight)
         .bind(&record.strategy)
         .bind(record.max_failures)
         .bind(record.retry_after_secs)

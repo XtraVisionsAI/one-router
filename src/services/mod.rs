@@ -10,8 +10,8 @@ pub mod ptc;
 pub mod usage_tracker;
 
 pub use backend_pool::{
-    AnthropicBackendConfig, ApiKeyCredential, AwsCredential, BedrockBackendConfig, Credential,
-    CredentialHealth, CredentialPool, GeminiBackendConfig, LoadBalanceStrategy,
+    AnthropicBackendConfig, ApiKeyCredential, AwsCredential, BackendInstance, BedrockBackendConfig,
+    Credential, CredentialHealth, CredentialPool, GeminiBackendConfig, LoadBalanceStrategy,
     OpenAIBackendConfig, PoolConfig, PoolSettings, PoolStats,
 };
 pub use bedrock::{

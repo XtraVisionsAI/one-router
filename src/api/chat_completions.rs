@@ -27,7 +27,7 @@ use crate::schemas::openai::{
     OpenAIErrorResponse, ToolCallDelta,
 };
 use crate::server::state::AppState;
-use crate::services::{BedrockError, BedrockService, ConverseRequest};
+use crate::services::{BedrockError, BedrockService, ConverseRequest, Credential};
 
 // ============================================================================
 // Error Types
@@ -649,11 +649,15 @@ async fn handle_gemini_backend(
     request_id: &str,
     start_time: Instant,
 ) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
-    let gemini_service = state.gemini_service.as_ref().ok_or_else(|| {
+    let gemini_pool = state.gemini_pool.as_ref().ok_or_else(|| {
         OpenAIApiError::internal_error(
             "Gemini backend is not configured. Add a 'gemini' entry to the backends table.",
         )
     })?;
+    let gemini_instance = gemini_pool
+        .get_next()
+        .ok_or_else(|| OpenAIApiError::internal_error("No healthy Gemini backend available"))?;
+    let gemini_service = &gemini_instance.service;
 
     // Convert OpenAI request to Gemini format
     let converter = OpenAIToGeminiConverter::new();
@@ -690,6 +694,8 @@ async fn handle_gemini_backend(
 
         let gemini_service_clone = gemini_service.clone();
         let cred_name = credential_name.clone();
+        let pool_clone = gemini_pool.clone();
+        let inst_name = gemini_instance.name().to_string();
 
         let stream = async_stream::stream! {
             let mut chunk_index: i32 = 0;
@@ -726,8 +732,10 @@ async fn handle_gemini_backend(
 
             if stream_error {
                 gemini_service_clone.record_failure(&cred_name);
+                pool_clone.record_failure(&inst_name);
             } else {
                 gemini_service_clone.record_success(&cred_name);
+                pool_clone.record_success(&inst_name);
             }
             let _ = final_model_clone;
         };
@@ -779,14 +787,15 @@ async fn handle_anthropic_backend(
     use crate::converters::anthropic_openai::{
         AnthropicToOpenAIStreamState, OpenAIToAnthropicConverter,
     };
-    use crate::services::PassthroughService;
-
-    let svc: &std::sync::Arc<PassthroughService> =
-        state.anthropic_service.as_ref().ok_or_else(|| {
-            OpenAIApiError::internal_error(
-                "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
-            )
-        })?;
+    let pool = state.anthropic_pool.as_ref().ok_or_else(|| {
+        OpenAIApiError::internal_error(
+            "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
+        )
+    })?;
+    let instance = pool
+        .get_next()
+        .ok_or_else(|| OpenAIApiError::internal_error("No healthy Anthropic backend available"))?;
+    let svc = &instance.service;
 
     // Convert OpenAI request to Anthropic format
     let converter = OpenAIToAnthropicConverter::new();
@@ -955,13 +964,15 @@ async fn handle_openai_passthrough(
     client_headers: &HeaderMap,
     start_time: Instant,
 ) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
-    use crate::services::PassthroughService;
-
-    let svc: &Arc<PassthroughService> = state.openai_service.as_ref().ok_or_else(|| {
+    let pool = state.openai_pool.as_ref().ok_or_else(|| {
         OpenAIApiError::internal_error(
             "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
         )
     })?;
+    let instance = pool
+        .get_next()
+        .ok_or_else(|| OpenAIApiError::internal_error("No healthy OpenAI backend available"))?;
+    let svc = &instance.service;
 
     // Serialize the request and replace model with resolved target model id
     let mut body_value =

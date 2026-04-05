@@ -109,6 +109,7 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             config TEXT NOT NULL,
             enabled BOOLEAN DEFAULT TRUE,
             priority INTEGER DEFAULT 0,
+            weight INTEGER DEFAULT 1,
             strategy TEXT DEFAULT 'round_robin',
             max_failures INTEGER DEFAULT 3,
             retry_after_secs BIGINT DEFAULT 300,
@@ -118,6 +119,11 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    // Migration: add weight column if upgrading
+    sqlx::query("ALTER TABLE backends ADD COLUMN IF NOT EXISTS weight INTEGER DEFAULT 1")
+        .execute(pool)
+        .await?;
 
     // Migration: add strategy/max_failures/retry_after_secs columns if upgrading
     sqlx::query(

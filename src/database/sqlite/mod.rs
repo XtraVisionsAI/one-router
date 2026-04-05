@@ -159,6 +159,7 @@ impl SqliteBackend {
                 config TEXT NOT NULL,
                 enabled INTEGER DEFAULT 1,
                 priority INTEGER DEFAULT 0,
+                weight INTEGER DEFAULT 1,
                 strategy TEXT DEFAULT 'round_robin',
                 max_failures INTEGER DEFAULT 3,
                 retry_after_secs INTEGER DEFAULT 300,
@@ -168,6 +169,12 @@ impl SqliteBackend {
         )
         .execute(&self.pool)
         .await?;
+
+        // Migration: add weight column if upgrading
+        sqlx::query("ALTER TABLE backends ADD COLUMN weight INTEGER DEFAULT 1")
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // Migration: add strategy/max_failures/retry_after_secs columns if upgrading
         sqlx::query("ALTER TABLE backends ADD COLUMN strategy TEXT DEFAULT 'round_robin'")
@@ -961,7 +968,7 @@ impl ModelMappingStore for SqliteBackend {
 impl BackendConfigStore for SqliteBackend {
     async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
         let row = sqlx::query(
-            "SELECT name, backend_type, config, enabled, priority, \
+            "SELECT name, backend_type, config, enabled, priority, weight, \
              strategy, max_failures, retry_after_secs, \
              created_at, updated_at \
              FROM backends WHERE name = ?",
@@ -977,6 +984,7 @@ impl BackendConfigStore for SqliteBackend {
                 config: r.get("config"),
                 enabled: r.get::<i32, _>("enabled") != 0,
                 priority: r.get("priority"),
+                weight: r.get("weight"),
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
@@ -989,7 +997,7 @@ impl BackendConfigStore for SqliteBackend {
 
     async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
-            "SELECT name, backend_type, config, enabled, priority, \
+            "SELECT name, backend_type, config, enabled, priority, weight, \
              strategy, max_failures, retry_after_secs, \
              created_at, updated_at \
              FROM backends WHERE enabled = 1 ORDER BY priority DESC",
@@ -1005,6 +1013,7 @@ impl BackendConfigStore for SqliteBackend {
                 config: r.get("config"),
                 enabled: true,
                 priority: r.get("priority"),
+                weight: r.get("weight"),
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
@@ -1018,7 +1027,7 @@ impl BackendConfigStore for SqliteBackend {
 
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
-            "SELECT name, backend_type, config, enabled, priority, \
+            "SELECT name, backend_type, config, enabled, priority, weight, \
              strategy, max_failures, retry_after_secs, \
              created_at, updated_at \
              FROM backends ORDER BY priority DESC",
@@ -1034,6 +1043,7 @@ impl BackendConfigStore for SqliteBackend {
                 config: r.get("config"),
                 enabled: r.get::<i32, _>("enabled") != 0,
                 priority: r.get("priority"),
+                weight: r.get("weight"),
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
@@ -1049,15 +1059,16 @@ impl BackendConfigStore for SqliteBackend {
         let now = unix_now();
         sqlx::query(
             "INSERT INTO backends \
-             (name, backend_type, config, enabled, priority, \
+             (name, backend_type, config, enabled, priority, weight, \
               strategy, max_failures, retry_after_secs, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(name) DO UPDATE SET \
              backend_type = excluded.backend_type, \
              config = excluded.config, \
              enabled = excluded.enabled, \
              priority = excluded.priority, \
+             weight = excluded.weight, \
              strategy = excluded.strategy, \
              max_failures = excluded.max_failures, \
              retry_after_secs = excluded.retry_after_secs, \
@@ -1068,6 +1079,7 @@ impl BackendConfigStore for SqliteBackend {
         .bind(&record.config)
         .bind(record.enabled as i32)
         .bind(record.priority)
+        .bind(record.weight)
         .bind(&record.strategy)
         .bind(record.max_failures)
         .bind(record.retry_after_secs)

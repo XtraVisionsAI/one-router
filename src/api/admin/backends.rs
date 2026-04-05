@@ -32,6 +32,7 @@ pub struct BackendSummary {
     pub backend_type: String,
     pub enabled: bool,
     pub priority: i32,
+    pub weight: i32,
     pub strategy: String,
     pub max_failures: i32,
     pub retry_after_secs: i64,
@@ -46,6 +47,7 @@ impl BackendSummary {
             backend_type: r.backend_type.clone(),
             enabled: r.enabled,
             priority: r.priority,
+            weight: r.weight,
             strategy: r.strategy.clone(),
             max_failures: r.max_failures,
             retry_after_secs: r.retry_after_secs,
@@ -105,6 +107,8 @@ fn make_config_summary(backend_type: &str, config: &str) -> Value {
 /// Get the live health status for a specific backend by name and type,
 /// querying the in-memory credential pool for that credential's state.
 fn backend_health_status(state: &AppState, name: &str, backend_type: &str) -> String {
+    use crate::services::Credential;
+
     match backend_type {
         "bedrock" => state
             .bedrock
@@ -112,19 +116,46 @@ fn backend_health_status(state: &AppState, name: &str, backend_type: &str) -> St
             .and_then(|svc| svc.credential_health(name))
             .unwrap_or_else(|| "not loaded".to_string()),
         "gemini" => state
-            .gemini_service
+            .gemini_pool
             .as_ref()
-            .and_then(|svc| svc.credential_health(name))
+            .and_then(|pool| pool.get_by_name(name))
+            .map(|inst| {
+                if !inst.is_enabled() {
+                    "unhealthy".to_string()
+                } else if inst.failure_count() > 0 {
+                    format!("degraded (failures: {})", inst.failure_count())
+                } else {
+                    "healthy".to_string()
+                }
+            })
             .unwrap_or_else(|| "not loaded".to_string()),
         "anthropic" => state
-            .anthropic_service
+            .anthropic_pool
             .as_ref()
-            .and_then(|svc| svc.credential_health(name))
+            .and_then(|pool| pool.get_by_name(name))
+            .map(|inst| {
+                if !inst.is_enabled() {
+                    "unhealthy".to_string()
+                } else if inst.failure_count() > 0 {
+                    format!("degraded (failures: {})", inst.failure_count())
+                } else {
+                    "healthy".to_string()
+                }
+            })
             .unwrap_or_else(|| "not loaded".to_string()),
         "openai" => state
-            .openai_service
+            .openai_pool
             .as_ref()
-            .and_then(|svc| svc.credential_health(name))
+            .and_then(|pool| pool.get_by_name(name))
+            .map(|inst| {
+                if !inst.is_enabled() {
+                    "unhealthy".to_string()
+                } else if inst.failure_count() > 0 {
+                    format!("degraded (failures: {})", inst.failure_count())
+                } else {
+                    "healthy".to_string()
+                }
+            })
             .unwrap_or_else(|| "not loaded".to_string()),
         _ => "unknown".to_string(),
     }
@@ -153,6 +184,8 @@ pub struct UpsertBackendRequest {
     pub enabled: bool,
     #[serde(default)]
     pub priority: i32,
+    #[serde(default = "default_weight")]
+    pub weight: i32,
     #[serde(default = "default_strategy")]
     pub strategy: String,
     #[serde(default = "default_max_failures")]
@@ -165,6 +198,9 @@ pub struct UpsertBackendRequest {
 
 fn default_true() -> bool {
     true
+}
+fn default_weight() -> i32 {
+    1
 }
 fn default_strategy() -> String {
     "round_robin".to_string()
@@ -254,6 +290,7 @@ pub async fn create_backend(
         config: encrypted_config,
         enabled: body.enabled,
         priority: body.priority,
+        weight: body.weight,
         strategy: body.strategy.clone(),
         max_failures: body.max_failures,
         retry_after_secs: body.retry_after_secs,
@@ -337,6 +374,7 @@ pub async fn update_backend(
         config,
         enabled: body.enabled,
         priority: body.priority,
+        weight: body.weight,
         strategy: body.strategy.clone(),
         max_failures: body.max_failures,
         retry_after_secs: body.retry_after_secs,
