@@ -38,17 +38,7 @@ pub struct BedrockService {
 }
 
 impl BedrockService {
-    /// Create a single-client service (backward compatible).
-    pub fn new(client: BedrockRuntimeClient) -> Self {
-        let cred = AwsCredential::default_credential("us-east-1", "default");
-        let pool = CredentialPool::single(cred);
-        Self {
-            clients: vec![("default".to_string(), client)],
-            pool: std::sync::Arc::new(pool),
-        }
-    }
-
-    /// Create a multi-client service with a credential pool.
+    /// Create a service with a credential pool.
     pub fn with_pool(
         clients: Vec<(String, BedrockRuntimeClient)>,
         pool: CredentialPool<AwsCredential>,
