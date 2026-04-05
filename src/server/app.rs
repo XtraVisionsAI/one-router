@@ -45,8 +45,14 @@ impl App {
         database.initialize().await?;
         tracing::info!("Database initialized successfully");
 
+        // 2.5. Create encryptor early — needed to decrypt backend configs
+        let encryptor = Encryptor::new(settings.encryption_key.as_deref());
+        if encryptor.is_enabled() {
+            tracing::info!("Credential encryption enabled (AES-256-GCM)");
+        }
+
         // 3. Initialize Bedrock service from backends table
-        let bedrock = match init_bedrock_from_backends(&database).await {
+        let bedrock = match init_bedrock_from_backends(&database, &encryptor).await {
             Ok(Some(service)) => {
                 tracing::info!("Bedrock service initialized from backends table");
                 Some(Arc::new(service))
@@ -65,7 +71,7 @@ impl App {
         };
 
         // 4. Initialize Gemini service from backends table
-        let gemini_service = match init_gemini_from_backends(&database).await {
+        let gemini_service = match init_gemini_from_backends(&database, &encryptor).await {
             Ok(Some(service)) => {
                 tracing::info!("Gemini service initialized from backends table");
                 Some(Arc::new(service))
@@ -88,6 +94,7 @@ impl App {
             &database,
             "anthropic",
             PassthroughTarget::Anthropic,
+            &encryptor,
         )
         .await
         {
@@ -109,26 +116,30 @@ impl App {
         };
 
         // 5b. Initialize OpenAI passthrough service from backends table
-        let openai_service =
-            match init_passthrough_from_backends(&database, "openai", PassthroughTarget::OpenAI)
-                .await
-            {
-                Ok(Some(service)) => {
-                    tracing::info!("OpenAI passthrough service initialized from backends table");
-                    Some(Arc::new(service))
-                }
-                Ok(None) => {
-                    tracing::debug!("No OpenAI backend configured");
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to initialize OpenAI passthrough service: {}. OpenAI disabled.",
-                        e
-                    );
-                    None
-                }
-            };
+        let openai_service = match init_passthrough_from_backends(
+            &database,
+            "openai",
+            PassthroughTarget::OpenAI,
+            &encryptor,
+        )
+        .await
+        {
+            Ok(Some(service)) => {
+                tracing::info!("OpenAI passthrough service initialized from backends table");
+                Some(Arc::new(service))
+            }
+            Ok(None) => {
+                tracing::debug!("No OpenAI backend configured");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to initialize OpenAI passthrough service: {}. OpenAI disabled.",
+                    e
+                );
+                None
+            }
+        };
 
         // 6. Initialize PTC service
         let ptc_service = match PtcService::new().await {
@@ -143,13 +154,7 @@ impl App {
         let model_mapping = Arc::new(ModelMappingService::new(database.clone()));
         let usage_tracker = Arc::new(UsageTracker::new(database.clone()));
 
-        // 8. Create encryptor (no-op when ENCRYPTION_KEY is not set)
-        let encryptor = Encryptor::new(settings.encryption_key.as_deref());
-        if encryptor.is_enabled() {
-            tracing::info!("Credential encryption enabled (AES-256-GCM)");
-        }
-
-        // 9. Initialize web tool executor
+        // 8. Initialize web tool executor
         let web_tool_executor = {
             let search = settings
                 .web_search_provider
@@ -226,6 +231,7 @@ impl App {
 /// Supports multiple Bedrock backends with CredentialPool for load balancing.
 async fn init_bedrock_from_backends(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
+    encryptor: &Encryptor,
 ) -> Result<Option<BedrockService>> {
     let backends = database.backends().list_enabled_backends().await?;
 
@@ -243,7 +249,10 @@ async fn init_bedrock_from_backends(
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in bedrock_backends.iter().enumerate() {
-        let cfg: BedrockBackendConfig = serde_json::from_str(&backend.config)
+        let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
+            anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
+        })?;
+        let cfg: BedrockBackendConfig = serde_json::from_str(&decrypted_config)
             .map_err(|e| anyhow::anyhow!("Invalid bedrock config for '{}': {}", backend.name, e))?;
 
         // Use pool settings from the first backend
@@ -306,6 +315,7 @@ async fn init_bedrock_from_backends(
 /// Merges API keys from all enabled gemini backends into a single credential pool.
 async fn init_gemini_from_backends(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
+    encryptor: &Encryptor,
 ) -> Result<Option<GeminiService>> {
     let backends = database.backends().list_enabled_backends().await?;
 
@@ -324,7 +334,10 @@ async fn init_gemini_from_backends(
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in gemini_backends.iter().enumerate() {
-        let cfg: GeminiBackendConfig = serde_json::from_str(&backend.config)
+        let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
+            anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
+        })?;
+        let cfg: GeminiBackendConfig = serde_json::from_str(&decrypted_config)
             .map_err(|e| anyhow::anyhow!("Invalid gemini config for '{}': {}", backend.name, e))?;
 
         if cfg.api_keys.is_empty() {
@@ -371,6 +384,7 @@ async fn init_passthrough_from_backends(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
     backend_type_name: &str,
     target: PassthroughTarget,
+    encryptor: &Encryptor,
 ) -> anyhow::Result<Option<PassthroughService>> {
     let backends = database.backends().list_enabled_backends().await?;
 
@@ -390,10 +404,14 @@ async fn init_passthrough_from_backends(
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in matching_backends.iter().enumerate() {
+        let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
+            anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
+        })?;
+
         match target {
             PassthroughTarget::Anthropic => {
                 let cfg: AnthropicBackendConfig =
-                    serde_json::from_str(&backend.config).map_err(|e| {
+                    serde_json::from_str(&decrypted_config).map_err(|e| {
                         anyhow::anyhow!(
                             "Invalid {} config for '{}': {}",
                             backend_type_name,
@@ -420,7 +438,7 @@ async fn init_passthrough_from_backends(
             }
             PassthroughTarget::OpenAI => {
                 let cfg: OpenAIBackendConfig =
-                    serde_json::from_str(&backend.config).map_err(|e| {
+                    serde_json::from_str(&decrypted_config).map_err(|e| {
                         anyhow::anyhow!(
                             "Invalid {} config for '{}': {}",
                             backend_type_name,
