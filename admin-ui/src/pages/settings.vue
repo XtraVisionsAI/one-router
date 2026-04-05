@@ -105,7 +105,7 @@
     saving.value = key
     try {
       await api.upsert(key, { value: values.value[key] ?? '', description })
-      message.success('Saved')
+      message.success('Saved — restart required to take effect')
     } catch (e: any) {
       message.error(e.message)
       await load() // revert on error

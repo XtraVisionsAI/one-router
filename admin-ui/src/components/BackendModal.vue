@@ -129,7 +129,7 @@
       } else {
         await api.create(body)
       }
-      message.success(isEdit.value ? 'Backend updated' : 'Backend created')
+      message.success(isEdit.value ? 'Backend updated — restart required' : 'Backend created — restart required')
       emit('update:show', false)
       emit('saved')
     } catch (e: any) {

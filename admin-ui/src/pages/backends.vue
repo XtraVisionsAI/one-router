@@ -40,7 +40,7 @@
   async function toggle(name: string) {
     try {
       await api.toggle(name)
-      message.success('Backend updated')
+      message.success('Backend updated — restart required to take effect')
       await load()
     } catch (e: any) {
       message.error(e.message)
@@ -56,7 +56,7 @@
       onPositiveClick: async () => {
         try {
           await api.delete(name)
-          message.success('Backend deleted')
+          message.success('Backend deleted — restart required to take effect')
           await load()
         } catch (e: any) {
           message.error(e.message)
