@@ -708,6 +708,7 @@ mod tests {
             n: None,
             logprobs: None,
             top_logprobs: None,
+            service_tier: None,
         };
         let config = converter.convert_generation_config(&request);
         assert_eq!(config.temperature, Some(0.7));

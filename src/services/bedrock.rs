@@ -35,6 +35,8 @@ pub struct BedrockService {
     clients: Vec<(String, BedrockRuntimeClient)>,
     /// Credential pool for load balancing
     pool: std::sync::Arc<CredentialPool<AwsCredential>>,
+    /// Per-credential service tier config (keyed by credential name)
+    service_tiers: std::collections::HashMap<String, Option<String>>,
 }
 
 impl BedrockService {
@@ -42,11 +44,18 @@ impl BedrockService {
     pub fn with_pool(
         clients: Vec<(String, BedrockRuntimeClient)>,
         pool: CredentialPool<AwsCredential>,
+        service_tiers: std::collections::HashMap<String, Option<String>>,
     ) -> Self {
         Self {
             clients,
             pool: std::sync::Arc::new(pool),
+            service_tiers,
         }
+    }
+
+    /// Get the service tier config for a credential.
+    pub fn credential_service_tier(&self, name: &str) -> Option<&str> {
+        self.service_tiers.get(name).and_then(|t| t.as_deref())
     }
 
     /// Get the next available client from the pool.
@@ -227,7 +236,12 @@ impl BedrockService {
             "Calling Bedrock InvokeModel API (Anthropic native format)"
         );
 
-        let body = build_invoke_model_body(request, model_id, false)?;
+        let effective_tier = crate::services::service_tier::resolve_for_provider(
+            self.credential_service_tier(&cred_name),
+            request.service_tier.as_deref(),
+            "bedrock",
+        );
+        let body = build_invoke_model_body(request, model_id, false, effective_tier.as_deref())?;
 
         let result = client
             .invoke_model()
@@ -266,7 +280,12 @@ impl BedrockService {
             "Calling Bedrock InvokeModelWithResponseStream API (Anthropic native format)"
         );
 
-        let body = build_invoke_model_body(request, model_id, true)?;
+        let effective_tier = crate::services::service_tier::resolve_for_provider(
+            self.credential_service_tier(&cred_name),
+            request.service_tier.as_deref(),
+            "bedrock",
+        );
+        let body = build_invoke_model_body(request, model_id, true, effective_tier.as_deref())?;
 
         let result = client
             .invoke_model_with_response_stream()
@@ -734,11 +753,12 @@ impl InvokeModelStreamResponse {
 /// - Replaces `model` with the resolved Bedrock `model_id`.
 /// - Removes `stream` (InvokeModel doesn't accept this field).
 /// - Removes `container` (PTC field, not recognized by Bedrock).
-/// - Removes `service_tier` (handled separately via Bedrock SDK options).
+/// - Sets or removes `service_tier` based on the resolved effective tier.
 fn build_invoke_model_body(
     request: &crate::schemas::anthropic::MessageRequest,
     model_id: &str,
     _streaming: bool,
+    effective_service_tier: Option<&str>,
 ) -> Result<Vec<u8>, BedrockError> {
     let mut body =
         serde_json::to_value(request).map_err(|e| BedrockError::Serialization(e.to_string()))?;
@@ -749,7 +769,13 @@ fn build_invoke_model_body(
         // Remove fields that Bedrock InvokeModel does not recognize
         obj.remove("stream");
         obj.remove("container");
-        obj.remove("service_tier");
+
+        // Set or remove service_tier based on backend config
+        if let Some(tier) = effective_service_tier {
+            obj.insert("service_tier".to_string(), serde_json::json!(tier));
+        } else {
+            obj.remove("service_tier");
+        }
 
         // Bedrock requires tool description to be non-empty (min length 1).
         // Fill empty descriptions with a placeholder to avoid validation errors.

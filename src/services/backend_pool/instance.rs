@@ -14,17 +14,28 @@ pub struct BackendInstance<S> {
     name: String,
     pub service: Arc<S>,
     weight: u32,
+    service_tier: Option<String>,
     health: CredentialHealth,
 }
 
 impl<S> BackendInstance<S> {
-    pub fn new(name: impl Into<String>, service: S, weight: u32) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        service: S,
+        weight: u32,
+        service_tier: Option<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             service: Arc::new(service),
             weight,
+            service_tier,
             health: CredentialHealth::new(),
         }
+    }
+
+    pub fn service_tier(&self) -> Option<&str> {
+        self.service_tier.as_deref()
     }
 }
 

@@ -32,7 +32,7 @@
     monthly_budget: null as number | null,
     tpm_limit: null as number | null,
     cache_ttl: null as string | null,
-    service_tier: 'default'
+    cost_rate: 1.0
   })
   const saving = ref(false)
 
@@ -46,7 +46,7 @@
           monthly_budget: props.existing?.monthly_budget ?? null,
           tpm_limit: props.existing?.tpm_limit ?? null,
           cache_ttl: props.existing?.cache_ttl ?? null,
-          service_tier: props.existing?.service_tier ?? 'default'
+          cost_rate: props.existing?.cost_rate ?? 1.0
         }
       }
     }
@@ -68,7 +68,7 @@
           body.monthly_budget = form.value.monthly_budget
         if (form.value.tpm_limit !== props.existing?.tpm_limit) body.tpm_limit = form.value.tpm_limit
         if (form.value.cache_ttl !== props.existing?.cache_ttl) body.cache_ttl = form.value.cache_ttl
-        if (form.value.service_tier !== props.existing?.service_tier) body.service_tier = form.value.service_tier
+        if (form.value.cost_rate !== props.existing?.cost_rate) body.cost_rate = form.value.cost_rate
         await api.update(props.existing!.api_key, body)
         message.success('Key updated')
         emit('update:show', false)
@@ -80,7 +80,7 @@
           monthly_budget: form.value.monthly_budget,
           tpm_limit: form.value.tpm_limit,
           cache_ttl: form.value.cache_ttl,
-          service_tier: form.value.service_tier
+          cost_rate: form.value.cost_rate
         }
         const result = await api.create(body)
         message.success('Key created')
@@ -135,8 +135,8 @@
         <NFormItem label="Cache TTL" class="flex-1">
           <NSelect v-model:value="form.cache_ttl" :options="cacheTtlOptions" class="w-full" />
         </NFormItem>
-        <NFormItem label="Service Tier" class="flex-1">
-          <NInput v-model:value="form.service_tier" />
+        <NFormItem label="Cost Rate" class="flex-1">
+          <NInputNumber v-model:value="form.cost_rate" :min="0" :step="0.1" :precision="2" class="w-full" />
         </NFormItem>
       </div>
     </div>

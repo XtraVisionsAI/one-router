@@ -129,6 +129,7 @@ impl AnthropicToOpenAIConverter {
             n: None,
             logprobs: None,
             top_logprobs: None,
+            service_tier: None,
         })
     }
 
@@ -1261,6 +1262,7 @@ mod tests {
             n: None,
             logprobs: None,
             top_logprobs: None,
+            service_tier: None,
         };
         let result = converter
             .convert_request(&request, "claude-3-5-sonnet-20241022")
@@ -1308,6 +1310,7 @@ mod tests {
             n: None,
             logprobs: None,
             top_logprobs: None,
+            service_tier: None,
         };
         let result = converter
             .convert_request(&request, "claude-3-5-sonnet-20241022")
@@ -1339,6 +1342,7 @@ mod tests {
             n: Some(2),
             logprobs: None,
             top_logprobs: None,
+            service_tier: None,
         };
         let result = converter.convert_request(&request, "claude-3-5-sonnet-20241022");
         assert!(result.is_err());
@@ -1374,6 +1378,7 @@ mod openai_to_anthropic_cache_tests {
             seed: None,
             logprobs: None,
             top_logprobs: None,
+            service_tier: None,
         }
     }
 

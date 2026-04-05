@@ -89,6 +89,20 @@ impl SqliteBackend {
             .await
             .ok(); // ignore error if column already exists
 
+        // Migration: add cost_rate column, backfill from service_tier
+        sqlx::query("ALTER TABLE api_keys ADD COLUMN cost_rate REAL DEFAULT 1.0")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query(
+            "UPDATE api_keys SET cost_rate = CASE service_tier \
+             WHEN 'flex' THEN 0.5 WHEN 'priority' THEN 1.75 WHEN 'master' THEN 0.0 \
+             ELSE 1.0 END WHERE cost_rate = 1.0 AND service_tier != 'default'",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
+
         // Migration: add unique index on api_keys.name if upgrading from older schema
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_name ON api_keys(name)")
             .execute(&self.pool)
@@ -186,6 +200,12 @@ impl SqliteBackend {
             .await
             .ok();
         sqlx::query("ALTER TABLE backends ADD COLUMN retry_after_secs INTEGER DEFAULT 300")
+            .execute(&self.pool)
+            .await
+            .ok();
+
+        // Migration: add service_tier column to backends
+        sqlx::query("ALTER TABLE backends ADD COLUMN service_tier TEXT")
             .execute(&self.pool)
             .await
             .ok();
@@ -350,7 +370,7 @@ impl DatabaseService for SqliteBackend {
 impl ApiKeyStore for SqliteBackend {
     async fn get_api_key(&self, api_key: &str) -> Result<Option<ApiKeyRecord>> {
         let row = sqlx::query(
-            "SELECT api_key, name, is_active, rate_limit, service_tier, \
+            "SELECT api_key, name, is_active, rate_limit, cost_rate, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = ?",
@@ -365,7 +385,7 @@ impl ApiKeyStore for SqliteBackend {
                 name: r.get("name"),
                 is_active: r.get::<i32, _>("is_active") != 0,
                 rate_limit: r.get("rate_limit"),
-                service_tier: r.get("service_tier"),
+                cost_rate: r.get("cost_rate"),
                 monthly_budget: r.get("monthly_budget"),
                 budget_used: r.get("budget_used"),
                 budget_used_mtd: r.get("budget_used_mtd"),
@@ -385,7 +405,7 @@ impl ApiKeyStore for SqliteBackend {
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO api_keys \
-             (api_key, name, is_active, rate_limit, service_tier, \
+             (api_key, name, is_active, rate_limit, cost_rate, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -394,7 +414,7 @@ impl ApiKeyStore for SqliteBackend {
         .bind(&record.name)
         .bind(record.is_active as i32)
         .bind(record.rate_limit)
-        .bind(&record.service_tier)
+        .bind(record.cost_rate)
         .bind(record.monthly_budget)
         .bind(record.budget_used)
         .bind(record.budget_used_mtd)
@@ -416,7 +436,7 @@ impl ApiKeyStore for SqliteBackend {
         let now = unix_now();
         sqlx::query(
             "UPDATE api_keys SET \
-             name = ?, is_active = ?, rate_limit = ?, service_tier = ?, \
+             name = ?, is_active = ?, rate_limit = ?, cost_rate = ?, \
              monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
              deactivated_reason = ?, budget_history = ?, tpm_limit = ?, cache_ttl = ?, metadata = ?, updated_at = ? \
              WHERE api_key = ?",
@@ -424,7 +444,7 @@ impl ApiKeyStore for SqliteBackend {
         .bind(&record.name)
         .bind(record.is_active as i32)
         .bind(record.rate_limit)
-        .bind(&record.service_tier)
+        .bind(record.cost_rate)
         .bind(record.monthly_budget)
         .bind(record.budget_used)
         .bind(record.budget_used_mtd)
@@ -559,7 +579,7 @@ impl ApiKeyStore for SqliteBackend {
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows = sqlx::query(
-            "SELECT api_key, name, is_active, rate_limit, service_tier, \
+            "SELECT api_key, name, is_active, rate_limit, cost_rate, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
@@ -574,7 +594,7 @@ impl ApiKeyStore for SqliteBackend {
                 name: r.get("name"),
                 is_active: r.get::<i32, _>("is_active") != 0,
                 rate_limit: r.get("rate_limit"),
-                service_tier: r.get("service_tier"),
+                cost_rate: r.get("cost_rate"),
                 monthly_budget: r.get("monthly_budget"),
                 budget_used: r.get("budget_used"),
                 budget_used_mtd: r.get("budget_used_mtd"),
@@ -969,7 +989,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
         let row = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, \
+             strategy, max_failures, retry_after_secs, service_tier, \
              created_at, updated_at \
              FROM backends WHERE name = ?",
         )
@@ -988,6 +1008,7 @@ impl BackendConfigStore for SqliteBackend {
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
+                service_tier: r.get("service_tier"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })),
@@ -998,7 +1019,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, \
+             strategy, max_failures, retry_after_secs, service_tier, \
              created_at, updated_at \
              FROM backends WHERE enabled = 1 ORDER BY priority DESC",
         )
@@ -1017,6 +1038,7 @@ impl BackendConfigStore for SqliteBackend {
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
+                service_tier: r.get("service_tier"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -1028,7 +1050,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, \
+             strategy, max_failures, retry_after_secs, service_tier, \
              created_at, updated_at \
              FROM backends ORDER BY priority DESC",
         )
@@ -1047,6 +1069,7 @@ impl BackendConfigStore for SqliteBackend {
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
+                service_tier: r.get("service_tier"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -1060,9 +1083,9 @@ impl BackendConfigStore for SqliteBackend {
         sqlx::query(
             "INSERT INTO backends \
              (name, backend_type, config, enabled, priority, weight, \
-              strategy, max_failures, retry_after_secs, \
+              strategy, max_failures, retry_after_secs, service_tier, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(name) DO UPDATE SET \
              backend_type = excluded.backend_type, \
              config = excluded.config, \
@@ -1072,6 +1095,7 @@ impl BackendConfigStore for SqliteBackend {
              strategy = excluded.strategy, \
              max_failures = excluded.max_failures, \
              retry_after_secs = excluded.retry_after_secs, \
+             service_tier = excluded.service_tier, \
              updated_at = excluded.updated_at",
         )
         .bind(&record.name)
@@ -1083,6 +1107,7 @@ impl BackendConfigStore for SqliteBackend {
         .bind(&record.strategy)
         .bind(record.max_failures)
         .bind(record.retry_after_secs)
+        .bind(&record.service_tier)
         .bind(record.created_at)
         .bind(now)
         .execute(&self.pool)
@@ -1190,7 +1215,7 @@ mod tests {
             name: "test".into(),
             is_active: true,
             rate_limit: 0,
-            service_tier: "default".into(),
+            cost_rate: 1.0,
             monthly_budget: Some(10.0),
             budget_used: 5.0,
             budget_used_mtd: 5.0,
@@ -1233,7 +1258,7 @@ mod tests {
             name: "test".into(),
             is_active: false,
             rate_limit: 0,
-            service_tier: "default".into(),
+            cost_rate: 1.0,
             monthly_budget: Some(10.0),
             budget_used: 10.0,
             budget_used_mtd: 10.0,
@@ -1269,7 +1294,7 @@ mod tests {
             name: "test".into(),
             is_active: false,
             rate_limit: 0,
-            service_tier: "default".into(),
+            cost_rate: 1.0,
             monthly_budget: None,
             budget_used: 0.0,
             budget_used_mtd: 0.0,

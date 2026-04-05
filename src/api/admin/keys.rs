@@ -32,7 +32,7 @@ pub struct AdminKeyItem {
     pub is_active: bool,
     pub rate_limit: i32,
     pub tpm_limit: Option<i32>,
-    pub service_tier: String,
+    pub cost_rate: f64,
     pub monthly_budget: Option<f64>,
     pub budget_used_mtd: f64,
     pub created_at: i64,
@@ -46,7 +46,7 @@ impl AdminKeyItem {
             is_active: r.is_active,
             rate_limit: r.rate_limit,
             tpm_limit: r.tpm_limit,
-            service_tier: r.service_tier.clone(),
+            cost_rate: r.cost_rate,
             monthly_budget: r.monthly_budget,
             budget_used_mtd: r.budget_used_mtd,
             created_at: r.created_at,
@@ -83,14 +83,14 @@ pub struct CreateKeyRequest {
     #[serde(default)]
     pub rate_limit: Option<i32>,
     pub tpm_limit: Option<i32>,
-    #[serde(default = "default_service_tier")]
-    pub service_tier: String,
+    #[serde(default = "default_cost_rate")]
+    pub cost_rate: f64,
     pub monthly_budget: Option<f64>,
     pub cache_ttl: Option<String>,
 }
 
-fn default_service_tier() -> String {
-    "default".to_string()
+fn default_cost_rate() -> f64 {
+    1.0
 }
 
 /// Deserialize a field that can be absent (don't touch), null (clear), or a value (set).
@@ -112,7 +112,7 @@ pub struct UpdateKeyRequest {
     /// None = don't change, Some(None) = clear, Some(Some(v)) = set to v
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub tpm_limit: Option<Option<i32>>,
-    pub service_tier: Option<String>,
+    pub cost_rate: Option<f64>,
     /// None = don't change, Some(None) = clear, Some(Some(v)) = set to v
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub monthly_budget: Option<Option<f64>>,
@@ -233,7 +233,7 @@ pub async fn create_key(
         name: body.name.clone(),
         is_active: true,
         rate_limit: body.rate_limit.unwrap_or(100),
-        service_tier: body.service_tier.clone(),
+        cost_rate: body.cost_rate,
         monthly_budget: body.monthly_budget,
         budget_used: 0.0,
         budget_used_mtd: 0.0,
@@ -297,8 +297,8 @@ pub async fn update_key(
     if let Some(tpm) = body.tpm_limit {
         record.tpm_limit = tpm; // Some(v) sets it, None clears it
     }
-    if let Some(service_tier) = body.service_tier {
-        record.service_tier = service_tier;
+    if let Some(cost_rate) = body.cost_rate {
+        record.cost_rate = cost_rate;
     }
     if let Some(budget) = body.monthly_budget {
         record.monthly_budget = budget; // Some(v) sets it, None clears it
@@ -413,7 +413,7 @@ mod tests {
             name: "Test".to_string(),
             is_active: true,
             rate_limit: 100,
-            service_tier: "default".to_string(),
+            cost_rate: 1.0,
             monthly_budget: None,
             budget_used: 0.0,
             budget_used_mtd: 0.0,
@@ -432,10 +432,10 @@ mod tests {
     }
 
     #[test]
-    fn create_request_default_service_tier() {
+    fn create_request_default_cost_rate() {
         let json = r#"{"name":"Test"}"#;
         let req: CreateKeyRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.service_tier, "default");
+        assert_eq!(req.cost_rate, 1.0);
         assert_eq!(req.rate_limit, None);
     }
 

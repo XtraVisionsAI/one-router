@@ -501,6 +501,7 @@ mod tests {
             seed: None,
             logprobs: None,
             top_logprobs: None,
+            service_tier: None,
         }
     }
 

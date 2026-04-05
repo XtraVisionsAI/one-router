@@ -96,6 +96,21 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
         .await
         .ok(); // ignore error if column already exists
 
+    // Migration: add cost_rate column, backfill from service_tier
+    sqlx::query(
+        "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS cost_rate DOUBLE PRECISION DEFAULT 1.0",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE api_keys SET cost_rate = CASE service_tier \
+         WHEN 'flex' THEN 0.5 WHEN 'priority' THEN 1.75 WHEN 'master' THEN 0.0 \
+         ELSE 1.0 END WHERE cost_rate = 1.0 AND service_tier != 'default'",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
     // Migration: add unique index on api_keys.name if upgrading from older schema
     sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_name ON api_keys(name)")
         .execute(pool)
@@ -122,6 +137,11 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
 
     // Migration: add weight column if upgrading
     sqlx::query("ALTER TABLE backends ADD COLUMN IF NOT EXISTS weight INTEGER DEFAULT 1")
+        .execute(pool)
+        .await?;
+
+    // Migration: add service_tier column to backends
+    sqlx::query("ALTER TABLE backends ADD COLUMN IF NOT EXISTS service_tier TEXT")
         .execute(pool)
         .await?;
 

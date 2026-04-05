@@ -14,7 +14,7 @@ pub struct ApiKeyRecord {
     pub name: String,
     pub is_active: bool,
     pub rate_limit: i32,
-    pub service_tier: String,
+    pub cost_rate: f64,
     pub monthly_budget: Option<f64>,
     pub budget_used: f64,
     pub budget_used_mtd: f64,
@@ -93,10 +93,11 @@ pub struct BackendRecord {
     pub config: String,       // JSON (possibly encrypted fields)
     pub enabled: bool,
     pub priority: i32,
-    pub weight: i32,           // load balancing weight, default 1
-    pub strategy: String,      // "round_robin" | "weighted" | "random" | "failover"
-    pub max_failures: i32,     // default 3
-    pub retry_after_secs: i64, // default 300
+    pub weight: i32,                  // load balancing weight, default 1
+    pub strategy: String,             // "round_robin" | "weighted" | "random" | "failover"
+    pub max_failures: i32,            // default 3
+    pub retry_after_secs: i64,        // default 300
+    pub service_tier: Option<String>, // None=ignore, "passthrough"=forward, "flex" etc.=override
     pub created_at: i64,
     pub updated_at: Option<i64>,
 }

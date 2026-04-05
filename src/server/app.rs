@@ -244,6 +244,8 @@ async fn init_bedrock_from_backends(
 
     let mut clients: Vec<(String, aws_sdk_bedrockruntime::Client)> = Vec::new();
     let mut credentials: Vec<crate::services::AwsCredential> = Vec::new();
+    let mut service_tiers: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in bedrock_backends.iter().enumerate() {
@@ -299,6 +301,7 @@ async fn init_bedrock_from_backends(
             crate::services::AwsCredential::default_credential(&cfg.region, &cred_name)
         };
 
+        service_tiers.insert(cred_name.clone(), backend.service_tier.clone());
         clients.push((cred_name, client));
         credentials.push(aws_cred);
     }
@@ -309,7 +312,11 @@ async fn init_bedrock_from_backends(
         strategy = %pool.strategy(),
         "Bedrock service initialized with credential pool"
     );
-    Ok(Some(BedrockService::with_pool(clients, pool)))
+    Ok(Some(BedrockService::with_pool(
+        clients,
+        pool,
+        service_tiers,
+    )))
 }
 
 /// Initialize Gemini pool from the backends table.
@@ -375,6 +382,7 @@ async fn init_gemini_from_backends(
                     &backend.name,
                     svc,
                     backend.weight as u32,
+                    backend.service_tier.clone(),
                 ));
             }
             Err(e) => {
@@ -469,6 +477,7 @@ async fn init_passthrough_from_backends(
                             &backend.name,
                             svc,
                             backend.weight as u32,
+                            backend.service_tier.clone(),
                         ));
                     }
                     Err(e) => {
@@ -511,6 +520,7 @@ async fn init_passthrough_from_backends(
                             &backend.name,
                             svc,
                             backend.weight as u32,
+                            backend.service_tier.clone(),
                         ));
                     }
                     Err(e) => {

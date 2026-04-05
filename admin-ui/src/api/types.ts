@@ -8,6 +8,7 @@ export interface BackendSummary {
   strategy: string
   max_failures: number
   retry_after_secs: number
+  service_tier: string | null
   health_status: string
   config_summary: Record<string, unknown>
 }
@@ -21,6 +22,7 @@ export interface UpsertBackendBody {
   strategy?: string
   max_failures?: number
   retry_after_secs?: number
+  service_tier?: string | null
   config?: Record<string, unknown>
 }
 
@@ -33,7 +35,7 @@ export interface ApiKey {
   budget_used_mtd: number | null
   tpm_limit: number | null
   cache_ttl: string | null
-  service_tier: string
+  cost_rate: number
   is_active: boolean
   created_at: number
 }
@@ -44,7 +46,7 @@ export interface CreateKeyBody {
   monthly_budget: number | null
   tpm_limit?: number | null
   cache_ttl?: string | null
-  service_tier: string
+  cost_rate: number
 }
 
 export interface UpdateKeyBody {
@@ -53,7 +55,7 @@ export interface UpdateKeyBody {
   monthly_budget?: number | null
   tpm_limit?: number | null
   cache_ttl?: string | null
-  service_tier?: string
+  cost_rate?: number
 }
 
 // ── Model Mappings ────────────────────────────────────────────

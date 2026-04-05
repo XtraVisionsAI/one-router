@@ -9,15 +9,6 @@ use crate::schemas::anthropic::Usage;
 use chrono::Utc;
 use std::sync::Arc;
 
-fn get_tier_multiplier(tier: &str) -> f64 {
-    match tier.to_lowercase().as_str() {
-        "flex" => 0.5,
-        "priority" => 1.75,
-        "master" => 0.0,
-        _ => 1.0,
-    }
-}
-
 fn is_new_month(stored_month: Option<&str>, current_month: &str) -> bool {
     stored_month.map(|m| m != current_month).unwrap_or(true)
 }
@@ -94,7 +85,7 @@ impl UsageTracker {
             .await
             .map_err(|e| UsageError::Database(e.to_string()))?;
 
-        let cost = self.calculate_cost(model, usage, &key_info.service_tier);
+        let cost = self.calculate_cost(model, usage, key_info.cost_rate);
 
         if cost > 0.0 {
             let budget_exceeded = self
@@ -118,7 +109,7 @@ impl UsageTracker {
         Ok(false)
     }
 
-    fn calculate_cost(&self, _model: &str, usage: &Usage, service_tier: &str) -> f64 {
+    fn calculate_cost(&self, _model: &str, usage: &Usage, cost_rate: f64) -> f64 {
         const INPUT_PRICE_PER_MILLION: f64 = 3.0;
         const OUTPUT_PRICE_PER_MILLION: f64 = 15.0;
         const CACHE_READ_PRICE_PER_MILLION: f64 = 0.30;
@@ -138,8 +129,7 @@ impl UsageTracker {
             .unwrap_or(0.0);
 
         let base_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
-        let multiplier = get_tier_multiplier(service_tier);
-        base_cost * multiplier
+        base_cost * cost_rate
     }
 }
 
@@ -168,14 +158,6 @@ pub enum UsageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_tier_multiplier() {
-        assert_eq!(get_tier_multiplier("default"), 1.0);
-        assert_eq!(get_tier_multiplier("flex"), 0.5);
-        assert_eq!(get_tier_multiplier("priority"), 1.75);
-        assert_eq!(get_tier_multiplier("master"), 0.0);
-    }
 
     #[test]
     fn test_is_new_month() {

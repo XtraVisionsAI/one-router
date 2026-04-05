@@ -7,6 +7,7 @@ pub mod gemini;
 pub mod model_mapping;
 pub mod passthrough;
 pub mod ptc;
+pub mod service_tier;
 pub mod usage_tracker;
 
 pub use backend_pool::{

@@ -19,7 +19,16 @@
   const isEdit = computed(() => !!props.existing)
   const title = computed(() => (isEdit.value ? `Edit Backend: ${props.existing!.name}` : 'Add Backend'))
 
-  const form = ref({ name: '', backend_type: 'bedrock', priority: 0, weight: 1 })
+  const form = ref({ name: '', backend_type: 'bedrock', priority: 0, weight: 1, service_tier: null as string | null })
+
+  const serviceTierOptions = [
+    { label: 'None (do not send)', value: null },
+    { label: 'Passthrough (forward request value)', value: 'passthrough' },
+    { label: 'Default', value: 'default' },
+    { label: 'Flex', value: 'flex' },
+    { label: 'Priority', value: 'priority' },
+    { label: 'Reserved', value: 'reserved' }
+  ]
   const saving = ref(false)
   const loadingConfig = ref(false)
   const configLoaded = ref(false)
@@ -69,7 +78,8 @@
           name: props.existing?.name ?? '',
           backend_type: props.existing?.backend_type ?? 'bedrock',
           priority: props.existing?.priority ?? 0,
-          weight: props.existing?.weight ?? 1
+          weight: props.existing?.weight ?? 1,
+          service_tier: props.existing?.service_tier ?? null
         }
         resetConfigFields()
         // Pool settings are stored as separate DB fields (not encrypted),
@@ -188,6 +198,7 @@
       strategy: pool.value.strategy,
       max_failures: pool.value.max_failures,
       retry_after_secs: pool.value.retry_after_secs,
+      service_tier: form.value.service_tier,
     }
 
     // Only include config if we have loaded/entered it
@@ -317,6 +328,10 @@
         <NInputNumber v-model:value="pool.retry_after_secs" :min="0" :max="3600" />
       </NFormItem>
     </div>
+
+    <NFormItem label="Service Tier">
+      <NSelect v-model:value="form.service_tier" :options="serviceTierOptions" clearable placeholder="None" />
+    </NFormItem>
 
     <template #footer>
       <div class="flex justify-end gap-2">

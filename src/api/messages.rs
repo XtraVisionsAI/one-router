@@ -401,6 +401,23 @@ async fn handle_anthropic_passthrough(
     let mut body_value =
         serde_json::to_value(request).map_err(|e| ApiError::internal_error(e.to_string()))?;
     body_value["model"] = serde_json::Value::String(target_model_id.to_string());
+
+    // Resolve service_tier: backend config → map to Anthropic provider value
+    if let Some(obj) = body_value.as_object_mut() {
+        match crate::services::service_tier::resolve_for_provider(
+            instance.service_tier(),
+            request.service_tier.as_deref(),
+            "anthropic",
+        ) {
+            Some(tier) => {
+                obj.insert("service_tier".to_string(), serde_json::json!(tier));
+            }
+            None => {
+                obj.remove("service_tier");
+            }
+        }
+    }
+
     let body_bytes =
         serde_json::to_vec(&body_value).map_err(|e| ApiError::internal_error(e.to_string()))?;
 
@@ -570,9 +587,16 @@ async fn handle_openai_backend(
 
     // Convert Anthropic request to OpenAI format
     let converter = AnthropicToOpenAIConverter::new();
-    let openai_request = converter
+    let mut openai_request = converter
         .convert_request(request, target_model_id)
         .map_err(|e| ApiError::bad_request(format!("Request conversion error: {e}")))?;
+
+    // Resolve service_tier: backend config → map to OpenAI provider value
+    openai_request.service_tier = crate::services::service_tier::resolve_for_provider(
+        instance.service_tier(),
+        request.service_tier.as_deref(),
+        "openai",
+    );
 
     let body_bytes =
         serde_json::to_vec(&openai_request).map_err(|e| ApiError::internal_error(e.to_string()))?;

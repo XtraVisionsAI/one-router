@@ -79,7 +79,7 @@ impl DatabaseService for PostgresBackend {
 impl ApiKeyStore for PostgresBackend {
     async fn get_api_key(&self, api_key: &str) -> Result<Option<ApiKeyRecord>> {
         let row = sqlx::query(
-            "SELECT api_key, name, is_active, rate_limit, service_tier, \
+            "SELECT api_key, name, is_active, rate_limit, cost_rate, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = $1",
@@ -94,7 +94,7 @@ impl ApiKeyStore for PostgresBackend {
                 name: r.get("name"),
                 is_active: r.get("is_active"),
                 rate_limit: r.get("rate_limit"),
-                service_tier: r.get("service_tier"),
+                cost_rate: r.get("cost_rate"),
                 monthly_budget: r.get("monthly_budget"),
                 budget_used: r.get("budget_used"),
                 budget_used_mtd: r.get("budget_used_mtd"),
@@ -114,7 +114,7 @@ impl ApiKeyStore for PostgresBackend {
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO api_keys \
-             (api_key, name, is_active, rate_limit, service_tier, \
+             (api_key, name, is_active, rate_limit, cost_rate, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
@@ -123,7 +123,7 @@ impl ApiKeyStore for PostgresBackend {
         .bind(&record.name)
         .bind(record.is_active)
         .bind(record.rate_limit)
-        .bind(&record.service_tier)
+        .bind(record.cost_rate)
         .bind(record.monthly_budget)
         .bind(record.budget_used)
         .bind(record.budget_used_mtd)
@@ -145,7 +145,7 @@ impl ApiKeyStore for PostgresBackend {
         let now = unix_now();
         sqlx::query(
             "UPDATE api_keys SET \
-             name = $1, is_active = $2, rate_limit = $3, service_tier = $4, \
+             name = $1, is_active = $2, rate_limit = $3, cost_rate = $4, \
              monthly_budget = $5, budget_used = $6, budget_used_mtd = $7, budget_mtd_month = $8, \
              deactivated_reason = $9, budget_history = $10, tpm_limit = $11, cache_ttl = $12, metadata = $13, updated_at = $14 \
              WHERE api_key = $15",
@@ -153,7 +153,7 @@ impl ApiKeyStore for PostgresBackend {
         .bind(&record.name)
         .bind(record.is_active)
         .bind(record.rate_limit)
-        .bind(&record.service_tier)
+        .bind(record.cost_rate)
         .bind(record.monthly_budget)
         .bind(record.budget_used)
         .bind(record.budget_used_mtd)
@@ -286,7 +286,7 @@ impl ApiKeyStore for PostgresBackend {
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows = sqlx::query(
-            "SELECT api_key, name, is_active, rate_limit, service_tier, \
+            "SELECT api_key, name, is_active, rate_limit, cost_rate, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
@@ -301,7 +301,7 @@ impl ApiKeyStore for PostgresBackend {
                 name: r.get("name"),
                 is_active: r.get("is_active"),
                 rate_limit: r.get("rate_limit"),
-                service_tier: r.get("service_tier"),
+                cost_rate: r.get("cost_rate"),
                 monthly_budget: r.get("monthly_budget"),
                 budget_used: r.get("budget_used"),
                 budget_used_mtd: r.get("budget_used_mtd"),
@@ -708,7 +708,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
         let row = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, \
+             strategy, max_failures, retry_after_secs, service_tier, \
              created_at, updated_at \
              FROM backends WHERE name = $1",
         )
@@ -727,6 +727,7 @@ impl BackendConfigStore for PostgresBackend {
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
+                service_tier: r.get("service_tier"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })),
@@ -737,7 +738,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, \
+             strategy, max_failures, retry_after_secs, service_tier, \
              created_at, updated_at \
              FROM backends WHERE enabled = TRUE ORDER BY priority DESC",
         )
@@ -756,6 +757,7 @@ impl BackendConfigStore for PostgresBackend {
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
+                service_tier: r.get("service_tier"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -767,7 +769,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, \
+             strategy, max_failures, retry_after_secs, service_tier, \
              created_at, updated_at \
              FROM backends ORDER BY priority DESC",
         )
@@ -786,6 +788,7 @@ impl BackendConfigStore for PostgresBackend {
                 strategy: r.get("strategy"),
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
+                service_tier: r.get("service_tier"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -799,9 +802,9 @@ impl BackendConfigStore for PostgresBackend {
         sqlx::query(
             "INSERT INTO backends \
              (name, backend_type, config, enabled, priority, weight, \
-              strategy, max_failures, retry_after_secs, \
+              strategy, max_failures, retry_after_secs, service_tier, \
               created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT(name) DO UPDATE SET \
              backend_type = EXCLUDED.backend_type, \
              config = EXCLUDED.config, \
@@ -811,6 +814,7 @@ impl BackendConfigStore for PostgresBackend {
              strategy = EXCLUDED.strategy, \
              max_failures = EXCLUDED.max_failures, \
              retry_after_secs = EXCLUDED.retry_after_secs, \
+             service_tier = EXCLUDED.service_tier, \
              updated_at = EXCLUDED.updated_at",
         )
         .bind(&record.name)
@@ -822,6 +826,7 @@ impl BackendConfigStore for PostgresBackend {
         .bind(&record.strategy)
         .bind(record.max_failures)
         .bind(record.retry_after_secs)
+        .bind(&record.service_tier)
         .bind(record.created_at)
         .bind(now)
         .execute(&self.pool)

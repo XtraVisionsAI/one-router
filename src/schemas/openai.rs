@@ -85,6 +85,10 @@ pub struct ChatCompletionRequest {
     /// Top log probabilities (not supported, ignored)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<i32>,
+
+    /// Service tier for the request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 /// Stream options

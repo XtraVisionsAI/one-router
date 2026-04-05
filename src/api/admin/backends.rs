@@ -36,6 +36,7 @@ pub struct BackendSummary {
     pub strategy: String,
     pub max_failures: i32,
     pub retry_after_secs: i64,
+    pub service_tier: Option<String>,
     pub health_status: String,
     pub config_summary: Value,
 }
@@ -51,6 +52,7 @@ impl BackendSummary {
             strategy: r.strategy.clone(),
             max_failures: r.max_failures,
             retry_after_secs: r.retry_after_secs,
+            service_tier: r.service_tier.clone(),
             health_status: health.to_string(),
             config_summary: make_config_summary(&r.backend_type, &r.config),
         }
@@ -192,6 +194,8 @@ pub struct UpsertBackendRequest {
     pub max_failures: i32,
     #[serde(default = "default_retry_after_secs")]
     pub retry_after_secs: i64,
+    /// Service tier: None=ignore, "passthrough"=forward, "flex"/"priority"/etc.=override
+    pub service_tier: Option<String>,
     /// Full config as a JSON object. If omitted on PUT, existing config is kept.
     pub config: Option<Value>,
 }
@@ -294,6 +298,7 @@ pub async fn create_backend(
         strategy: body.strategy.clone(),
         max_failures: body.max_failures,
         retry_after_secs: body.retry_after_secs,
+        service_tier: body.service_tier.clone(),
         created_at: now,
         updated_at: None,
     };
@@ -378,6 +383,7 @@ pub async fn update_backend(
         strategy: body.strategy.clone(),
         max_failures: body.max_failures,
         retry_after_secs: body.retry_after_secs,
+        service_tier: body.service_tier.clone(),
         created_at: existing.created_at,
         updated_at: Some(now),
     };

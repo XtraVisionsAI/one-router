@@ -160,7 +160,15 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
         name: get_s(item, "name"),
         is_active: get_bool(item, "is_active"),
         rate_limit: get_i32(item, "rate_limit"),
-        service_tier: get_s(item, "service_tier"),
+        cost_rate: get_opt_f64(item, "cost_rate").unwrap_or_else(|| {
+            // Backward compatibility: derive from old service_tier string
+            match get_opt_s(item, "service_tier").as_deref() {
+                Some("flex") => 0.5,
+                Some("priority") => 1.75,
+                Some("master") => 0.0,
+                _ => 1.0,
+            }
+        }),
         monthly_budget: get_opt_f64(item, "monthly_budget"),
         budget_used: get_f64(item, "budget_used"),
         budget_used_mtd: get_f64(item, "budget_used_mtd"),
@@ -181,7 +189,7 @@ fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
     item.insert("name".into(), av_s(&record.name));
     item.insert("is_active".into(), av_bool(record.is_active));
     item.insert("rate_limit".into(), av_n(record.rate_limit as i64));
-    item.insert("service_tier".into(), av_s(&record.service_tier));
+    item.insert("cost_rate".into(), av_n_f64(record.cost_rate));
     item.insert("monthly_budget".into(), av_opt_n_f64(record.monthly_budget));
     item.insert("budget_used".into(), av_n_f64(record.budget_used));
     item.insert("budget_used_mtd".into(), av_n_f64(record.budget_used_mtd));
@@ -258,6 +266,7 @@ fn backend_from_item(item: &HashMap<String, AttributeValue>) -> BackendRecord {
         strategy: get_s(item, "strategy"),
         max_failures: get_i32(item, "max_failures"),
         retry_after_secs: get_i64(item, "retry_after_secs"),
+        service_tier: get_opt_s(item, "service_tier"),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
     }
@@ -830,6 +839,7 @@ impl BackendConfigStore for DynamoDbBackend {
         item.insert("strategy".into(), av_s(&record.strategy));
         item.insert("max_failures".into(), av_n(record.max_failures as i64));
         item.insert("retry_after_secs".into(), av_n(record.retry_after_secs));
+        item.insert("service_tier".into(), av_opt_s(&record.service_tier));
         item.insert("created_at".into(), av_n(record.created_at));
         item.insert("updated_at".into(), av_n(now));
 
