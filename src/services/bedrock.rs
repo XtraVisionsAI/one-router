@@ -758,7 +758,7 @@ impl InvokeModelStreamResponse {
 /// - Sets or removes `service_tier` based on the resolved effective tier.
 fn build_invoke_model_body(
     request: &crate::schemas::anthropic::MessageRequest,
-    model_id: &str,
+    _model_id: &str,
     _streaming: bool,
     effective_service_tier: Option<&str>,
 ) -> Result<Vec<u8>, BedrockError> {
@@ -772,9 +772,9 @@ fn build_invoke_model_body(
             "anthropic_version".to_string(),
             serde_json::json!("bedrock-2023-05-31"),
         );
-        // Replace model with the resolved Bedrock model ID
-        obj.insert("model".to_string(), serde_json::json!(model_id));
-        // Remove fields that Bedrock InvokeModel does not recognize
+        // Remove fields that Bedrock InvokeModel does not accept in the body.
+        // Model ID is passed via the .model_id() API parameter, not in the body.
+        obj.remove("model");
         obj.remove("stream");
         obj.remove("container");
 

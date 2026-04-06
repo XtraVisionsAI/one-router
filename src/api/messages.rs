@@ -568,6 +568,11 @@ async fn handle_anthropic_passthrough(
         serde_json::to_value(request).map_err(|e| ApiError::internal_error(e.to_string()))?;
     body_value["model"] = serde_json::Value::String(target_model_id.to_string());
 
+    // Remove fields not recognized by the Anthropic API
+    if let Some(obj) = body_value.as_object_mut() {
+        obj.remove("container"); // PTC field, not part of Anthropic API
+    }
+
     // Resolve service_tier: backend config → map to Anthropic provider value
     if let Some(obj) = body_value.as_object_mut() {
         match crate::services::service_tier::resolve_for_provider(
