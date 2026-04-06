@@ -187,12 +187,10 @@ impl PassthroughService {
             .post(&url)
             .header("Content-Type", "application/json");
 
-        // Set auth and required headers based on target
+        // Set auth header based on target
         match self.target {
             PassthroughTarget::Anthropic => {
-                req_builder = req_builder
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", "2023-06-01");
+                req_builder = req_builder.header("x-api-key", &api_key);
             }
             PassthroughTarget::OpenAI => {
                 req_builder = req_builder.header("Authorization", format!("Bearer {api_key}"));
@@ -207,6 +205,17 @@ impl PassthroughService {
         for (name, value) in extra_headers {
             if !BLOCKED_HEADERS.contains(&name.to_lowercase().as_str()) {
                 req_builder = req_builder.header(name.as_str(), value.as_str());
+            }
+        }
+
+        // Anthropic API requires anthropic-version header.
+        // Inject default only if client didn't provide one.
+        if self.target == PassthroughTarget::Anthropic {
+            let has_version = extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("anthropic-version"));
+            if !has_version {
+                req_builder = req_builder.header("anthropic-version", "2023-06-01");
             }
         }
 
