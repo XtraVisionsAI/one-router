@@ -170,7 +170,10 @@ pub async fn create_mapping(
     };
 
     match state.database.model_mapping().upsert_mapping(&record).await {
-        Ok(()) => (StatusCode::CREATED, Json(record)).into_response(),
+        Ok(()) => {
+            state.model_mapping.invalidate_all().await;
+            (StatusCode::CREATED, Json(record)).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to create model mapping");
             (
@@ -244,7 +247,10 @@ pub async fn update_mapping(
     };
 
     match state.database.model_mapping().upsert_mapping(&record).await {
-        Ok(()) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(()) => {
+            state.model_mapping.invalidate_all().await;
+            (StatusCode::OK, Json(record)).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to update model mapping");
             (
@@ -270,7 +276,10 @@ pub async fn delete_mapping(
         .delete_mapping(&path.source_model_id, &path.provider)
         .await
     {
-        Ok(()) => (StatusCode::OK, Json(OkResponse { ok: true })).into_response(),
+        Ok(()) => {
+            state.model_mapping.invalidate_all().await;
+            (StatusCode::OK, Json(OkResponse { ok: true })).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to delete model mapping");
             (
