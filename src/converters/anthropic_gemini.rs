@@ -9,9 +9,9 @@ use crate::schemas::anthropic::{
     Usage,
 };
 use crate::schemas::gemini::{
-    Candidate, FunctionCallingConfig, FunctionDeclaration, GeminiContent, GeminiRequest,
-    GeminiResponse, GenerationConfig, Part, StreamChunk, Tool as GeminiTool, ToolConfig,
-    UsageMetadata,
+    Candidate, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, GeminiContent,
+    GeminiRequest, GeminiResponse, GenerationConfig, Part, StreamChunk, Tool as GeminiTool,
+    ToolConfig, UsageMetadata,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -355,19 +355,19 @@ mod request {
                 None => Ok(None),
                 Some(ToolChoice::Auto(s)) => {
                     let mode = match s.as_str() {
-                        "any" => "ANY",
-                        _ => "AUTO",
+                        "any" => FunctionCallingMode::Any,
+                        _ => FunctionCallingMode::Auto,
                     };
                     Ok(Some(ToolConfig {
                         function_calling_config: FunctionCallingConfig {
-                            mode: mode.to_string(),
+                            mode,
                             allowed_function_names: None,
                         },
                     }))
                 }
                 Some(ToolChoice::Specific { name }) => Ok(Some(ToolConfig {
                     function_calling_config: FunctionCallingConfig {
-                        mode: "ANY".to_string(),
+                        mode: FunctionCallingMode::Any,
                         allowed_function_names: Some(vec![name.clone()]),
                     },
                 })),
@@ -376,13 +376,13 @@ mod request {
                         match tool_type {
                             "auto" => Ok(Some(ToolConfig {
                                 function_calling_config: FunctionCallingConfig {
-                                    mode: "AUTO".to_string(),
+                                    mode: FunctionCallingMode::Auto,
                                     allowed_function_names: None,
                                 },
                             })),
                             "any" => Ok(Some(ToolConfig {
                                 function_calling_config: FunctionCallingConfig {
-                                    mode: "ANY".to_string(),
+                                    mode: FunctionCallingMode::Any,
                                     allowed_function_names: None,
                                 },
                             })),
@@ -394,7 +394,7 @@ mod request {
                                     .to_string();
                                 Ok(Some(ToolConfig {
                                     function_calling_config: FunctionCallingConfig {
-                                        mode: "ANY".to_string(),
+                                        mode: FunctionCallingMode::Any,
                                         allowed_function_names: Some(vec![name]),
                                     },
                                 }))

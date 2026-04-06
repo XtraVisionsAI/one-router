@@ -193,6 +193,7 @@ pub async fn get_usage_records(
             api_key_filter,
             params.start_time.as_deref(),
             Some(limit + 1),
+            None,
         )
         .await
     {

@@ -44,7 +44,7 @@ impl OpenAIApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            error: OpenAIErrorResponse::invalid_request(&message.into()),
+            error: OpenAIErrorResponse::invalid_request_error(&message.into()),
         }
     }
 

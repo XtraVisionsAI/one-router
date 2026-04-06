@@ -180,15 +180,45 @@ pub struct GenerationConfig {
     pub candidate_count: Option<i32>,
 }
 
+/// Harm category for safety settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HarmCategory {
+    #[serde(rename = "HARM_CATEGORY_HARASSMENT")]
+    Harassment,
+    #[serde(rename = "HARM_CATEGORY_HATE_SPEECH")]
+    HateSpeech,
+    #[serde(rename = "HARM_CATEGORY_SEXUALLY_EXPLICIT")]
+    SexuallyExplicit,
+    #[serde(rename = "HARM_CATEGORY_DANGEROUS_CONTENT")]
+    DangerousContent,
+    #[serde(other)]
+    Other,
+}
+
+/// Harm block threshold for safety settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HarmBlockThreshold {
+    #[serde(rename = "BLOCK_NONE")]
+    BlockNone,
+    #[serde(rename = "BLOCK_LOW_AND_ABOVE")]
+    BlockLowAndAbove,
+    #[serde(rename = "BLOCK_MEDIUM_AND_ABOVE")]
+    BlockMediumAndAbove,
+    #[serde(rename = "BLOCK_ONLY_HIGH")]
+    BlockOnlyHigh,
+    #[serde(other)]
+    Other,
+}
+
 /// Safety setting
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SafetySetting {
     /// Harm category
-    pub category: String,
+    pub category: HarmCategory,
 
     /// Block threshold
-    pub threshold: String,
+    pub threshold: HarmBlockThreshold,
 }
 
 /// Tool definition
@@ -221,12 +251,25 @@ pub struct ToolConfig {
     pub function_calling_config: FunctionCallingConfig,
 }
 
+/// Function calling mode
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum FunctionCallingMode {
+    #[serde(rename = "AUTO")]
+    #[default]
+    Auto,
+    #[serde(rename = "ANY")]
+    Any,
+    #[serde(rename = "NONE")]
+    None,
+}
+
 /// Function calling configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FunctionCallingConfig {
-    /// Mode: "AUTO", "ANY", "NONE"
-    pub mode: String,
+    /// Mode: AUTO, ANY, NONE
+    #[serde(default)]
+    pub mode: FunctionCallingMode,
 
     /// Allowed function names (for ANY mode)
     #[serde(skip_serializing_if = "Option::is_none")]

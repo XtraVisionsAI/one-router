@@ -561,6 +561,25 @@ impl ApiKeyStore for DynamoDbBackend {
 
         Ok(records)
     }
+
+    async fn find_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKeyRecord>> {
+        let result = self
+            .client
+            .scan()
+            .table_name(Self::table_name("api_keys"))
+            .filter_expression("begins_with(api_key, :prefix)")
+            .expression_attribute_values(":prefix", av_s(prefix))
+            .limit(2)
+            .send()
+            .await?;
+
+        let items = result.items();
+        if items.len() > 1 {
+            anyhow::bail!("ambiguous_prefix");
+        }
+
+        Ok(items.first().map(api_key_from_item))
+    }
 }
 
 // ============================================================================
@@ -601,6 +620,7 @@ impl UsageStore for DynamoDbBackend {
         api_key: &str,
         since: Option<&str>,
         limit: Option<i64>,
+        _before_id: Option<i64>,
     ) -> Result<Vec<UsageRecord>> {
         // Empty api_key means "all keys" — use Scan instead of Query
         let records = if api_key.is_empty() {
@@ -655,30 +675,93 @@ impl UsageStore for DynamoDbBackend {
     ) -> Result<Vec<UsageSummaryRow>> {
         use std::collections::HashMap;
 
-        // 复用已有的 get_usage_by_api_key 拉全量记录
-        // 注意：DynamoDB 后端会拉取指定时间范围内该 api_key 的全量记录到内存再聚合，
-        // 数据量大时（如数百万条）可能造成高内存占用。
-        // 生产环境建议配合合理的 start_time 参数缩小查询范围。
-        let records = self.get_usage_by_api_key(api_key, start, None).await?;
+        const MAX_ITEMS: i32 = 10_000;
 
-        // 按 end 过滤（DynamoDB 查询只支持 sort_key >= start）
-        let records: Vec<_> = if let Some(end_ts) = end {
-            records
-                .into_iter()
-                .filter(|r| r.timestamp.as_str() <= end_ts)
-                .collect()
+        let filter_by_key = !api_key.is_empty();
+
+        // Build timestamp filter expression for server-side filtering
+        let mut filter_parts: Vec<String> = Vec::new();
+        let mut expr_values: Vec<(String, AttributeValue)> = Vec::new();
+
+        if let Some(start_ts) = start {
+            filter_parts.push("#ts >= :start_ts".to_string());
+            expr_values.push((":start_ts".to_string(), av_s(start_ts)));
+        }
+        if let Some(end_ts) = end {
+            filter_parts.push("#ts <= :end_ts".to_string());
+            expr_values.push((":end_ts".to_string(), av_s(end_ts)));
+        }
+
+        let filter_expr = if filter_parts.is_empty() {
+            None
         } else {
-            records
+            Some(filter_parts.join(" AND "))
         };
 
-        // 聚合
+        // When api_key is provided, use Query (partition key lookup) instead of Scan
+        let records: Vec<UsageRecord> = if filter_by_key {
+            let mut query = self
+                .client
+                .query()
+                .table_name(Self::table_name("usage"))
+                .key_condition_expression("api_key = :ak")
+                .expression_attribute_values(":ak", av_s(api_key))
+                .limit(MAX_ITEMS);
+
+            if let Some(ref fe) = filter_expr {
+                query = query
+                    .filter_expression(fe.as_str())
+                    .expression_attribute_names("#ts", "timestamp");
+            }
+            for (k, v) in &expr_values {
+                query = query.expression_attribute_values(k, v.clone());
+            }
+
+            let result = query.send().await?;
+            let items = result.items();
+            if items.len() >= MAX_ITEMS as usize {
+                tracing::warn!(
+                    api_key = %api_key,
+                    count = items.len(),
+                    "query_usage_summary hit item limit ({MAX_ITEMS}); results may be incomplete"
+                );
+            }
+            items.iter().map(usage_from_item).collect()
+        } else {
+            // No api_key filter — must scan
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(Self::table_name("usage"))
+                .limit(MAX_ITEMS);
+
+            if let Some(ref fe) = filter_expr {
+                scan = scan
+                    .filter_expression(fe.as_str())
+                    .expression_attribute_names("#ts", "timestamp");
+            }
+            for (k, v) in &expr_values {
+                scan = scan.expression_attribute_values(k, v.clone());
+            }
+
+            let result = scan.send().await?;
+            let items = result.items();
+            if items.len() >= MAX_ITEMS as usize {
+                tracing::warn!(
+                    count = items.len(),
+                    "query_usage_summary hit item limit ({MAX_ITEMS}); results may be incomplete"
+                );
+            }
+            items.iter().map(usage_from_item).collect()
+        };
+
+        // Aggregate in memory
         let mut map: HashMap<String, UsageSummaryRow> = HashMap::new();
 
         for r in &records {
             let key = if group_by == "model" {
                 r.model.clone()
             } else {
-                // 取 timestamp 的前 13 字符："2026-03-24T15"
                 r.timestamp.chars().take(13).collect()
             };
 

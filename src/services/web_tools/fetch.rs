@@ -157,23 +157,49 @@ fn strip_html(html: &str) -> String {
 }
 
 fn remove_script_style(html: &str) -> String {
-    let mut result = html.to_string();
-    for tag in &["script", "style"] {
-        let open = format!("<{tag}");
-        let close = format!("</{tag}>");
-        loop {
-            let lower = result.to_lowercase();
-            if let Some(start) = lower.find(&open) {
-                if let Some(end_offset) = lower[start..].find(&close) {
-                    result.drain(start..start + end_offset + close.len());
-                } else {
-                    break;
-                }
+    let lower = html.to_lowercase();
+    let mut result = String::with_capacity(html.len());
+    let mut pos = 0;
+
+    while pos < html.len() {
+        let remaining_lower = &lower[pos..];
+        // Find the nearest <script or <style tag
+        let script_pos = remaining_lower.find("<script");
+        let style_pos = remaining_lower.find("<style");
+
+        let tag_start = match (script_pos, style_pos) {
+            (Some(s), Some(st)) => Some(if s <= st {
+                (s, "script")
             } else {
+                (st, "style")
+            }),
+            (Some(s), None) => Some((s, "script")),
+            (None, Some(st)) => Some((st, "style")),
+            (None, None) => None,
+        };
+
+        match tag_start {
+            Some((offset, tag)) => {
+                // Copy everything before this tag
+                result.push_str(&html[pos..pos + offset]);
+                let close_tag = format!("</{tag}>");
+                let search_from = pos + offset;
+                if let Some(end_offset) = lower[search_from..].find(&close_tag) {
+                    // Skip past the closing tag
+                    pos = search_from + end_offset + close_tag.len();
+                } else {
+                    // No closing tag found; skip to end
+                    pos = html.len();
+                }
+            }
+            None => {
+                // No more tags; copy the rest
+                result.push_str(&html[pos..]);
                 break;
             }
         }
     }
+
     result
 }
 

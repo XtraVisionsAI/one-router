@@ -5,9 +5,9 @@
 //! - Gemini API response → OpenAI Chat Completions API response
 
 use crate::schemas::gemini::{
-    Candidate, FunctionCallingConfig, FunctionDeclaration, GeminiContent, GeminiRequest,
-    GeminiResponse, GenerationConfig, Part, StreamChunk, Tool as GeminiTool, ToolConfig,
-    UsageMetadata,
+    Candidate, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, GeminiContent,
+    GeminiRequest, GeminiResponse, GenerationConfig, Part, StreamChunk, Tool as GeminiTool,
+    ToolConfig, UsageMetadata,
 };
 use crate::schemas::openai::{
     AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
@@ -386,22 +386,22 @@ impl OpenAIToGeminiConverter {
             None => Ok(None),
             Some(ToolChoice::Mode(mode)) => {
                 let gemini_mode = match mode.as_str() {
-                    "none" => "NONE",
-                    "auto" => "AUTO",
-                    "required" => "ANY",
-                    _ => "AUTO",
+                    "none" => FunctionCallingMode::None,
+                    "auto" => FunctionCallingMode::Auto,
+                    "required" => FunctionCallingMode::Any,
+                    _ => FunctionCallingMode::Auto,
                 };
 
                 Ok(Some(ToolConfig {
                     function_calling_config: FunctionCallingConfig {
-                        mode: gemini_mode.to_string(),
+                        mode: gemini_mode,
                         allowed_function_names: None,
                     },
                 }))
             }
             Some(ToolChoice::Function { function, .. }) => Ok(Some(ToolConfig {
                 function_calling_config: FunctionCallingConfig {
-                    mode: "ANY".to_string(),
+                    mode: FunctionCallingMode::Any,
                     allowed_function_names: Some(vec![function.name.clone()]),
                 },
             })),

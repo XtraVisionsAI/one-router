@@ -145,46 +145,41 @@ async fn resolve_key(
     state: &AppState,
     key_prefix: &str,
 ) -> Result<ApiKeyRecord, axum::response::Response> {
-    let records = state
+    // Strip trailing "..." from truncated key to get the raw prefix for DB lookup
+    let raw_prefix = key_prefix.trim_end_matches("...");
+
+    match state
         .database
         .api_keys()
-        .list_api_keys()
+        .find_api_key_by_prefix(raw_prefix)
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to list API keys");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    "Failed to retrieve API keys",
-                )),
-            )
-                .into_response()
-        })?;
-
-    let mut matches: Vec<ApiKeyRecord> = records
-        .into_iter()
-        .filter(|r| ApiKeyInfo::truncate_key(&r.api_key) == key_prefix)
-        .collect();
-
-    if matches.len() > 1 {
-        return Err((
+    {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("not_found_error", "API key not found")),
+        )
+            .into_response()),
+        Err(e) if e.to_string().contains("ambiguous_prefix") => Err((
             StatusCode::CONFLICT,
             Json(ErrorResponse::new(
                 "conflict_error",
                 "Ambiguous key prefix — multiple keys share this prefix",
             )),
         )
-            .into_response());
+            .into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to find API key by prefix");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Failed to retrieve API keys",
+                )),
+            )
+                .into_response())
+        }
     }
-
-    matches.pop().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new("not_found_error", "API key not found")),
-        )
-            .into_response()
-    })
 }
 
 // ============================================================================

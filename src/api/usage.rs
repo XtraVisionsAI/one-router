@@ -204,14 +204,19 @@ pub async fn get_usage_records(
             .into_response();
     }
 
-    // Fetch all records after start_time (no row limit preset).
-    // The before_id cursor must be filtered at the application layer to correctly determine has_more.
+    // Push before_id and limit+1 down to the database layer for efficient filtering.
+    // We fetch limit+1 to determine has_more without loading all records.
     // Note: The before_id cursor does not work with DynamoDB backend (id field is None);
     // in that case start_time must be used instead.
-    let all_records = match state
+    let mut records = match state
         .database
         .usage()
-        .get_usage_by_api_key(&key_info.api_key, params.start_time.as_deref(), None)
+        .get_usage_by_api_key(
+            &key_info.api_key,
+            params.start_time.as_deref(),
+            Some(limit + 1),
+            params.before_id,
+        )
         .await
     {
         Ok(r) => r,
@@ -226,16 +231,6 @@ pub async fn get_usage_records(
             )
                 .into_response();
         }
-    };
-
-    // before_id cursor filtering (records ordered by timestamp DESC, id monotonically increasing)
-    let mut records: Vec<_> = if let Some(before) = params.before_id {
-        all_records
-            .into_iter()
-            .filter(|r| r.id.map(|id| id < before).unwrap_or(true))
-            .collect()
-    } else {
-        all_records
     };
 
     let has_more = records.len() as i64 > limit;

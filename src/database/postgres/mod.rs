@@ -318,6 +318,41 @@ impl ApiKeyStore for PostgresBackend {
 
         Ok(records)
     }
+
+    async fn find_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKeyRecord>> {
+        let rows = sqlx::query(
+            "SELECT api_key, name, is_active, rate_limit, cost_rate, \
+             monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
+             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
+             FROM api_keys WHERE api_key LIKE $1 || '%' LIMIT 2",
+        )
+        .bind(prefix)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.len() > 1 {
+            anyhow::bail!("ambiguous_prefix");
+        }
+
+        Ok(rows.first().map(|r| ApiKeyRecord {
+            api_key: r.get("api_key"),
+            name: r.get("name"),
+            is_active: r.get("is_active"),
+            rate_limit: r.get("rate_limit"),
+            cost_rate: r.get("cost_rate"),
+            monthly_budget: r.get("monthly_budget"),
+            budget_used: r.get("budget_used"),
+            budget_used_mtd: r.get("budget_used_mtd"),
+            budget_mtd_month: r.get("budget_mtd_month"),
+            deactivated_reason: r.get("deactivated_reason"),
+            budget_history: r.get("budget_history"),
+            tpm_limit: r.get("tpm_limit"),
+            cache_ttl: r.get("cache_ttl"),
+            metadata: r.get("metadata"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
 }
 
 // ============================================================================
@@ -356,6 +391,7 @@ impl UsageStore for PostgresBackend {
         api_key: &str,
         since: Option<&str>,
         limit: Option<i64>,
+        before_id: Option<i64>,
     ) -> Result<Vec<UsageRecord>> {
         // Empty api_key means "all keys" (admin query with no key filter)
         let filter_by_key = !api_key.is_empty();
@@ -376,6 +412,13 @@ impl UsageStore for PostgresBackend {
         } else {
             String::new()
         };
+        let before_id_clause = if before_id.is_some() {
+            let s = format!("AND id < ${param_idx}");
+            param_idx += 1;
+            s
+        } else {
+            String::new()
+        };
         let limit_clause = if limit.is_some() {
             format!("LIMIT ${param_idx}")
         } else {
@@ -386,7 +429,7 @@ impl UsageStore for PostgresBackend {
             "SELECT id, api_key, timestamp, request_id, model, \
              input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
              cost, success, duration_ms, error_message \
-             FROM usage {key_clause} {since_clause} \
+             FROM usage {key_clause} {since_clause} {before_id_clause} \
              ORDER BY timestamp DESC {limit_clause}",
         );
 
@@ -396,6 +439,9 @@ impl UsageStore for PostgresBackend {
         }
         if let Some(s) = since {
             q = q.bind(s);
+        }
+        if let Some(bid) = before_id {
+            q = q.bind(bid);
         }
         if let Some(l) = limit {
             q = q.bind(l);

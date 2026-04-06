@@ -552,7 +552,7 @@ impl OpenAIErrorResponse {
         }
     }
 
-    pub fn invalid_request(message: &str) -> Self {
+    pub fn invalid_request_error(message: &str) -> Self {
         Self::new("invalid_request_error", message)
     }
 
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_error_response() {
-        let err = OpenAIErrorResponse::invalid_request("Invalid model");
+        let err = OpenAIErrorResponse::invalid_request_error("Invalid model");
         assert_eq!(err.error.error_type, "invalid_request_error");
         assert_eq!(err.error.message, "Invalid model");
     }

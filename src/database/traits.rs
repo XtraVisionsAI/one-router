@@ -29,6 +29,11 @@ pub trait ApiKeyStore: Send + Sync {
     ) -> Result<()>;
     async fn reactivate_api_key(&self, api_key: &str) -> Result<()>;
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>>;
+
+    /// Find an API key by a raw prefix (e.g. first 8 chars).
+    /// Returns `Some` if exactly one key matches, `None` if zero match.
+    /// Implementations should `LIMIT 2` to detect ambiguity cheaply.
+    async fn find_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKeyRecord>>;
 }
 
 #[async_trait]
@@ -39,6 +44,7 @@ pub trait UsageStore: Send + Sync {
         api_key: &str,
         since: Option<&str>,
         limit: Option<i64>,
+        before_id: Option<i64>,
     ) -> Result<Vec<UsageRecord>>;
     /// Aggregate usage query, grouped by group_by ("hour" or "model").
     /// start / end are RFC3339 strings, both optional.
