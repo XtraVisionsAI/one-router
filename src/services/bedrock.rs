@@ -766,6 +766,11 @@ fn build_invoke_model_body(
         serde_json::to_value(request).map_err(|e| BedrockError::Serialization(e.to_string()))?;
 
     if let Some(obj) = body.as_object_mut() {
+        // Bedrock InvokeModel requires anthropic_version in the request body
+        obj.insert(
+            "anthropic_version".to_string(),
+            serde_json::json!("bedrock-2023-05-31"),
+        );
         // Replace model with the resolved Bedrock model ID
         obj.insert("model".to_string(), serde_json::json!(model_id));
         // Remove fields that Bedrock InvokeModel does not recognize
