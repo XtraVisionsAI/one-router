@@ -187,10 +187,12 @@ impl PassthroughService {
             .post(&url)
             .header("Content-Type", "application/json");
 
-        // Set auth header based on target
+        // Set auth and required headers based on target
         match self.target {
             PassthroughTarget::Anthropic => {
-                req_builder = req_builder.header("x-api-key", &api_key);
+                req_builder = req_builder
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01");
             }
             PassthroughTarget::OpenAI => {
                 req_builder = req_builder.header("Authorization", format!("Bearer {api_key}"));
