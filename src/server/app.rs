@@ -184,6 +184,9 @@ impl App {
             "Startup settings loaded"
         );
 
+        // 11. Initialize self-update service
+        let update_service = Arc::new(crate::services::UpdateService::new());
+
         let state = AppState {
             settings: settings_arc,
             database,
@@ -200,6 +203,7 @@ impl App {
             prompt_cache_mode,
             rate_limit_rpm,
             default_capabilities,
+            update_service,
         };
 
         tracing::info!("Application state initialized successfully");
@@ -210,7 +214,20 @@ impl App {
     /// Run the server with graceful shutdown support
     pub async fn run_with_graceful_shutdown(self) -> Result<()> {
         let addr = self.settings.server_addr().parse::<SocketAddr>()?;
-        let router = routes::create_router(self.state);
+        let router = routes::create_router(self.state.clone());
+
+        // Spawn background update checker (every hour)
+        let update_svc = self.state.update_service.clone();
+        tokio::spawn(async move {
+            // Initial check shortly after startup
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            loop {
+                if let Err(e) = update_svc.check_latest().await {
+                    tracing::debug!(error = %e, "Background update check failed");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
 
         tracing::info!("Starting server on {}", addr);
 

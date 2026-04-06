@@ -116,6 +116,10 @@ pub fn create_router(state: AppState) -> Router {
         // Usage (admin — no unbounded query guard)
         .route("/usage/summary", get(admin::admin_usage::get_usage_summary))
         .route("/usage/records", get(admin::admin_usage::get_usage_records))
+        // Self-update
+        .route("/update", get(admin::update::get_update_status))
+        .route("/update", post(admin::update::trigger_update))
+        .route("/update/check", post(admin::update::check_for_update))
         .layer(middleware::from_fn_with_state(
             admin_auth_state,
             require_admin_key,

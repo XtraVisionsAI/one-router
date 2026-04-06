@@ -10,7 +10,7 @@ use crate::services::capabilities::ModelCapabilities;
 use crate::services::web_tools::executor::WebToolExecutor;
 use crate::services::{
     BackendInstance, BedrockService, CredentialPool, GeminiService, ModelMappingService,
-    PassthroughService, PtcService, UsageTracker,
+    PassthroughService, PtcService, UpdateService, UsageTracker,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -70,6 +70,9 @@ pub struct AppState {
     /// `enable_document_support` / `enable_ptc` system settings at startup.
     /// Requires restart to take effect.
     pub default_capabilities: ModelCapabilities,
+
+    /// Self-update service for checking and applying binary updates from GitHub Releases.
+    pub update_service: Arc<UpdateService>,
 }
 
 impl AppState {

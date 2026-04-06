@@ -42,6 +42,8 @@ aws-credential-types = "1.2.11"
 # Docker API (for PTC, using rustls)
 bollard = { version = "0.16", default-features = false, features = ["ssl", "rustls"] }
 tar = "0.4"
+flate2 = "1.0"
+semver = "1.0"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres"] }
@@ -86,5 +88,5 @@ governor = "0.6"
 # Caching
 moka = { version = "0.12", features = ["future"] }
 
-[dev-dependencies]
+# Self-update
 tempfile = "3.10"

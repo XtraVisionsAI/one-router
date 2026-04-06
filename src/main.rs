@@ -3,18 +3,42 @@
 //! A high-performance API gateway with pluggable storage backends.
 
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 use one_router::{config::Settings, server::App};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
+#[derive(Parser)]
+#[command(name = "one-router", version = env!("CARGO_PKG_VERSION"))]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Check for updates and optionally apply
+    Update {
+        /// Only check for updates, don't download or apply
+        #[arg(long)]
+        check: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load configuration from environment
-    let mut settings = Settings::load()?;
+    let cli = Cli::parse();
 
-    // Initialize tracing
+    match cli.command {
+        Some(Command::Update { check }) => run_update(check).await,
+        None => run_server().await,
+    }
+}
+
+/// Run the main HTTP server (default behavior).
+async fn run_server() -> Result<()> {
+    let mut settings = Settings::load()?;
     init_tracing(&settings.log_level);
 
-    // Generate ephemeral API key for dev convenience
     let ephemeral_key = settings.generate_ephemeral_key();
 
     println!("\n{}", "=".repeat(60));
@@ -42,11 +66,58 @@ async fn main() -> Result<()> {
         "Starting One Router"
     );
 
-    // Build and run the application
     let app = App::new(settings).await?;
     app.run_with_graceful_shutdown().await?;
 
     tracing::info!("Application shutdown complete");
+    Ok(())
+}
+
+/// Run the CLI update subcommand (no HTTP server).
+async fn run_update(check_only: bool) -> Result<()> {
+    // Minimal tracing for CLI mode
+    let filter = tracing_subscriber::EnvFilter::new("warn");
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_target(false)
+                .without_time()
+                .with_filter(filter),
+        )
+        .init();
+
+    let update_svc = one_router::services::UpdateService::new();
+    let current = env!("CARGO_PKG_VERSION");
+
+    println!("One Router v{current}");
+    println!("Checking for updates...\n");
+
+    let info = update_svc.check_latest().await?;
+
+    if let Some(ref latest) = info.latest_version {
+        if info.update_available {
+            println!("  New version available: v{latest} (current: v{current})");
+            if let Some(ref notes) = info.release_notes {
+                let summary: String = notes.lines().take(5).collect::<Vec<_>>().join("\n");
+                println!("\n  Release notes:\n  {summary}");
+            }
+        } else {
+            println!("  Already up to date (v{current}).");
+            return Ok(());
+        }
+    } else {
+        println!("  Could not determine latest version.");
+        return Ok(());
+    }
+
+    if check_only {
+        return Ok(());
+    }
+
+    println!("\n  Downloading and applying update...");
+    update_svc.download_and_apply().await?;
+    println!("\n  Update applied! Restart one-router to activate the new version.");
+
     Ok(())
 }
 

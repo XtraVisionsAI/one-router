@@ -21,6 +21,7 @@ pub mod keys;
 pub mod mappings;
 pub mod status;
 pub mod system_settings;
+pub mod update;
 
 /// Embedded static files from `static/admin/`
 #[derive(Embed)]

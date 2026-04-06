@@ -8,6 +8,7 @@ pub mod model_mapping;
 pub mod passthrough;
 pub mod ptc;
 pub mod service_tier;
+pub mod update;
 pub mod usage_tracker;
 
 pub use backend_pool::{
@@ -26,6 +27,7 @@ pub use ptc::{
     ContainerInfo, ExecutionResult, PendingToolCall, PtcError, PtcHealthStatus, PtcResponse,
     PtcResult, PtcService, PtcSession, SandboxConfig, SandboxExecutor, SessionState,
 };
+pub use update::UpdateService;
 pub use usage_tracker::UsageTracker;
 
 pub mod web_tools;
