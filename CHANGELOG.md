@@ -1,3 +1,19 @@
+## v0.12.1 (2026-04-06)
+
+### Feat
+
+- **ptc**: wire PTC service into API layer with sandbox orchestration
+
+### Fix
+
+- clarify anthropic_version injection logic
+- **bedrock**: add anthropic_version to InvokeModel request body
+- **passthrough**: auto-inject anthropic-version header
+- complete remaining 6 items from code review plan
+- **sqlite**: add model_mapping index + migration script
+- **dynamodb**: add GSI for O(1) name uniqueness lookups
+- comprehensive code review fixes across 34 files
+
 ## v0.12.0 (2026-04-05)
 
 ### Feat
