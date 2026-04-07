@@ -98,10 +98,10 @@ run_postgres() {
 
         if psql "$DATABASE_URL" -f "$sql_file" -v ON_ERROR_STOP=1 > /dev/null 2>&1; then
             echo "OK"
-            ((count++))
+            count=$((count + 1))
         else
             echo "FAILED"
-            ((failed++))
+            failed=$((failed + 1))
             # Show error details
             psql "$DATABASE_URL" -f "$sql_file" -v ON_ERROR_STOP=1 2>&1 | tail -5 || true
         fi
@@ -136,10 +136,10 @@ run_dynamodb() {
 
         if bash "$script" "${args[@]}"; then
             echo "  ${name}: OK"
-            ((count++))
+            count=$((count + 1))
         else
             echo "  ${name}: FAILED"
-            ((failed++))
+            failed=$((failed + 1))
         fi
         echo ""
     done
@@ -176,10 +176,10 @@ run_sqlite() {
 
         if sqlite3 "$db_path" < "$sql_file" 2>/dev/null; then
             echo "OK"
-            ((count++))
+            count=$((count + 1))
         else
             echo "FAILED"
-            ((failed++))
+            failed=$((failed + 1))
             sqlite3 "$db_path" < "$sql_file" 2>&1 | tail -5 || true
         fi
     done
