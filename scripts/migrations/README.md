@@ -16,11 +16,16 @@ The application auto-applies all migrations on startup. These scripts are for:
 scripts/migrations/
 ├── run.sh                                      # Batch runner (all backends)
 ├── sqlite/
-│   └── 001_model_mapping_index.sql             # source_model_id index
+│   ├── 001_model_mapping_index.sql             # source_model_id index
+│   ├── 002_api_key_display.sql                 # key_display column
+│   └── 003_model_pricing.sql                   # model pricing backfill
 ├── postgres/
-│   └── 001_model_mapping_pattern_index.sql     # text_pattern_ops index
+│   ├── 001_model_mapping_pattern_index.sql     # text_pattern_ops index
+│   ├── 002_api_key_display.sql                 # key_display column
+│   └── 003_model_pricing.sql                   # model pricing backfill
 └── dynamodb/
-    └── 001_apikeys_name_gsi.sh                 # name-index GSI
+    ├── 001_apikeys_name_gsi.sh                 # name-index GSI
+    └── 002_model_pricing.sh                    # model pricing backfill
 ```
 
 Migrations are numbered `NNN_description` and execute in lexicographic order.
@@ -96,6 +101,15 @@ Creates a Global Secondary Index `name-index` on the `api_keys` table:
 - **Purpose:** O(1) name uniqueness checks (replaces full-table scans)
 
 The GSI builds asynchronously. The script waits for ACTIVE status by default. The application handles the building period gracefully by falling back to filtered scans.
+
+### SQLite/PostgreSQL 003 & DynamoDB 002: Model pricing backfill
+
+Populates `input_price`, `output_price`, `cache_write_price`, and `cache_read_price` for all default model mappings. Prices are in USD per million tokens, sourced from Anthropic / Google / AWS Bedrock published rates as of April 2026.
+
+- Claude models: Anthropic published rates (3.5 Sonnet uses Bedrock Extended Access pricing)
+- Gemini models: Google AI published rates (cache_write = 0; Google charges storage-per-hour instead)
+- Embedding models: input-only pricing; output/cache fields remain 0
+- Rerank models: per-query pricing ($2/1K queries), not per-token — left at 0
 
 ## Adding new migrations
 
