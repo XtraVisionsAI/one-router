@@ -1,3 +1,13 @@
+## v0.15.0 (2026-04-07)
+
+### Feat
+
+- **admin-ui**: add Update page + fix settings descriptions
+
+### Refactor
+
+- **admin-ui**: replace Update page with version popover
+
 ## v0.14.1 (2026-04-07)
 
 ### Fix
