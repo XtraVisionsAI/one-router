@@ -1,3 +1,10 @@
+## v0.14.1 (2026-04-07)
+
+### Fix
+
+- replace blocking_read with try_read to avoid panic in async runtime
+- **migrations**: fix run.sh exiting after first migration
+
 ## v0.14.0 (2026-04-07)
 
 ### Feat
