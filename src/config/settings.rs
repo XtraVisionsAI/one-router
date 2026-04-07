@@ -101,6 +101,38 @@ impl Settings {
         })
     }
 
+    /// Apply CLI argument overrides (highest priority).
+    ///
+    /// Priority: .env file < environment variable < CLI argument.
+    pub fn apply_overrides(
+        &mut self,
+        database: Option<String>,
+        port: Option<u16>,
+        host: Option<String>,
+        log_level: Option<String>,
+        master_api_key: Option<String>,
+        encryption_key: Option<String>,
+    ) {
+        if let Some(v) = database {
+            self.database = v;
+        }
+        if let Some(v) = port {
+            self.port = v;
+        }
+        if let Some(v) = host {
+            self.host = v;
+        }
+        if let Some(v) = log_level {
+            self.log_level = v;
+        }
+        if let Some(v) = master_api_key {
+            self.master_api_key = Some(v);
+        }
+        if let Some(v) = encryption_key {
+            self.encryption_key = Some(v);
+        }
+    }
+
     /// Generate and store an ephemeral API key (for dev convenience).
     pub fn generate_ephemeral_key(&mut self) -> String {
         let key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace("-", ""));

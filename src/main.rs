@@ -10,6 +10,30 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Lay
 #[derive(Parser)]
 #[command(name = "one-router", version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
+    /// Database connection string (overrides DATABASE env var)
+    #[arg(long, short = 'd')]
+    database: Option<String>,
+
+    /// HTTP listen port (overrides PORT env var)
+    #[arg(long, short = 'p')]
+    port: Option<u16>,
+
+    /// HTTP bind host (overrides HOST env var)
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Log level (overrides LOG_LEVEL env var)
+    #[arg(long, short = 'l')]
+    log_level: Option<String>,
+
+    /// Master API key for admin access (overrides MASTER_API_KEY env var)
+    #[arg(long)]
+    master_api_key: Option<String>,
+
+    /// Encryption key for credential storage (overrides ENCRYPTION_KEY env var)
+    #[arg(long)]
+    encryption_key: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -30,13 +54,21 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Update { check }) => run_update(check).await,
-        None => run_server().await,
+        None => run_server(cli).await,
     }
 }
 
 /// Run the main HTTP server (default behavior).
-async fn run_server() -> Result<()> {
+async fn run_server(cli: Cli) -> Result<()> {
     let mut settings = Settings::load()?;
+    settings.apply_overrides(
+        cli.database,
+        cli.port,
+        cli.host,
+        cli.log_level,
+        cli.master_api_key,
+        cli.encryption_key,
+    );
     init_tracing(&settings.log_level);
 
     let ephemeral_key = settings.generate_ephemeral_key();
