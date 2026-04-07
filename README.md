@@ -303,7 +303,8 @@ One Router includes a built-in admin UI at **`/admin`**. Open it in a browser an
 | **Model Maps** | Manage source → target model mappings, priorities, pricing, and per-model capabilities |
 | **Usage** | Query usage statistics by API key, time range, and grouping |
 | **Settings** | Configure default capabilities (tool use, thinking, document, PTC), rate limiting, and prompt cache behavior. Changes take effect immediately |
-| **Update** | Check for updates, view release notes, apply updates |
+
+Click the **version number** in the sidebar footer to check for updates, apply them, or view the changelog on GitHub.
 
 The UI is built with Vue 3 + Naive UI + Vite, compiled into static assets, and embedded directly in the binary via rust-embed (no separate deployment needed).
 
