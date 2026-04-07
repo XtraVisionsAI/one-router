@@ -36,6 +36,10 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Per-Model Capabilities** — declare per-model capabilities (thinking, document, tool use, PTC) in model mappings; global defaults configurable via settings
 - **Admin Web UI** — built-in browser UI at `/admin` for managing API keys, backends, model mappings, settings, and usage stats — no external tools needed
 - **AES-256-GCM Encryption** — encrypt backend credentials at rest; the Admin UI handles plaintext input and encrypts automatically on save
+- **API Key Hashing** — API keys are HMAC-SHA256 hashed before storage; plaintext shown once at creation, middle-masked in admin UI (sk-abcd....5678)
+- **Self-Update** — check and apply updates from GitHub Releases via CLI (`one-router update`) or Admin API
+- **Hot-Reload** — backend and settings changes via Admin UI take effect immediately without restart
+- **CLI Configuration** — override any setting via command-line flags (`--port`, `--database`, `--log-level`)
 - **Prometheus Metrics** — built-in `/health`, `/ready`, `/liveness` endpoints
 - **Multi-Arch Docker** — ships `linux/amd64` and `linux/arm64` images
 - **Deploy Anywhere** — Docker, AWS App Runner, or bare metal
@@ -45,7 +49,11 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 ### Option 1: Docker (recommended)
 
 ```bash
-docker run -p 8000:8000 xtravisions/one-router:latest
+docker run -p 8000:8000 \
+  -e MASTER_API_KEY=sk-your-secret \
+  -e ENCRYPTION_KEY=your-64-char-hex-key \
+  -v one-router-data:/app/data \
+  xtravisions/one-router:latest
 ```
 
 ### Option 2: Docker Compose
@@ -69,7 +77,7 @@ On startup, One Router prints an **ephemeral API key** for immediate use:
 
 ```
 ============================================================
-  One Router v0.10.0
+  One Router v0.13.0
 ============================================================
   Database:  sqlite://./data/gateway.db
   Listen:    0.0.0.0:8000
@@ -294,21 +302,29 @@ One Router includes a built-in admin UI at **`/admin`**. Open it in a browser an
 | **Backends** | Add / edit backends (Gemini, Anthropic, OpenAI, Bedrock) — credentials entered in plaintext, encrypted before saving |
 | **Model Maps** | Manage source → target model mappings, priorities, pricing, and per-model capabilities |
 | **Usage** | Query usage statistics by API key, time range, and grouping |
-| **Settings** | Configure default capabilities (tool use, thinking, document, PTC), rate limiting, and prompt cache behavior |
+| **Settings** | Configure default capabilities (tool use, thinking, document, PTC), rate limiting, and prompt cache behavior. Changes take effect immediately |
+| **Update** | Check for updates, view release notes, apply updates |
 
 The UI is embedded directly in the binary (no separate deployment). It requires **no build step** — it's plain HTML + CSS + vanilla JS.
 
 ## Configuration
 
-One Router is configured through **5 environment variables**. Everything else lives in the database.
+One Router uses environment variables for infrastructure config. All runtime settings live in the database (`system_settings` table) and can be managed via the Admin UI.
 
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE` | `sqlite://./data/gateway.db` | Storage backend URI. Supports `sqlite://`, `postgres://`, `dynamodb://` |
 | `PORT` | `8000` | HTTP listen port |
+| `HOST` | `0.0.0.0` | HTTP bind host |
 | `LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `MASTER_API_KEY` | _(none)_ | Admin API key that bypasses rate limits |
-| `ENCRYPTION_KEY` | _(none)_ | AES-256-GCM key for encrypting backend credentials at rest |
+| `MASTER_API_KEY` | _(auto-generated)_ | Admin API key — auto-generated and saved to `.env` on first bare-metal run |
+| `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
+
+**First-run behavior:**
+- **Bare metal:** Missing `MASTER_API_KEY` or `ENCRYPTION_KEY` are auto-generated and saved to `.env`.
+- **Docker:** These must be provided explicitly via `-e` flags. The container will refuse to start without them.
+
+CLI flags override environment variables: `one-router --port 9000 --database postgres://...`
 
 ### Storage Backends
 
@@ -325,49 +341,7 @@ DATABASE=dynamodb://us-east-1
 
 ### Backend Configuration
 
-Backend credentials are stored in the `backends` database table. Use the built-in helper script to generate config:
-
-```bash
-# Interactive mode
-./scripts/backend-config-builder.sh
-
-# Bedrock with AWS profile
-./scripts/backend-config-builder.sh --type bedrock --region us-east-1 --profile prod
-
-# Bedrock with access keys
-./scripts/backend-config-builder.sh --type bedrock --region us-east-1 \
-  --access-key-id AKIA... --secret-access-key ...
-
-# Gemini with multiple API keys
-./scripts/backend-config-builder.sh --type gemini --api-keys "key1,key2"
-
-# Anthropic with API key
-./scripts/backend-config-builder.sh --type anthropic --api-keys "sk-ant-..."
-
-# OpenAI with API key
-./scripts/backend-config-builder.sh --type openai --api-keys "sk-..."
-
-# Pool settings (shared by all backend types)
-./scripts/backend-config-builder.sh --type bedrock --region us-east-1 \
-  --strategy weighted --max-failures 5 --retry-after 600
-```
-
-Output formats via `--format`:
-
-| Format | Description |
-|---|---|
-| `json` | Pretty JSON (default) |
-| `json-compact` | Single-line JSON (also `--compact`) |
-| `dynamodb` | DynamoDB item JSON for AWS Console / `put-item` |
-| `sql` | SQL INSERT with ON CONFLICT upsert (SQLite / PostgreSQL) |
-
-```bash
-# Output as DynamoDB item
-./scripts/backend-config-builder.sh --type bedrock --region ap-northeast-1 --format dynamodb
-
-# Output as SQL
-./scripts/backend-config-builder.sh --type gemini --api-keys "key1" --format sql
-```
+Backend credentials are managed via the Admin UI at `/admin` -> Backends page. Credentials are encrypted at rest with AES-256-GCM.
 
 ## Architecture
 
@@ -477,7 +451,7 @@ Each mapping declares what features the target model supports. This controls wha
 
 Pre-configured mappings ship with sensible defaults: Claude models have full capabilities, Gemini models have thinking disabled, and embedding/rerank models have all capabilities disabled.
 
-For model mappings with no explicit capabilities, the **Settings → default capabilities** values are used as fallback (configurable, take effect on restart).
+For model mappings with no explicit capabilities, the **Settings -> default capabilities** values are used as fallback (configurable). Changes take effect immediately.
 
 ## Project Structure
 
@@ -527,6 +501,7 @@ docker run -d \
   -p 8000:8000 \
   -e DATABASE=sqlite:///app/data/gateway.db \
   -e MASTER_API_KEY=sk-your-secret \
+  -e ENCRYPTION_KEY=your-64-char-hex-key \
   -v one-router-data:/app/data \
   xtravisions/one-router:latest
 ```
@@ -568,6 +543,15 @@ cargo run
 
 # Run with debug logging
 LOG_LEVEL=debug cargo run
+
+# Run with CLI overrides
+one-router --port 9000 --database postgres://localhost/mydb
+
+# Check for updates
+one-router update --check
+
+# Apply update
+one-router update
 
 # Run tests
 cargo test
