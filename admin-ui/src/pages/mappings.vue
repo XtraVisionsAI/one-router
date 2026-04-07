@@ -72,10 +72,38 @@
     })
   }
 
+  function fmtPrice(v: number) {
+    if (v === 0) return '0'
+    if (v < 1) return `${v}`
+    return v % 1 === 0 ? `${v}` : `${v}`
+  }
+
+  function renderPricing(row: ModelMapping) {
+    const { input_price, output_price, cache_read_price, cache_write_price } = row
+    if (input_price === 0 && output_price === 0 && cache_read_price === 0 && cache_write_price === 0) {
+      return h('span', { class: 'text-slate-600' }, '—')
+    }
+    return h('span', { class: 'font-mono text-[11px] text-slate-400 whitespace-nowrap' }, [
+      h('span', { class: 'text-slate-300' }, `$${fmtPrice(input_price)}`),
+      h('span', { class: 'text-slate-600 mx-0.5' }, '/'),
+      h('span', { class: 'text-slate-300' }, `$${fmtPrice(output_price)}`),
+      ...(cache_read_price > 0 || cache_write_price > 0
+        ? [
+            h('span', { class: 'text-slate-700 mx-1' }, '·'),
+            h('span', { class: 'text-slate-500' }, `c$${fmtPrice(cache_read_price)}`),
+            h('span', { class: 'text-slate-700 mx-0.5' }, '/'),
+            h('span', { class: 'text-slate-500' }, `$${fmtPrice(cache_write_price)}`),
+          ]
+        : []),
+    ])
+  }
+
   const columns = [
     {
       title: 'Source Model',
       key: 'source_model_id',
+      width: 280,
+      ellipsis: { tooltip: true },
       render: (row: ModelMapping) => h('span', { class: 'font-mono text-xs text-slate-200' }, row.source_model_id)
     },
     {
@@ -87,22 +115,31 @@
     {
       title: 'Provider',
       key: 'provider',
+      width: 90,
       render: (row: ModelMapping) => h(NTag, { size: 'small' }, { default: () => row.provider })
     },
-    { title: 'Priority', key: 'priority' },
+    {
+      title: 'Pricing',
+      key: 'pricing',
+      width: 180,
+      render: renderPricing
+    },
+    { title: 'Priority', key: 'priority', width: 70, align: 'center' as const },
     {
       title: 'Status',
       key: 'status',
+      width: 80,
       render: (row: ModelMapping) =>
         h(NTag, { type: row.status === 'active' ? 'success' : 'default', size: 'small' }, { default: () => row.status })
     },
     {
       title: 'Actions',
       key: 'actions',
+      width: 130,
       render: (row: ModelMapping) =>
         h('div', { class: 'flex gap-2' }, [
           h(NButton, { size: 'small', onClick: () => openEdit(row) }, { default: () => 'Edit' }),
-          h(NButton, { size: 'small', type: 'error', onClick: () => confirmRemove(row) }, { default: () => 'Delete' })
+          h(NButton, { size: 'small', type: 'error', onClick: () => confirmRemove(row) }, { default: () => 'Del' })
         ])
     }
   ]
