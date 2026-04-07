@@ -16,7 +16,7 @@
       key: 'prompt_cache',
       label: 'Prompt Cache',
       description:
-        'Prompt caching behavior for Bedrock (Claude) requests. Disable: strip all cache_control. Passthrough: preserve as-is. 5m/1h: override TTL on all cache_control blocks. Takes effect on restart.',
+        'Prompt caching behavior for Bedrock (Claude) requests. Disable: strip all cache_control. Passthrough: preserve as-is. 5m/1h: override TTL on all cache_control blocks. Changes take effect immediately.',
       type: 'select' as const,
       options: [
         { label: 'Passthrough (default)', value: 'passthrough' },
@@ -29,7 +29,7 @@
       key: 'rate_limit',
       label: 'Rate Limit',
       description:
-        'Default rate limit for API keys (requests per minute). Disable turns off rate limiting globally — per-key limits are also ignored. Takes effect on restart.',
+        'Default rate limit for API keys (requests per minute). Disable turns off rate limiting globally — per-key limits are also ignored. Changes take effect immediately.',
       type: 'select' as const,
       options: [
         { label: 'Disabled', value: 'disable' },
@@ -43,28 +43,28 @@
       key: 'enable_tool_use',
       label: 'Tool Use (default)',
       description:
-        'Default capability: enable tool use for model mappings without explicit capabilities. Takes effect on restart.',
+        'Default capability: enable tool use for model mappings without explicit capabilities. Changes take effect immediately.',
       type: 'bool' as const
     },
     {
       key: 'enable_ptc',
       label: 'PTC (default)',
       description:
-        'Default capability: enable Programmatic Tool Calling for model mappings without explicit capabilities. Takes effect on restart.',
+        'Default capability: enable Programmatic Tool Calling for model mappings without explicit capabilities. Changes take effect immediately.',
       type: 'bool' as const
     },
     {
       key: 'enable_extended_thinking',
       label: 'Extended Thinking (default)',
       description:
-        'Default capability: enable extended thinking for model mappings without explicit capabilities. Takes effect on restart.',
+        'Default capability: enable extended thinking for model mappings without explicit capabilities. Changes take effect immediately.',
       type: 'bool' as const
     },
     {
       key: 'enable_document_support',
       label: 'Document Support (default)',
       description:
-        'Default capability: enable document content blocks for model mappings without explicit capabilities. Takes effect on restart.',
+        'Default capability: enable document content blocks for model mappings without explicit capabilities. Changes take effect immediately.',
       type: 'bool' as const
     }
   ]
@@ -105,7 +105,7 @@
     saving.value = key
     try {
       await api.upsert(key, { value: values.value[key] ?? '', description })
-      message.success('Saved — restart required to take effect')
+      message.success('Saved')
     } catch (e: any) {
       message.error(e.message)
       await load() // revert on error
