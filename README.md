@@ -77,7 +77,7 @@ On startup, One Router prints an **ephemeral API key** for immediate use:
 
 ```
 ============================================================
-  One Router v0.13.0
+  One Router v0.14.0
 ============================================================
   Database:  sqlite://./data/gateway.db
   Listen:    0.0.0.0:8000
@@ -305,7 +305,7 @@ One Router includes a built-in admin UI at **`/admin`**. Open it in a browser an
 | **Settings** | Configure default capabilities (tool use, thinking, document, PTC), rate limiting, and prompt cache behavior. Changes take effect immediately |
 | **Update** | Check for updates, view release notes, apply updates |
 
-The UI is embedded directly in the binary (no separate deployment). It requires **no build step** — it's plain HTML + CSS + vanilla JS.
+The UI is built with Vue 3 + Naive UI + Vite, compiled into static assets, and embedded directly in the binary via rust-embed (no separate deployment needed).
 
 ## Configuration
 
@@ -478,10 +478,9 @@ src/
 │   └── usage_tracker.rs # Usage & cost tracking
 └── utils/
 static/
-└── admin/               # Admin Web UI (embedded into binary via rust-embed)
+└── admin/               # Admin Web UI build output (embedded via rust-embed)
     ├── index.html
-    ├── app.js
-    └── app.css
+    └── assets/          # Vite-compiled JS/CSS chunks
 docker/
 ├── Dockerfile           # Multi-stage build
 ├── Dockerfile.prebuilt  # Pre-built binary (used in CI)
