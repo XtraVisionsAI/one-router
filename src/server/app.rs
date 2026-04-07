@@ -4,7 +4,10 @@ use crate::{
     config::Settings,
     database,
     database::encryption::Encryptor,
-    server::{routes, state::AppState},
+    server::{
+        routes,
+        state::{AppState, DynamicConfig},
+    },
     services::web_tools::{executor::WebToolExecutor, search::build_search_provider},
     services::{
         AnthropicBackendConfig, BackendInstance, BedrockBackendConfig, BedrockService,
@@ -18,6 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal;
+use tokio::sync::RwLock;
 
 /// Main application struct
 pub struct App {
@@ -54,92 +58,10 @@ impl App {
             tracing::info!("Credential encryption enabled (AES-256-GCM)");
         }
 
-        // 3. Initialize Bedrock service from backends table
-        let bedrock = match init_bedrock_from_backends(&database, &encryptor).await {
-            Ok(Some(service)) => {
-                tracing::info!("Bedrock service initialized from backends table");
-                Some(Arc::new(service))
-            }
-            Ok(None) => {
-                tracing::debug!("No Bedrock backend configured");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to initialize Bedrock service: {}. Bedrock disabled.",
-                    e
-                );
-                None
-            }
-        };
-
-        // 4. Initialize Gemini pool from backends table
-        let gemini_pool = match init_gemini_from_backends(&database, &encryptor).await {
-            Ok(Some(pool)) => {
-                tracing::info!("Gemini pool initialized from backends table");
-                Some(pool)
-            }
-            Ok(None) => {
-                tracing::debug!("No Gemini backend configured");
-                None
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize Gemini pool: {}. Gemini disabled.", e);
-                None
-            }
-        };
-
-        // 5a. Initialize Anthropic passthrough pool from backends table
-        let anthropic_pool = match init_passthrough_from_backends(
-            &database,
-            "anthropic",
-            PassthroughTarget::Anthropic,
-            &encryptor,
-        )
-        .await
-        {
-            Ok(Some(pool)) => {
-                tracing::info!("Anthropic passthrough pool initialized from backends table");
-                Some(pool)
-            }
-            Ok(None) => {
-                tracing::debug!("No Anthropic backend configured");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to initialize Anthropic passthrough pool: {}. Anthropic disabled.",
-                    e
-                );
-                None
-            }
-        };
-
-        // 5b. Initialize OpenAI passthrough pool from backends table
-        let openai_pool = match init_passthrough_from_backends(
-            &database,
-            "openai",
-            PassthroughTarget::OpenAI,
-            &encryptor,
-        )
-        .await
-        {
-            Ok(Some(pool)) => {
-                tracing::info!("OpenAI passthrough pool initialized from backends table");
-                Some(pool)
-            }
-            Ok(None) => {
-                tracing::debug!("No OpenAI backend configured");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to initialize OpenAI passthrough pool: {}. OpenAI disabled.",
-                    e
-                );
-                None
-            }
-        };
+        // 3-5. Build dynamic config (backends + settings + web tools)
+        let dynamic = Arc::new(RwLock::new(
+            build_dynamic_config(&database, &encryptor, &settings).await,
+        ));
 
         // 6. Initialize PTC service
         let ptc_service = match PtcService::new().await {
@@ -154,64 +76,19 @@ impl App {
         let model_mapping = Arc::new(ModelMappingService::new(database.clone()));
         let usage_tracker = Arc::new(UsageTracker::new(database.clone(), model_mapping.clone()));
 
-        // 8. Load startup settings from DB
-        let prompt_cache_mode = load_prompt_cache_mode(&database).await;
-        let rate_limit_rpm = load_rate_limit_rpm(&database).await;
-        let default_capabilities = load_default_capabilities(&database).await;
-
-        // 9. Initialize web tool executor (settings from DB, env var as fallback)
-        let web_tool_executor = {
-            let provider = load_string_setting(&database, "web_search_provider")
-                .await
-                .or_else(|| settings.web_search_provider.clone());
-            let api_key = load_string_setting(&database, "web_search_api_key")
-                .await
-                .or_else(|| settings.web_search_api_key.clone());
-            let max_kb = load_string_setting(&database, "web_fetch_max_content_kb")
-                .await
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(settings.web_fetch_max_content_kb);
-
-            let search = provider
-                .as_deref()
-                .zip(api_key.as_deref())
-                .and_then(|(p, k)| build_search_provider(p, k))
-                .map(|p| {
-                    Arc::from(p) as Arc<dyn crate::services::web_tools::search::SearchProvider>
-                });
-            Some(Arc::new(WebToolExecutor::new(search, max_kb, 10)))
-        };
-
-        tracing::info!(
-            prompt_cache = ?prompt_cache_mode,
-            rate_limit_rpm = ?rate_limit_rpm,
-            tool_use = default_capabilities.tool_use.enabled,
-            extended_thinking = default_capabilities.thinking.enabled,
-            document_support = default_capabilities.document.enabled,
-            ptc = default_capabilities.ptc.enabled,
-            "Startup settings loaded"
-        );
-
-        // 11. Initialize self-update service
+        // 8. Initialize self-update service
         let update_service = Arc::new(crate::services::UpdateService::new());
 
         let state = AppState {
             settings: settings_arc,
             database,
-            bedrock,
             usage_tracker,
             model_mapping,
             start_time,
             ptc_service,
-            gemini_pool,
-            anthropic_pool,
-            openai_pool,
             encryptor,
-            web_tool_executor,
-            prompt_cache_mode,
-            rate_limit_rpm,
-            default_capabilities,
             update_service,
+            dynamic,
         };
 
         tracing::info!("Application state initialized successfully");
@@ -564,8 +441,138 @@ async fn init_passthrough_from_backends(
     Ok(Some(Arc::new(pool)))
 }
 
-/// Load prompt_cache mode from system settings at startup.
-/// Falls back to Passthrough on any error or missing value.
+// ============================================================================
+// Dynamic config: build + reload
+// ============================================================================
+
+/// Build a fresh DynamicConfig by reading backends and settings from the database.
+/// Used at startup and for hot-reload.
+async fn build_dynamic_config(
+    database: &Arc<dyn crate::database::traits::DatabaseService>,
+    encryptor: &Encryptor,
+    settings: &Settings,
+) -> DynamicConfig {
+    let bedrock = match init_bedrock_from_backends(database, encryptor).await {
+        Ok(Some(service)) => {
+            tracing::info!("Bedrock service initialized");
+            Some(Arc::new(service))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("Failed to initialize Bedrock: {e}");
+            None
+        }
+    };
+
+    let gemini_pool = match init_gemini_from_backends(database, encryptor).await {
+        Ok(Some(pool)) => {
+            tracing::info!("Gemini pool initialized");
+            Some(pool)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("Failed to initialize Gemini: {e}");
+            None
+        }
+    };
+
+    let anthropic_pool = match init_passthrough_from_backends(
+        database,
+        "anthropic",
+        PassthroughTarget::Anthropic,
+        encryptor,
+    )
+    .await
+    {
+        Ok(Some(pool)) => {
+            tracing::info!("Anthropic pool initialized");
+            Some(pool)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("Failed to initialize Anthropic: {e}");
+            None
+        }
+    };
+
+    let openai_pool = match init_passthrough_from_backends(
+        database,
+        "openai",
+        PassthroughTarget::OpenAI,
+        encryptor,
+    )
+    .await
+    {
+        Ok(Some(pool)) => {
+            tracing::info!("OpenAI pool initialized");
+            Some(pool)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("Failed to initialize OpenAI: {e}");
+            None
+        }
+    };
+
+    let prompt_cache_mode = load_prompt_cache_mode(database).await;
+    let rate_limit_rpm = load_rate_limit_rpm(database).await;
+    let default_capabilities = load_default_capabilities(database).await;
+
+    let web_tool_executor = {
+        let provider = load_string_setting(database, "web_search_provider")
+            .await
+            .or_else(|| settings.web_search_provider.clone());
+        let api_key = load_string_setting(database, "web_search_api_key")
+            .await
+            .or_else(|| settings.web_search_api_key.clone());
+        let max_kb = load_string_setting(database, "web_fetch_max_content_kb")
+            .await
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(settings.web_fetch_max_content_kb);
+
+        let search = provider
+            .as_deref()
+            .zip(api_key.as_deref())
+            .and_then(|(p, k)| build_search_provider(p, k))
+            .map(|p| Arc::from(p) as Arc<dyn crate::services::web_tools::search::SearchProvider>);
+        Some(Arc::new(WebToolExecutor::new(search, max_kb, 10)))
+    };
+
+    tracing::info!(
+        prompt_cache = ?prompt_cache_mode,
+        rate_limit_rpm = ?rate_limit_rpm,
+        tool_use = default_capabilities.tool_use.enabled,
+        extended_thinking = default_capabilities.thinking.enabled,
+        document_support = default_capabilities.document.enabled,
+        ptc = default_capabilities.ptc.enabled,
+        "Dynamic config loaded"
+    );
+
+    DynamicConfig {
+        bedrock,
+        gemini_pool,
+        anthropic_pool,
+        openai_pool,
+        web_tool_executor,
+        prompt_cache_mode,
+        rate_limit_rpm,
+        default_capabilities,
+    }
+}
+
+/// Reload all dynamic config (backends + settings) from the database.
+/// Called by admin API after changes to backends or system settings.
+pub async fn reload_dynamic_config(state: &AppState) {
+    let new_config = build_dynamic_config(&state.database, &state.encryptor, &state.settings).await;
+    let mut dynamic = state.dynamic.write().await;
+    *dynamic = new_config;
+    tracing::info!("Dynamic config reloaded");
+}
+
+// ============================================================================
+// Setting loaders
+// ============================================================================
+
 /// Load a string setting from DB. Returns None if missing, empty, or on error.
 async fn load_string_setting(
     database: &Arc<dyn crate::database::traits::DatabaseService>,

@@ -334,7 +334,7 @@ async fn handle_bedrock_request(
     usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
-    let bedrock = state.bedrock.as_ref().ok_or_else(|| {
+    let bedrock = state.dynamic.read().await.bedrock.clone().ok_or_else(|| {
         OpenAIApiError::internal_error(
             "Bedrock backend is not configured. Add a 'bedrock' entry to the backends table.",
         )
@@ -365,7 +365,8 @@ async fn handle_bedrock_request(
             .map_err(|e| OpenAIApiError::bad_request(format!("Conversion error: {e}")))?;
 
         // Apply capability filter
-        let effective_caps = caps.as_ref().unwrap_or(&state.default_capabilities);
+        let default_caps = state.dynamic.read().await.default_capabilities.clone();
+        let effective_caps = caps.as_ref().unwrap_or(&default_caps);
         anthropic_req = crate::converters::capability_filter::apply_capabilities(
             &anthropic_req,
             effective_caps,
@@ -760,11 +761,17 @@ async fn handle_gemini_backend(
     usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
-    let gemini_pool = state.gemini_pool.as_ref().ok_or_else(|| {
-        OpenAIApiError::internal_error(
-            "Gemini backend is not configured. Add a 'gemini' entry to the backends table.",
-        )
-    })?;
+    let gemini_pool = state
+        .dynamic
+        .read()
+        .await
+        .gemini_pool
+        .clone()
+        .ok_or_else(|| {
+            OpenAIApiError::internal_error(
+                "Gemini backend is not configured. Add a 'gemini' entry to the backends table.",
+            )
+        })?;
     let gemini_instance = gemini_pool
         .get_next()
         .ok_or_else(|| OpenAIApiError::internal_error("No healthy Gemini backend available"))?;
@@ -911,11 +918,17 @@ async fn handle_anthropic_backend(
     use crate::converters::anthropic_openai::{
         AnthropicToOpenAIStreamState, OpenAIToAnthropicConverter,
     };
-    let pool = state.anthropic_pool.as_ref().ok_or_else(|| {
-        OpenAIApiError::internal_error(
-            "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
-        )
-    })?;
+    let pool = state
+        .dynamic
+        .read()
+        .await
+        .anthropic_pool
+        .clone()
+        .ok_or_else(|| {
+            OpenAIApiError::internal_error(
+                "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
+            )
+        })?;
     let instance = pool
         .get_next()
         .ok_or_else(|| OpenAIApiError::internal_error("No healthy Anthropic backend available"))?;
@@ -1126,11 +1139,17 @@ async fn handle_openai_passthrough(
     usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
-    let pool = state.openai_pool.as_ref().ok_or_else(|| {
-        OpenAIApiError::internal_error(
-            "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
-        )
-    })?;
+    let pool = state
+        .dynamic
+        .read()
+        .await
+        .openai_pool
+        .clone()
+        .ok_or_else(|| {
+            OpenAIApiError::internal_error(
+                "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
+            )
+        })?;
     let instance = pool
         .get_next()
         .ok_or_else(|| OpenAIApiError::internal_error("No healthy OpenAI backend available"))?;

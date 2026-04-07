@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::database::models::SystemSettingRecord;
 use crate::schemas::anthropic::ErrorResponse;
+use crate::server::app::reload_dynamic_config;
 use crate::server::state::AppState;
 
 // ============================================================================
@@ -128,6 +129,7 @@ pub async fn upsert_setting(
         .await
     {
         Ok(()) => {
+            reload_dynamic_config(&state).await;
             // Return the freshly saved record
             match state.database.system_settings().get_setting(&key).await {
                 Ok(Some(saved)) => (StatusCode::OK, Json(saved)).into_response(),

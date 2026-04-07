@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::database::models::BackendRecord;
 use crate::schemas::anthropic::ErrorResponse;
+use crate::server::app::reload_dynamic_config;
 use crate::server::state::AppState;
 
 // ============================================================================
@@ -108,16 +109,23 @@ fn make_config_summary(backend_type: &str, config: &str) -> Value {
 
 /// Get the live health status for a specific backend by name and type,
 /// querying the in-memory credential pool for that credential's state.
-fn backend_health_status(state: &AppState, name: &str, backend_type: &str) -> String {
+///
+/// Accepts a reference to `DynamicConfig` so callers can acquire the read lock
+/// once and reuse it across multiple backends.
+fn backend_health_status(
+    dyn_config: &crate::server::state::DynamicConfig,
+    name: &str,
+    backend_type: &str,
+) -> String {
     use crate::services::Credential;
 
     match backend_type {
-        "bedrock" => state
+        "bedrock" => dyn_config
             .bedrock
             .as_ref()
             .and_then(|svc| svc.credential_health(name))
             .unwrap_or_else(|| "not loaded".to_string()),
-        "gemini" => state
+        "gemini" => dyn_config
             .gemini_pool
             .as_ref()
             .and_then(|pool| pool.get_by_name(name))
@@ -131,7 +139,7 @@ fn backend_health_status(state: &AppState, name: &str, backend_type: &str) -> St
                 }
             })
             .unwrap_or_else(|| "not loaded".to_string()),
-        "anthropic" => state
+        "anthropic" => dyn_config
             .anthropic_pool
             .as_ref()
             .and_then(|pool| pool.get_by_name(name))
@@ -145,7 +153,7 @@ fn backend_health_status(state: &AppState, name: &str, backend_type: &str) -> St
                 }
             })
             .unwrap_or_else(|| "not loaded".to_string()),
-        "openai" => state
+        "openai" => dyn_config
             .openai_pool
             .as_ref()
             .and_then(|pool| pool.get_by_name(name))
@@ -224,10 +232,11 @@ fn default_retry_after_secs() -> i64 {
 pub async fn list_backends(State(state): State<AppState>) -> impl IntoResponse {
     match state.database.backends().list_all_backends().await {
         Ok(records) => {
+            let dyn_config = state.dynamic.read().await;
             let data = records
                 .iter()
                 .map(|r| {
-                    let health = backend_health_status(&state, &r.name, &r.backend_type);
+                    let health = backend_health_status(&dyn_config, &r.name, &r.backend_type);
                     BackendSummary::from_record(r, &health)
                 })
                 .collect();
@@ -317,7 +326,9 @@ pub async fn create_backend(
 
     match state.database.backends().upsert_backend(&record).await {
         Ok(()) => {
-            let health = backend_health_status(&state, &record.name, &record.backend_type);
+            reload_dynamic_config(&state).await;
+            let dyn_config = state.dynamic.read().await;
+            let health = backend_health_status(&dyn_config, &record.name, &record.backend_type);
             (
                 StatusCode::CREATED,
                 Json(BackendSummary::from_record(&record, &health)),
@@ -402,7 +413,11 @@ pub async fn update_backend(
 
     match state.database.backends().upsert_backend(&record).await {
         Ok(()) => {
-            let health = backend_health_status(&state, &record.name, &record.backend_type);
+            reload_dynamic_config(&state).await;
+            let health = {
+                let dc = state.dynamic.read().await;
+                backend_health_status(&dc, &record.name, &record.backend_type)
+            };
             (
                 StatusCode::OK,
                 Json(BackendSummary::from_record(&record, &health)),
@@ -426,7 +441,10 @@ pub async fn delete_backend(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     match state.database.backends().delete_backend(&name).await {
-        Ok(()) => (StatusCode::OK, Json(OkResponse { ok: true })).into_response(),
+        Ok(()) => {
+            reload_dynamic_config(&state).await;
+            (StatusCode::OK, Json(OkResponse { ok: true })).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to delete backend");
             (
@@ -474,7 +492,11 @@ pub async fn toggle_backend(
 
     match state.database.backends().upsert_backend(&record).await {
         Ok(()) => {
-            let health = backend_health_status(&state, &record.name, &record.backend_type);
+            reload_dynamic_config(&state).await;
+            let health = {
+                let dc = state.dynamic.read().await;
+                backend_health_status(&dc, &record.name, &record.backend_type)
+            };
             (
                 StatusCode::OK,
                 Json(BackendSummary::from_record(&record, &health)),

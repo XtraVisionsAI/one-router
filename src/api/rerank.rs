@@ -44,7 +44,7 @@ pub async fn create_rerank(
         )));
     }
 
-    let bedrock = state.bedrock.as_ref().ok_or_else(|| {
+    let bedrock = state.dynamic.read().await.bedrock.clone().ok_or_else(|| {
         OpenAIApiError::internal_error(
             "Bedrock backend is not configured. Add a 'bedrock' entry to the backends table.",
         )

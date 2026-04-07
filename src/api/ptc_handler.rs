@@ -70,8 +70,11 @@ pub async fn handle_ptc_request(
 
     // 4. Call Claude
     let bedrock = state
+        .dynamic
+        .read()
+        .await
         .bedrock
-        .as_ref()
+        .clone()
         .ok_or_else(|| ApiError::service_unavailable("Bedrock backend required for PTC"))?;
 
     let response = bedrock
@@ -392,8 +395,11 @@ async fn call_claude_with_code_result(
     use crate::schemas::anthropic::{Message, MessageContent, ToolResultValue};
 
     let bedrock = state
+        .dynamic
+        .read()
+        .await
         .bedrock
-        .as_ref()
+        .clone()
         .ok_or_else(|| ApiError::service_unavailable("Bedrock backend required for PTC"))?;
 
     // Build messages: original + assistant (with execute_code) + user (tool_result)
@@ -453,8 +459,11 @@ async fn finalize_with_claude(
     depth: u32,
 ) -> Result<MessageResponse, ApiError> {
     let bedrock = state
+        .dynamic
+        .read()
+        .await
         .bedrock
-        .as_ref()
+        .clone()
         .ok_or_else(|| ApiError::service_unavailable("Bedrock backend required for PTC"))?;
 
     // For continuation, the request already has the full conversation history.

@@ -84,11 +84,17 @@ async fn handle_openai_images(
     request: &ImageGenerationRequest,
     target_model_id: &str,
 ) -> Result<ImageGenerationResponse, OpenAIApiError> {
-    let pool = state.openai_pool.as_ref().ok_or_else(|| {
-        OpenAIApiError::internal_error(
-            "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
-        )
-    })?;
+    let pool = state
+        .dynamic
+        .read()
+        .await
+        .openai_pool
+        .clone()
+        .ok_or_else(|| {
+            OpenAIApiError::internal_error(
+                "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
+            )
+        })?;
     let instance = pool
         .get_next()
         .ok_or_else(|| OpenAIApiError::internal_error("No healthy OpenAI backend available"))?;
@@ -161,11 +167,17 @@ async fn handle_gemini_images(
         ));
     }
 
-    let gemini_pool = state.gemini_pool.as_ref().ok_or_else(|| {
-        OpenAIApiError::internal_error(
-            "Gemini backend is not configured. Add a 'gemini' entry to the backends table.",
-        )
-    })?;
+    let gemini_pool = state
+        .dynamic
+        .read()
+        .await
+        .gemini_pool
+        .clone()
+        .ok_or_else(|| {
+            OpenAIApiError::internal_error(
+                "Gemini backend is not configured. Add a 'gemini' entry to the backends table.",
+            )
+        })?;
     let gemini_instance = gemini_pool
         .get_next()
         .ok_or_else(|| OpenAIApiError::internal_error("No healthy Gemini backend available"))?;
@@ -236,18 +248,18 @@ async fn handle_bedrock_images(
         ));
     }
 
-    let bedrock = state.bedrock.as_ref().ok_or_else(|| {
+    let bedrock = state.dynamic.read().await.bedrock.clone().ok_or_else(|| {
         OpenAIApiError::internal_error(
             "Bedrock backend is not configured. Add a 'bedrock' entry to the backends table.",
         )
     })?;
 
     if target_model_id.starts_with("stability.") {
-        generate_image_stability(bedrock, request, target_model_id).await
+        generate_image_stability(&bedrock, request, target_model_id).await
     } else if target_model_id.starts_with("amazon.nova-canvas") {
-        generate_image_nova_canvas(bedrock, request, target_model_id).await
+        generate_image_nova_canvas(&bedrock, request, target_model_id).await
     } else if target_model_id.starts_with("amazon.titan-image-generator") {
-        generate_image_titan(bedrock, request, target_model_id).await
+        generate_image_titan(&bedrock, request, target_model_id).await
     } else {
         Err(OpenAIApiError::bad_request(format!(
             "Model '{target_model_id}' is not a supported Bedrock image generation model. \

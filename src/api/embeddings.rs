@@ -50,7 +50,7 @@ pub async fn create_embeddings(
         )));
     }
 
-    let bedrock = state.bedrock.as_ref().ok_or_else(|| {
+    let bedrock = state.dynamic.read().await.bedrock.clone().ok_or_else(|| {
         OpenAIApiError::internal_error(
             "Bedrock backend is not configured. Add a 'bedrock' entry to the backends table.",
         )
@@ -68,11 +68,11 @@ pub async fn create_embeddings(
     );
 
     let (embeddings, total_tokens) = if model_id.starts_with("cohere.embed-") {
-        embed_cohere(bedrock, model_id, &texts).await?
+        embed_cohere(&bedrock, model_id, &texts).await?
     } else if model_id.starts_with("amazon.titan-embed-") {
-        embed_titan(bedrock, model_id, &texts).await?
+        embed_titan(&bedrock, model_id, &texts).await?
     } else if model_id.contains("nova") && model_id.contains("embed") {
-        embed_nova(bedrock, model_id, &texts).await?
+        embed_nova(&bedrock, model_id, &texts).await?
     } else {
         return Err(OpenAIApiError::bad_request(format!(
             "Model '{model_id}' is not a supported Bedrock embedding model."

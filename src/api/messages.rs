@@ -234,10 +234,11 @@ pub async fn create_message(
     }
 
     // Route to appropriate backend based on resolved provider
+    let default_capabilities = state.dynamic.read().await.default_capabilities.clone();
     let effective_caps = resolved
         .capabilities
         .as_ref()
-        .unwrap_or(&state.default_capabilities);
+        .unwrap_or(&default_capabilities);
     let filtered_request =
         crate::converters::capability_filter::apply_capabilities(&request, effective_caps);
 
@@ -286,12 +287,13 @@ pub async fn create_message(
             .await
         }
         _ => {
+            let prompt_cache_mode = state.dynamic.read().await.prompt_cache_mode.clone();
             handle_bedrock_request(
                 &state,
                 &filtered_request,
                 &resolved.target_model_id,
                 &request_id,
-                &state.prompt_cache_mode,
+                &prompt_cache_mode,
                 key_info.cache_ttl.as_deref(),
                 &usage_ctx,
                 start_time,
@@ -397,7 +399,7 @@ async fn handle_bedrock_request(
     usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
-    let bedrock = state.bedrock.as_ref().ok_or_else(|| {
+    let bedrock = state.dynamic.read().await.bedrock.clone().ok_or_else(|| {
         ApiError::service_unavailable(
             "Bedrock backend is not configured. Add a 'bedrock' entry to the backends table.",
         )
@@ -476,10 +478,11 @@ async fn handle_bedrock_request(
 
     // Server-side web tool execution loop
     if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {
-        return match state.web_tool_executor.as_ref() {
+        let web_tool_executor = state.dynamic.read().await.web_tool_executor.clone();
+        return match web_tool_executor.as_ref() {
             Some(executor) => {
                 let response = executor
-                    .run(request, bedrock, bedrock_model)
+                    .run(request, &bedrock, bedrock_model)
                     .await
                     .map_err(|e| ApiError::internal_error(e.to_string()))?;
                 if request.stream {
@@ -553,11 +556,17 @@ async fn handle_anthropic_passthrough(
     usage_ctx: &UsageContext,
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
-    let pool = state.anthropic_pool.as_ref().ok_or_else(|| {
-        ApiError::service_unavailable(
-            "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
-        )
-    })?;
+    let pool = state
+        .dynamic
+        .read()
+        .await
+        .anthropic_pool
+        .clone()
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
+            )
+        })?;
     let instance = pool
         .get_next()
         .ok_or_else(|| ApiError::service_unavailable("No healthy Anthropic backend available"))?;
@@ -793,11 +802,17 @@ async fn handle_openai_backend(
 ) -> Result<MessageApiResponse, ApiError> {
     use crate::converters::anthropic_openai::OpenAIToAnthropicStreamState;
 
-    let pool = state.openai_pool.as_ref().ok_or_else(|| {
-        ApiError::service_unavailable(
-            "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
-        )
-    })?;
+    let pool = state
+        .dynamic
+        .read()
+        .await
+        .openai_pool
+        .clone()
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
+            )
+        })?;
     let instance = pool
         .get_next()
         .ok_or_else(|| ApiError::service_unavailable("No healthy OpenAI backend available"))?;
@@ -992,8 +1007,11 @@ async fn handle_gemini_request(
     start_time: Instant,
 ) -> Result<MessageApiResponse, ApiError> {
     let gemini_pool = state
+        .dynamic
+        .read()
+        .await
         .gemini_pool
-        .as_ref()
+        .clone()
         .ok_or_else(|| ApiError::internal_error("Gemini service not available"))?;
     let gemini_instance = gemini_pool
         .get_next()

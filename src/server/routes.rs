@@ -21,6 +21,10 @@ use crate::middleware::{
 use crate::server::state::AppState;
 
 /// Create the main application router
+///
+/// Note: reads `DynamicConfig` synchronously via `blocking_read()` to extract
+/// the rate-limit RPM at startup.  This is safe because the router is built
+/// once before the server starts accepting requests.
 pub fn create_router(state: AppState) -> Router {
     // Health check routes (no authentication required)
     let health_routes = Router::new()
@@ -33,7 +37,8 @@ pub fn create_router(state: AppState) -> Router {
     let auth_state_clone = auth_state.clone();
 
     // Rate limit state from startup settings (None = globally disabled)
-    let rate_limit_state = RateLimitState::new(state.rate_limit_rpm);
+    let rate_limit_rpm = state.dynamic.blocking_read().rate_limit_rpm;
+    let rate_limit_state = RateLimitState::new(rate_limit_rpm);
     let rate_limit_state_clone = rate_limit_state.clone();
 
     // Anthropic API routes (POST /v1/messages)
