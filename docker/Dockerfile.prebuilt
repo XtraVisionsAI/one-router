@@ -24,6 +24,7 @@ RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
 ENV DATABASE=sqlite:///app/data/gateway.db
 ENV PORT=8000
 ENV LOG_LEVEL=info
+ENV CONTAINER=true
 
 EXPOSE 8000
 
