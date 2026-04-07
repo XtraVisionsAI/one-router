@@ -1,3 +1,24 @@
+## v0.14.0 (2026-04-07)
+
+### Feat
+
+- populate model pricing for all 54 seed mappings
+- hot-reload backends and settings without restart
+- auto-generate MASTER_API_KEY and ENCRYPTION_KEY on first run
+- API key hashing with HMAC-SHA256 and middle-mask display
+- add CLI argument overrides for configuration
+
+### Fix
+
+- **anthropic**: correct SSE response protocol conformance issues
+- **admin**: invalidate model mapping cache on create/update/delete
+- **seed**: add -v1 version suffix to all Sonnet 4.6 Bedrock model IDs
+- **seed**: add missing dateless model aliases for Claude 4.x family
+
+### Refactor
+
+- move web search/fetch config to system_settings table
+
 ## v0.13.0 (2026-04-06)
 
 ### Feat
