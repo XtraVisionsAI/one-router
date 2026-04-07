@@ -154,27 +154,33 @@ impl App {
         let model_mapping = Arc::new(ModelMappingService::new(database.clone()));
         let usage_tracker = Arc::new(UsageTracker::new(database.clone(), model_mapping.clone()));
 
-        // 8. Initialize web tool executor
+        // 8. Load startup settings from DB
+        let prompt_cache_mode = load_prompt_cache_mode(&database).await;
+        let rate_limit_rpm = load_rate_limit_rpm(&database).await;
+        let default_capabilities = load_default_capabilities(&database).await;
+
+        // 9. Initialize web tool executor (settings from DB, env var as fallback)
         let web_tool_executor = {
-            let search = settings
-                .web_search_provider
+            let provider = load_string_setting(&database, "web_search_provider")
+                .await
+                .or_else(|| settings.web_search_provider.clone());
+            let api_key = load_string_setting(&database, "web_search_api_key")
+                .await
+                .or_else(|| settings.web_search_api_key.clone());
+            let max_kb = load_string_setting(&database, "web_fetch_max_content_kb")
+                .await
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(settings.web_fetch_max_content_kb);
+
+            let search = provider
                 .as_deref()
-                .zip(settings.web_search_api_key.as_deref())
+                .zip(api_key.as_deref())
                 .and_then(|(p, k)| build_search_provider(p, k))
                 .map(|p| {
                     Arc::from(p) as Arc<dyn crate::services::web_tools::search::SearchProvider>
                 });
-            Some(Arc::new(WebToolExecutor::new(
-                search,
-                settings.web_fetch_max_content_kb,
-                10,
-            )))
+            Some(Arc::new(WebToolExecutor::new(search, max_kb, 10)))
         };
-
-        // 10. Load startup settings from DB (rate_limit, prompt_cache, default capabilities)
-        let prompt_cache_mode = load_prompt_cache_mode(&database).await;
-        let rate_limit_rpm = load_rate_limit_rpm(&database).await;
-        let default_capabilities = load_default_capabilities(&database).await;
 
         tracing::info!(
             prompt_cache = ?prompt_cache_mode,
@@ -560,6 +566,21 @@ async fn init_passthrough_from_backends(
 
 /// Load prompt_cache mode from system settings at startup.
 /// Falls back to Passthrough on any error or missing value.
+/// Load a string setting from DB. Returns None if missing, empty, or on error.
+async fn load_string_setting(
+    database: &Arc<dyn crate::database::traits::DatabaseService>,
+    key: &str,
+) -> Option<String> {
+    database
+        .system_settings()
+        .get_setting(key)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.value)
+        .filter(|v| !v.is_empty())
+}
+
 async fn load_prompt_cache_mode(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
 ) -> crate::converters::cache_transform::PromptCacheMode {

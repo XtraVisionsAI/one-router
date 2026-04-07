@@ -914,5 +914,31 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                 .into(),
             updated_at: None,
         },
+        SystemSettingRecord {
+            key: "web_search_provider".into(),
+            value: "".into(),
+            description: "Web search provider for server-side web_search tool. \
+                          Supported: 'tavily', 'brave', or empty to disable. \
+                          Takes effect on restart."
+                .into(),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "web_search_api_key".into(),
+            value: "".into(),
+            description: "API key for the web search provider (Tavily or Brave). \
+                          Required when web_search_provider is set. \
+                          Takes effect on restart."
+                .into(),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "web_fetch_max_content_kb".into(),
+            value: "512".into(),
+            description: "Maximum content size in KB for web_fetch tool responses. \
+                          Takes effect on restart."
+                .into(),
+            updated_at: None,
+        },
     ]
 }

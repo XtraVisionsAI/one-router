@@ -56,6 +56,17 @@ fn validate_setting(key: &str, value: &str) -> Result<(), &'static str> {
                 _ => Err("rate_limit must be 'disable' or a positive integer (RPM)"),
             }
         }
+        "web_search_provider" => {
+            if matches!(value, "" | "tavily" | "brave") {
+                Ok(())
+            } else {
+                Err("web_search_provider must be 'tavily', 'brave', or empty to disable")
+            }
+        }
+        "web_fetch_max_content_kb" => match value.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(()),
+            _ => Err("web_fetch_max_content_kb must be a positive integer"),
+        },
         _ => Ok(()), // unknown keys are accepted as-is
     }
 }
