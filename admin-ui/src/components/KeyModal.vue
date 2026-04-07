@@ -69,7 +69,7 @@
         if (form.value.tpm_limit !== props.existing?.tpm_limit) body.tpm_limit = form.value.tpm_limit
         if (form.value.cache_ttl !== props.existing?.cache_ttl) body.cache_ttl = form.value.cache_ttl
         if (form.value.cost_rate !== props.existing?.cost_rate) body.cost_rate = form.value.cost_rate
-        await api.update(props.existing!.api_key, body)
+        await api.update(props.existing!.name, body)
         message.success('Key updated')
         emit('update:show', false)
         emit('saved')

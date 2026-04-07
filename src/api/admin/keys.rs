@@ -19,6 +19,7 @@ use crate::database::models::ApiKeyRecord;
 use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::state::AppState;
+use crate::utils::api_key::{hash_key, mask_key};
 
 // ============================================================================
 // Response types
@@ -41,7 +42,11 @@ pub struct AdminKeyItem {
 impl AdminKeyItem {
     fn from_record(r: &ApiKeyRecord) -> Self {
         Self {
-            api_key: ApiKeyInfo::truncate_key(&r.api_key),
+            api_key: if r.key_display.is_empty() {
+                ApiKeyInfo::truncate_key(&r.api_key)
+            } else {
+                r.key_display.clone()
+            },
             name: r.name.clone(),
             is_active: r.is_active,
             rate_limit: r.rate_limit,
@@ -139,42 +144,29 @@ fn is_name_unique_error(e: &anyhow::Error) -> bool {
         || msg.contains("duplicate key value violates unique constraint")
 }
 
-/// Find a single ApiKeyRecord by its truncated key form.
-/// Returns Err(Response) with 404 if not found, 409 if multiple keys share the same prefix.
-async fn resolve_key(
+/// Find a single ApiKeyRecord by its name.
+/// Returns Err(Response) with 404 if not found.
+async fn resolve_key_by_name(
     state: &AppState,
-    key_prefix: &str,
+    name: &str,
 ) -> Result<ApiKeyRecord, axum::response::Response> {
-    // Strip trailing "..." from truncated key to get the raw prefix for DB lookup
-    let raw_prefix = key_prefix.trim_end_matches("...");
-
-    match state
-        .database
-        .api_keys()
-        .find_api_key_by_prefix(raw_prefix)
-        .await
-    {
+    match state.database.api_keys().get_api_key_by_name(name).await {
         Ok(Some(record)) => Ok(record),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new("not_found_error", "API key not found")),
-        )
-            .into_response()),
-        Err(e) if e.to_string().contains("ambiguous_prefix") => Err((
-            StatusCode::CONFLICT,
             Json(ErrorResponse::new(
-                "conflict_error",
-                "Ambiguous key prefix — multiple keys share this prefix",
+                "not_found_error",
+                format!("API key '{name}' not found"),
             )),
         )
             .into_response()),
         Err(e) => {
-            tracing::error!(error = %e, "Failed to find API key by prefix");
+            tracing::error!(error = %e, "Failed to find API key by name");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "api_error",
-                    "Failed to retrieve API keys",
+                    "Failed to retrieve API key",
                 )),
             )
                 .into_response())
@@ -221,10 +213,13 @@ pub async fn create_key(
 ) -> impl IntoResponse {
     // Generate key: sk-<32 hex chars>
     let raw_key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let hashed = hash_key(&raw_key, state.settings.encryption_key.as_deref());
+    let display = mask_key(&raw_key);
 
     let now = Utc::now().timestamp();
     let record = ApiKeyRecord {
-        api_key: raw_key.clone(),
+        api_key: hashed,
+        key_display: display,
         name: body.name.clone(),
         is_active: true,
         rate_limit: body.rate_limit.unwrap_or(100),
@@ -271,13 +266,13 @@ pub async fn create_key(
     }
 }
 
-/// PUT /admin/api/keys/:key — update mutable fields
+/// PUT /admin/api/keys/:name — update mutable fields
 pub async fn update_key(
     State(state): State<AppState>,
-    Path(key_prefix): Path<String>,
+    Path(name): Path<String>,
     Json(body): Json<UpdateKeyRequest>,
 ) -> impl IntoResponse {
-    let mut record = match resolve_key(&state, &key_prefix).await {
+    let mut record = match resolve_key_by_name(&state, &name).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -323,17 +318,17 @@ pub async fn update_key(
     }
 }
 
-/// DELETE /admin/api/keys/:key?action=deactivate|delete
+/// DELETE /admin/api/keys/:name?action=deactivate|delete
 pub async fn delete_key(
     State(state): State<AppState>,
-    Path(key_prefix): Path<String>,
+    Path(name): Path<String>,
     Query(query): Query<DeleteKeyQuery>,
 ) -> impl IntoResponse {
     // NOTE: "delete" action calls deactivate_api_key with reason="deleted".
     // There is no hard-delete in the DatabaseService trait; this is intentional.
     let action = query.action.as_deref().unwrap_or("deactivate");
 
-    let record = match resolve_key(&state, &key_prefix).await {
+    let record = match resolve_key_by_name(&state, &name).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -361,12 +356,12 @@ pub async fn delete_key(
     }
 }
 
-/// POST /admin/api/keys/:key/activate — re-activate a deactivated key
+/// POST /admin/api/keys/:name/activate — re-activate a deactivated key
 pub async fn activate_key(
     State(state): State<AppState>,
-    Path(key_prefix): Path<String>,
+    Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let mut record = match resolve_key(&state, &key_prefix).await {
+    let mut record = match resolve_key_by_name(&state, &name).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -405,6 +400,7 @@ mod tests {
     fn admin_key_item_truncates_key() {
         let record = ApiKeyRecord {
             api_key: "sk-a1b2c3d4e5f6a1b2".to_string(),
+            key_display: String::new(),
             name: "Test".to_string(),
             is_active: true,
             rate_limit: 100,

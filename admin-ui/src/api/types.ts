@@ -28,7 +28,8 @@ export interface UpsertBackendBody {
 
 // ── API Keys ──────────────────────────────────────────────────
 export interface ApiKey {
-  api_key: string
+  api_key: string // masked display form (e.g. "sk-abcd••••5678")
+  key_display: string
   name: string
   rate_limit: number
   monthly_budget: number | null

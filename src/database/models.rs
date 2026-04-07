@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
     pub api_key: String,
+    #[serde(default)]
+    pub key_display: String,
     pub name: String,
     pub is_active: bool,
     pub rate_limit: i32,

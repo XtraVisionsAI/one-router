@@ -1,5 +1,6 @@
 //! Utility modules
 
+pub mod api_key;
 pub mod retry;
 pub mod string;
 pub mod timeout;

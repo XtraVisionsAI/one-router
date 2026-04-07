@@ -80,9 +80,9 @@ pub fn create_router(state: AppState) -> Router {
         // API Keys
         .route("/keys", get(admin::keys::list_keys))
         .route("/keys", post(admin::keys::create_key))
-        .route("/keys/:key", put(admin::keys::update_key))
-        .route("/keys/:key", delete(admin::keys::delete_key))
-        .route("/keys/:key/activate", post(admin::keys::activate_key))
+        .route("/keys/:name", put(admin::keys::update_key))
+        .route("/keys/:name", delete(admin::keys::delete_key))
+        .route("/keys/:name/activate", post(admin::keys::activate_key))
         // Backends
         .route("/backends", get(admin::backends::list_backends))
         .route("/backends", post(admin::backends::create_backend))

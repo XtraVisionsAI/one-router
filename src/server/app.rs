@@ -42,8 +42,10 @@ impl App {
         tracing::info!(database = %settings.database, "Initializing database backend");
         let database = database::create_database(&settings.database).await?;
 
-        // 2. Initialize database (auto-create tables + seed defaults)
-        database.initialize().await?;
+        // 2. Initialize database (auto-create tables + seed defaults + backfill key hashes)
+        database
+            .initialize(settings.encryption_key.as_deref())
+            .await?;
         tracing::info!("Database initialized successfully");
 
         // 2.5. Create encryptor early — needed to decrypt backend configs

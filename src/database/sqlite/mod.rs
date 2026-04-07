@@ -109,6 +109,12 @@ impl SqliteBackend {
             .await
             .ok(); // ignore error if index already exists
 
+        // Migration: add key_display column for masked display form
+        sqlx::query("ALTER TABLE api_keys ADD COLUMN key_display TEXT DEFAULT ''")
+            .execute(&self.pool)
+            .await
+            .ok();
+
         // --- usage ---
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS usage (
@@ -246,6 +252,48 @@ impl SqliteBackend {
         Ok(())
     }
 
+    /// Backfill plaintext API keys with HMAC-SHA256 hashes.
+    /// For each key that is not yet hashed, compute hash + masked display,
+    /// then update both api_keys and usage tables.
+    async fn backfill_key_hashes(&self, encryption_key: Option<&str>) -> Result<()> {
+        use crate::utils::api_key::{hash_key, is_hashed, mask_key};
+
+        let rows = sqlx::query("SELECT api_key FROM api_keys")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut migrated = 0u32;
+        for row in &rows {
+            let old_key: String = row.get("api_key");
+            if is_hashed(&old_key) {
+                continue;
+            }
+            let hashed = hash_key(&old_key, encryption_key);
+            let display = mask_key(&old_key);
+
+            sqlx::query("UPDATE api_keys SET api_key = ?, key_display = ? WHERE api_key = ?")
+                .bind(&hashed)
+                .bind(&display)
+                .bind(&old_key)
+                .execute(&self.pool)
+                .await?;
+
+            sqlx::query("UPDATE usage SET api_key = ? WHERE api_key = ?")
+                .bind(&hashed)
+                .bind(&old_key)
+                .execute(&self.pool)
+                .await?;
+
+            migrated += 1;
+        }
+
+        if migrated > 0 {
+            tracing::info!(count = migrated, "Backfilled API key hashes");
+        }
+
+        Ok(())
+    }
+
     /// Migrate old model_mappings table (single PK) to new schema (composite PK + priority).
     async fn migrate_model_mappings(&self) -> Result<()> {
         // Check if priority column exists
@@ -353,8 +401,9 @@ impl DatabaseService for SqliteBackend {
         self
     }
 
-    async fn initialize(&self) -> Result<()> {
+    async fn initialize(&self, encryption_key: Option<&str>) -> Result<()> {
         self.run_migrations().await?;
+        self.backfill_key_hashes(encryption_key).await?;
         self.seed_defaults().await?;
         Ok(())
     }
@@ -372,7 +421,7 @@ impl DatabaseService for SqliteBackend {
 impl ApiKeyStore for SqliteBackend {
     async fn get_api_key(&self, api_key: &str) -> Result<Option<ApiKeyRecord>> {
         let row = sqlx::query(
-            "SELECT api_key, name, is_active, rate_limit, cost_rate, \
+            "SELECT api_key, key_display, name, is_active, rate_limit, cost_rate, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key = ?",
@@ -384,6 +433,9 @@ impl ApiKeyStore for SqliteBackend {
         match row {
             Some(r) => Ok(Some(ApiKeyRecord {
                 api_key: r.get("api_key"),
+                key_display: r
+                    .get::<Option<String>, _>("key_display")
+                    .unwrap_or_default(),
                 name: r.get("name"),
                 is_active: r.get::<i32, _>("is_active") != 0,
                 rate_limit: r.get("rate_limit"),
@@ -407,12 +459,13 @@ impl ApiKeyStore for SqliteBackend {
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO api_keys \
-             (api_key, name, is_active, rate_limit, cost_rate, \
+             (api_key, key_display, name, is_active, rate_limit, cost_rate, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
+        .bind(&record.key_display)
         .bind(&record.name)
         .bind(record.is_active as i32)
         .bind(record.rate_limit)
@@ -584,7 +637,7 @@ impl ApiKeyStore for SqliteBackend {
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows = sqlx::query(
-            "SELECT api_key, name, is_active, rate_limit, cost_rate, \
+            "SELECT api_key, key_display, name, is_active, rate_limit, cost_rate, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys ORDER BY created_at DESC",
@@ -596,6 +649,9 @@ impl ApiKeyStore for SqliteBackend {
             .iter()
             .map(|r| ApiKeyRecord {
                 api_key: r.get("api_key"),
+                key_display: r
+                    .get::<Option<String>, _>("key_display")
+                    .unwrap_or_default(),
                 name: r.get("name"),
                 is_active: r.get::<i32, _>("is_active") != 0,
                 rate_limit: r.get("rate_limit"),
@@ -619,7 +675,7 @@ impl ApiKeyStore for SqliteBackend {
 
     async fn find_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKeyRecord>> {
         let rows = sqlx::query(
-            "SELECT api_key, name, is_active, rate_limit, cost_rate, \
+            "SELECT api_key, key_display, name, is_active, rate_limit, cost_rate, \
              monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
              FROM api_keys WHERE api_key LIKE ? || '%' LIMIT 2",
@@ -634,6 +690,9 @@ impl ApiKeyStore for SqliteBackend {
 
         Ok(rows.first().map(|r| ApiKeyRecord {
             api_key: r.get("api_key"),
+            key_display: r
+                .get::<Option<String>, _>("key_display")
+                .unwrap_or_default(),
             name: r.get("name"),
             is_active: r.get::<i32, _>("is_active") != 0,
             rate_limit: r.get("rate_limit"),
@@ -650,6 +709,43 @@ impl ApiKeyStore for SqliteBackend {
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))
+    }
+
+    async fn get_api_key_by_name(&self, name: &str) -> Result<Option<ApiKeyRecord>> {
+        let row = sqlx::query(
+            "SELECT api_key, key_display, name, is_active, rate_limit, cost_rate, \
+             monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
+             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
+             FROM api_keys WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(ApiKeyRecord {
+                api_key: r.get("api_key"),
+                key_display: r
+                    .get::<Option<String>, _>("key_display")
+                    .unwrap_or_default(),
+                name: r.get("name"),
+                is_active: r.get::<i32, _>("is_active") != 0,
+                rate_limit: r.get("rate_limit"),
+                cost_rate: r.get("cost_rate"),
+                monthly_budget: r.get("monthly_budget"),
+                budget_used: r.get("budget_used"),
+                budget_used_mtd: r.get("budget_used_mtd"),
+                budget_mtd_month: r.get("budget_mtd_month"),
+                deactivated_reason: r.get("deactivated_reason"),
+                budget_history: r.get("budget_history"),
+                tpm_limit: r.get("tpm_limit"),
+                cache_ttl: r.get("cache_ttl"),
+                metadata: r.get("metadata"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1252,7 +1348,7 @@ mod tests {
             .await
             .unwrap();
         let backend = SqliteBackend { pool };
-        backend.initialize().await.unwrap();
+        backend.initialize(None).await.unwrap();
         backend
     }
 
@@ -1261,6 +1357,7 @@ mod tests {
         let db = in_memory_db().await;
         let record = ApiKeyRecord {
             api_key: "sk-test-budget".into(),
+            key_display: String::new(),
             name: "test".into(),
             is_active: true,
             rate_limit: 0,
@@ -1304,6 +1401,7 @@ mod tests {
         let db = in_memory_db().await;
         let record = ApiKeyRecord {
             api_key: "sk-test-reactivate".into(),
+            key_display: String::new(),
             name: "test".into(),
             is_active: false,
             rate_limit: 0,
@@ -1340,6 +1438,7 @@ mod tests {
         let db = in_memory_db().await;
         let record = ApiKeyRecord {
             api_key: "sk-test-manual".into(),
+            key_display: String::new(),
             name: "test".into(),
             is_active: false,
             rate_limit: 0,

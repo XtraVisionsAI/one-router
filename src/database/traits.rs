@@ -34,6 +34,9 @@ pub trait ApiKeyStore: Send + Sync {
     /// Returns `Some` if exactly one key matches, `None` if zero match.
     /// Implementations should `LIMIT 2` to detect ambiguity cheaply.
     async fn find_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKeyRecord>>;
+
+    /// Find an API key by its human-readable name.
+    async fn get_api_key_by_name(&self, name: &str) -> Result<Option<ApiKeyRecord>>;
 }
 
 #[async_trait]
@@ -103,7 +106,8 @@ pub trait DatabaseService: Send + Sync {
     fn system_settings(&self) -> &dyn SystemSettingStore;
 
     /// Initialize storage: create tables + insert default seed data.
-    async fn initialize(&self) -> Result<()>;
+    /// `encryption_key` is passed through to enable API key hash backfill.
+    async fn initialize(&self, encryption_key: Option<&str>) -> Result<()>;
 
     /// Quick health check (e.g., SELECT 1).
     async fn health_check(&self) -> bool;

@@ -114,14 +114,38 @@ pub async fn get_usage_summary(
             .into_response();
     }
 
-    // Empty or absent api_key means "all keys" — the DB layer now supports this.
-    let api_key_filter = params.api_key.as_deref().unwrap_or("");
+    // Resolve api_key param as a key name, then look up the hash for DB filtering.
+    let api_key_filter = match params.api_key.as_deref().filter(|s| !s.is_empty()) {
+        Some(name) => {
+            match state.database.api_keys().get_api_key_by_name(name).await {
+                Ok(Some(record)) => record.api_key, // the hash
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse::new(
+                            "not_found_error",
+                            format!("API key '{name}' not found"),
+                        )),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new("api_error", e.to_string())),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => String::new(), // empty = all keys
+    };
 
     let rows = match state
         .database
         .usage()
         .query_usage_summary(
-            api_key_filter,
+            &api_key_filter,
             params.start_time.as_deref(),
             params.end_time.as_deref(),
             &params.group_by,
@@ -182,7 +206,33 @@ pub async fn get_usage_records(
     Query(params): Query<AdminRecordsQueryParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(500).min(1000);
-    let api_key_filter = params.api_key.as_deref().unwrap_or("");
+
+    // Resolve api_key param as a key name, then look up the hash for DB filtering.
+    let api_key_filter = match params.api_key.as_deref().filter(|s| !s.is_empty()) {
+        Some(name) => {
+            match state.database.api_keys().get_api_key_by_name(name).await {
+                Ok(Some(record)) => record.api_key, // the hash
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse::new(
+                            "not_found_error",
+                            format!("API key '{name}' not found"),
+                        )),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new("api_error", e.to_string())),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => String::new(), // empty = all keys
+    };
 
     // Fetch limit+1 rows so we can detect has_more without an extra query.
     // Passes the limit directly to the DB to avoid loading unbounded rows into RAM.
@@ -190,7 +240,7 @@ pub async fn get_usage_records(
         .database
         .usage()
         .get_usage_by_api_key(
-            api_key_filter,
+            &api_key_filter,
             params.start_time.as_deref(),
             Some(limit + 1),
             None,

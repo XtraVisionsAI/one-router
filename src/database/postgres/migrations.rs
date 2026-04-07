@@ -123,6 +123,11 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await?;
 
+    // Migration: add key_display column for masked display form
+    sqlx::query("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_display TEXT DEFAULT ''")
+        .execute(pool)
+        .await?;
+
     // --- backends ---
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS backends (

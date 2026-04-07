@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::config::Settings;
 use crate::database::traits::DatabaseService;
 use crate::schemas::anthropic::ErrorResponse;
+use crate::utils::api_key::hash_key;
 use crate::utils::truncate_str;
 
 // ============================================================================
@@ -25,6 +26,10 @@ use crate::utils::truncate_str;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyInfo {
     pub api_key: String,
+    /// The hashed api_key value used as PK in the database.
+    /// Never serialize this into JSON responses.
+    #[serde(skip_serializing)]
+    pub raw_api_key: String,
     pub is_master: bool,
     pub rate_limit: Option<u32>,
     pub cost_rate: f64,
@@ -38,6 +43,7 @@ impl ApiKeyInfo {
     pub fn master(api_key: &str) -> Self {
         Self {
             api_key: Self::truncate_key(api_key),
+            raw_api_key: String::new(),
             is_master: true,
             rate_limit: None,
             cost_rate: 0.0,
@@ -50,7 +56,12 @@ impl ApiKeyInfo {
 
     pub fn from_db_record(record: &crate::database::models::ApiKeyRecord) -> Self {
         Self {
-            api_key: Self::truncate_key(&record.api_key),
+            api_key: if record.key_display.is_empty() {
+                Self::truncate_key(&record.api_key)
+            } else {
+                record.key_display.clone()
+            },
+            raw_api_key: record.api_key.clone(),
             is_master: false,
             rate_limit: if record.rate_limit > 0 {
                 Some(record.rate_limit as u32)
@@ -210,6 +221,7 @@ pub async fn require_api_key(
         if api_key == *ephemeral_key {
             request.extensions_mut().insert(ApiKeyInfo {
                 api_key: ApiKeyInfo::truncate_key(&api_key),
+                raw_api_key: String::new(),
                 is_master: false,
                 rate_limit: None,
                 cost_rate: 1.0,
@@ -222,11 +234,14 @@ pub async fn require_api_key(
         }
     }
 
+    // Hash the incoming key before looking it up in the database
+    let hashed = hash_key(&api_key, auth_state.settings.encryption_key.as_deref());
+
     // Validate against storage
     let result = auth_state
         .storage
         .api_keys()
-        .get_api_key(&api_key)
+        .get_api_key(&hashed)
         .await
         .map_err(|e| AuthError::InternalError(e.to_string()))?;
 

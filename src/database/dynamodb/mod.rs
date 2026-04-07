@@ -77,6 +77,91 @@ impl DynamoDbBackend {
         }
     }
 
+    /// Backfill plaintext API keys with HMAC-SHA256 hashes.
+    async fn backfill_key_hashes(&self, encryption_key: Option<&str>) -> Result<()> {
+        use crate::utils::api_key::{hash_key, is_hashed, mask_key};
+
+        let result = self
+            .client
+            .scan()
+            .table_name(Self::table_name("api_keys"))
+            .send()
+            .await?;
+
+        let mut migrated = 0u32;
+        for item in result.items() {
+            let old_key = get_s(item, "api_key");
+            if is_hashed(&old_key) {
+                continue;
+            }
+            let hashed = hash_key(&old_key, encryption_key);
+            let display = mask_key(&old_key);
+
+            // Delete old item, insert new one with hashed key
+            self.client
+                .delete_item()
+                .table_name(Self::table_name("api_keys"))
+                .key("api_key", av_s(&old_key))
+                .send()
+                .await?;
+
+            let mut new_item = item.clone();
+            new_item.insert("api_key".into(), av_s(&hashed));
+            new_item.insert("key_display".into(), av_s(&display));
+
+            self.client
+                .put_item()
+                .table_name(Self::table_name("api_keys"))
+                .set_item(Some(new_item))
+                .send()
+                .await?;
+
+            // Update usage records: scan for old key and re-insert with new key
+            // Note: DynamoDB usage table has composite key (api_key, sort_key),
+            // so we need to delete + re-insert
+            let usage_result = self
+                .client
+                .query()
+                .table_name(Self::table_name("usage"))
+                .key_condition_expression("api_key = :ak")
+                .expression_attribute_values(":ak", av_s(&old_key))
+                .send()
+                .await;
+
+            if let Ok(usage_output) = usage_result {
+                for usage_item in usage_output.items() {
+                    let sort_key = get_s(usage_item, "sort_key");
+
+                    self.client
+                        .delete_item()
+                        .table_name(Self::table_name("usage"))
+                        .key("api_key", av_s(&old_key))
+                        .key("sort_key", av_s(&sort_key))
+                        .send()
+                        .await?;
+
+                    let mut new_usage = usage_item.clone();
+                    new_usage.insert("api_key".into(), av_s(&hashed));
+
+                    self.client
+                        .put_item()
+                        .table_name(Self::table_name("usage"))
+                        .set_item(Some(new_usage))
+                        .send()
+                        .await?;
+                }
+            }
+
+            migrated += 1;
+        }
+
+        if migrated > 0 {
+            tracing::info!(count = migrated, "Backfilled API key hashes");
+        }
+
+        Ok(())
+    }
+
     /// Fallback: filtered scan for name uniqueness check.
     async fn name_exists_scan(&self, name: &str, exclude_api_key: Option<&str>) -> Result<bool> {
         let mut scan = self
@@ -218,6 +303,7 @@ fn get_bool(item: &HashMap<String, AttributeValue>, key: &str) -> bool {
 fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
     ApiKeyRecord {
         api_key: get_s(item, "api_key"),
+        key_display: get_s(item, "key_display"),
         name: get_s(item, "name"),
         is_active: get_bool(item, "is_active"),
         rate_limit: get_i32(item, "rate_limit"),
@@ -247,6 +333,7 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
 fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();
     item.insert("api_key".into(), av_s(&record.api_key));
+    item.insert("key_display".into(), av_s(&record.key_display));
     item.insert("name".into(), av_s(&record.name));
     item.insert("is_active".into(), av_bool(record.is_active));
     item.insert("rate_limit".into(), av_n(record.rate_limit as i64));
@@ -355,8 +442,9 @@ impl DatabaseService for DynamoDbBackend {
         self
     }
 
-    async fn initialize(&self) -> Result<()> {
+    async fn initialize(&self, encryption_key: Option<&str>) -> Result<()> {
         migrations::create_tables(self).await?;
+        self.backfill_key_hashes(encryption_key).await?;
         self.seed_defaults().await?;
         Ok(())
     }
@@ -579,6 +667,49 @@ impl ApiKeyStore for DynamoDbBackend {
         }
 
         Ok(items.first().map(api_key_from_item))
+    }
+
+    async fn get_api_key_by_name(&self, name: &str) -> Result<Option<ApiKeyRecord>> {
+        let result = self
+            .client
+            .query()
+            .table_name(Self::table_name("api_keys"))
+            .index_name("name-index")
+            .key_condition_expression("#n = :name")
+            .expression_attribute_names("#n", "name")
+            .expression_attribute_values(":name", av_s(name))
+            .limit(1)
+            .send()
+            .await;
+
+        match result {
+            Ok(output) => {
+                let items = output.items();
+                if let Some(item) = items.first() {
+                    // GSI is KEYS_ONLY — fetch the full item by primary key
+                    let api_key = get_s(item, "api_key");
+                    self.get_api_key(&api_key).await
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                // GSI may not be available; fall back to scan
+                tracing::debug!(error = %e, "GSI name-index query failed for get_api_key_by_name, falling back to scan");
+                let scan_result = self
+                    .client
+                    .scan()
+                    .table_name(Self::table_name("api_keys"))
+                    .filter_expression("#n = :name")
+                    .expression_attribute_names("#n", "name")
+                    .expression_attribute_values(":name", av_s(name))
+                    .limit(1)
+                    .send()
+                    .await?;
+
+                Ok(scan_result.items().first().map(api_key_from_item))
+            }
+        }
     }
 }
 

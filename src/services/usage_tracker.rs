@@ -58,13 +58,13 @@ impl UsageTracker {
             let prev_mtd = key_info.budget_used_mtd;
             self.storage
                 .api_keys()
-                .reset_monthly_budget(&key_info.api_key, &current_month, prev_month, prev_mtd)
+                .reset_monthly_budget(&key_info.raw_api_key, &current_month, prev_month, prev_mtd)
                 .await
                 .map_err(|e| UsageError::Database(e.to_string()))?;
             if key_info.is_budget_exceeded() {
                 self.storage
                     .api_keys()
-                    .reactivate_api_key(&key_info.api_key)
+                    .reactivate_api_key(&key_info.raw_api_key)
                     .await
                     .map_err(|e| UsageError::Database(e.to_string()))?;
                 tracing::info!(api_key = %key_info.api_key, month = %current_month, "Budget key reactivated for new month");
@@ -73,7 +73,7 @@ impl UsageTracker {
 
         let record = UsageRecord {
             id: None,
-            api_key: key_info.api_key.clone(),
+            api_key: key_info.raw_api_key.clone(),
             timestamp: timestamp.to_rfc3339(),
             request_id: request_id.to_string(),
             model: model.to_string(),
@@ -102,7 +102,7 @@ impl UsageTracker {
             let budget_exceeded = self
                 .storage
                 .api_keys()
-                .increment_budget_used(&key_info.api_key, cost)
+                .increment_budget_used(&key_info.raw_api_key, cost)
                 .await
                 .map_err(|e| UsageError::Database(e.to_string()))?;
 

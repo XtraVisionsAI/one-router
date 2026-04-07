@@ -20,7 +20,7 @@
 
   const keyOptions = computed(() => [
     { label: 'All keys', value: null },
-    ...keys.value.map((k) => ({ label: k.name, value: k.api_key }))
+    ...keys.value.map((k) => ({ label: k.name, value: k.name }))
   ])
 
   onMounted(async () => {

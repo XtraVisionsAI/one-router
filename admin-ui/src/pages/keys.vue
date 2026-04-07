@@ -40,10 +40,10 @@
   async function toggleActive(key: ApiKey) {
     try {
       if (key.is_active) {
-        await api.deactivate(key.api_key)
+        await api.deactivate(key.name)
         message.success('Key deactivated')
       } else {
-        await api.activate(key.api_key)
+        await api.activate(key.name)
         message.success('Key activated')
       }
       await load()
