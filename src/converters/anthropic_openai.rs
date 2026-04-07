@@ -546,7 +546,6 @@ impl AnthropicToOpenAIConverter {
                 let msg_delta = serde_json::json!({
                     "type": "message_delta",
                     "delta": {
-                        "type": "message_delta",
                         "stop_reason": stop_reason,
                         "stop_sequence": null
                     },
@@ -913,6 +912,7 @@ impl OpenAIToAnthropicConverter {
             StopReason::MaxTokens => "length".to_string(),
             StopReason::ToolUse => "tool_calls".to_string(),
             StopReason::StopSequence => "stop".to_string(),
+            StopReason::PauseTurn => "stop".to_string(),
         });
 
         let usage = CompletionUsage {

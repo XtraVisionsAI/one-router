@@ -1156,6 +1156,7 @@ async fn create_gemini_streaming_response(
                                     StopReason::MaxTokens => "max_tokens".to_string(),
                                     StopReason::StopSequence => "stop_sequence".to_string(),
                                     StopReason::ToolUse => "tool_use".to_string(),
+                                    StopReason::PauseTurn => "pause_turn".to_string(),
                                 };
                             }
 
@@ -1458,17 +1459,46 @@ fn response_to_sse_stream(response: MessageResponse) -> SseStream {
 
         // 3. content blocks
         for (index, block) in response.content.iter().enumerate() {
-            let block_start_json = match block {
-                ContentBlock::Text { .. } => serde_json::json!({
-                    "type": "text",
-                    "text": ""
-                }),
-                ContentBlock::ToolUse { id, name, .. } => serde_json::json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": {}
-                }),
+            let (block_start_json, delta_data) = match block {
+                ContentBlock::Text { text, .. } => (
+                    serde_json::json!({"type": "text", "text": ""}),
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": text}
+                    }),
+                ),
+                ContentBlock::ToolUse { id, name, input, .. } => (
+                    serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": serde_json::to_string(input).unwrap_or_default()
+                        }
+                    }),
+                ),
+                ContentBlock::Thinking { thinking, signature } => (
+                    serde_json::json!({"type": "thinking", "thinking": ""}),
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "thinking_delta",
+                            "thinking": thinking,
+                            "signature": signature
+                        }
+                    }),
+                ),
+                ContentBlock::RedactedThinking { data } => (
+                    serde_json::json!({"type": "redacted_thinking", "data": ""}),
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "redacted_thinking_delta", "data": data}
+                    }),
+                ),
                 _ => continue,
             };
 
@@ -1482,22 +1512,6 @@ fn response_to_sse_stream(response: MessageResponse) -> SseStream {
             ));
 
             // content_block_delta
-            let delta_data = match block {
-                ContentBlock::Text { text, .. } => serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "text_delta", "text": text}
-                }),
-                ContentBlock::ToolUse { input, .. } => serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": serde_json::to_string(input).unwrap_or_default()
-                    }
-                }),
-                _ => continue,
-            };
             yield Ok(Event::default().event("content_block_delta").data(delta_data.to_string()));
 
             // content_block_stop

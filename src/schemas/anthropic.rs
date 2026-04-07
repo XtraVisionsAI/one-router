@@ -612,6 +612,7 @@ pub enum StopReason {
     MaxTokens,
     StopSequence,
     ToolUse,
+    PauseTurn,
 }
 
 impl std::fmt::Display for StopReason {
@@ -621,6 +622,7 @@ impl std::fmt::Display for StopReason {
             StopReason::MaxTokens => write!(f, "max_tokens"),
             StopReason::StopSequence => write!(f, "stop_sequence"),
             StopReason::ToolUse => write!(f, "tool_use"),
+            StopReason::PauseTurn => write!(f, "pause_turn"),
         }
     }
 }
