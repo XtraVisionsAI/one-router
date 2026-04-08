@@ -67,6 +67,22 @@ pub enum PtcError {
     #[error("Network error: {0}")]
     NetworkError(String),
 
+    /// Failed to attach to container
+    #[error("Failed to attach to container: {0}")]
+    AttachFailed(String),
+
+    /// Container runner not ready
+    #[error("Container runner not ready: {0}")]
+    RunnerNotReady(String),
+
+    /// Unexpected container message
+    #[error("Unexpected container message: {0}")]
+    UnexpectedMessage(String),
+
+    /// Execution state not found (continuation without prior execution)
+    #[error("Execution state not found for session: {0}")]
+    ExecutionStateNotFound(String),
+
     /// Internal error
     #[error("Internal PTC error: {0}")]
     Internal(String),
@@ -86,12 +102,14 @@ impl PtcError {
     /// Convert to HTTP status code
     pub fn status_code(&self) -> u16 {
         match self {
-            PtcError::DockerNotAvailable(_) => 503, // Service Unavailable
-            PtcError::SessionNotFound(_) => 404,
-            PtcError::SessionExpired(_) => 410, // Gone
+            PtcError::DockerNotAvailable(_) => 503,
+            PtcError::SessionNotFound(_) | PtcError::ExecutionStateNotFound(_) => 404,
+            PtcError::SessionExpired(_) => 410,
             PtcError::InvalidToolResult(_) => 400,
-            PtcError::ExecutionTimeout(_) => 504, // Gateway Timeout
-            PtcError::MaxIterationsExceeded(_) => 429, // Too Many Requests
+            PtcError::ExecutionTimeout(_) => 504,
+            PtcError::MaxIterationsExceeded(_) => 429,
+            PtcError::AttachFailed(_) | PtcError::RunnerNotReady(_) => 503,
+            PtcError::UnexpectedMessage(_) => 500,
             _ => 500,
         }
     }

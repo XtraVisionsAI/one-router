@@ -2,273 +2,313 @@
 //!
 //! This module contains the Python runner script that gets injected into
 //! the sandbox container for executing Claude-generated code.
+//!
+//! The runner operates in **loop mode**: it stays alive waiting for code
+//! blocks on stdin, executes them, and communicates tool calls / results
+//! via boundary-marker framed messages on stderr/stdout/stdin.
 
-/// The Python runner script that handles code execution and tool calls.
+/// IPC boundary markers — must stay in sync with the Rust reader in sandbox.rs.
+pub const IPC_CODE_START: &str = "__CODE_START__";
+pub const IPC_CODE_END: &str = "__CODE_END__";
+pub const IPC_TOOL_CALL_START: &str = "__PTC_TOOL_CALL__";
+pub const IPC_TOOL_CALL_END: &str = "__PTC_END_CALL__";
+pub const IPC_TOOL_RESULT_START: &str = "__PTC_TOOL_RESULT__";
+pub const IPC_TOOL_RESULT_END: &str = "__PTC_END_RESULT__";
+pub const IPC_CODE_OUTPUT_START: &str = "__PTC_OUTPUT__";
+pub const IPC_CODE_OUTPUT_END: &str = "__PTC_END_OUTPUT__";
+pub const IPC_READY: &str = "__READY__";
+
+/// The Python runner script injected into sandbox containers.
 ///
-/// This script:
-/// 1. Reads code from stdin or a file
-/// 2. Executes the code in a controlled environment
-/// 3. Intercepts tool calls and writes them to a special file
-/// 4. Waits for tool results from a results file
-/// 5. Continues execution with the tool results
+/// Protocol:
+///   stderr → host:  `__READY__\n`  (runner is waiting for code)
+///   stdin  → runner: `__CODE_START__\n{code}\n__CODE_END__\n`
+///   stderr → host:  `__PTC_TOOL_CALL__{json}__PTC_END_CALL__\n`
+///   stdin  → runner: `__PTC_TOOL_RESULT__{json}__PTC_END_RESULT__\n`
+///   stdout → host:  `__PTC_OUTPUT__{json}__PTC_END_OUTPUT__\n`
 pub const RUNNER_SCRIPT: &str = r#"#!/usr/bin/env python3
 """
-PTC Runner Script - Executes code and handles tool calls
+PTC Runner Script — loop-mode, boundary-marker IPC.
 
-This script is injected into the sandbox container and handles:
-- Code execution
-- Tool call interception
-- Result injection
-- Communication with the proxy via files
+Stays alive for the lifetime of the container session.
+Communicates with the Rust host via stdin/stdout/stderr using
+boundary markers for message framing.
+
+Channels:
+  stderr → host:  __READY__, __PTC_TOOL_CALL__
+  stdout → host:  __PTC_OUTPUT__
+  stdin  ← host:  __CODE_START__/__CODE_END__, __PTC_TOOL_RESULT__/__PTC_END_RESULT__
 """
 
 import sys
-import json
 import os
+import json
 import time
+import select
 import traceback
-from typing import Any, Dict, List, Optional
 import asyncio
+import uuid
+from typing import Any, Dict, List, Optional
 
-# File paths for IPC
-TOOL_CALLS_FILE = "/tmp/tool_calls.json"
-TOOL_RESULTS_FILE = "/tmp/tool_results.json"
-STATUS_FILE = "/tmp/status.json"
-READY_FILE = "/tmp/ready"
+# ── IPC markers ──────────────────────────────────────────────────────
+IPC_CODE_START = "__CODE_START__"
+IPC_CODE_END = "__CODE_END__"
+IPC_TOOL_CALL_START = "__PTC_TOOL_CALL__"
+IPC_TOOL_CALL_END = "__PTC_END_CALL__"
+IPC_TOOL_RESULT_START = "__PTC_TOOL_RESULT__"
+IPC_TOOL_RESULT_END = "__PTC_END_RESULT__"
+IPC_CODE_OUTPUT_START = "__PTC_OUTPUT__"
+IPC_CODE_OUTPUT_END = "__PTC_END_OUTPUT__"
+IPC_READY = "__READY__"
+EXIT_SIGNAL = "__EXIT_SESSION__"
 
-# Batch window for collecting parallel tool calls (ms)
+# ── Unbuffered I/O ───────────────────────────────────────────────────
+_stdin_fd = 0
+_stdin_buffer = ""
+
+def _write_stderr(data: str) -> None:
+    """Write to stderr (unbuffered)."""
+    os.write(2, data.encode("utf-8"))
+
+def _write_stdout(data: str) -> None:
+    """Write to stdout (unbuffered)."""
+    os.write(1, data.encode("utf-8"))
+
+def _read_and_buffer(timeout: float = 300.0) -> bool:
+    """Read available data from stdin into buffer. Returns False on EOF."""
+    global _stdin_buffer
+    try:
+        readable, _, _ = select.select([_stdin_fd], [], [], timeout)
+        if not readable:
+            return True  # timeout, not EOF
+        chunk = os.read(_stdin_fd, 65536)
+        if not chunk:
+            return False  # EOF
+        _stdin_buffer += chunk.decode("utf-8")
+        return True
+    except (OSError, ValueError):
+        return False
+
+def _read_line(timeout: float = 300.0) -> Optional[str]:
+    """Read one line from stdin buffer. Returns None on EOF/timeout."""
+    global _stdin_buffer
+    deadline = time.monotonic() + timeout
+    while "\n" not in _stdin_buffer:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        if not _read_and_buffer(min(remaining, 1.0)):
+            # EOF — return whatever is left
+            if _stdin_buffer:
+                line = _stdin_buffer
+                _stdin_buffer = ""
+                return line.rstrip("\n")
+            return None
+    idx = _stdin_buffer.index("\n")
+    line = _stdin_buffer[:idx]
+    _stdin_buffer = _stdin_buffer[idx + 1:]
+    return line
+
+# ── Code block reading ───────────────────────────────────────────────
+
+def read_code_block() -> Optional[str]:
+    """Read a code block delimited by __CODE_START__/__CODE_END__ from stdin."""
+    while True:
+        line = _read_line()
+        if line is None:
+            return None
+        if line == EXIT_SIGNAL:
+            return None
+        if line == IPC_CODE_START:
+            break
+        # Ignore unexpected lines before code start
+
+    code_lines = []
+    while True:
+        line = _read_line()
+        if line is None:
+            return None
+        if line == IPC_CODE_END:
+            break
+        code_lines.append(line)
+
+    return "\n".join(code_lines)
+
+# ── Tool result reading ──────────────────────────────────────────────
+
+def _read_tool_result(timeout: float = 300.0) -> Optional[Dict]:
+    """Read a tool result message from stdin.
+
+    Looks for __PTC_TOOL_RESULT__{json}__PTC_END_RESULT__ on a single line.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        line = _read_line(remaining)
+        if line is None:
+            return None
+        if IPC_TOOL_RESULT_START in line and IPC_TOOL_RESULT_END in line:
+            start = line.find(IPC_TOOL_RESULT_START) + len(IPC_TOOL_RESULT_START)
+            end = line.find(IPC_TOOL_RESULT_END)
+            try:
+                return json.loads(line[start:end])
+            except json.JSONDecodeError:
+                return None
+
+# ── Tool calling ─────────────────────────────────────────────────────
+
 BATCH_WINDOW_MS = 100
 
-
-class ToolCallBatcher:
-    """Collects tool calls within a batch window for parallel execution."""
-
-    def __init__(self, batch_window_ms: int = BATCH_WINDOW_MS):
-        self.batch_window_ms = batch_window_ms
-        self.pending_calls: List[Dict] = []
-        self.last_call_time: Optional[float] = None
-
-    def add_call(self, tool_use_id: str, name: str, input_data: Dict) -> None:
-        """Add a tool call to the batch."""
-        self.pending_calls.append({
-            "tool_use_id": tool_use_id,
-            "name": name,
-            "input": input_data
-        })
-        self.last_call_time = time.time()
-
-    def should_flush(self) -> bool:
-        """Check if the batch window has elapsed."""
-        if not self.last_call_time:
-            return False
-        elapsed_ms = (time.time() - self.last_call_time) * 1000
-        return elapsed_ms >= self.batch_window_ms
-
-    def flush(self) -> List[Dict]:
-        """Get and clear pending calls."""
-        calls = self.pending_calls
-        self.pending_calls = []
-        self.last_call_time = None
-        return calls
-
-
 class ToolCallHandler:
-    """Handles tool calls by writing to file and waiting for results."""
+    """Handles tool calls by writing to stderr and waiting for results on stdin."""
 
     def __init__(self):
         self.call_counter = 0
-        self.batcher = ToolCallBatcher()
-        self.results_cache: Dict[str, Any] = {}
+        self._pending_calls: List[Dict] = []
+        self._last_call_time: Optional[float] = None
+        self._results_cache: Dict[str, Any] = {}
 
-    def generate_tool_use_id(self) -> str:
-        """Generate a unique tool use ID."""
+    def _generate_id(self) -> str:
         self.call_counter += 1
         return f"toolu_{self.call_counter:012d}"
 
     def request_tool_call(self, name: str, **kwargs) -> Any:
-        """Request a tool call and wait for the result."""
-        tool_use_id = self.generate_tool_use_id()
+        """Issue a tool call. Batches with other calls within the batch window."""
+        tool_use_id = self._generate_id()
 
-        # Add to batch
-        self.batcher.add_call(tool_use_id, name, kwargs)
+        self._pending_calls.append({
+            "tool_use_id": tool_use_id,
+            "name": name,
+            "input": kwargs,
+        })
+        self._last_call_time = time.monotonic()
 
-        # Wait a bit for potential parallel calls
-        time.sleep(self.batcher.batch_window_ms / 1000.0)
+        # Wait for the batch window to collect parallel calls
+        time.sleep(BATCH_WINDOW_MS / 1000.0)
 
-        # Flush and write all pending calls
-        if self.batcher.should_flush():
-            calls = self.batcher.flush()
-            self._write_tool_calls(calls)
+        # Check if batch window elapsed
+        elapsed_ms = (time.monotonic() - self._last_call_time) * 1000
+        if elapsed_ms >= BATCH_WINDOW_MS and self._pending_calls:
+            calls = self._pending_calls
+            self._pending_calls = []
+            self._last_call_time = None
+            self._flush_calls(calls)
 
-            # Wait for results
-            results = self._wait_for_results([c["tool_use_id"] for c in calls])
-            self.results_cache.update(results)
+        return self._results_cache.get(tool_use_id)
 
-        return self.results_cache.get(tool_use_id)
+    def _flush_calls(self, calls: List[Dict]) -> None:
+        """Write tool calls to stderr and wait for results on stdin."""
+        request = json.dumps({"calls": calls})
+        _write_stderr(f"{IPC_TOOL_CALL_START}{request}{IPC_TOOL_CALL_END}\n")
 
-    def _write_tool_calls(self, calls: List[Dict]) -> None:
-        """Write tool calls to the IPC file."""
-        with open(TOOL_CALLS_FILE, 'w') as f:
-            json.dump({
-                "type": "tool_calls",
-                "calls": calls
-            }, f)
-
-        # Write status to signal we're waiting
-        with open(STATUS_FILE, 'w') as f:
-            json.dump({
-                "status": "waiting_for_tools",
-                "pending_ids": [c["tool_use_id"] for c in calls]
-            }, f)
-
-    def _wait_for_results(self, tool_use_ids: List[str], timeout: int = 300) -> Dict[str, Any]:
-        """Wait for tool results from the proxy."""
-        start_time = time.time()
-        results = {}
-
-        while len(results) < len(tool_use_ids):
-            if time.time() - start_time > timeout:
-                raise TimeoutError(f"Timeout waiting for tool results")
-
-            if os.path.exists(TOOL_RESULTS_FILE):
-                try:
-                    with open(TOOL_RESULTS_FILE, 'r') as f:
-                        data = json.load(f)
-
-                    if data.get("type") == "tool_results":
-                        for result in data.get("results", []):
-                            tool_id = result.get("tool_use_id")
-                            if tool_id in tool_use_ids:
-                                results[tool_id] = result.get("content")
-
-                    # Clear the file after reading
-                    os.remove(TOOL_RESULTS_FILE)
-
-                except json.JSONDecodeError:
-                    pass
-                except Exception as e:
-                    print(f"Error reading results: {e}", file=sys.stderr)
-
-            time.sleep(0.1)  # Poll every 100ms
-
-        # Update status
-        with open(STATUS_FILE, 'w') as f:
-            json.dump({"status": "running"}, f)
-
-        return results
+        # Wait for results
+        ids_needed = {c["tool_use_id"] for c in calls}
+        while not ids_needed.issubset(self._results_cache.keys()):
+            data = _read_tool_result()
+            if data is None:
+                # Timeout or EOF — fill missing with errors
+                for cid in ids_needed:
+                    if cid not in self._results_cache:
+                        self._results_cache[cid] = {"error": "Timeout waiting for tool result"}
+                return
+            if "results" in data:
+                for r in data["results"]:
+                    rid = r.get("tool_use_id")
+                    if rid:
+                        if r.get("is_error"):
+                            self._results_cache[rid] = {"error": r.get("content", "Tool error")}
+                        else:
+                            self._results_cache[rid] = r.get("content")
 
 
-# Global tool call handler
 _handler = ToolCallHandler()
 
 
 def call_tool(name: str, **kwargs) -> Any:
-    """Call a tool and wait for the result.
-
-    This function is called by Claude-generated code to invoke tools.
-    It writes the tool call to a file and waits for the result.
-    """
+    """Call a tool. Used by Claude-generated code."""
     return _handler.request_tool_call(name, **kwargs)
 
 
-# Async version for asyncio.gather support
 async def async_call_tool(name: str, **kwargs) -> Any:
-    """Async version of call_tool for parallel execution."""
-    # Run synchronously since we're doing file-based IPC
+    """Async wrapper for call_tool (still synchronous under the hood)."""
     return call_tool(name, **kwargs)
 
 
-def create_tool_function(name: str):
-    """Create a tool function that can be called by generated code."""
+def _create_tool_function(name: str):
+    """Create a named tool function."""
     def tool_func(**kwargs):
         return call_tool(name, **kwargs)
+    tool_func.__name__ = name
     return tool_func
 
 
-def execute_code(code: str, tools: List[str] = None) -> Dict:
-    """Execute the provided code with tool support.
+# ── Code execution ───────────────────────────────────────────────────
 
-    Args:
-        code: Python code to execute
-        tools: List of tool names to make available
-
-    Returns:
-        Dict with stdout, stderr, and exit_code
-    """
+def execute_code(code: str, tools: List[str]) -> Dict:
+    """Execute code in a controlled namespace with tool functions available."""
     import io
     from contextlib import redirect_stdout, redirect_stderr
 
-    # Capture stdout and stderr
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
 
-    # Create execution namespace with tool functions
     namespace = {
-        '__builtins__': __builtins__,
-        'call_tool': call_tool,
-        'async_call_tool': async_call_tool,
-        'asyncio': asyncio,
+        "__builtins__": __builtins__,
+        "call_tool": call_tool,
+        "async_call_tool": async_call_tool,
+        "asyncio": asyncio,
+        "json": json,
     }
 
-    # Add named tool functions
-    if tools:
-        for tool_name in tools:
-            namespace[tool_name] = create_tool_function(tool_name)
+    for tool_name in tools:
+        namespace[tool_name] = _create_tool_function(tool_name)
 
     exit_code = 0
-
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
             exec(code, namespace)
-    except Exception as e:
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 1
+    except Exception:
         exit_code = 1
-        stderr_capture.write(f"\n{traceback.format_exc()}")
+        stderr_capture.write(traceback.format_exc())
 
     return {
         "stdout": stdout_capture.getvalue(),
         "stderr": stderr_capture.getvalue(),
-        "exit_code": exit_code
+        "exit_code": exit_code,
     }
 
+# ── Main loop ────────────────────────────────────────────────────────
 
 def main():
-    """Main entry point for the runner script."""
-    # Signal that we're ready
-    with open(READY_FILE, 'w') as f:
-        f.write("ready")
-
-    with open(STATUS_FILE, 'w') as f:
-        json.dump({"status": "ready"}, f)
-
-    # Read code from stdin or file argument
-    if len(sys.argv) > 1:
-        code_file = sys.argv[1]
-        with open(code_file, 'r') as f:
-            code = f.read()
-    else:
-        code = sys.stdin.read()
-
-    # Read tools from environment or second argument
+    # Parse tool names from environment
     tools = []
-    if len(sys.argv) > 2:
-        tools = sys.argv[2].split(',')
-    elif os.environ.get('PTC_TOOLS'):
-        tools = os.environ['PTC_TOOLS'].split(',')
+    ptc_tools = os.environ.get("PTC_TOOLS", "")
+    if ptc_tools:
+        tools = [t.strip() for t in ptc_tools.split(",") if t.strip()]
 
-    # Execute the code
-    result = execute_code(code, tools)
+    # Signal ready
+    _write_stderr(f"{IPC_READY}\n")
 
-    # Write final status
-    with open(STATUS_FILE, 'w') as f:
-        json.dump({
-            "status": "completed",
-            "exit_code": result["exit_code"]
-        }, f)
+    while True:
+        code = read_code_block()
+        if code is None:
+            break  # EOF or exit signal
 
-    # Output results
-    sys.stdout.write(result["stdout"])
-    sys.stderr.write(result["stderr"])
-    sys.exit(result["exit_code"])
+        # Reset tool handler state between executions
+        _handler.call_counter = 0
+        _handler._pending_calls = []
+        _handler._last_call_time = None
+        _handler._results_cache = {}
+
+        result = execute_code(code, tools)
+
+        # Send result to host via stdout
+        result_json = json.dumps(result)
+        _write_stdout(f"{IPC_CODE_OUTPUT_START}{result_json}{IPC_CODE_OUTPUT_END}\n")
 
 
 if __name__ == "__main__":
@@ -295,7 +335,6 @@ mod tests {
     fn test_runner_script_bytes() {
         let bytes = get_runner_script_bytes();
         assert!(!bytes.is_empty());
-        // Should be valid UTF-8
         assert!(std::str::from_utf8(&bytes).is_ok());
     }
 
@@ -306,9 +345,42 @@ mod tests {
     }
 
     #[test]
-    fn test_runner_has_ipc_files() {
-        assert!(RUNNER_SCRIPT.contains("TOOL_CALLS_FILE"));
-        assert!(RUNNER_SCRIPT.contains("TOOL_RESULTS_FILE"));
-        assert!(RUNNER_SCRIPT.contains("STATUS_FILE"));
+    fn test_runner_has_ipc_markers() {
+        assert!(RUNNER_SCRIPT.contains("__PTC_TOOL_CALL__"));
+        assert!(RUNNER_SCRIPT.contains("__PTC_END_CALL__"));
+        assert!(RUNNER_SCRIPT.contains("__PTC_TOOL_RESULT__"));
+        assert!(RUNNER_SCRIPT.contains("__PTC_END_RESULT__"));
+        assert!(RUNNER_SCRIPT.contains("__PTC_OUTPUT__"));
+        assert!(RUNNER_SCRIPT.contains("__PTC_END_OUTPUT__"));
+        assert!(RUNNER_SCRIPT.contains("__READY__"));
+    }
+
+    #[test]
+    fn test_runner_loop_mode() {
+        assert!(RUNNER_SCRIPT.contains("__CODE_START__"));
+        assert!(RUNNER_SCRIPT.contains("__CODE_END__"));
+        assert!(RUNNER_SCRIPT.contains("while True:"));
+        assert!(RUNNER_SCRIPT.contains("read_code_block"));
+    }
+
+    #[test]
+    fn test_runner_unbuffered_io() {
+        // Uses os.write/os.read instead of print/sys.stdin
+        assert!(RUNNER_SCRIPT.contains("os.write("));
+        assert!(RUNNER_SCRIPT.contains("os.read("));
+        assert!(RUNNER_SCRIPT.contains("select.select"));
+    }
+
+    #[test]
+    fn test_ipc_constants_match_script() {
+        assert!(RUNNER_SCRIPT.contains(IPC_CODE_START));
+        assert!(RUNNER_SCRIPT.contains(IPC_CODE_END));
+        assert!(RUNNER_SCRIPT.contains(IPC_TOOL_CALL_START));
+        assert!(RUNNER_SCRIPT.contains(IPC_TOOL_CALL_END));
+        assert!(RUNNER_SCRIPT.contains(IPC_TOOL_RESULT_START));
+        assert!(RUNNER_SCRIPT.contains(IPC_TOOL_RESULT_END));
+        assert!(RUNNER_SCRIPT.contains(IPC_CODE_OUTPUT_START));
+        assert!(RUNNER_SCRIPT.contains(IPC_CODE_OUTPUT_END));
+        assert!(RUNNER_SCRIPT.contains(IPC_READY));
     }
 }

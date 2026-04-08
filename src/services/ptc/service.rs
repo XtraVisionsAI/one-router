@@ -7,11 +7,16 @@
 //! - Tool call handling
 
 use super::exceptions::{PtcError, PtcResult};
-use super::sandbox::{ContainerInfo, ExecutionResult, SandboxConfig, SandboxExecutor};
-use crate::schemas::anthropic::{MessageRequest, MessageResponse};
+use super::sandbox::{
+    ContainerHandle, ContainerInfo, ContainerMessage, SandboxConfig, SandboxExecutor,
+};
+use crate::schemas::anthropic::{
+    ContentBlock, Message, MessageRequest, MessageResponse, Metadata, SystemContent, ThinkingConfig,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 // ============================================================================
 // Constants
@@ -117,6 +122,38 @@ pub enum PtcResponse {
 }
 
 // ============================================================================
+// Execution State (preserved across continuation turns)
+// ============================================================================
+
+/// State preserved between PTC turns for proper continuation.
+///
+/// When the sandbox yields a tool call, this state is saved so that
+/// the continuation request can reconstruct the full Claude conversation.
+#[derive(Debug, Clone)]
+pub struct PtcExecutionState {
+    /// The execute_code tool_use ID from Claude's response
+    pub execute_code_tool_id: String,
+    /// The code that was sent to the sandbox
+    pub code: String,
+    /// Claude's full assistant response content (including thinking blocks)
+    pub original_assistant_content: Vec<ContentBlock>,
+    /// Original conversation messages (before the assistant turn)
+    pub original_messages: Vec<Message>,
+    /// Original request parameters needed for Claude continuation
+    pub original_model: String,
+    pub original_system: Option<SystemContent>,
+    pub original_max_tokens: i32,
+    pub original_temperature: Option<f32>,
+    pub original_top_p: Option<f32>,
+    pub original_top_k: Option<i32>,
+    pub original_stop_sequences: Option<Vec<String>>,
+    pub original_tools: Option<Vec<serde_json::Value>>,
+    pub original_thinking: Option<ThinkingConfig>,
+    pub original_metadata: Option<Metadata>,
+    pub original_service_tier: Option<String>,
+}
+
+// ============================================================================
 // PTC Service
 // ============================================================================
 
@@ -124,8 +161,12 @@ pub enum PtcResponse {
 pub struct PtcService {
     /// Sandbox executor
     sandbox: Arc<SandboxExecutor>,
-    /// Active sessions
+    /// Active sessions (cloneable metadata)
     sessions: Arc<RwLock<HashMap<String, PtcSession>>>,
+    /// Container handles (not cloneable — stored separately)
+    container_handles: Arc<TokioMutex<HashMap<String, ContainerHandle>>>,
+    /// Execution states for continuation (preserved across turns)
+    execution_states: Arc<RwLock<HashMap<String, PtcExecutionState>>>,
     /// Session timeout in seconds
     session_timeout: u64,
     /// Max iterations per session
@@ -139,6 +180,8 @@ impl PtcService {
         Ok(Self {
             sandbox,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            container_handles: Arc::new(TokioMutex::new(HashMap::new())),
+            execution_states: Arc::new(RwLock::new(HashMap::new())),
             session_timeout: DEFAULT_SESSION_TIMEOUT_SECS,
             max_iterations: DEFAULT_MAX_ITERATIONS,
         })
@@ -154,6 +197,8 @@ impl PtcService {
         Ok(Self {
             sandbox,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            container_handles: Arc::new(TokioMutex::new(HashMap::new())),
+            execution_states: Arc::new(RwLock::new(HashMap::new())),
             session_timeout,
             max_iterations,
         })
@@ -241,11 +286,59 @@ impl PtcService {
     // Session Management
     // ========================================================================
 
-    /// Create a new PTC session
-    pub async fn create_session(&self) -> PtcResult<String> {
+    /// Create a new PTC session with tool support.
+    ///
+    /// Sets up the runner script, attaches to the container, starts it,
+    /// and waits for the runner's `__READY__` signal.
+    pub async fn create_session(&self, tool_names: &[String]) -> PtcResult<String> {
         let session_id = format!("ptc_sess_{}", uuid::Uuid::new_v4());
-        let container = self.sandbox.create_and_start(None).await?;
 
+        // 1. Create container (not started yet — CMD is runner.py)
+        let container = self.sandbox.create_container(None).await?;
+
+        // 2. Copy runner script into container
+        self.sandbox
+            .copy_file_to_container(
+                &container.id,
+                &super::runner::get_runner_script_bytes(),
+                "/tmp/runner.py",
+            )
+            .await?;
+
+        // 3. Copy PTC_TOOLS env wrapper script
+        let tools_csv = tool_names.join(",");
+        let wrapper =
+            format!("#!/bin/sh\nexport PTC_TOOLS=\"{tools_csv}\"\npython -u /tmp/runner.py\n");
+        self.sandbox
+            .copy_file_to_container(&container.id, wrapper.as_bytes(), "/tmp/run.sh")
+            .await?;
+
+        // 4. Attach and start (attach first, then start)
+        let mut handle = self.sandbox.attach_and_start(&container.id).await?;
+
+        // 5. Wait for __READY__ signal from runner
+        let msg = handle
+            .recv_message_timeout(Duration::from_secs(30))
+            .await
+            .map_err(|_| {
+                PtcError::RunnerNotReady("Timeout waiting for runner ready signal".into())
+            })?;
+
+        match msg {
+            ContainerMessage::Ready => {}
+            ContainerMessage::Error(e) => {
+                return Err(PtcError::RunnerNotReady(format!(
+                    "Runner error during startup: {e}"
+                )));
+            }
+            other => {
+                return Err(PtcError::RunnerNotReady(format!(
+                    "Unexpected message during startup: {other:?}"
+                )));
+            }
+        }
+
+        // 6. Store session and handle
         let session = PtcSession {
             id: session_id.clone(),
             container,
@@ -256,9 +349,16 @@ impl PtcService {
             state: SessionState::Active,
         };
 
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(session_id.clone(), session);
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(session_id.clone(), session);
+        }
+        {
+            let mut handles = self.container_handles.lock().await;
+            handles.insert(session_id.clone(), handle);
+        }
 
+        tracing::info!(session_id, "PTC session created with attach");
         Ok(session_id)
     }
 
@@ -298,9 +398,15 @@ impl PtcService {
 
     /// Remove a session and clean up its container
     pub async fn remove_session(&self, session_id: &str) -> PtcResult<()> {
+        // Remove handle first (aborts background reader)
+        if let Some(handle) = self.container_handles.lock().await.remove(session_id) {
+            handle.shutdown();
+        }
+        // Remove execution state
+        self.execution_states.write().await.remove(session_id);
+        // Remove session and clean up container
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.remove(session_id) {
-            // Clean up container
             let _ = self.sandbox.stop_and_remove(&session.container.id).await;
         }
         Ok(())
@@ -319,6 +425,12 @@ impl PtcService {
 
         for session_id in expired {
             if let Some(session) = sessions.remove(&session_id) {
+                // Clean up handle
+                if let Some(handle) = self.container_handles.lock().await.remove(&session_id) {
+                    handle.shutdown();
+                }
+                // Clean up execution state
+                self.execution_states.write().await.remove(&session_id);
                 // Clean up container in background
                 let sandbox = Arc::clone(&self.sandbox);
                 let container_id = session.container.id.clone();
@@ -341,254 +453,136 @@ impl PtcService {
     }
 
     // ========================================================================
-    // Code Execution
+    // Channel-based Code Execution
     // ========================================================================
 
-    /// Execute Python code in a session
-    pub async fn execute_code(&self, session_id: &str, code: &str) -> PtcResult<ExecutionResult> {
+    /// Send code to the container and wait for the next message (ToolCall or CodeOutput).
+    pub async fn run_code_via_channel(
+        &self,
+        session_id: &str,
+        code: &str,
+    ) -> PtcResult<ContainerMessage> {
         // Update session state
         self.with_session(session_id, |session| {
             session.state = SessionState::Executing;
             session.iteration_count += 1;
-
             if session.iteration_count > self.max_iterations {
                 return Err(PtcError::MaxIterationsExceeded(self.max_iterations));
             }
-
-            Ok(session.container.id.clone())
-        })
-        .await?;
-
-        let container_id = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .get(session_id)
-                .map(|s| s.container.id.clone())
-                .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))?
-        };
-
-        // Execute the code
-        let result = self.sandbox.execute_python(&container_id, code).await?;
-
-        // Update session state
-        self.with_session(session_id, |session| {
-            session.state = SessionState::Active;
             Ok(())
         })
         .await?;
 
-        Ok(result)
-    }
+        let mut handles = self.container_handles.lock().await;
+        let handle = handles
+            .get_mut(session_id)
+            .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))?;
 
-    // ========================================================================
-    // IPC: Read/Write files in container
-    // ========================================================================
+        // Send code to container
+        handle.send_code(code).await?;
 
-    /// Read a JSON file from the container. Returns None if file doesn't exist.
-    pub async fn read_container_json(
-        &self,
-        container_id: &str,
-        path: &str,
-    ) -> PtcResult<Option<serde_json::Value>> {
-        let result = self
-            .sandbox
-            .exec_command(container_id, vec!["cat", path])
+        // Wait for response (ToolCall or CodeOutput)
+        let msg = handle
+            .recv_message_timeout(Duration::from_secs(
+                self.sandbox.config().execution_timeout + 5,
+            ))
             .await?;
 
-        if result.exit_code != 0 {
-            // File doesn't exist or can't be read
-            return Ok(None);
-        }
-
-        let trimmed = result.stdout.trim();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-
-        serde_json::from_str(trimmed)
-            .map(Some)
-            .map_err(|e| PtcError::IpcError(format!("Invalid JSON in {path}: {e}")))
-    }
-
-    /// Write a JSON file to the container.
-    pub async fn write_container_json(
-        &self,
-        container_id: &str,
-        path: &str,
-        value: &serde_json::Value,
-    ) -> PtcResult<()> {
-        let json_bytes = serde_json::to_vec(value)
-            .map_err(|e| PtcError::IpcError(format!("Failed to serialize JSON: {e}")))?;
-        self.sandbox
-            .copy_file_to_container(container_id, &json_bytes, path)
-            .await
-    }
-
-    /// Remove a file from the container (best-effort).
-    pub async fn remove_container_file(&self, container_id: &str, path: &str) {
-        let _ = self
-            .sandbox
-            .exec_command(container_id, vec!["rm", "-f", path])
-            .await;
-    }
-
-    /// Set up runner script and tool definitions in a session container.
-    pub async fn setup_runner(&self, session_id: &str, tool_names: &[String]) -> PtcResult<()> {
-        let container_id = self.get_session(session_id).await?.container.id;
-
-        // Copy runner script
-        self.sandbox
-            .copy_file_to_container(
-                &container_id,
-                &super::runner::get_runner_script_bytes(),
-                "/tmp/runner.py",
-            )
-            .await?;
-
-        // Set PTC_TOOLS env var via a wrapper script
-        let tools_csv = tool_names.join(",");
-        let wrapper =
-            format!("#!/bin/sh\nexport PTC_TOOLS=\"{tools_csv}\"\npython /tmp/runner.py \"$@\"\n");
-        self.sandbox
-            .copy_file_to_container(&container_id, wrapper.as_bytes(), "/tmp/run.sh")
-            .await?;
-
-        Ok(())
-    }
-
-    /// Execute code via the runner script (supports tool calls via IPC).
-    ///
-    /// 1. Writes code to /tmp/code.py
-    /// 2. Runs the runner script
-    /// 3. Returns execution result
-    pub async fn run_code_with_tools(
-        &self,
-        session_id: &str,
-        code: &str,
-    ) -> PtcResult<ExecutionResult> {
-        let container_id = {
-            self.with_session(session_id, |session| {
-                session.state = SessionState::Executing;
-                session.iteration_count += 1;
-                if session.iteration_count > self.max_iterations {
-                    return Err(PtcError::MaxIterationsExceeded(self.max_iterations));
-                }
-                Ok(session.container.id.clone())
-            })
-            .await?
-        };
-
-        // Clean up previous IPC files
-        self.remove_container_file(&container_id, "/tmp/tool_calls.json")
-            .await;
-        self.remove_container_file(&container_id, "/tmp/tool_results.json")
-            .await;
-        self.remove_container_file(&container_id, "/tmp/status.json")
-            .await;
-
-        // Write code
-        self.sandbox
-            .copy_file_to_container(&container_id, code.as_bytes(), "/tmp/code.py")
-            .await?;
-
-        // Execute via runner
-        let result = self
-            .sandbox
-            .exec_command(&container_id, vec!["sh", "/tmp/run.sh", "/tmp/code.py"])
-            .await?;
-
-        // Update session state
-        self.with_session(session_id, |session| {
-            session.state = SessionState::Active;
-            Ok(())
-        })
-        .await?;
-
-        Ok(result)
-    }
-
-    /// Read pending tool calls from container (file-based IPC).
-    /// Returns None if no tool calls are pending.
-    pub async fn read_tool_calls(
-        &self,
-        session_id: &str,
-    ) -> PtcResult<Option<Vec<PendingToolCall>>> {
-        let container_id = self.get_session(session_id).await?.container.id;
-
-        let data = self
-            .read_container_json(&container_id, "/tmp/tool_calls.json")
-            .await?;
-
-        let Some(data) = data else {
-            return Ok(None);
-        };
-
-        if data.get("type").and_then(|t| t.as_str()) != Some("tool_calls") {
-            return Ok(None);
-        }
-
-        let calls: Vec<PendingToolCall> = data
-            .get("calls")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|call| {
-                        let tool_use_id = call.get("tool_use_id")?.as_str()?.to_string();
-                        let name = call.get("name")?.as_str()?.to_string();
-                        let input = call.get("input").cloned().unwrap_or(serde_json::json!({}));
-                        Some(PendingToolCall {
-                            tool_use_id,
-                            name,
-                            input,
-                            server_tool_use_id: None,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if calls.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(calls))
-        }
-    }
-
-    /// Inject tool results into container (file-based IPC).
-    pub async fn inject_tool_results(
-        &self,
-        session_id: &str,
-        results: &[(String, serde_json::Value, bool)], // (tool_use_id, content, is_error)
-    ) -> PtcResult<()> {
-        let container_id = self.get_session(session_id).await?.container.id;
-
-        let results_json = serde_json::json!({
-            "type": "tool_results",
-            "results": results.iter().map(|(id, content, is_error)| {
-                serde_json::json!({
-                    "tool_use_id": id,
-                    "content": content,
-                    "is_error": is_error,
+        // Update session state based on result
+        match &msg {
+            ContainerMessage::ToolCall(_) => {
+                self.with_session(session_id, |session| {
+                    session.state = SessionState::WaitingForToolResults;
+                    Ok(())
                 })
-            }).collect::<Vec<_>>()
-        });
+                .await?;
+            }
+            ContainerMessage::CodeOutput(_) => {
+                self.with_session(session_id, |session| {
+                    session.state = SessionState::Active;
+                    Ok(())
+                })
+                .await?;
+            }
+            _ => {}
+        }
 
-        self.write_container_json(&container_id, "/tmp/tool_results.json", &results_json)
+        Ok(msg)
+    }
+
+    /// Send tool results to the container and wait for the next message.
+    pub async fn send_tool_results_via_channel(
+        &self,
+        session_id: &str,
+        results: &serde_json::Value,
+    ) -> PtcResult<ContainerMessage> {
+        let mut handles = self.container_handles.lock().await;
+        let handle = handles
+            .get_mut(session_id)
+            .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))?;
+
+        // Send tool results
+        handle.send_tool_result(results).await?;
+
+        // Wait for response
+        let msg = handle
+            .recv_message_timeout(Duration::from_secs(
+                self.sandbox.config().execution_timeout + 5,
+            ))
             .await?;
 
-        // Clear tool_calls file so runner can proceed
-        self.remove_container_file(&container_id, "/tmp/tool_calls.json")
-            .await;
+        // Update session state
+        match &msg {
+            ContainerMessage::ToolCall(_) => {
+                self.with_session(session_id, |session| {
+                    session.state = SessionState::WaitingForToolResults;
+                    Ok(())
+                })
+                .await?;
+            }
+            ContainerMessage::CodeOutput(_) => {
+                self.with_session(session_id, |session| {
+                    session.state = SessionState::Active;
+                    Ok(())
+                })
+                .await?;
+            }
+            _ => {}
+        }
 
-        Ok(())
+        Ok(msg)
     }
 
-    /// Read execution status from container.
-    pub async fn read_status(&self, session_id: &str) -> PtcResult<Option<serde_json::Value>> {
-        let container_id = self.get_session(session_id).await?.container.id;
-        self.read_container_json(&container_id, "/tmp/status.json")
-            .await
+    // ========================================================================
+    // Execution State Management
+    // ========================================================================
+
+    /// Save execution state for a session (for continuation).
+    pub async fn save_execution_state(&self, session_id: &str, state: PtcExecutionState) {
+        let mut states = self.execution_states.write().await;
+        states.insert(session_id.to_string(), state);
     }
+
+    /// Take (remove and return) execution state for a session.
+    pub async fn take_execution_state(&self, session_id: &str) -> PtcResult<PtcExecutionState> {
+        let mut states = self.execution_states.write().await;
+        states
+            .remove(session_id)
+            .ok_or_else(|| PtcError::ExecutionStateNotFound(session_id.to_string()))
+    }
+
+    /// Peek at execution state without removing it.
+    pub async fn get_execution_state(&self, session_id: &str) -> PtcResult<PtcExecutionState> {
+        let states = self.execution_states.read().await;
+        states
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| PtcError::ExecutionStateNotFound(session_id.to_string()))
+    }
+
+    // ========================================================================
+    // Legacy methods kept for backward compatibility
+    // ========================================================================
 
     /// Set session pending tool calls and transition to WaitingForToolResults.
     pub async fn set_pending_tool_calls(

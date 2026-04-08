@@ -4,14 +4,20 @@
 //! for secure code execution in the PTC (Programmatic Tool Calling) system.
 
 use super::exceptions::{PtcError, PtcResult};
+use super::runner;
 use bollard::container::{
-    Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions, UploadToContainerOptions,
+    AttachContainerOptions, Config, CreateContainerOptions, LogOutput, LogsOptions,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions, UploadToContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
 use futures::StreamExt;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 // ============================================================================
@@ -115,6 +121,121 @@ impl ExecutionResult {
 }
 
 // ============================================================================
+// Container Handle (persistent attach connection)
+// ============================================================================
+
+/// A parsed tool call from the sandbox runner.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallData {
+    pub tool_use_id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+/// Parsed code execution output from the sandbox runner.
+#[derive(Debug, Clone)]
+pub struct CodeOutputData {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i64,
+}
+
+/// Messages received from a sandbox container via the attach stream.
+#[derive(Debug)]
+pub enum ContainerMessage {
+    /// Runner is ready for code
+    Ready,
+    /// Runner is requesting tool calls
+    ToolCall(Vec<ToolCallData>),
+    /// Code execution completed
+    CodeOutput(CodeOutputData),
+    /// An error occurred
+    Error(String),
+    /// The output stream ended (container exited)
+    StreamEnded,
+}
+
+/// Persistent bidirectional connection to a sandbox container.
+///
+/// Created by [`SandboxExecutor::attach_and_start`]. Wraps:
+/// - An async writer for the container's stdin
+/// - A channel receiver for parsed messages from a background reader task
+pub struct ContainerHandle {
+    /// Writer to container stdin
+    stdin: Arc<TokioMutex<Pin<Box<dyn tokio::io::AsyncWrite + Send>>>>,
+    /// Receiver for parsed messages from the background reader
+    messages_rx: mpsc::Receiver<ContainerMessage>,
+    /// Handle for the background reader task
+    reader_task: JoinHandle<()>,
+}
+
+impl ContainerHandle {
+    /// Send a code block to the container for execution.
+    pub async fn send_code(&self, code: &str) -> PtcResult<()> {
+        let payload = format!(
+            "{}\n{}\n{}\n",
+            runner::IPC_CODE_START,
+            code,
+            runner::IPC_CODE_END
+        );
+        let mut stdin = self.stdin.lock().await;
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| PtcError::IpcError(format!("Failed to send code: {e}")))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| PtcError::IpcError(format!("Failed to flush stdin: {e}")))?;
+        Ok(())
+    }
+
+    /// Send tool results back to the container.
+    pub async fn send_tool_result(&self, results: &serde_json::Value) -> PtcResult<()> {
+        let json_str = serde_json::to_string(results)
+            .map_err(|e| PtcError::IpcError(format!("Failed to serialize tool results: {e}")))?;
+        let payload = format!(
+            "{}{}{}\n",
+            runner::IPC_TOOL_RESULT_START,
+            json_str,
+            runner::IPC_TOOL_RESULT_END
+        );
+        let mut stdin = self.stdin.lock().await;
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| PtcError::IpcError(format!("Failed to send tool result: {e}")))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| PtcError::IpcError(format!("Failed to flush stdin: {e}")))?;
+        Ok(())
+    }
+
+    /// Receive the next message from the container.
+    pub async fn recv_message(&mut self) -> PtcResult<ContainerMessage> {
+        self.messages_rx.recv().await.ok_or(PtcError::IpcError(
+            "Container stream ended unexpectedly".into(),
+        ))
+    }
+
+    /// Receive the next message with a timeout.
+    pub async fn recv_message_timeout(
+        &mut self,
+        duration: Duration,
+    ) -> PtcResult<ContainerMessage> {
+        timeout(duration, self.recv_message())
+            .await
+            .map_err(|_| PtcError::ExecutionTimeout(duration.as_secs()))?
+    }
+
+    /// Shut down the background reader and drop resources.
+    pub fn shutdown(self) {
+        self.reader_task.abort();
+    }
+}
+
+// ============================================================================
 // Sandbox Executor
 // ============================================================================
 
@@ -149,6 +270,11 @@ impl SandboxExecutor {
     /// Check if Docker is available
     pub async fn is_available(&self) -> bool {
         self.docker.ping().await.is_ok()
+    }
+
+    /// Get the sandbox configuration
+    pub fn config(&self) -> &SandboxConfig {
+        &self.config
     }
 
     /// Get Docker version info
@@ -196,16 +322,16 @@ impl SandboxExecutor {
             image: Some(self.config.image.clone()),
             working_dir: Some(self.config.working_dir.clone()),
             host_config: Some(host_config),
-            tty: Some(true),
+            tty: Some(false), // Disable TTY for multiplexed stdout/stderr separation
             attach_stdin: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             open_stdin: Some(true),
-            // Keep container running with a simple command
+            // Run the runner script as main process (unbuffered Python)
             cmd: Some(vec![
-                "tail".to_string(),
-                "-f".to_string(),
-                "/dev/null".to_string(),
+                "python".to_string(),
+                "-u".to_string(),
+                "/tmp/runner.py".to_string(),
             ]),
             ..Default::default()
         };
@@ -491,6 +617,75 @@ impl SandboxExecutor {
         Ok(info)
     }
 
+    /// Create a container, copy the runner script, attach, and start.
+    ///
+    /// Returns both a `ContainerInfo` and a `ContainerHandle` for persistent
+    /// bidirectional communication. The runner script must already be copied
+    /// to the container before calling this method (via `copy_file_to_container`).
+    ///
+    /// Attach happens **before** start so we catch the runner's `__READY__` signal.
+    pub async fn attach_and_start(&self, container_id: &str) -> PtcResult<ContainerHandle> {
+        // Attach before starting to capture all output
+        let attach_options = AttachContainerOptions::<String> {
+            stdin: Some(true),
+            stdout: Some(true),
+            stderr: Some(true),
+            stream: Some(true),
+            logs: Some(false),
+            ..Default::default()
+        };
+
+        let attach_result = self
+            .docker
+            .attach_container(container_id, Some(attach_options))
+            .await
+            .map_err(|e| PtcError::AttachFailed(format!("Failed to attach: {e}")))?;
+
+        // Now start the container (runner.py begins executing)
+        self.start_container(container_id).await?;
+
+        // Split attach result into input (stdin writer) and output (stream reader)
+        let stdin_writer = Arc::new(TokioMutex::new(attach_result.input));
+        let mut output_stream = attach_result.output;
+
+        // Create channel for parsed messages
+        let (tx, rx) = mpsc::channel::<ContainerMessage>(32);
+
+        // Spawn background reader task
+        let reader_task = tokio::spawn(async move {
+            let mut stdout_buf = String::new();
+            let mut stderr_buf = String::new();
+
+            while let Some(result) = output_stream.next().await {
+                match result {
+                    Ok(LogOutput::StdOut { message }) => {
+                        stdout_buf.push_str(&String::from_utf8_lossy(&message));
+                        parse_stdout_messages(&mut stdout_buf, &tx).await;
+                    }
+                    Ok(LogOutput::StdErr { message }) => {
+                        stderr_buf.push_str(&String::from_utf8_lossy(&message));
+                        parse_stderr_messages(&mut stderr_buf, &tx).await;
+                    }
+                    Ok(_) => {} // StdIn echo, Console — ignore
+                    Err(e) => {
+                        let _ = tx
+                            .send(ContainerMessage::Error(format!("Stream error: {e}")))
+                            .await;
+                        break;
+                    }
+                }
+            }
+
+            let _ = tx.send(ContainerMessage::StreamEnded).await;
+        });
+
+        Ok(ContainerHandle {
+            stdin: stdin_writer,
+            messages_rx: rx,
+            reader_task,
+        })
+    }
+
     /// Stop and remove a container in one step
     pub async fn stop_and_remove(&self, container_id: &str) -> PtcResult<()> {
         // Try to stop first, but don't fail if already stopped
@@ -512,6 +707,108 @@ impl SandboxExecutor {
             info.state.and_then(|s| s.running).unwrap_or(false)
         } else {
             false
+        }
+    }
+}
+
+// ============================================================================
+// Boundary Marker Parsers (used by the background reader task)
+// ============================================================================
+
+/// Parse stdout buffer for `__PTC_OUTPUT__{json}__PTC_END_OUTPUT__` messages.
+async fn parse_stdout_messages(buf: &mut String, tx: &mpsc::Sender<ContainerMessage>) {
+    while let Some(start_idx) = buf.find(runner::IPC_CODE_OUTPUT_START) {
+        let json_start = start_idx + runner::IPC_CODE_OUTPUT_START.len();
+        if let Some(end_idx) = buf[json_start..].find(runner::IPC_CODE_OUTPUT_END) {
+            let json_str = &buf[json_start..json_start + end_idx];
+            let msg = match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(val) => ContainerMessage::CodeOutput(CodeOutputData {
+                    stdout: val
+                        .get("stdout")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    stderr: val
+                        .get("stderr")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    exit_code: val.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1),
+                }),
+                Err(e) => ContainerMessage::Error(format!("Invalid code output JSON: {e}")),
+            };
+            let consume_end = json_start + end_idx + runner::IPC_CODE_OUTPUT_END.len();
+            // Also consume trailing newline if present
+            let consume_end = if buf[consume_end..].starts_with('\n') {
+                consume_end + 1
+            } else {
+                consume_end
+            };
+            buf.drain(..consume_end);
+            let _ = tx.send(msg).await;
+        } else {
+            // Incomplete marker — wait for more data
+            break;
+        }
+    }
+}
+
+/// Parse stderr buffer for `__READY__` and `__PTC_TOOL_CALL__` messages.
+async fn parse_stderr_messages(buf: &mut String, tx: &mpsc::Sender<ContainerMessage>) {
+    // Check for __READY__ signal
+    while let Some(idx) = buf.find(runner::IPC_READY) {
+        let consume_end = idx + runner::IPC_READY.len();
+        let consume_end = if buf[consume_end..].starts_with('\n') {
+            consume_end + 1
+        } else {
+            consume_end
+        };
+        buf.drain(..consume_end);
+        let _ = tx.send(ContainerMessage::Ready).await;
+    }
+
+    // Check for tool call messages
+    while let Some(start_idx) = buf.find(runner::IPC_TOOL_CALL_START) {
+        let json_start = start_idx + runner::IPC_TOOL_CALL_START.len();
+        if let Some(end_idx) = buf[json_start..].find(runner::IPC_TOOL_CALL_END) {
+            let json_str = &buf[json_start..json_start + end_idx];
+            let msg = match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(val) => {
+                    let calls = val
+                        .get("calls")
+                        .and_then(|c| c.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|call| {
+                                    let tool_use_id =
+                                        call.get("tool_use_id")?.as_str()?.to_string();
+                                    let name = call.get("name")?.as_str()?.to_string();
+                                    let input =
+                                        call.get("input").cloned().unwrap_or(serde_json::json!({}));
+                                    Some(ToolCallData {
+                                        tool_use_id,
+                                        name,
+                                        input,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    ContainerMessage::ToolCall(calls)
+                }
+                Err(e) => ContainerMessage::Error(format!("Invalid tool call JSON: {e}")),
+            };
+            let consume_end = json_start + end_idx + runner::IPC_TOOL_CALL_END.len();
+            let consume_end = if buf[consume_end..].starts_with('\n') {
+                consume_end + 1
+            } else {
+                consume_end
+            };
+            buf.drain(..consume_end);
+            let _ = tx.send(msg).await;
+        } else {
+            // Incomplete marker — wait for more data
+            break;
         }
     }
 }
@@ -575,5 +872,62 @@ mod tests {
         };
         assert_eq!(info.id, "abc123");
         assert!(info.running);
+    }
+
+    #[tokio::test]
+    async fn test_parse_stdout_code_output() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buf =
+            r#"__PTC_OUTPUT__{"stdout":"hello","stderr":"","exit_code":0}__PTC_END_OUTPUT__
+"#
+            .to_string();
+        parse_stdout_messages(&mut buf, &tx).await;
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            ContainerMessage::CodeOutput(data) => {
+                assert_eq!(data.stdout, "hello");
+                assert_eq!(data.exit_code, 0);
+            }
+            _ => panic!("Expected CodeOutput"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_stderr_ready() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buf = "__READY__\n".to_string();
+        parse_stderr_messages(&mut buf, &tx).await;
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg, ContainerMessage::Ready));
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_stderr_tool_call() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buf = r#"__PTC_TOOL_CALL__{"calls":[{"tool_use_id":"toolu_1","name":"web_search","input":{"query":"test"}}]}__PTC_END_CALL__
+"#.to_string();
+        parse_stderr_messages(&mut buf, &tx).await;
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            ContainerMessage::ToolCall(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "web_search");
+                assert_eq!(calls[0].tool_use_id, "toolu_1");
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_incomplete_marker() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buf = "__PTC_OUTPUT__{\"stdout\":\"partial".to_string();
+        parse_stdout_messages(&mut buf, &tx).await;
+        // Should not produce a message — waiting for end marker
+        assert!(rx.try_recv().is_err());
+        assert!(buf.contains("partial"));
     }
 }
