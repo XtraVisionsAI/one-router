@@ -1,3 +1,10 @@
+## v0.16.0 (2026-04-08)
+
+### Feat
+
+- **ptc**: implement continuation support via persistent container attach
+- **admin-ui**: add pricing column to model mappings table
+
 ## v0.15.0 (2026-04-07)
 
 ### Feat
