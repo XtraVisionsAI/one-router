@@ -71,7 +71,7 @@ impl UsageTracker {
             }
         }
 
-        let record = UsageRecord {
+        let mut record = UsageRecord {
             id: None,
             api_key: key_info.raw_api_key.clone(),
             timestamp: timestamp.to_rfc3339(),
@@ -84,19 +84,20 @@ impl UsageTracker {
                 .cache_creation_input_tokens
                 .map(|t| t as i64)
                 .unwrap_or(0),
-            cost: 0.0, // Will be calculated below
+            cost: 0.0, // set below after calculation
             success,
             duration_ms: None,
             error_message: None,
         };
+
+        let cost = self.calculate_cost(model, usage, key_info.cost_rate).await;
+        record.cost = cost;
 
         self.storage
             .usage()
             .record_usage(&record)
             .await
             .map_err(|e| UsageError::Database(e.to_string()))?;
-
-        let cost = self.calculate_cost(model, usage, key_info.cost_rate).await;
 
         if cost > 0.0 {
             let budget_exceeded = self
