@@ -119,10 +119,13 @@ export interface UpsertSettingBody {
 // ── Usage ─────────────────────────────────────────────────────
 export interface UsageSummaryRow {
   group_key: string
+  split_key?: string | null
   total_requests: number
   error_requests: number
   input_tokens: number
   output_tokens: number
+  cached_tokens: number
+  cache_write_tokens: number
   total_cost: number
 }
 
@@ -132,6 +135,7 @@ export interface UsageSummaryResponse {
     total_requests: number
     total_input_tokens: number
     total_output_tokens: number
+    total_cached_tokens: number
     total_cost: number
   }
 }
