@@ -41,6 +41,16 @@ pub async fn serve_asset(
     serve_file(&format!("assets/{path}"))
 }
 
+/// Serve logo.png for GET /admin/logo.png
+pub async fn serve_logo() -> impl IntoResponse {
+    serve_file("logo.png")
+}
+
+/// Serve favicon.png for GET /admin/favicon.png
+pub async fn serve_favicon() -> impl IntoResponse {
+    serve_file("favicon.png")
+}
+
 fn serve_file(path: &str) -> Response<Body> {
     match AdminAssets::get(path) {
         Some(content) => {

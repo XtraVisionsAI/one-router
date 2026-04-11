@@ -138,7 +138,9 @@ pub fn create_router(state: AppState) -> Router {
     // Assets are served under /admin/assets/* to avoid shadowing /admin/api/*
     let admin_static_routes = Router::new()
         .route("/", get(admin::serve_index))
-        .route("/assets/*path", get(admin::serve_asset));
+        .route("/assets/*path", get(admin::serve_asset))
+        .route("/logo.png", get(admin::serve_logo))
+        .route("/favicon.png", get(admin::serve_favicon));
 
     // Combine all routes
     Router::new()

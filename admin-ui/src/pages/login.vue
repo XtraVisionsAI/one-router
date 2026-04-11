@@ -33,9 +33,10 @@
 
 <template>
   <div class="bg-[#1e293b] rounded-xl shadow-2xl p-8 w-[400px] border border-slate-700">
-    <div class="mb-6 text-center">
+    <div class="mb-6 flex items-center justify-center gap-3">
+      <img src="/logo.png" alt="one-router" class="w-10 h-10 rounded-lg">
       <span class="text-indigo-400 font-semibold text-xl">one-router</span>
-      <span class="ml-2 text-sm text-slate-500 bg-slate-700 px-2 py-0.5 rounded">admin</span>
+      <span class="text-sm text-slate-500 bg-slate-700 px-2 py-0.5 rounded">admin</span>
     </div>
     <p class="text-slate-400 text-sm text-center mb-6"> Enter your master or ephemeral API key to continue. </p>
 

@@ -90,9 +90,12 @@
     <!-- Sidebar -->
     <aside class="w-52 flex flex-col bg-slate-800 border-r border-slate-700/60 shrink-0">
       <!-- Logo -->
-      <div class="px-5 py-4 border-b border-slate-700/60">
-        <span class="text-indigo-400 font-semibold text-[15px]">one-router</span>
-        <span class="ml-2 text-[11px] text-slate-400 bg-slate-700 px-1.5 py-0.5 rounded">admin</span>
+      <div class="px-4 py-3.5 border-b border-slate-700/60 flex items-center gap-2.5">
+        <img src="/logo.png" alt="one-router" class="w-9 h-9 rounded-lg shrink-0">
+        <div class="flex flex-col">
+          <span class="text-indigo-400 font-semibold text-sm leading-tight tracking-wide">one-router</span>
+          <span class="text-[10px] text-slate-500 mt-0.5">admin console</span>
+        </div>
       </div>
 
       <!-- Nav -->
