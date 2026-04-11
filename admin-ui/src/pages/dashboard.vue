@@ -89,12 +89,12 @@
   const trendOption = computed(() => ({
     ...baseOption,
     tooltip: { ...baseOption.tooltip, trigger: 'axis' },
-    legend: { ...baseOption.legend, data: ['Requests', 'Cost'], right: 0, top: 0 },
-    grid: { left: 55, right: 55, top: 35, bottom: 25 },
+    legend: { ...baseOption.legend, data: ['Requests', 'Cost'], left: 0, top: 0, itemGap: 16 },
+    grid: { left: 55, right: 55, top: 30, bottom: 25 },
     xAxis: { type: 'category', data: dailyData.value.map(r => r.group_key), ...axisCommon },
     yAxis: [
-      { type: 'value', name: 'Requests', ...axisCommon, splitLine: axisCommon.splitLine },
-      { type: 'value', name: 'Cost ($)', ...axisCommon, splitLine: { show: false } },
+      { type: 'value', ...axisCommon, splitLine: axisCommon.splitLine },
+      { type: 'value', ...axisCommon, splitLine: { show: false } },
     ],
     series: [
       {
