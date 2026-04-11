@@ -1,3 +1,14 @@
+## v0.17.0 (2026-04-11)
+
+### Feat
+
+- **admin-ui**: redesign dashboard as ops panel and enhance usage analytics
+- **usage**: add provider/protocol tracking and multi-dimension analytics
+
+### Fix
+
+- write calculated cost to usage records instead of always 0.0
+
 ## v0.16.0 (2026-04-08)
 
 ### Feat
