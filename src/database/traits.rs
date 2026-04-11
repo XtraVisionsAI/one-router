@@ -49,7 +49,8 @@ pub trait UsageStore: Send + Sync {
         limit: Option<i64>,
         before_id: Option<i64>,
     ) -> Result<Vec<UsageRecord>>;
-    /// Aggregate usage query, grouped by group_by ("hour" or "model").
+    /// Aggregate usage query, grouped by group_by ("hour", "day", "month", "model", "provider", "api_key").
+    /// Optional split_by adds a secondary grouping dimension.
     /// start / end are RFC3339 strings, both optional.
     async fn query_usage_summary(
         &self,
@@ -57,6 +58,7 @@ pub trait UsageStore: Send + Sync {
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
+        split_by: Option<&str>,
     ) -> Result<Vec<UsageSummaryRow>>;
 }
 

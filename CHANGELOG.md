@@ -1,3 +1,9 @@
+## v0.16.1 (2026-04-11)
+
+### Fix
+
+- write calculated cost to usage records instead of always 0.0
+
 ## v0.16.0 (2026-04-08)
 
 ### Feat

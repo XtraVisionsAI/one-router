@@ -11,13 +11,19 @@
     "lint:fix": "eslint . --fix"
   },
   "dependencies": {
+    "echarts": "^6.0.0",
     "naive-ui": "^2.41.0",
     "pinia": "^3.0.0",
     "vue": "^3.5.32",
+    "vue-echarts": "^8.0.1",
     "vue-router": "^5.0.4"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["@swc/core", "esbuild", "unrs-resolver"]
+    "onlyBuiltDependencies": [
+      "@swc/core",
+      "esbuild",
+      "unrs-resolver"
+    ]
   },
   "devDependencies": {
     "@iconify-json/carbon": "^1.2.0",

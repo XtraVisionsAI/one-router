@@ -157,12 +157,14 @@ struct UsageContext {
     key_info: crate::middleware::auth::ApiKeyInfo,
     model: String,
     request_id: String,
+    provider: String,
     /// Shared state for streaming usage — handlers write, entry wrapper reads.
     stream_usage: Arc<tokio::sync::Mutex<StreamUsage>>,
 }
 
 /// Wrap an SSE stream so that after the inner stream completes, usage is
 /// read from the shared `StreamUsage` state and recorded via the tracker.
+#[allow(clippy::too_many_arguments)]
 fn wrap_stream_with_usage_recording(
     inner: SseStream,
     usage: Arc<tokio::sync::Mutex<StreamUsage>>,
@@ -170,6 +172,8 @@ fn wrap_stream_with_usage_recording(
     key_info: crate::middleware::auth::ApiKeyInfo,
     model: String,
     request_id: String,
+    provider: String,
+    protocol: &'static str,
 ) -> SseStream {
     use futures::StreamExt;
     let stream = async_stream::stream! {
@@ -186,7 +190,7 @@ fn wrap_stream_with_usage_recording(
         };
         drop(u);
         if let Err(e) = tracker
-            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true)
+            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true, &provider, protocol)
             .await
         {
             tracing::warn!(error = %e, "Failed to record streaming usage");
@@ -234,6 +238,7 @@ pub async fn chat_completions(
         key_info: key_info.clone(),
         model: request.model.clone(),
         request_id: request_id.clone(),
+        provider: resolved.provider.clone(),
         stream_usage: stream_usage.clone(),
     };
 
@@ -293,7 +298,15 @@ pub async fn chat_completions(
             tokio::spawn(async move {
                 if let Err(e) = ctx
                     .tracker
-                    .record_usage(&ctx.key_info, &ctx.request_id, &ctx.model, &usage, true)
+                    .record_usage(
+                        &ctx.key_info,
+                        &ctx.request_id,
+                        &ctx.model,
+                        &usage,
+                        true,
+                        &ctx.provider,
+                        "openai",
+                    )
                     .await
                 {
                     tracing::warn!(error = %e, "Failed to record usage");
@@ -309,6 +322,8 @@ pub async fn chat_completions(
                 key_info.clone(),
                 request.model.clone(),
                 request_id,
+                resolved.provider.clone(),
+                "openai",
             );
             Ok(ChatCompletionApiResponse::Stream(wrapped))
         }

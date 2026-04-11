@@ -55,6 +55,18 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await?;
 
+    // Migration: add provider and protocol columns for usage analytics dimensions
+    sqlx::query("ALTER TABLE usage ADD COLUMN IF NOT EXISTS provider TEXT")
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER TABLE usage ADD COLUMN IF NOT EXISTS protocol TEXT")
+        .execute(pool)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage(provider)")
+        .execute(pool)
+        .await?;
+
     // --- model_mappings ---
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS model_mappings (

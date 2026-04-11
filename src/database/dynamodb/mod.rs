@@ -375,6 +375,8 @@ fn usage_from_item(item: &HashMap<String, AttributeValue>) -> UsageRecord {
         success: get_bool(item, "success"),
         duration_ms: get_opt_i64(item, "duration_ms"),
         error_message: get_opt_s(item, "error_message"),
+        provider: get_opt_s(item, "provider"),
+        protocol: get_opt_s(item, "protocol"),
     }
 }
 
@@ -735,6 +737,12 @@ impl UsageStore for DynamoDbBackend {
         item.insert("success".into(), av_bool(record.success));
         item.insert("duration_ms".into(), av_opt_n_i64(record.duration_ms));
         item.insert("error_message".into(), av_opt_s(&record.error_message));
+        if let Some(ref provider) = record.provider {
+            item.insert("provider".into(), av_s(provider));
+        }
+        if let Some(ref protocol) = record.protocol {
+            item.insert("protocol".into(), av_s(protocol));
+        }
 
         self.client
             .put_item()
@@ -803,6 +811,7 @@ impl UsageStore for DynamoDbBackend {
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
+        split_by: Option<&str>,
     ) -> Result<Vec<UsageSummaryRow>> {
         use std::collections::HashMap;
 
@@ -887,17 +896,31 @@ impl UsageStore for DynamoDbBackend {
         };
 
         // Aggregate in memory
+        fn dim_value(r: &UsageRecord, dim: &str) -> String {
+            match dim {
+                "model" => r.model.clone(),
+                "day" => r.timestamp.chars().take(10).collect(),
+                "month" => r.timestamp.chars().take(7).collect(),
+                "provider" => r.provider.as_deref().unwrap_or("unknown").to_string(),
+                "api_key" => r.api_key.clone(),
+                _ => r.timestamp.chars().take(13).collect(),
+            }
+        }
+
+        // Composite key: "group_key\0split_key" (split_key may be empty)
         let mut map: HashMap<String, UsageSummaryRow> = HashMap::new();
 
         for r in &records {
-            let key = if group_by == "model" {
-                r.model.clone()
-            } else {
-                r.timestamp.chars().take(13).collect()
+            let gk = dim_value(r, group_by);
+            let sk = split_by.map(|sb| dim_value(r, sb));
+            let composite = match &sk {
+                Some(s) => format!("{gk}\0{s}"),
+                None => gk.clone(),
             };
 
-            let entry = map.entry(key.clone()).or_insert(UsageSummaryRow {
-                group_key: key,
+            let entry = map.entry(composite).or_insert(UsageSummaryRow {
+                group_key: gk,
+                split_key: sk,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,

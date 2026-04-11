@@ -60,6 +60,8 @@ pub struct UsageRecord {
     pub success: bool,
     pub duration_ms: Option<i64>,
     pub error_message: Option<String>,
+    pub provider: Option<String>,
+    pub protocol: Option<String>,
 }
 
 // ============================================================================
@@ -124,6 +126,8 @@ pub struct SystemSettingRecord {
 pub struct UsageSummaryRow {
     /// 分组键，按 hour 时格式为 "2026-03-24T15"，按 model 时为模型名
     pub group_key: String,
+    /// 可选的次级分组键（split_by 参数生效时填充）
+    pub split_key: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cached_tokens: i64,
