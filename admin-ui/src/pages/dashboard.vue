@@ -89,8 +89,8 @@
   const trendOption = computed(() => ({
     ...baseOption,
     tooltip: { ...baseOption.tooltip, trigger: 'axis' },
-    legend: { ...baseOption.legend, data: ['Requests', 'Cost'], left: 0, top: 0, itemGap: 16 },
-    grid: { left: 55, right: 55, top: 30, bottom: 25 },
+    legend: { show: false },
+    grid: { left: 55, right: 55, top: 10, bottom: 25 },
     xAxis: { type: 'category', data: dailyData.value.map(r => r.group_key), ...axisCommon },
     yAxis: [
       { type: 'value', ...axisCommon, splitLine: axisCommon.splitLine },
@@ -229,7 +229,13 @@
 
       <!-- Trend chart -->
       <NCard size="small" class="mb-6">
-        <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Requests & Cost Trend</h2>
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider">Requests & Cost Trend</h2>
+          <div class="flex items-center gap-4 text-xs text-slate-400">
+            <span class="flex items-center gap-1.5"><span class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#60a5fa" />&nbsp;Requests</span>
+            <span class="flex items-center gap-1.5"><span class="inline-block w-4 h-0.5 rounded" style="background:#fbbf24" />&nbsp;Cost</span>
+          </div>
+        </div>
         <VChart :option="trendOption" style="height: 260px" autoresize />
       </NCard>
 
