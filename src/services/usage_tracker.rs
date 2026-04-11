@@ -38,6 +38,7 @@ impl UsageTracker {
     /// Record usage for a completed request.
     ///
     /// Returns `Ok(true)` if budget was exceeded and the key was deactivated.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_usage(
         &self,
         key_info: &ApiKeyInfo,
@@ -45,6 +46,8 @@ impl UsageTracker {
         model: &str,
         usage: &Usage,
         success: bool,
+        provider: &str,
+        protocol: &str,
     ) -> Result<bool, UsageError> {
         let timestamp = Utc::now();
 
@@ -88,6 +91,8 @@ impl UsageTracker {
             success,
             duration_ms: None,
             error_message: None,
+            provider: Some(provider.to_string()),
+            protocol: Some(protocol.to_string()),
         };
 
         let cost = self.calculate_cost(model, usage, key_info.cost_rate).await;

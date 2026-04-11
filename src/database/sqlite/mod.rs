@@ -140,6 +140,21 @@ impl SqliteBackend {
             .execute(&self.pool)
             .await?;
 
+        // Migration: add provider and protocol columns for usage analytics dimensions
+        sqlx::query("ALTER TABLE usage ADD COLUMN provider TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE usage ADD COLUMN protocol TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage(provider)")
+            .execute(&self.pool)
+            .await
+            .ok();
+
         // --- model_mappings ---
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS model_mappings (
@@ -759,8 +774,9 @@ impl UsageStore for SqliteBackend {
         sqlx::query(
             "INSERT INTO usage \
              (api_key, timestamp, request_id, model, input_tokens, output_tokens, \
-              cached_tokens, cache_write_tokens, cost, success, duration_ms, error_message) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              cached_tokens, cache_write_tokens, cost, success, duration_ms, error_message, \
+              provider, protocol) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
         .bind(&record.timestamp)
@@ -774,6 +790,8 @@ impl UsageStore for SqliteBackend {
         .bind(record.success as i32)
         .bind(record.duration_ms)
         .bind(&record.error_message)
+        .bind(&record.provider)
+        .bind(&record.protocol)
         .execute(&self.pool)
         .await?;
 
@@ -810,7 +828,7 @@ impl UsageStore for SqliteBackend {
         let sql = format!(
             "SELECT id, api_key, timestamp, request_id, model, \
              input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-             cost, success, duration_ms, error_message \
+             cost, success, duration_ms, error_message, provider, protocol \
              FROM usage {key_clause} {since_clause} {before_id_clause} \
              ORDER BY timestamp DESC {limit_clause}",
         );
@@ -847,6 +865,8 @@ impl UsageStore for SqliteBackend {
                 success: r.get::<i32, _>("success") != 0,
                 duration_ms: r.get("duration_ms"),
                 error_message: r.get("error_message"),
+                provider: r.get("provider"),
+                protocol: r.get("protocol"),
             })
             .collect();
 
@@ -859,17 +879,33 @@ impl UsageStore for SqliteBackend {
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
+        split_by: Option<&str>,
     ) -> Result<Vec<UsageSummaryRow>> {
-        // SQLite strftime: truncate by hour -> "2026-03-24T15"
-        // By model -> use the model field directly
-        let group_expr = if group_by == "model" {
-            "model"
+        fn dim_expr(dim: &str) -> &str {
+            match dim {
+                "model" => "model",
+                "day" => "strftime('%Y-%m-%d', timestamp)",
+                "month" => "strftime('%Y-%m', timestamp)",
+                "provider" => "COALESCE(provider, 'unknown')",
+                "api_key" => "api_key",
+                _ => "strftime('%Y-%m-%dT%H', timestamp)",
+            }
+        }
+
+        let group_expr = dim_expr(group_by);
+
+        // Build split clause
+        let (split_select, split_group, split_order) = if let Some(sb) = split_by {
+            let se = dim_expr(sb);
+            (
+                format!(", {se} AS split_key"),
+                format!(", {se}"),
+                ", split_key",
+            )
         } else {
-            "strftime('%Y-%m-%dT%H', timestamp)"
+            (String::new(), String::new(), "")
         };
 
-        // Build dynamic SQL (group_expr is an internal constant, no injection risk)
-        // Empty api_key means "all keys" (admin query with no key filter)
         let filter_by_key = !api_key.is_empty();
         let key_clause = if filter_by_key {
             "WHERE api_key = ?"
@@ -878,7 +914,7 @@ impl UsageStore for SqliteBackend {
         };
 
         let sql = format!(
-            "SELECT {group_expr} AS group_key, \
+            "SELECT {group_expr} AS group_key{split_select}, \
              SUM(input_tokens) AS input_tokens, \
              SUM(output_tokens) AS output_tokens, \
              SUM(cached_tokens) AS cached_tokens, \
@@ -888,10 +924,8 @@ impl UsageStore for SqliteBackend {
              SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS error_requests \
              FROM usage \
              {key_clause} {start_clause} {end_clause} \
-             GROUP BY {group_expr} \
-             ORDER BY group_key DESC",
-            group_expr = group_expr,
-            key_clause = key_clause,
+             GROUP BY {group_expr}{split_group} \
+             ORDER BY group_key DESC{split_order}",
             start_clause = if start.is_some() {
                 "AND timestamp >= ?"
             } else {
@@ -916,11 +950,13 @@ impl UsageStore for SqliteBackend {
         }
 
         let rows = q.fetch_all(&self.pool).await?;
+        let has_split = split_by.is_some();
 
         let records = rows
             .iter()
             .map(|r| UsageSummaryRow {
                 group_key: r.get("group_key"),
+                split_key: if has_split { r.get("split_key") } else { None },
                 input_tokens: r.get("input_tokens"),
                 output_tokens: r.get("output_tokens"),
                 cached_tokens: r.get("cached_tokens"),

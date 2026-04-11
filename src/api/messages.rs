@@ -223,8 +223,12 @@ pub async fn create_message(
             let key = key_info.clone();
             let model = request.model.clone();
             let rid = request_id.clone();
+            let provider = resolved.provider.clone();
             tokio::spawn(async move {
-                if let Err(e) = tracker.record_usage(&key, &rid, &model, &usage, true).await {
+                if let Err(e) = tracker
+                    .record_usage(&key, &rid, &model, &usage, true, &provider, "anthropic")
+                    .await
+                {
                     tracing::warn!(error = %e, "Failed to record PTC usage");
                 }
             });
@@ -249,6 +253,7 @@ pub async fn create_message(
         key_info: key_info.clone(),
         model: request.model.clone(),
         request_id: request_id.clone(),
+        provider: resolved.provider.clone(),
         stream_usage: stream_usage.clone(),
     };
 
@@ -310,7 +315,15 @@ pub async fn create_message(
             tokio::spawn(async move {
                 if let Err(e) = ctx
                     .tracker
-                    .record_usage(&ctx.key_info, &ctx.request_id, &ctx.model, &usage, true)
+                    .record_usage(
+                        &ctx.key_info,
+                        &ctx.request_id,
+                        &ctx.model,
+                        &usage,
+                        true,
+                        &ctx.provider,
+                        "anthropic",
+                    )
                     .await
                 {
                     tracing::warn!(error = %e, "Failed to record usage");
@@ -326,6 +339,8 @@ pub async fn create_message(
                 key_info.clone(),
                 request.model.clone(),
                 request_id,
+                resolved.provider.clone(),
+                "anthropic",
             );
             Ok(MessageApiResponse::Stream(wrapped))
         }
@@ -349,12 +364,14 @@ struct UsageContext {
     key_info: ApiKeyInfo,
     model: String,
     request_id: String,
+    provider: String,
     /// Shared state for streaming usage — handlers write, entry wrapper reads.
     stream_usage: Arc<tokio::sync::Mutex<StreamUsage>>,
 }
 
 /// Wrap an SSE stream so that after the inner stream completes, usage is
 /// read from the shared `StreamUsage` state and recorded via the tracker.
+#[allow(clippy::too_many_arguments)]
 fn wrap_stream_with_usage_recording(
     inner: SseStream,
     usage: Arc<tokio::sync::Mutex<StreamUsage>>,
@@ -362,6 +379,8 @@ fn wrap_stream_with_usage_recording(
     key_info: ApiKeyInfo,
     model: String,
     request_id: String,
+    provider: String,
+    protocol: &'static str,
 ) -> SseStream {
     use futures::StreamExt;
     let stream = async_stream::stream! {
@@ -378,7 +397,7 @@ fn wrap_stream_with_usage_recording(
         };
         drop(u);
         if let Err(e) = tracker
-            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true)
+            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true, &provider, protocol)
             .await
         {
             tracing::warn!(error = %e, "Failed to record streaming usage");

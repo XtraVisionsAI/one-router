@@ -453,8 +453,9 @@ impl UsageStore for PostgresBackend {
         sqlx::query(
             "INSERT INTO usage \
              (api_key, timestamp, request_id, model, input_tokens, output_tokens, \
-              cached_tokens, cache_write_tokens, cost, success, duration_ms, error_message) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+              cached_tokens, cache_write_tokens, cost, success, duration_ms, error_message, \
+              provider, protocol) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&record.api_key)
         .bind(&record.timestamp)
@@ -468,6 +469,8 @@ impl UsageStore for PostgresBackend {
         .bind(record.success)
         .bind(record.duration_ms)
         .bind(&record.error_message)
+        .bind(&record.provider)
+        .bind(&record.protocol)
         .execute(&self.pool)
         .await?;
 
@@ -516,7 +519,7 @@ impl UsageStore for PostgresBackend {
         let sql = format!(
             "SELECT id, api_key, timestamp, request_id, model, \
              input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
-             cost, success, duration_ms, error_message \
+             cost, success, duration_ms, error_message, provider, protocol \
              FROM usage {key_clause} {since_clause} {before_id_clause} \
              ORDER BY timestamp DESC {limit_clause}",
         );
@@ -553,6 +556,8 @@ impl UsageStore for PostgresBackend {
                 success: r.get("success"),
                 duration_ms: r.get("duration_ms"),
                 error_message: r.get("error_message"),
+                provider: r.get("provider"),
+                protocol: r.get("protocol"),
             })
             .collect();
 
@@ -565,19 +570,42 @@ impl UsageStore for PostgresBackend {
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
+        split_by: Option<&str>,
     ) -> Result<Vec<UsageSummaryRow>> {
-        let group_expr = if group_by == "model" {
-            "model".to_string()
+        fn dim_expr(dim: &str) -> String {
+            match dim {
+                "model" => "model".to_string(),
+                "day" => {
+                    "to_char(date_trunc('day', timestamp::timestamptz), 'YYYY-MM-DD')".to_string()
+                }
+                "month" => {
+                    "to_char(date_trunc('month', timestamp::timestamptz), 'YYYY-MM')".to_string()
+                }
+                "provider" => "COALESCE(provider, 'unknown')".to_string(),
+                "api_key" => "api_key".to_string(),
+                _ => "to_char(date_trunc('hour', timestamp::timestamptz), 'YYYY-MM-DD\"T\"HH24')"
+                    .to_string(),
+            }
+        }
+
+        let group_expr = dim_expr(group_by);
+
+        let (split_select, split_group, split_order) = if let Some(sb) = split_by {
+            let se = dim_expr(sb);
+            (
+                format!(", {se} AS split_key"),
+                format!(", {se}"),
+                ", split_key".to_string(),
+            )
         } else {
-            "to_char(date_trunc('hour', timestamp::timestamptz), 'YYYY-MM-DD\"T\"HH24')".to_string()
+            (String::new(), String::new(), String::new())
         };
 
         // Postgres uses $1, $2... placeholders, parameter order adjusted dynamically
-        // Empty api_key means "all keys" (admin query with no key filter)
         let filter_by_key = !api_key.is_empty();
 
         #[allow(unused_assignments)]
-        let mut param_idx = if filter_by_key { 2usize } else { 1usize }; // $1 = api_key (if filtered)
+        let mut param_idx = if filter_by_key { 2usize } else { 1usize };
         let key_clause = if filter_by_key {
             "WHERE api_key = $1".to_string()
         } else {
@@ -597,7 +625,7 @@ impl UsageStore for PostgresBackend {
         };
 
         let sql = format!(
-            "SELECT {group_expr} AS group_key, \
+            "SELECT {group_expr} AS group_key{split_select}, \
              SUM(input_tokens) AS input_tokens, \
              SUM(output_tokens) AS output_tokens, \
              SUM(cached_tokens) AS cached_tokens, \
@@ -607,10 +635,9 @@ impl UsageStore for PostgresBackend {
              SUM(CASE WHEN success = false THEN 1 ELSE 0 END) AS error_requests \
              FROM usage \
              {key_clause} {start_clause} {end_clause} \
-             GROUP BY {group_expr} \
-             ORDER BY group_key DESC",
+             GROUP BY {group_expr}{split_group} \
+             ORDER BY group_key DESC{split_order}",
         );
-        // Note: Postgres does not allow GROUP BY to reference column aliases; the original expression must be repeated.
 
         let mut q = sqlx::query(&sql);
         if filter_by_key {
@@ -624,11 +651,13 @@ impl UsageStore for PostgresBackend {
         }
 
         let rows = q.fetch_all(&self.pool).await?;
+        let has_split = split_by.is_some();
 
         let records = rows
             .iter()
             .map(|r| UsageSummaryRow {
                 group_key: r.get("group_key"),
+                split_key: if has_split { r.get("split_key") } else { None },
                 input_tokens: r.get("input_tokens"),
                 output_tokens: r.get("output_tokens"),
                 cached_tokens: r.get("cached_tokens"),

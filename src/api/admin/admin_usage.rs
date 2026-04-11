@@ -26,6 +26,8 @@ pub struct AdminUsageQueryParams {
     pub end_time: Option<String>,
     #[serde(default = "default_group_by")]
     pub group_by: String,
+    /// Optional secondary grouping dimension (e.g. split_by=provider with group_by=day)
+    pub split_by: Option<String>,
 }
 
 fn default_group_by() -> String {
@@ -53,6 +55,8 @@ pub struct UsageSummaryResponse {
 #[derive(Debug, Serialize)]
 pub struct UsageBucket {
     pub group_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_key: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cached_tokens: i64,
@@ -92,6 +96,8 @@ pub struct UsageRecordItem {
     pub cost: f64,
     pub success: bool,
     pub duration_ms: Option<i64>,
+    pub provider: Option<String>,
+    pub protocol: Option<String>,
 }
 
 // ============================================================================
@@ -103,15 +109,29 @@ pub async fn get_usage_summary(
     State(state): State<AppState>,
     Query(params): Query<AdminUsageQueryParams>,
 ) -> impl IntoResponse {
-    if params.group_by != "hour" && params.group_by != "model" {
+    const VALID_GROUP_BY: &[&str] = &["hour", "day", "month", "model", "provider", "api_key"];
+    if !VALID_GROUP_BY.contains(&params.group_by.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                "group_by must be 'hour' or 'model'",
+                format!("group_by must be one of: {}", VALID_GROUP_BY.join(", ")),
             )),
         )
             .into_response();
+    }
+
+    if let Some(ref sb) = params.split_by {
+        if !VALID_GROUP_BY.contains(&sb.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("split_by must be one of: {}", VALID_GROUP_BY.join(", ")),
+                )),
+            )
+                .into_response();
+        }
     }
 
     // Resolve api_key param as a key name, then look up the hash for DB filtering.
@@ -149,6 +169,7 @@ pub async fn get_usage_summary(
             params.start_time.as_deref(),
             params.end_time.as_deref(),
             &params.group_by,
+            params.split_by.as_deref(),
         )
         .await
     {
@@ -178,6 +199,7 @@ pub async fn get_usage_summary(
         .into_iter()
         .map(|r| UsageBucket {
             group_key: r.group_key,
+            split_key: r.split_key,
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
             cached_tokens: r.cached_tokens,
@@ -281,6 +303,8 @@ pub async fn get_usage_records(
             cost: r.cost,
             success: r.success,
             duration_ms: r.duration_ms,
+            provider: r.provider,
+            protocol: r.protocol,
         })
         .collect();
 

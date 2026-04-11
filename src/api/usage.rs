@@ -23,8 +23,10 @@ pub struct UsageQueryParams {
     pub start_time: Option<String>,
     /// RFC3339
     pub end_time: Option<String>,
-    /// "hour" (default) or "model"
+    /// "hour" (default), "day", "month", "model", "provider"
     pub group_by: Option<String>,
+    /// Optional secondary grouping dimension
+    pub split_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +52,8 @@ pub struct UsageSummaryResponse {
 pub struct UsageBucket {
     /// Group key: "2026-03-24T15" in hour mode, model name in model mode
     pub group_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_key: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cached_tokens: i64,
@@ -103,16 +107,30 @@ pub async fn get_usage_summary(
 ) -> impl IntoResponse {
     let group_by = params.group_by.as_deref().unwrap_or("hour");
 
-    // Validate group_by parameter
-    if group_by != "hour" && group_by != "model" {
+    // Validate group_by parameter (api_key dimension is admin-only)
+    const VALID_GROUP_BY: &[&str] = &["hour", "day", "month", "model", "provider"];
+    if !VALID_GROUP_BY.contains(&group_by) {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                "group_by must be 'hour' or 'model'",
+                format!("group_by must be one of: {}", VALID_GROUP_BY.join(", ")),
             )),
         )
             .into_response();
+    }
+
+    if let Some(ref sb) = params.split_by {
+        if !VALID_GROUP_BY.contains(&sb.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("split_by must be one of: {}", VALID_GROUP_BY.join(", ")),
+                )),
+            )
+                .into_response();
+        }
     }
 
     let rows = match state
@@ -123,6 +141,7 @@ pub async fn get_usage_summary(
             params.start_time.as_deref(),
             params.end_time.as_deref(),
             group_by,
+            params.split_by.as_deref(),
         )
         .await
     {
@@ -159,6 +178,7 @@ pub async fn get_usage_summary(
         .into_iter()
         .map(|r| UsageBucket {
             group_key: r.group_key,
+            split_key: r.split_key,
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
             cached_tokens: r.cached_tokens,
@@ -280,6 +300,7 @@ mod tests {
             start_time: None,
             end_time: None,
             group_by: None,
+            split_by: None,
         };
         assert_eq!(params.group_by.as_deref().unwrap_or("hour"), "hour");
     }
@@ -290,6 +311,7 @@ mod tests {
             start_time: None,
             end_time: None,
             group_by: Some("model".to_string()),
+            split_by: None,
         };
         assert_eq!(params.group_by.as_deref().unwrap_or("hour"), "model");
     }
