@@ -4,7 +4,7 @@
 
 One Router is a Rust API gateway that routes **Anthropic** and **OpenAI** protocol requests to four backend providers: **AWS Bedrock**, **Google Gemini**, **Anthropic API**, and **OpenAI API**.
 
-- **Version:** 0.13.0
+- **Version:** 0.18.0
 - **Tech stack:** Rust / Axum / Tokio / AWS SDK / SQLx
 - **Docker image:** `xtravisions/one-router`
 
@@ -408,3 +408,5 @@ Multiple credentials per backend are supported. Strategies:
 - Streaming responses use `async_stream::stream!` macro.
 - Database migrations run automatically on startup. Standalone scripts in `scripts/migrations/`.
 - API keys are HMAC-SHA256 hashed. Admin routes use key `name` as identifier, not the key itself.
+- Master and ephemeral keys record usage with identifiers `__master__` / `__ephemeral__` (no budget management). Master key `cost_rate` is `1.0`.
+- Credential `record_success()` auto-re-enables a disabled credential — no need to wait for `try_recover_credential()`.

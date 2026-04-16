@@ -77,7 +77,7 @@ On startup, One Router prints an **ephemeral API key** for immediate use:
 
 ```
 ============================================================
-  One Router v0.14.0
+  One Router v0.18.0
 ============================================================
   Database:  sqlite://./data/gateway.db
   Listen:    0.0.0.0:8000
