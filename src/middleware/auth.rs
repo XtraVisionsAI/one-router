@@ -46,7 +46,7 @@ impl ApiKeyInfo {
             raw_api_key: String::new(),
             is_master: true,
             rate_limit: None,
-            cost_rate: 0.0,
+            cost_rate: 1.0,
             monthly_budget: None,
             budget_used_mtd: 0.0,
             budget_mtd_month: None,

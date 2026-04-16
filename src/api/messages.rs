@@ -535,8 +535,74 @@ async fn handle_bedrock_request(
                 ApiError::from_bedrock_error(&e)
             })?;
         let cred_name = stream_response.credential_name.clone();
-        let sse_stream = stream_response.into_sse_stream();
-        bedrock.record_success(&cred_name);
+        let event_pairs = stream_response.into_event_pairs();
+        let stream_usage = usage_ctx.stream_usage.clone();
+        let bedrock_clone = bedrock.clone();
+        let req_id = request_id.to_string();
+
+        let sse_stream: SseStream = Box::pin(async_stream::stream! {
+            use axum::response::sse::Event;
+            use futures::StreamExt;
+
+            let mut input_tokens: i32 = 0;
+            let mut output_tokens: i32 = 0;
+            let mut cache_read: Option<i32> = None;
+            let mut cache_creation: Option<i32> = None;
+
+            futures::pin_mut!(event_pairs);
+            while let Some((event_type, data)) = event_pairs.next().await {
+                // Extract usage from Anthropic SSE events
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                    match event_type.as_str() {
+                        "message_start" => {
+                            if let Some(usage) = parsed.pointer("/message/usage") {
+                                if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+                                    input_tokens = v as i32;
+                                }
+                                if let Some(v) = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
+                                    cache_read = Some(v as i32);
+                                }
+                                if let Some(v) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) {
+                                    cache_creation = Some(v as i32);
+                                }
+                            }
+                        }
+                        "message_delta" => {
+                            if let Some(v) = parsed.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
+                                output_tokens = v as i32;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                let mut ev = Event::default().data(data);
+                if !event_type.is_empty() {
+                    ev = ev.event(event_type);
+                }
+                yield Ok(ev);
+            }
+
+            bedrock_clone.record_success(&cred_name);
+
+            tracing::debug!(
+                request_id = %req_id,
+                input_tokens,
+                output_tokens,
+                cache_read = ?cache_read,
+                cache_creation = ?cache_creation,
+                "Bedrock InvokeModel stream usage extracted"
+            );
+
+            {
+                let mut u = stream_usage.lock().await;
+                u.input_tokens = input_tokens;
+                u.output_tokens = output_tokens;
+                u.cache_creation_input_tokens = cache_creation;
+                u.cache_read_input_tokens = cache_read;
+            }
+        });
+
         return Ok(MessageApiResponse::Stream(sse_stream));
     }
 
