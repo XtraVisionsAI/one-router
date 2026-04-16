@@ -1,3 +1,15 @@
+## v0.18.0 (2026-04-16)
+
+### Feat
+
+- **admin-ui**: add logo icon to sidebar, login page, and favicon
+
+### Fix
+
+- track usage for all keys including master and ephemeral
+- **admin-ui**: inline trend chart legend with card title
+- **admin-ui**: move trend chart legend to left to avoid overlap with axis
+
 ## v0.17.0 (2026-04-11)
 
 ### Feat
