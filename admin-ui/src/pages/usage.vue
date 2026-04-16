@@ -28,15 +28,6 @@
   const result = ref<UsageSummaryResponse | null>(null)
   const loading = ref(false)
 
-  const INTERNAL_KEY_LABELS: Record<string, string> = {
-    __master__: 'Master Key',
-    __ephemeral__: 'Ephemeral Key',
-  }
-
-  function displayKeyName(raw: string): string {
-    return INTERNAL_KEY_LABELS[raw] ?? raw
-  }
-
   const keyOptions = computed(() => [
     { label: 'All keys', value: null },
     { label: 'Master Key', value: '__master__' },
@@ -139,14 +130,10 @@
     }
 
     // Multi-series (split_by)
-    const rawSplitKeys = [...new Set(data.map(r => r.split_key ?? 'unknown'))]
-    const splitKeys = rawSplitKeys.map(k => splitBy.value === 'api_key' ? displayKeyName(k) : k)
+    const splitKeys = [...new Set(data.map(r => r.split_key ?? 'unknown'))]
     const groupKeys = [...new Set(data.map(r => r.group_key))].sort()
     const lookup = new Map<string, number>()
-    for (const r of data) {
-      const sk = splitBy.value === 'api_key' ? displayKeyName(r.split_key ?? 'unknown') : (r.split_key ?? 'unknown')
-      lookup.set(`${r.group_key}\0${sk}`, r.total_cost)
-    }
+    for (const r of data) lookup.set(`${r.group_key}\0${r.split_key ?? 'unknown'}`, r.total_cost)
 
     return {
       ...baseOption,
@@ -172,16 +159,14 @@
       {
         title: groupByLabel[groupBy.value] ?? groupBy.value,
         key: 'group_key',
-        render: (row: UsageSummaryRow) => h('span', { class: 'font-mono text-xs' },
-          groupBy.value === 'api_key' ? displayKeyName(row.group_key) : row.group_key)
+        render: (row: UsageSummaryRow) => h('span', { class: 'font-mono text-xs' }, row.group_key)
       }
     ]
     if (splitBy.value) {
       cols.push({
         title: groupByLabel[splitBy.value] ?? splitBy.value,
         key: 'split_key',
-        render: (row: UsageSummaryRow) => h('span', { class: 'font-mono text-xs' },
-          splitBy.value === 'api_key' ? displayKeyName(row.split_key ?? '—') : (row.split_key ?? '—'))
+        render: (row: UsageSummaryRow) => h('span', { class: 'font-mono text-xs' }, row.split_key ?? '—')
       })
     }
     cols.push(

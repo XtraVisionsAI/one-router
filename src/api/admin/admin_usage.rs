@@ -11,6 +11,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::state::AppState;
 
@@ -136,6 +138,34 @@ async fn resolve_api_key_filter(
     }
 }
 
+/// Build a mapping from raw api_key identifiers (hashes / internal IDs) to
+/// human-readable display names.  Used to replace hashes in usage responses.
+async fn build_api_key_labels(state: &AppState) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    labels.insert("__master__".to_string(), "Master Key".to_string());
+    labels.insert("__ephemeral__".to_string(), "Ephemeral Key".to_string());
+
+    if let Ok(keys) = state.database.api_keys().list_api_keys().await {
+        for k in keys {
+            labels.insert(k.api_key, k.name);
+        }
+    }
+    labels
+}
+
+/// Resolve a raw api_key value to its display name.
+/// Falls back to `"<first 8 hex chars>… (unknown key)"` for unrecognised hashes.
+fn resolve_display_name(raw: &str, labels: &HashMap<String, String>) -> String {
+    if let Some(name) = labels.get(raw) {
+        return name.clone();
+    }
+    if raw.len() > 8 {
+        format!("{}… (unknown key)", &raw[..8])
+    } else {
+        format!("{raw} (unknown key)")
+    }
+}
+
 /// GET /admin/api/usage/summary
 pub async fn get_usage_summary(
     State(state): State<AppState>,
@@ -206,11 +236,28 @@ pub async fn get_usage_summary(
         total_cost: rows.iter().map(|r| r.total_cost).sum(),
     };
 
+    // Resolve api_key hashes to display names when grouped/split by api_key
+    let resolve_group = params.group_by == "api_key";
+    let resolve_split = params.split_by.as_deref() == Some("api_key");
+    let labels = if resolve_group || resolve_split {
+        build_api_key_labels(&state).await
+    } else {
+        HashMap::new()
+    };
+
     let data = rows
         .into_iter()
         .map(|r| UsageBucket {
-            group_key: r.group_key,
-            split_key: r.split_key,
+            group_key: if resolve_group {
+                resolve_display_name(&r.group_key, &labels)
+            } else {
+                r.group_key
+            },
+            split_key: if resolve_split {
+                r.split_key.map(|sk| resolve_display_name(&sk, &labels))
+            } else {
+                r.split_key
+            },
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
             cached_tokens: r.cached_tokens,
@@ -278,11 +325,14 @@ pub async fn get_usage_records(
         records.truncate(limit as usize);
     }
 
+    // Resolve api_key hashes to display names
+    let labels = build_api_key_labels(&state).await;
+
     let data = records
         .into_iter()
         .map(|r| UsageRecordItem {
             id: r.id,
-            api_key: r.api_key,
+            api_key: resolve_display_name(&r.api_key, &labels),
             timestamp: r.timestamp,
             request_id: r.request_id,
             model: r.model,
