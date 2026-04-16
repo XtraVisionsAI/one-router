@@ -61,6 +61,10 @@ impl CredentialHealth {
 
     pub fn record_success(&self) {
         self.failure_count.store(0, Ordering::SeqCst);
+        // Re-enable if previously disabled — a successful request proves the credential works
+        if !self.enabled.load(Ordering::SeqCst) {
+            self.enabled.store(true, Ordering::SeqCst);
+        }
         if let Ok(mut last) = self.last_success.lock() {
             *last = Some(Instant::now());
         }
