@@ -550,6 +550,7 @@ async fn handle_bedrock_request(
             let mut cache_creation: Option<i32> = None;
 
             futures::pin_mut!(event_pairs);
+            let mut first_event_logged = false;
             while let Some((event_type, data)) = event_pairs.next().await {
                 // Extract usage from Anthropic SSE events.
                 // Use JSON "type" field as primary identifier — Bedrock may omit
@@ -557,6 +558,20 @@ async fn handle_bedrock_request(
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
                     let json_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let effective_type = if !event_type.is_empty() { event_type.as_str() } else { json_type };
+
+                    if !first_event_logged {
+                        first_event_logged = true;
+                        tracing::info!(
+                            request_id = %req_id,
+                            sse_event_type = %event_type,
+                            json_type = %json_type,
+                            effective_type = %effective_type,
+                            has_message_usage = parsed.pointer("/message/usage").is_some(),
+                            data_preview = %&data[..data.len().min(300)],
+                            "Stream first event diagnostic"
+                        );
+                    }
+
                     match effective_type {
                         "message_start" => {
                             if let Some(usage) = parsed.pointer("/message/usage") {
