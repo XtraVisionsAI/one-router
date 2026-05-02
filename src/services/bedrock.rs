@@ -707,11 +707,24 @@ impl InvokeModelStreamResponse {
             let mut receiver = self.inner;
             let cred_name = self.credential_name;
             let mut buffer = String::new();
+            let mut chunk_count: u32 = 0;
+            let mut yield_count: u32 = 0;
 
             loop {
                 match receiver.recv().await {
                     Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: Some(blob), .. }))) => {
-                        buffer.push_str(&String::from_utf8_lossy(blob.as_ref()));
+                        let chunk_str = String::from_utf8_lossy(blob.as_ref());
+                        chunk_count += 1;
+                        if chunk_count <= 2 {
+                            tracing::info!(
+                                credential = %cred_name,
+                                chunk_num = chunk_count,
+                                chunk_len = chunk_str.len(),
+                                chunk_preview = %&chunk_str[..chunk_str.len().min(200)],
+                                "InvokeModel stream chunk received"
+                            );
+                        }
+                        buffer.push_str(&chunk_str);
 
                         while let Some(pos) = buffer.find("\n\n") {
                             let event_str = buffer[..pos].to_string();
@@ -729,6 +742,7 @@ impl InvokeModelStreamResponse {
                             }
 
                             if !data.is_empty() {
+                                yield_count += 1;
                                 yield (event_type, data);
                             }
                         }
@@ -745,6 +759,15 @@ impl InvokeModelStreamResponse {
                     }
                 }
             }
+
+            tracing::info!(
+                credential = %cred_name,
+                total_chunks = chunk_count,
+                total_yields = yield_count,
+                remaining_buffer_len = buffer.len(),
+                remaining_buffer_preview = %&buffer[..buffer.len().min(200)],
+                "InvokeModel stream ended"
+            );
         })
     }
 }
