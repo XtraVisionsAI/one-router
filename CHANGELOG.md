@@ -1,3 +1,15 @@
+## v0.19.0 (2026-05-02)
+
+### Feat
+
+- **admin-ui**: resolve api_key hashes to display names in usage pages
+
+### Fix
+
+- **streaming**: treat each Bedrock chunk as complete JSON event
+- **usage**: extract streaming token counts from JSON type field
+- re-enable disabled credential on successful request
+
 ## v0.18.0 (2026-04-16)
 
 ### Feat
