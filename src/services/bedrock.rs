@@ -637,9 +637,9 @@ pub struct InvokeModelStreamResponse {
 impl InvokeModelStreamResponse {
     /// Convert into an SSE event stream compatible with Axum's `Sse`.
     ///
-    /// Bedrock yields `PayloadPart` chunks whose bytes contain raw Anthropic SSE text
-    /// (lines like `event: content_block_delta\ndata: {...}\n\n`).
-    /// We buffer across chunks, parse complete SSE events, and forward them.
+    /// Each Bedrock `PayloadPart` chunk contains a complete JSON object
+    /// (e.g. `{"type":"message_start",...}`). We extract the `type` field
+    /// as the SSE event name and forward the full JSON as the data payload.
     pub fn into_sse_stream(
         self,
     ) -> Pin<
@@ -650,41 +650,26 @@ impl InvokeModelStreamResponse {
         Box::pin(async_stream::stream! {
             let mut receiver = self.inner;
             let cred_name = self.credential_name;
-            let mut buffer = String::new();
 
             loop {
                 match receiver.recv().await {
                     Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: Some(blob), .. }))) => {
-                        buffer.push_str(&String::from_utf8_lossy(blob.as_ref()));
-
-                        // Emit complete SSE events (delimited by \n\n)
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event_str = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
-
-                            let mut event_type: Option<String> = None;
-                            let mut data: Option<String> = None;
-
-                            for line in event_str.lines() {
-                                if let Some(v) = line.strip_prefix("event: ") {
-                                    event_type = Some(v.to_string());
-                                } else if let Some(v) = line.strip_prefix("data: ") {
-                                    data = Some(v.to_string());
-                                }
-                            }
-
-                            if let Some(data_str) = data {
-                                let mut ev = Event::default().data(data_str);
-                                if let Some(et) = event_type {
-                                    ev = ev.event(et);
-                                }
-                                yield Ok(ev);
-                            }
+                        let chunk = String::from_utf8_lossy(blob.as_ref()).to_string();
+                        if chunk.is_empty() {
+                            continue;
                         }
+
+                        let event_type = serde_json::from_str::<serde_json::Value>(&chunk)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from));
+
+                        let mut ev = Event::default().data(chunk);
+                        if let Some(et) = event_type {
+                            ev = ev.event(et);
+                        }
+                        yield Ok(ev);
                     }
-                    Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: None, .. }))) => {
-                        // Empty chunk, skip
-                    }
+                    Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: None, .. }))) => {}
                     Ok(Some(_)) | Ok(None) => break,
                     Err(e) => {
                         tracing::warn!(
@@ -702,50 +687,28 @@ impl InvokeModelStreamResponse {
     /// Variant of `into_sse_stream` that yields raw `(event_type, data)` pairs
     /// instead of `axum::sse::Event`. Useful when the caller needs to re-process
     /// the Anthropic SSE events (e.g. convert to OpenAI SSE format).
+    ///
+    /// Each Bedrock `PayloadPart` chunk contains a complete JSON object.
+    /// The `type` field is extracted as event_type; the full JSON is data.
     pub fn into_event_pairs(self) -> Pin<Box<dyn Stream<Item = (String, String)> + Send>> {
         Box::pin(async_stream::stream! {
             let mut receiver = self.inner;
             let cred_name = self.credential_name;
-            let mut buffer = String::new();
-            let mut chunk_count: u32 = 0;
-            let mut yield_count: u32 = 0;
 
             loop {
                 match receiver.recv().await {
                     Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: Some(blob), .. }))) => {
-                        let chunk_str = String::from_utf8_lossy(blob.as_ref());
-                        chunk_count += 1;
-                        if chunk_count <= 2 {
-                            tracing::info!(
-                                credential = %cred_name,
-                                chunk_num = chunk_count,
-                                chunk_len = chunk_str.len(),
-                                chunk_preview = %&chunk_str[..chunk_str.len().min(200)],
-                                "InvokeModel stream chunk received"
-                            );
+                        let chunk = String::from_utf8_lossy(blob.as_ref()).to_string();
+                        if chunk.is_empty() {
+                            continue;
                         }
-                        buffer.push_str(&chunk_str);
 
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event_str = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                        let event_type = serde_json::from_str::<serde_json::Value>(&chunk)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                            .unwrap_or_default();
 
-                            let mut event_type = String::new();
-                            let mut data = String::new();
-
-                            for line in event_str.lines() {
-                                if let Some(v) = line.strip_prefix("event: ") {
-                                    event_type = v.to_string();
-                                } else if let Some(v) = line.strip_prefix("data: ") {
-                                    data = v.to_string();
-                                }
-                            }
-
-                            if !data.is_empty() {
-                                yield_count += 1;
-                                yield (event_type, data);
-                            }
-                        }
+                        yield (event_type, chunk);
                     }
                     Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: None, .. }))) => {}
                     Ok(Some(_)) | Ok(None) => break,
@@ -759,15 +722,6 @@ impl InvokeModelStreamResponse {
                     }
                 }
             }
-
-            tracing::info!(
-                credential = %cred_name,
-                total_chunks = chunk_count,
-                total_yields = yield_count,
-                remaining_buffer_len = buffer.len(),
-                remaining_buffer_preview = %&buffer[..buffer.len().min(200)],
-                "InvokeModel stream ended"
-            );
         })
     }
 }
