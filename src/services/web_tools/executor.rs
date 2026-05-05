@@ -68,6 +68,24 @@ impl WebToolExecutor {
             };
             modified.stream = false;
 
+            // Clear tool_choice if it references a server tool we've stripped
+            if let Some(ref tc) = modified.tool_choice {
+                let points_to_server = match tc {
+                    crate::schemas::anthropic::ToolChoice::Specific { name, .. } => {
+                        server_names.contains(name)
+                    }
+                    crate::schemas::anthropic::ToolChoice::Object(obj) => obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|n| server_names.contains(n))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if points_to_server {
+                    modified.tool_choice = None;
+                }
+            }
+
             let response = bedrock
                 .invoke_model_messages(&modified, target_model)
                 .await

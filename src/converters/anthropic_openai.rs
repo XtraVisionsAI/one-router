@@ -305,7 +305,7 @@ impl AnthropicToOpenAIConverter {
                 };
                 Ok(Some(ToolChoice::Mode(mode.to_string())))
             }
-            Some(crate::schemas::anthropic::ToolChoice::Specific { name }) => {
+            Some(crate::schemas::anthropic::ToolChoice::Specific { name, .. }) => {
                 Ok(Some(ToolChoice::Function {
                     choice_type: "function".to_string(),
                     function: crate::schemas::openai::ToolChoiceFunction { name: name.clone() },
@@ -863,6 +863,7 @@ impl OpenAIToAnthropicConverter {
             }
             Some(ToolChoice::Function { function, .. }) => {
                 Ok(Some(crate::schemas::anthropic::ToolChoice::Specific {
+                    choice_type: "tool".to_string(),
                     name: function.name.clone(),
                 }))
             }

@@ -365,7 +365,7 @@ mod request {
                         },
                     }))
                 }
-                Some(ToolChoice::Specific { name }) => Ok(Some(ToolConfig {
+                Some(ToolChoice::Specific { name, .. }) => Ok(Some(ToolConfig {
                     function_calling_config: FunctionCallingConfig {
                         mode: FunctionCallingMode::Any,
                         allowed_function_names: Some(vec![name.clone()]),

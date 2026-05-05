@@ -413,8 +413,12 @@ impl Default for CodeExecutionTool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ToolChoice {
-    Auto(String),              // "auto" or "any"
-    Specific { name: String }, // {"type": "tool", "name": "tool_name"}
+    Auto(String), // "auto" or "any"
+    Specific {
+        #[serde(rename = "type")]
+        choice_type: String,
+        name: String,
+    },
     Object(serde_json::Value), // Generic object form
 }
 

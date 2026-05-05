@@ -17,8 +17,15 @@ pub struct ServerToolCall {
 }
 
 pub fn is_server_tool(tool: &serde_json::Value) -> bool {
+    let tool_type = tool["type"].as_str().unwrap_or("");
+    if tool_type.starts_with("web_search_") || tool_type.starts_with("web_fetch_") {
+        return true;
+    }
     let name = tool["name"].as_str().unwrap_or("");
-    name.starts_with("web_search_") || name.starts_with("web_fetch_")
+    name == "web_search"
+        || name == "web_fetch"
+        || name.starts_with("web_search_")
+        || name.starts_with("web_fetch_")
 }
 
 pub fn split_tools(
@@ -49,7 +56,7 @@ pub fn extract_server_calls(
             } = block
             {
                 if server_tool_names.contains(name) {
-                    let kind = if name.starts_with("web_search_") {
+                    let kind = if name == "web_search" || name.starts_with("web_search_") {
                         WebToolKind::Search
                     } else {
                         WebToolKind::Fetch
@@ -93,8 +100,24 @@ mod tests {
         assert!(is_server_tool(&json!({"name": "web_search_20250305"})));
     }
     #[test]
+    fn test_is_server_tool_web_search_by_type() {
+        assert!(is_server_tool(
+            &json!({"type": "web_search_20250305", "name": "web_search"})
+        ));
+    }
+    #[test]
+    fn test_is_server_tool_web_search_name_only() {
+        assert!(is_server_tool(&json!({"name": "web_search"})));
+    }
+    #[test]
     fn test_is_server_tool_web_fetch() {
         assert!(is_server_tool(&json!({"name": "web_fetch_20250910"})));
+    }
+    #[test]
+    fn test_is_server_tool_web_fetch_by_type() {
+        assert!(is_server_tool(
+            &json!({"type": "web_fetch_20250305", "name": "web_fetch"})
+        ));
     }
     #[test]
     fn test_is_server_tool_regular() {
@@ -103,9 +126,9 @@ mod tests {
     #[test]
     fn test_split_tools() {
         let tools = vec![
-            json!({"name": "web_search_20250305"}),
+            json!({"type": "web_search_20250305", "name": "web_search"}),
             json!({"name": "calculator"}),
-            json!({"name": "web_fetch_20250910"}),
+            json!({"type": "web_fetch_20250305", "name": "web_fetch"}),
             json!({"name": "get_weather"}),
         ];
         let (server, client) = split_tools(&tools);
