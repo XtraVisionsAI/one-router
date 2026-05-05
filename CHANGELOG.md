@@ -1,3 +1,9 @@
+## v0.19.1 (2026-05-05)
+
+### Fix
+
+- **web_tools**: correct server tool detection and tool_choice serialization
+
 ## v0.19.0 (2026-05-02)
 
 ### Feat
