@@ -203,11 +203,17 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
             description TEXT NOT NULL DEFAULT '',
+            ui_schema TEXT,
             updated_at BIGINT
         )",
     )
     .execute(pool)
     .await?;
+
+    // Migration: add ui_schema column for existing databases
+    sqlx::query("ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ui_schema TEXT")
+        .execute(pool)
+        .await?;
 
     Ok(())
 }

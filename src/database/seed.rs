@@ -862,6 +862,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                  Applies to model mappings without explicit capabilities. \
                  Takes effect on restart."
                     .into(),
+            ui_schema: Some(
+                r#"{"type":"bool","label":"Tool Use (default)","group":"Capabilities","sort_order":10}"#.into(),
+            ),
             updated_at: None,
         },
         SystemSettingRecord {
@@ -872,6 +875,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                  Applies to model mappings without explicit capabilities. \
                  Takes effect on restart."
                     .into(),
+            ui_schema: Some(
+                r#"{"type":"bool","label":"Extended Thinking (default)","group":"Capabilities","sort_order":20}"#.into(),
+            ),
             updated_at: None,
         },
         SystemSettingRecord {
@@ -882,6 +888,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                  Applies to model mappings without explicit capabilities. \
                  Takes effect on restart."
                     .into(),
+            ui_schema: Some(
+                r#"{"type":"bool","label":"Document Support (default)","group":"Capabilities","sort_order":30}"#.into(),
+            ),
             updated_at: None,
         },
         SystemSettingRecord {
@@ -892,6 +901,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                  Applies to model mappings without explicit capabilities. \
                  Takes effect on restart."
                     .into(),
+            ui_schema: Some(
+                r#"{"type":"bool","label":"PTC (default)","group":"Capabilities","sort_order":40}"#.into(),
+            ),
             updated_at: None,
         },
         SystemSettingRecord {
@@ -902,6 +914,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                           '5m'/'1h' overrides TTL on all cache_control blocks. \
                           Takes effect on restart."
                 .into(),
+            ui_schema: Some(
+                r#"{"type":"select","label":"Prompt Cache","group":"General","sort_order":10,"options":[{"label":"Passthrough (default)","value":"passthrough"},{"label":"Disabled","value":"disable"},{"label":"5 minutes","value":"5m"},{"label":"1 hour","value":"1h"}]}"#.into(),
+            ),
             updated_at: None,
         },
         SystemSettingRecord {
@@ -912,6 +927,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                           Numeric values (60/100/200/500) set the default RPM. \
                           Takes effect on restart."
                 .into(),
+            ui_schema: Some(
+                r#"{"type":"select","label":"Rate Limit","group":"General","sort_order":20,"options":[{"label":"Disabled","value":"disable"},{"label":"60 RPM","value":"60"},{"label":"100 RPM (default)","value":"100"},{"label":"200 RPM","value":"200"},{"label":"500 RPM","value":"500"}]}"#.into(),
+            ),
             updated_at: None,
         },
         SystemSettingRecord {
@@ -921,6 +939,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                           Supported: 'tavily', 'brave', or empty to disable. \
                           Takes effect on restart."
                 .into(),
+            ui_schema: Some(
+                r#"{"type":"select","label":"Web Search Provider","group":"Web Tools","sort_order":10,"options":[{"label":"Disabled","value":""},{"label":"Tavily","value":"tavily"},{"label":"Brave","value":"brave"}]}"#.into(),
+            ),
             updated_at: None,
         },
         SystemSettingRecord {
@@ -930,6 +951,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                           Required when web_search_provider is set. \
                           Takes effect on restart."
                 .into(),
+            ui_schema: Some(
+                r#"{"type":"password","label":"Web Search API Key","group":"Web Tools","sort_order":20,"sensitive":true,"placeholder":"Enter API key..."}"#.into(),
+            ),
             updated_at: None,
         },
         SystemSettingRecord {
@@ -938,6 +962,9 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             description: "Maximum content size in KB for web_fetch tool responses. \
                           Takes effect on restart."
                 .into(),
+            ui_schema: Some(
+                r#"{"type":"number","label":"Web Fetch Max Content (KB)","group":"Web Tools","sort_order":30,"placeholder":"512"}"#.into(),
+            ),
             updated_at: None,
         },
     ]

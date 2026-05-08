@@ -129,13 +129,18 @@ pub trait DatabaseService: Send + Sync {
             }
         }
         for setting in seed::default_system_settings() {
-            if self
-                .system_settings()
-                .get_setting(&setting.key)
-                .await?
-                .is_none()
-            {
-                self.system_settings().upsert_setting(&setting).await?;
+            match self.system_settings().get_setting(&setting.key).await? {
+                None => {
+                    self.system_settings().upsert_setting(&setting).await?;
+                }
+                Some(existing) if existing.ui_schema.is_none() && setting.ui_schema.is_some() => {
+                    let backfill = SystemSettingRecord {
+                        ui_schema: setting.ui_schema,
+                        ..existing
+                    };
+                    self.system_settings().upsert_setting(&backfill).await?;
+                }
+                _ => {}
             }
         }
         tracing::info!("Seed data applied");

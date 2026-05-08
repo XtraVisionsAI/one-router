@@ -108,7 +108,18 @@ export interface SystemSetting {
   key: string
   value: string
   description: string
+  ui_schema: string | null
   updated_at: number | null
+}
+
+export interface UiSchema {
+  type: 'text' | 'select' | 'bool' | 'number' | 'password'
+  label: string
+  options?: Array<{ label: string; value: string }>
+  group?: string
+  sort_order?: number
+  sensitive?: boolean
+  placeholder?: string
 }
 
 export interface UpsertSettingBody {

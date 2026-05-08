@@ -258,11 +258,18 @@ impl SqliteBackend {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '',
+                ui_schema TEXT,
                 updated_at INTEGER
             )",
         )
         .execute(&self.pool)
         .await?;
+
+        // Migration: add ui_schema column for existing databases
+        sqlx::query("ALTER TABLE system_settings ADD COLUMN ui_schema TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
 
         Ok(())
     }
@@ -1315,7 +1322,7 @@ impl BackendConfigStore for SqliteBackend {
 impl SystemSettingStore for SqliteBackend {
     async fn get_setting(&self, key: &str) -> Result<Option<SystemSettingRecord>> {
         let row = sqlx::query(
-            "SELECT key, value, description, updated_at FROM system_settings WHERE key = ?",
+            "SELECT key, value, description, ui_schema, updated_at FROM system_settings WHERE key = ?",
         )
         .bind(key)
         .fetch_optional(&self.pool)
@@ -1325,6 +1332,7 @@ impl SystemSettingStore for SqliteBackend {
             key: r.get("key"),
             value: r.get("value"),
             description: r.get("description"),
+            ui_schema: r.get("ui_schema"),
             updated_at: r.get("updated_at"),
         }))
     }
@@ -1332,16 +1340,18 @@ impl SystemSettingStore for SqliteBackend {
     async fn upsert_setting(&self, record: &SystemSettingRecord) -> Result<()> {
         let now = unix_now();
         sqlx::query(
-            "INSERT INTO system_settings (key, value, description, updated_at) \
-             VALUES (?, ?, ?, ?) \
+            "INSERT INTO system_settings (key, value, description, ui_schema, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT(key) DO UPDATE SET \
              value = excluded.value, \
              description = excluded.description, \
+             ui_schema = COALESCE(excluded.ui_schema, system_settings.ui_schema), \
              updated_at = excluded.updated_at",
         )
         .bind(&record.key)
         .bind(&record.value)
         .bind(&record.description)
+        .bind(&record.ui_schema)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -1351,7 +1361,7 @@ impl SystemSettingStore for SqliteBackend {
 
     async fn list_settings(&self) -> Result<Vec<SystemSettingRecord>> {
         let rows = sqlx::query(
-            "SELECT key, value, description, updated_at FROM system_settings ORDER BY key",
+            "SELECT key, value, description, ui_schema, updated_at FROM system_settings ORDER BY key",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1362,6 +1372,7 @@ impl SystemSettingStore for SqliteBackend {
                 key: r.get("key"),
                 value: r.get("value"),
                 description: r.get("description"),
+                ui_schema: r.get("ui_schema"),
                 updated_at: r.get("updated_at"),
             })
             .collect())

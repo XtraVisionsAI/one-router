@@ -1016,7 +1016,7 @@ impl BackendConfigStore for PostgresBackend {
 impl SystemSettingStore for PostgresBackend {
     async fn get_setting(&self, key: &str) -> Result<Option<SystemSettingRecord>> {
         let row = sqlx::query(
-            "SELECT key, value, description, updated_at FROM system_settings WHERE key = $1",
+            "SELECT key, value, description, ui_schema, updated_at FROM system_settings WHERE key = $1",
         )
         .bind(key)
         .fetch_optional(&self.pool)
@@ -1026,6 +1026,7 @@ impl SystemSettingStore for PostgresBackend {
             key: r.get("key"),
             value: r.get("value"),
             description: r.get("description"),
+            ui_schema: r.get("ui_schema"),
             updated_at: r.get("updated_at"),
         }))
     }
@@ -1033,16 +1034,18 @@ impl SystemSettingStore for PostgresBackend {
     async fn upsert_setting(&self, record: &SystemSettingRecord) -> Result<()> {
         let now = unix_now();
         sqlx::query(
-            "INSERT INTO system_settings (key, value, description, updated_at) \
-             VALUES ($1, $2, $3, $4) \
+            "INSERT INTO system_settings (key, value, description, ui_schema, updated_at) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT(key) DO UPDATE SET \
              value = EXCLUDED.value, \
              description = EXCLUDED.description, \
+             ui_schema = COALESCE(EXCLUDED.ui_schema, system_settings.ui_schema), \
              updated_at = EXCLUDED.updated_at",
         )
         .bind(&record.key)
         .bind(&record.value)
         .bind(&record.description)
+        .bind(&record.ui_schema)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -1052,7 +1055,7 @@ impl SystemSettingStore for PostgresBackend {
 
     async fn list_settings(&self) -> Result<Vec<SystemSettingRecord>> {
         let rows = sqlx::query(
-            "SELECT key, value, description, updated_at FROM system_settings ORDER BY key",
+            "SELECT key, value, description, ui_schema, updated_at FROM system_settings ORDER BY key",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1063,6 +1066,7 @@ impl SystemSettingStore for PostgresBackend {
                 key: r.get("key"),
                 value: r.get("value"),
                 description: r.get("description"),
+                ui_schema: r.get("ui_schema"),
                 updated_at: r.get("updated_at"),
             })
             .collect())

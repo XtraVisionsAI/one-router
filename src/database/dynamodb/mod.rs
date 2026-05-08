@@ -1184,25 +1184,48 @@ impl SystemSettingStore for DynamoDbBackend {
             key: get_s(item, "key"),
             value: get_s(item, "value"),
             description: get_s(item, "description"),
+            ui_schema: get_opt_s(item, "ui_schema"),
             updated_at: get_opt_i64(item, "updated_at"),
         }))
     }
 
     async fn upsert_setting(&self, record: &SystemSettingRecord) -> Result<()> {
         let now = unix_now();
-        let mut item = HashMap::new();
-        item.insert("key".into(), av_s(&record.key));
-        item.insert("value".into(), av_s(&record.value));
-        item.insert("description".into(), av_s(&record.description));
-        item.insert("updated_at".into(), av_n(now));
 
-        self.client
-            .put_item()
+        let (expr, attr_values) = if let Some(ref schema) = record.ui_schema {
+            (
+                "SET #v = :v, description = :d, ui_schema = :u, updated_at = :t",
+                vec![
+                    (":v", av_s(&record.value)),
+                    (":d", av_s(&record.description)),
+                    (":u", av_s(schema)),
+                    (":t", av_n(now)),
+                ],
+            )
+        } else {
+            (
+                "SET #v = :v, description = :d, updated_at = :t",
+                vec![
+                    (":v", av_s(&record.value)),
+                    (":d", av_s(&record.description)),
+                    (":t", av_n(now)),
+                ],
+            )
+        };
+
+        let mut req = self
+            .client
+            .update_item()
             .table_name(Self::table_name("system_settings"))
-            .set_item(Some(item))
-            .send()
-            .await?;
+            .key("key", av_s(&record.key))
+            .update_expression(expr)
+            .expression_attribute_names("#v", "value");
 
+        for (k, v) in attr_values {
+            req = req.expression_attribute_values(k, v);
+        }
+
+        req.send().await?;
         Ok(())
     }
 
@@ -1221,6 +1244,7 @@ impl SystemSettingStore for DynamoDbBackend {
                 key: get_s(item, "key"),
                 value: get_s(item, "value"),
                 description: get_s(item, "description"),
+                ui_schema: get_opt_s(item, "ui_schema"),
                 updated_at: get_opt_i64(item, "updated_at"),
             })
             .collect();

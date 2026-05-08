@@ -115,6 +115,7 @@ pub struct SystemSettingRecord {
     pub key: String,
     pub value: String,
     pub description: String,
+    pub ui_schema: Option<String>,
     pub updated_at: Option<i64>,
 }
 

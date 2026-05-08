@@ -76,17 +76,33 @@ fn validate_setting(key: &str, value: &str) -> Result<(), &'static str> {
 // Handlers
 // ============================================================================
 
+/// Check if a setting's ui_schema marks it as sensitive
+fn is_sensitive(ui_schema: &Option<String>) -> bool {
+    ui_schema
+        .as_ref()
+        .is_some_and(|s| s.contains("\"sensitive\":true") || s.contains("\"sensitive\": true"))
+}
+
 /// GET /admin/api/settings
 pub async fn list_settings(State(state): State<AppState>) -> impl IntoResponse {
     match state.database.system_settings().list_settings().await {
-        Ok(records) => (
-            StatusCode::OK,
-            Json(SettingsListResponse {
-                object: "list",
-                data: records,
-            }),
-        )
-            .into_response(),
+        Ok(mut records) => {
+            for record in &mut records {
+                if is_sensitive(&record.ui_schema) && !record.value.is_empty() {
+                    record.value =
+                        "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+                            .to_string();
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(SettingsListResponse {
+                    object: "list",
+                    data: records,
+                }),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to list system settings");
             (
@@ -119,6 +135,7 @@ pub async fn upsert_setting(
         key: key.clone(),
         value: body.value,
         description: body.description,
+        ui_schema: None,
         updated_at: None,
     };
 
