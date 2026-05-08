@@ -1,3 +1,9 @@
+## v0.20.0 (2026-05-08)
+
+### Feat
+
+- **settings**: add ui_schema field for dynamic admin UI rendering
+
 ## v0.19.1 (2026-05-05)
 
 ### Fix
