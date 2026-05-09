@@ -55,16 +55,23 @@ impl WebToolExecutor {
             .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
             .collect();
 
+        // Convert server tools into standard tool definitions so the model knows
+        // it can call them. The actual execution is intercepted by the executor.
+        let model_server_tools = server_tools_to_model_definitions(&server_tools);
+
+        let mut all_model_tools = model_server_tools;
+        all_model_tools.extend(client_tools.clone());
+
         let mut messages = request.messages.clone();
         let mut server_blocks: Vec<ContentBlock> = Vec::new();
 
         for iteration in 0..self.max_iterations {
             let mut modified = request.clone();
             modified.messages = messages.clone();
-            modified.tools = if client_tools.is_empty() {
+            modified.tools = if all_model_tools.is_empty() {
                 None
             } else {
-                Some(client_tools.clone())
+                Some(all_model_tools.clone())
             };
             modified.stream = false;
 
@@ -192,6 +199,76 @@ impl WebToolExecutor {
             }
         }
     }
+}
+
+/// Convert server tool definitions (e.g. `{"type": "web_search_20250305", "name": "web_search"}`)
+/// into standard tool definitions with input_schema that the model can call.
+fn server_tools_to_model_definitions(server_tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    use serde_json::json;
+
+    server_tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool["name"].as_str()?;
+            if name == "web_search" || name.starts_with("web_search_") {
+                Some(json!({
+                    "name": "web_search",
+                    "description": "Search the web for information. Returns search results with titles, URLs, and snippets.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query"
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "description": "Maximum number of results to return (default 5)"
+                            },
+                            "allowed_domains": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Only include results from these domains"
+                            },
+                            "blocked_domains": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Exclude results from these domains"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }))
+            } else if name == "web_fetch" || name.starts_with("web_fetch_") {
+                Some(json!({
+                    "name": "web_fetch",
+                    "description": "Fetch the content of a web page at the given URL.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "The URL to fetch"
+                            },
+                            "allowed_domains": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Only allow fetching from these domains"
+                            },
+                            "blocked_domains": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Block fetching from these domains"
+                            }
+                        },
+                        "required": ["url"]
+                    }
+                }))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
