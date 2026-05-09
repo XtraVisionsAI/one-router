@@ -206,16 +206,6 @@ pub async fn require_api_key(
         return Err(AuthError::MissingApiKey);
     };
 
-    // Check master key
-    if let Some(ref master_key) = auth_state.settings.master_api_key {
-        if api_key == *master_key {
-            request
-                .extensions_mut()
-                .insert(ApiKeyInfo::master(&api_key));
-            return Ok(next.run(request).await);
-        }
-    }
-
     // Check ephemeral key
     if let Some(ref ephemeral_key) = auth_state.settings.ephemeral_api_key {
         if api_key == *ephemeral_key {

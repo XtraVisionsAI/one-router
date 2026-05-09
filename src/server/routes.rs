@@ -81,7 +81,12 @@ pub fn create_router(state: AppState) -> Router {
         ));
 
     // Admin auth state
-    let admin_auth_state = AdminAuthState::new(state.settings.clone());
+    let admin_auth_state = AdminAuthState::new(state.settings.clone(), state.sessions.clone());
+
+    // Admin session routes (no auth middleware — they ARE the auth entry point)
+    let admin_session_routes = Router::new()
+        .route("/login", post(admin::session::login))
+        .route("/logout", post(admin::session::logout));
 
     // Admin API routes (protected by require_admin_key)
     let admin_api_routes = Router::new()
@@ -147,7 +152,8 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/v1", anthropic_routes)
         .nest("/v1", openai_routes)
         .merge(health_routes)
-        .nest("/admin/api", admin_api_routes) // more specific first
+        .nest("/admin/api", admin_session_routes) // login/logout (no auth)
+        .nest("/admin/api", admin_api_routes) // protected admin endpoints
         .nest("/admin", admin_static_routes) // broader wildcard second
         .fallback(move |request: Request<Body>| async move { fallback_handler(request) })
         .layer(create_cors_layer())

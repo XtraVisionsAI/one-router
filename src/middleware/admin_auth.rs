@@ -1,8 +1,9 @@
 //! Admin authentication middleware
 //!
-//! Grants access to `/admin/api/*` routes only to:
-//!   - The MASTER_API_KEY holder (is_master == true), OR
-//!   - The ephemeral key holder (raw key matches settings.ephemeral_api_key)
+//! Grants access to `/admin/api/*` routes via:
+//!   1. A valid session cookie (admin_session) — issued by POST /admin/api/login
+//!   2. The MASTER_API_KEY in x-api-key / Authorization header
+//!   3. The ephemeral key (debug builds only)
 //!
 //! Regular database-stored API keys are explicitly rejected.
 
@@ -16,18 +17,21 @@ use axum::{
 };
 use std::sync::Arc;
 
+use crate::api::admin::session::extract_session_cookie;
 use crate::config::Settings;
 use crate::middleware::auth::extract_api_key;
 use crate::schemas::anthropic::ErrorResponse;
+use crate::server::state::SessionStore;
 
 #[derive(Clone)]
 pub struct AdminAuthState {
     pub settings: Arc<Settings>,
+    pub sessions: SessionStore,
 }
 
 impl AdminAuthState {
-    pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
+    pub fn new(settings: Arc<Settings>, sessions: SessionStore) -> Self {
+        Self { settings, sessions }
     }
 }
 
@@ -36,7 +40,18 @@ pub async fn require_admin_key(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, AdminAuthError> {
-    let raw_key = extract_api_key(&request).ok_or(AdminAuthError::Missing)?;
+    // Path 1: Check session cookie
+    if let Some(token) = extract_session_cookie(request.headers()) {
+        if state.sessions.read().await.contains(&token) {
+            return Ok(next.run(request).await);
+        }
+    }
+
+    // Path 2: Check x-api-key / Authorization header
+    let raw_key = match extract_api_key(&request) {
+        Some(key) => key,
+        None => return Err(AdminAuthError::Missing),
+    };
 
     // Check master key
     if let Some(ref master_key) = state.settings.master_api_key {
@@ -45,7 +60,7 @@ pub async fn require_admin_key(
         }
     }
 
-    // Check ephemeral key (is_master is false for ephemeral, so we re-check raw value)
+    // Check ephemeral key
     if let Some(ref ephemeral_key) = state.settings.ephemeral_api_key {
         if raw_key == *ephemeral_key {
             return Ok(next.run(request).await);

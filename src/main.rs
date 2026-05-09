@@ -71,23 +71,26 @@ async fn run_server(cli: Cli) -> Result<()> {
     );
     init_tracing(&settings.log_level);
 
-    let ephemeral_key = settings.generate_ephemeral_key();
-
     println!("\n{}", "=".repeat(60));
     println!("  One Router v{}", settings.app_version);
     println!("{}", "=".repeat(60));
     println!("  Database:  {}", settings.database);
     println!("  Listen:    {}:{}", settings.host, settings.port);
-    println!();
-    println!("  Ephemeral API Key (valid for this session only):");
-    println!("  {ephemeral_key}");
-    println!();
-    println!("  Usage:");
-    println!("    export ANTHROPIC_API_KEY=\"{ephemeral_key}\"");
-    println!(
-        "    export ANTHROPIC_BASE_URL=\"http://{}:{}\"",
-        settings.host, settings.port
-    );
+
+    if cfg!(debug_assertions) {
+        let ephemeral_key = settings.generate_ephemeral_key();
+        println!();
+        println!("  Ephemeral API Key (valid for this session only):");
+        println!("  {ephemeral_key}");
+        println!();
+        println!("  Usage:");
+        println!("    export ANTHROPIC_API_KEY=\"{ephemeral_key}\"");
+        println!(
+            "    export ANTHROPIC_BASE_URL=\"http://{}:{}\"",
+            settings.host, settings.port
+        );
+    }
+
     println!("{}\n", "=".repeat(60));
 
     tracing::info!(

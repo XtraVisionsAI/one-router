@@ -13,9 +13,13 @@ use crate::services::{
     BackendInstance, BedrockService, CredentialPool, GeminiService, ModelMappingService,
     PassthroughService, PtcService, UpdateService, UsageTracker,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+
+/// In-memory store of active admin session tokens.
+pub type SessionStore = Arc<RwLock<HashSet<String>>>;
 
 /// Hot-reloadable configuration — wrapped in `Arc<RwLock<>>` for shared mutable access.
 pub struct DynamicConfig {
@@ -73,6 +77,9 @@ pub struct AppState {
 
     /// Self-update service
     pub update_service: Arc<UpdateService>,
+
+    /// Active admin sessions (cookie tokens)
+    pub sessions: SessionStore,
 
     /// Hot-reloadable config (backends, settings, web tools)
     pub dynamic: Arc<RwLock<DynamicConfig>>,

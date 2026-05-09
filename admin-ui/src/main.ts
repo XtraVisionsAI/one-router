@@ -15,8 +15,15 @@ const router = createRouter({
   routes: setupLayouts(routes)
 })
 
+app.use(pinia)
+
+// Check existing session cookie before first navigation
+const auth = useAuthStore()
+const sessionReady = auth.check()
+
 // Route guard: redirect to /login when not authenticated, redirect to /dashboard when already authenticated
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
+  await sessionReady
   const auth = useAuthStore()
   if (!auth.isAuthenticated && to.path !== '/login') {
     return { path: '/login', query: { redirect: to.fullPath } }
@@ -26,6 +33,5 @@ router.beforeEach((to) => {
   }
 })
 
-app.use(pinia)
 app.use(router)
 app.mount('#app')

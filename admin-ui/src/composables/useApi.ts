@@ -8,8 +8,8 @@ export function useApi() {
   async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const res = await fetch(`/admin/api${path}`, {
       method,
+      credentials: 'same-origin',
       headers: {
-        'x-api-key': auth.apiKey,
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
       },
       body: body !== undefined ? JSON.stringify(body) : undefined

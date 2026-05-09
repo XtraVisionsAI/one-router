@@ -15,12 +15,7 @@
     if (!apiKey.value.trim()) return
     loading.value = true
     try {
-      const res = await fetch('/admin/api/status', {
-        headers: { 'x-api-key': apiKey.value.trim() }
-      })
-      if (!res.ok) throw new Error('Invalid API key')
-      const data = await res.json()
-      auth.login(apiKey.value.trim(), data.version ?? '')
+      await auth.login(apiKey.value)
       const redirect = (route.query.redirect as string) || '/dashboard'
       router.push(redirect)
     } catch {

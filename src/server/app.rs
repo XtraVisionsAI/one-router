@@ -17,6 +17,7 @@ use crate::{
     },
 };
 use anyhow::Result;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -88,6 +89,7 @@ impl App {
             ptc_service,
             encryptor,
             update_service,
+            sessions: Arc::new(RwLock::new(HashSet::new())),
             dynamic,
         };
 

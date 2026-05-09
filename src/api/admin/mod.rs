@@ -19,6 +19,7 @@ pub mod admin_usage;
 pub mod backends;
 pub mod keys;
 pub mod mappings;
+pub mod session;
 pub mod status;
 pub mod system_settings;
 pub mod update;

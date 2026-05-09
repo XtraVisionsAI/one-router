@@ -1,22 +1,40 @@
 export const useAuthStore = defineStore('auth', () => {
-  const apiKey = ref(sessionStorage.getItem('admin_api_key') ?? '')
-  const version = ref(sessionStorage.getItem('admin_version') ?? '')
+  const isAuthenticated = ref(false)
+  const version = ref('')
 
-  const isAuthenticated = computed(() => !!apiKey.value)
-
-  function login(key: string, ver: string) {
-    apiKey.value = key
-    version.value = ver
-    sessionStorage.setItem('admin_api_key', key)
-    sessionStorage.setItem('admin_version', ver)
+  async function login(key: string) {
+    const res = await fetch('/admin/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ key: key.trim() }),
+    })
+    if (!res.ok) throw new Error('Invalid API key')
+    const data = await res.json()
+    version.value = data.version ?? ''
+    isAuthenticated.value = true
   }
 
-  function logout() {
-    apiKey.value = ''
+  async function logout() {
+    await fetch('/admin/api/logout', { method: 'POST', credentials: 'same-origin' })
+    isAuthenticated.value = false
     version.value = ''
-    sessionStorage.removeItem('admin_api_key')
-    sessionStorage.removeItem('admin_version')
   }
 
-  return { apiKey, version, isAuthenticated, login, logout }
+  async function check() {
+    try {
+      const res = await fetch('/admin/api/status', { credentials: 'same-origin' })
+      if (res.ok) {
+        const data = await res.json()
+        version.value = data.version ?? ''
+        isAuthenticated.value = true
+      } else {
+        isAuthenticated.value = false
+      }
+    } catch {
+      isAuthenticated.value = false
+    }
+  }
+
+  return { isAuthenticated, version, login, logout, check }
 })
