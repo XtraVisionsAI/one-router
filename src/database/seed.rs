@@ -859,8 +859,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             value: "true".into(),
             description:
                 "Default capability: enable tool use / function calling. \
-                 Applies to model mappings without explicit capabilities. \
-                 Takes effect on restart."
+                 Applies to model mappings without explicit capabilities."
                     .into(),
             ui_schema: Some(
                 r#"{"type":"bool","label":"Tool Use (default)","group":"Capabilities","sort_order":10}"#.into(),
@@ -872,8 +871,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             value: "true".into(),
             description:
                 "Default capability: enable extended thinking (Claude budget_tokens). \
-                 Applies to model mappings without explicit capabilities. \
-                 Takes effect on restart."
+                 Applies to model mappings without explicit capabilities."
                     .into(),
             ui_schema: Some(
                 r#"{"type":"bool","label":"Extended Thinking (default)","group":"Capabilities","sort_order":20}"#.into(),
@@ -885,8 +883,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             value: "true".into(),
             description:
                 "Default capability: enable document content blocks. \
-                 Applies to model mappings without explicit capabilities. \
-                 Takes effect on restart."
+                 Applies to model mappings without explicit capabilities."
                     .into(),
             ui_schema: Some(
                 r#"{"type":"bool","label":"Document Support (default)","group":"Capabilities","sort_order":30}"#.into(),
@@ -898,8 +895,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             value: "false".into(),
             description:
                 "Default capability: enable Programmatic Tool Calling (PTC). \
-                 Applies to model mappings without explicit capabilities. \
-                 Takes effect on restart."
+                 Applies to model mappings without explicit capabilities."
                     .into(),
             ui_schema: Some(
                 r#"{"type":"bool","label":"PTC (default)","group":"Capabilities","sort_order":40}"#.into(),
@@ -911,8 +907,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             value: "passthrough".into(),
             description: "Prompt cache behavior for Bedrock InvokeModel (Claude) requests. \
                           'disable' strips all cache_control, 'passthrough' preserves as-is, \
-                          '5m'/'1h' overrides TTL on all cache_control blocks. \
-                          Takes effect on restart."
+                          '5m'/'1h' overrides TTL on all cache_control blocks."
                 .into(),
             ui_schema: Some(
                 r#"{"type":"select","label":"Prompt Cache","group":"General","sort_order":10,"options":[{"label":"Passthrough (default)","value":"passthrough"},{"label":"Disabled","value":"disable"},{"label":"5 minutes","value":"5m"},{"label":"1 hour","value":"1h"}]}"#.into(),
@@ -924,8 +919,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             value: "100".into(),
             description: "Default rate limit for API keys (requests per minute). \
                           'disable' turns off rate limiting globally (per-key limits also ignored). \
-                          Numeric values (60/100/200/500) set the default RPM. \
-                          Takes effect on restart."
+                          Numeric values (60/100/200/500) set the default RPM."
                 .into(),
             ui_schema: Some(
                 r#"{"type":"select","label":"Rate Limit","group":"General","sort_order":20,"options":[{"label":"Disabled","value":"disable"},{"label":"60 RPM","value":"60"},{"label":"100 RPM (default)","value":"100"},{"label":"200 RPM","value":"200"},{"label":"500 RPM","value":"500"}]}"#.into(),
@@ -936,8 +930,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             key: "web_search_provider".into(),
             value: "".into(),
             description: "Web search provider for server-side web_search tool. \
-                          Supported: 'tavily', 'brave', or empty to disable. \
-                          Takes effect on restart."
+                          Supported: 'tavily', 'brave', or empty to disable."
                 .into(),
             ui_schema: Some(
                 r#"{"type":"select","label":"Web Search Provider","group":"Web Tools","sort_order":10,"options":[{"label":"Disabled","value":""},{"label":"Tavily","value":"tavily"},{"label":"Brave","value":"brave"}]}"#.into(),
@@ -948,8 +941,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             key: "web_search_api_key".into(),
             value: "".into(),
             description: "API key for the web search provider (Tavily or Brave). \
-                          Required when web_search_provider is set. \
-                          Takes effect on restart."
+                          Required when web_search_provider is set."
                 .into(),
             ui_schema: Some(
                 r#"{"type":"password","label":"Web Search API Key","group":"Web Tools","sort_order":20,"sensitive":true,"placeholder":"Enter API key..."}"#.into(),
@@ -959,8 +951,7 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
         SystemSettingRecord {
             key: "web_fetch_max_content_kb".into(),
             value: "512".into(),
-            description: "Maximum content size in KB for web_fetch tool responses. \
-                          Takes effect on restart."
+            description: "Maximum content size in KB for web_fetch tool responses."
                 .into(),
             ui_schema: Some(
                 r#"{"type":"number","label":"Web Fetch Max Content (KB)","group":"Web Tools","sort_order":30,"placeholder":"512"}"#.into(),
