@@ -1,3 +1,10 @@
+## v0.20.1 (2026-05-09)
+
+### Fix
+
+- remove misleading 'restart required' messages from UI
+- **web_tools**: inject server tool definitions so model can call them
+
 ## v0.20.0 (2026-05-08)
 
 ### Feat
