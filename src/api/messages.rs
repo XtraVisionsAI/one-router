@@ -177,6 +177,16 @@ pub async fn create_message(
         "Processing messages request"
     );
 
+    // Diagnostic: log tools array to diagnose web_search detection
+    if let Some(ref tools) = request.tools {
+        tracing::info!(
+            request_id = %request_id,
+            tools_count = tools.len(),
+            tools_json = %serde_json::to_string(tools).unwrap_or_default(),
+            "Request tools"
+        );
+    }
+
     // Print prompts if enabled (for debugging)
     if std::env::var("PRINT_PROMPTS")
         .map(|v| v == "true" || v == "1")
@@ -496,7 +506,14 @@ async fn handle_bedrock_request(
         crate::converters::cache_transform::apply_to_request(request, cache_mode_ref);
 
     // Server-side web tool execution loop
-    if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {
+    let has_server_tools =
+        crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request);
+    tracing::info!(
+        request_id = %request_id,
+        has_server_tools = has_server_tools,
+        "Web tool detection result"
+    );
+    if has_server_tools {
         let web_tool_executor = state.dynamic.read().await.web_tool_executor.clone();
         return match web_tool_executor.as_ref() {
             Some(executor) => {
