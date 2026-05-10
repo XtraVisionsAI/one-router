@@ -1,3 +1,10 @@
+## v0.21.0 (2026-05-10)
+
+### Feat
+
+- implement web tools, PTC, and bedrock improvements from design doc
+- **auth**: HttpOnly cookie session for admin UI, restrict master key to admin-only
+
 ## v0.20.1 (2026-05-09)
 
 ### Fix
