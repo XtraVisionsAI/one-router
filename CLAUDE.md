@@ -4,7 +4,7 @@
 
 One Router is a Rust API gateway that routes **Anthropic** and **OpenAI** protocol requests to four backend providers: **AWS Bedrock**, **Google Gemini**, **Anthropic API**, and **OpenAI API**.
 
-- **Version:** 0.18.0
+- **Version:** 0.20.1
 - **Tech stack:** Rust / Axum / Tokio / AWS SDK / SQLx
 - **Docker image:** `xtravisions/one-router`
 
@@ -107,6 +107,7 @@ Managed via Admin UI or `PUT /admin/api/settings/:key`. Changes take effect **im
 | `web_search_provider` | _(empty)_ | Web search: `tavily` / `brave` / empty to disable |
 | `web_search_api_key` | _(empty)_ | API key for web search provider |
 | `web_fetch_max_content_kb` | `512` | Max content size (KB) for web_fetch tool |
+| `web_fetch_provider` | _(empty)_ | Fetch method: `tavily` (Tavily Extract API) / empty (direct HTTP) |
 
 ---
 
@@ -164,7 +165,15 @@ src/
 │   ├── update.rs                # Self-update from GitHub Releases
 │   ├── backend_pool/            # Credential pool & load balancing
 │   ├── ptc/                     # Programmatic Tool Calling (Docker sandbox)
+│   │   ├── service.rs           # PtcService: session management, owner validation
+│   │   ├── sandbox.rs           # SandboxExecutor, CodeExecutor trait, OneshotExecutor
+│   │   ├── runner.rs            # Python runner script for sandbox
+│   │   └── exceptions.rs        # PtcError enum with HTTP status codes
 │   └── web_tools/               # Web search & fetch tools
+│       ├── mod.rs               # is_server_tool(), version matching, split_tools()
+│       ├── executor.rs          # WebToolExecutor, WebToolBackend trait, run/run_stream
+│       ├── search.rs            # SearchProvider trait, Tavily/Brave providers
+│       └── fetch.rs             # FetchProvider trait, Reqwest/TavilyExtract providers
 ├── database/
 │   ├── traits.rs                # DatabaseService trait (5 sub-traits)
 │   ├── models.rs                # Data models (6 tables)
@@ -225,7 +234,14 @@ HTTP Request
     ├── /v1/messages         → messages.rs
     └── /v1/chat/completions → chat_completions.rs
               │
-              ├── ModelMappingService  (resolve model ID)
+              ├── ModelMappingService  (resolve model ID + provider)
+              ├── PTC detection        (before routing, if beta header present)
+              ├── Web Tools detection  (before routing, for Bedrock/Gemini only)
+              │     ├── WebToolExecutor agentic loop (search/fetch/code_execution)
+              │     ├── Citation post-processing
+              │     └── Streaming: per-iteration SSE events
+              ├── Capability filtering
+              ├── Provider routing     (bedrock / gemini / anthropic / openai)
               ├── Converter            (transform request)
               ├── Service              (call backend)
               └── Converter            (transform response)
@@ -243,6 +259,7 @@ pub struct AppState {
     pub encryptor: Encryptor,
     pub ptc_service: Option<Arc<PtcService>>,
     pub update_service: Arc<UpdateService>,
+    pub sessions: SessionStore,
     pub start_time: Instant,
 
     // Hot-reloadable (rebuilt on admin API changes)
@@ -410,3 +427,11 @@ Multiple credentials per backend are supported. Strategies:
 - API keys are HMAC-SHA256 hashed. Admin routes use key `name` as identifier, not the key itself.
 - Master and ephemeral keys record usage with identifiers `__master__` / `__ephemeral__` (no budget management). Master key `cost_rate` is `1.0`.
 - Credential `record_success()` auto-re-enables a disabled credential — no need to wait for `try_recover_credential()`.
+- Web tools (web_search/web_fetch) are detected **before** provider routing. Anthropic/OpenAI passthrough natively support them (transparent). Bedrock/Gemini use `WebToolExecutor` proxy-side execution.
+- Server tool versions are exact-matched (`SUPPORTED_WEB_SEARCH_VERSIONS` / `SUPPORTED_WEB_FETCH_VERSIONS`). Unsupported versions return `invalid_request_error`.
+- PTC sessions are bound to the creating API key (`owner_key_hash`). Continuation requests validate ownership (403 on mismatch).
+- PTC errors map to specific HTTP codes via `From<PtcError> for ApiError` (403/404/410/429/503/504).
+- Graceful shutdown cleans up all PTC Docker containers before exiting.
+- `WebToolBackend` trait abstracts the LLM call in the web tool loop — `BedrockService` and `GeminiWebToolBackend` implement it.
+- `CodeExecutor` trait (in `ptc/sandbox.rs`) provides one-shot code execution. `OneshotExecutor` creates a container per call. Used by Dynamic Filtering (`web_search_20260209`).
+- Bedrock `invoke_model_messages` auto-retries without `service_tier` if the initial call fails with a tier-related ValidationError.

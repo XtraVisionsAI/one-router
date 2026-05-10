@@ -33,6 +33,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Streaming Support** — full SSE streaming for both OpenAI and Anthropic protocols
 - **Extended Thinking** — per-model extended thinking support with style hints (Claude, Nova 2, Kimi)
 - **Tool Use & PTC** — tool calling support including Programmatic Tool Calling with sandboxed code execution
+- **Web Search & Fetch** — proxy-side web search (Tavily/Brave) and page fetch with agentic loop, streaming, citation post-processing, and Dynamic Filtering (code execution in loop for v2 tools)
 - **Per-Model Capabilities** — declare per-model capabilities (thinking, document, tool use, PTC) in model mappings; global defaults configurable via settings
 - **Admin Web UI** — built-in browser UI at `/admin` for managing API keys, backends, model mappings, settings, and usage stats — no external tools needed
 - **AES-256-GCM Encryption** — encrypt backend credentials at rest; the Admin UI handles plaintext input and encrypts automatically on save
@@ -40,7 +41,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Self-Update** — check and apply updates from GitHub Releases via CLI (`one-router update`) or Admin API
 - **Hot-Reload** — backend and settings changes via Admin UI take effect immediately without restart
 - **CLI Configuration** — override any setting via command-line flags (`--port`, `--database`, `--log-level`)
-- **Prometheus Metrics** — built-in `/health`, `/ready`, `/liveness` endpoints
+- **Health Endpoints** — built-in `/health`, `/ready`, `/liveness` endpoints
 - **Multi-Arch Docker** — ships `linux/amd64` and `linux/arm64` images
 - **Deploy Anywhere** — Docker, AWS App Runner, or bare metal
 
@@ -77,7 +78,7 @@ On startup, One Router prints an **ephemeral API key** for immediate use:
 
 ```
 ============================================================
-  One Router v0.18.0
+  One Router v0.20.1
 ============================================================
   Database:  sqlite://./data/gateway.db
   Listen:    0.0.0.0:8000
@@ -226,8 +227,6 @@ print(response.data[0].b64_json[:40], "...")
 ```
 
 > **Note:** Bedrock and Gemini backends only support `response_format=b64_json`. Requesting `url` format for these backends returns a `400 Bad Request`. The OpenAI passthrough supports both `url` and `b64_json`.
-
-```
 
 ### Usage Query API
 
@@ -472,6 +471,7 @@ src/
 ├── services/            # Business logic
 │   ├── backend_pool/    # Backend instance pool & load balancing
 │   ├── ptc/             # Programmatic Tool Calling (sandboxed execution)
+│   ├── web_tools/       # Web search, fetch, and Dynamic Filtering (agentic loop)
 │   ├── bedrock.rs       # AWS Bedrock service (InvokeModel for Claude; Converse for non-Claude /v1/chat/completions; Bedrock Mantle for non-Claude /v1/messages)
 │   ├── gemini.rs        # Google Gemini service
 │   ├── passthrough.rs   # Anthropic & OpenAI passthrough service
