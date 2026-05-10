@@ -203,6 +203,7 @@ pub async fn create_message(
                     &resolved.target_model_id,
                     &request_id,
                     container_id,
+                    &key_info,
                 )
                 .await
             } else {
@@ -211,6 +212,7 @@ pub async fn create_message(
                     &request,
                     &resolved.target_model_id,
                     &request_id,
+                    &key_info,
                 )
                 .await
             };
@@ -233,6 +235,9 @@ pub async fn create_message(
                 }
             });
 
+            if request.stream {
+                return Ok(MessageApiResponse::Stream(response_to_sse_stream(response)));
+            }
             return Ok(MessageApiResponse::Json(Json(response)));
         }
     }
@@ -256,6 +261,113 @@ pub async fn create_message(
         provider: resolved.provider.clone(),
         stream_usage: stream_usage.clone(),
     };
+
+    // ========================================================================
+    // Web Tools detection — before provider routing
+    // For Anthropic/OpenAI passthrough: server tools are natively supported, skip.
+    // For Bedrock/Gemini: proxy-side execution via WebToolExecutor.
+    // ========================================================================
+    if matches!(resolved.provider.as_str(), "bedrock" | "gemini")
+        && crate::services::web_tools::executor::WebToolExecutor::has_server_tools(
+            &filtered_request,
+        )
+    {
+        // Check for unsupported versions early
+        if let Some(tools) = filtered_request.tools.as_deref() {
+            for tool in tools {
+                if let Some(version) =
+                    crate::services::web_tools::unsupported_server_tool_version(tool)
+                {
+                    return Err(ApiError::bad_request(format!(
+                        "{version} is not supported by this proxy"
+                    )));
+                }
+            }
+        }
+
+        let dynamic = state.dynamic.read().await;
+        let executor = dynamic.web_tool_executor.clone().ok_or_else(|| {
+            ApiError::bad_request(
+                "web_search/web_fetch tools require web_search_provider to be configured",
+            )
+        })?;
+
+        let backend: Arc<dyn crate::services::web_tools::executor::WebToolBackend> =
+            match resolved.provider.as_str() {
+                "gemini" => {
+                    let gemini_pool = dynamic.gemini_pool.clone().ok_or_else(|| {
+                        ApiError::service_unavailable("Gemini backend not configured")
+                    })?;
+                    let instance = gemini_pool.get_next().ok_or_else(|| {
+                        ApiError::service_unavailable("No healthy Gemini backend available")
+                    })?;
+                    Arc::new(crate::services::web_tools::executor::GeminiWebToolBackend {
+                        service: instance.service.clone(),
+                    })
+                }
+                _ => {
+                    // Bedrock
+                    let bedrock = dynamic.bedrock.clone().ok_or_else(|| {
+                        ApiError::service_unavailable("Bedrock backend not configured")
+                    })?;
+                    bedrock as Arc<dyn crate::services::web_tools::executor::WebToolBackend>
+                }
+            };
+        drop(dynamic);
+
+        // Streaming: use run_stream for per-iteration SSE output
+        if filtered_request.stream {
+            let stream = executor.run_stream(
+                filtered_request.clone(),
+                backend,
+                resolved.target_model_id.clone(),
+            );
+            let wrapped = wrap_stream_with_usage_recording(
+                stream,
+                stream_usage,
+                state.usage_tracker.clone(),
+                key_info.clone(),
+                request.model.clone(),
+                request_id,
+                resolved.provider.clone(),
+                "anthropic",
+            );
+            return Ok(MessageApiResponse::Stream(wrapped));
+        }
+
+        // Non-streaming: use run() and return JSON
+        let response = executor
+            .run(
+                &filtered_request,
+                backend.as_ref(),
+                &resolved.target_model_id,
+            )
+            .await
+            .map_err(|e| ApiError::internal_error(e.to_string()))?;
+
+        // Record usage for non-streaming
+        let usage = response.usage.clone();
+        let ctx = usage_ctx;
+        tokio::spawn(async move {
+            if let Err(e) = ctx
+                .tracker
+                .record_usage(
+                    &ctx.key_info,
+                    &ctx.request_id,
+                    &ctx.model,
+                    &usage,
+                    true,
+                    &ctx.provider,
+                    "anthropic",
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to record web tools usage");
+            }
+        });
+
+        return Ok(MessageApiResponse::Json(Json(response)));
+    }
 
     let result = match resolved.provider.as_str() {
         "gemini" => {
@@ -494,36 +606,6 @@ async fn handle_bedrock_request(
     };
     let transformed_request =
         crate::converters::cache_transform::apply_to_request(request, cache_mode_ref);
-
-    // Server-side web tool execution loop
-    if crate::services::web_tools::executor::WebToolExecutor::has_server_tools(request) {
-        let web_tool_executor = state.dynamic.read().await.web_tool_executor.clone();
-        return match web_tool_executor.as_ref() {
-            Some(executor) => {
-                let response = executor
-                    .run(request, &bedrock, bedrock_model)
-                    .await
-                    .map_err(|e| ApiError::internal_error(e.to_string()))?;
-                if request.stream {
-                    {
-                        let mut u = usage_ctx.stream_usage.lock().await;
-                        u.input_tokens = response.usage.input_tokens;
-                        u.output_tokens = response.usage.output_tokens;
-                        u.cache_creation_input_tokens =
-                            response.usage.cache_creation_input_tokens;
-                        u.cache_read_input_tokens =
-                            response.usage.cache_read_input_tokens;
-                    }
-                    Ok(MessageApiResponse::Stream(response_to_sse_stream(response)))
-                } else {
-                    Ok(MessageApiResponse::Json(Json(response)))
-                }
-            }
-            None => Err(ApiError::bad_request(
-                "web_search/web_fetch tools require WEB_SEARCH_PROVIDER or WEB_FETCH_MAX_CONTENT_KB to be set",
-            )),
-        };
-    }
 
     // Streaming via InvokeModelWithResponseStream
     if request.stream {

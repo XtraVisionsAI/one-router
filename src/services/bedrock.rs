@@ -251,19 +251,58 @@ impl BedrockService {
             .content_type("application/json")
             .accept("application/json")
             .send()
-            .await
-            .map_err(|e| {
-                self.record_failure(&cred_name);
-                BedrockError::from_invoke_model_error(e)
-            })?;
+            .await;
 
-        self.record_success(&cred_name);
-
-        let response_bytes = result.body().as_ref();
-        serde_json::from_slice::<crate::schemas::anthropic::MessageResponse>(response_bytes)
-            .map_err(|e| {
-                BedrockError::Deserialization(format!("Failed to parse InvokeModel response: {e}"))
-            })
+        match result {
+            Ok(output) => {
+                self.record_success(&cred_name);
+                let response_bytes = output.body().as_ref();
+                serde_json::from_slice::<crate::schemas::anthropic::MessageResponse>(response_bytes)
+                    .map_err(|e| {
+                        BedrockError::Deserialization(format!(
+                            "Failed to parse InvokeModel response: {e}"
+                        ))
+                    })
+            }
+            Err(e) => {
+                let err = BedrockError::from_invoke_model_error(e);
+                // Auto-fallback: if a service tier was set and the error looks tier-related,
+                // retry without the tier.
+                if effective_tier.is_some() && is_tier_related_error(&err) {
+                    tracing::warn!(
+                        model_id,
+                        credential = %cred_name,
+                        "Service tier not supported, retrying without tier"
+                    );
+                    let fallback_body = build_invoke_model_body(request, model_id, false, None)?;
+                    let retry_result = client
+                        .invoke_model()
+                        .model_id(model_id)
+                        .body(Blob::new(fallback_body))
+                        .content_type("application/json")
+                        .accept("application/json")
+                        .send()
+                        .await
+                        .map_err(|e2| {
+                            self.record_failure(&cred_name);
+                            BedrockError::from_invoke_model_error(e2)
+                        })?;
+                    self.record_success(&cred_name);
+                    let response_bytes = retry_result.body().as_ref();
+                    serde_json::from_slice::<crate::schemas::anthropic::MessageResponse>(
+                        response_bytes,
+                    )
+                    .map_err(|e| {
+                        BedrockError::Deserialization(format!(
+                            "Failed to parse InvokeModel response: {e}"
+                        ))
+                    })
+                } else {
+                    self.record_failure(&cred_name);
+                    Err(err)
+                }
+            }
+        }
     }
 
     /// Invoke a Claude model using InvokeModelWithResponseStream API with native Anthropic SSE.
@@ -833,6 +872,18 @@ pub enum BedrockStreamError {
 // ============================================================================
 // OpenAI SSE → Anthropic SSE converter (for Bedrock Mantle)
 // ============================================================================
+
+/// Check if a BedrockError is likely caused by an unsupported service tier.
+fn is_tier_related_error(err: &BedrockError) -> bool {
+    if let BedrockError::ValidationError(msg) = err {
+        let lower = msg.to_lowercase();
+        lower.contains("service_tier")
+            || lower.contains("service tier")
+            || (lower.contains("tier") && lower.contains("not supported"))
+    } else {
+        false
+    }
+}
 
 /// Convert an OpenAI SSE byte stream from Bedrock Mantle into Anthropic SSE events.
 fn openai_sse_to_anthropic_sse(

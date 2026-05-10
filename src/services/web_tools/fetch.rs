@@ -113,6 +113,82 @@ fn check_domain_filters(
     Ok(())
 }
 
+/// Fetch provider that uses the Tavily Extract API for high-quality content extraction.
+/// Handles JS-rendered pages and PDF content that direct HTTP fetching cannot.
+pub struct TavilyExtractProvider {
+    client: reqwest::Client,
+    api_key: String,
+}
+
+impl TavilyExtractProvider {
+    pub fn new(api_key: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build reqwest client");
+        Self { client, api_key }
+    }
+}
+
+#[async_trait]
+impl FetchProvider for TavilyExtractProvider {
+    async fn fetch(
+        &self,
+        url: &str,
+        allowed_domains: Option<&[String]>,
+        blocked_domains: Option<&[String]>,
+        max_content_kb: u64,
+    ) -> Result<FetchResult, WebToolError> {
+        check_domain_filters(url, allowed_domains, blocked_domains)?;
+
+        let response = self
+            .client
+            .post("https://api.tavily.com/extract")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "api_key": self.api_key,
+                "urls": [url]
+            }))
+            .send()
+            .await
+            .map_err(|e| WebToolError::FetchError(format!("Tavily Extract API error: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(WebToolError::FetchError(format!(
+                "Tavily Extract API returned {status}: {body}"
+            )));
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| {
+            WebToolError::FetchError(format!("Failed to parse Tavily response: {e}"))
+        })?;
+
+        // Tavily returns { "results": [{"url": "...", "raw_content": "..."}] }
+        let content = json["results"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|r| r["raw_content"].as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let max_bytes = (max_content_kb * 1024) as usize;
+        let content = if content.len() > max_bytes {
+            content[..max_bytes].to_string()
+        } else {
+            content
+        };
+
+        Ok(FetchResult {
+            url: url.to_string(),
+            content,
+            content_type: "text/plain".to_string(),
+            status_code: 200,
+        })
+    }
+}
+
 fn extract_host(url: &str) -> String {
     url.trim_start_matches("https://")
         .trim_start_matches("http://")

@@ -8,6 +8,7 @@
 //! 5. Sandbox completes → finalize with Claude using saved execution state
 
 use crate::api::messages::ApiError;
+use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::{
     CallerInfo, ContainerResponse, ContentBlock, Message, MessageContent, MessageRequest,
     MessageResponse, StopReason, ToolResultValue,
@@ -38,6 +39,49 @@ const EXECUTE_CODE_TOOL: &str = r#"{
 }"#;
 
 // ============================================================================
+// PtcError → ApiError conversion
+// ============================================================================
+
+impl From<crate::services::ptc::PtcError> for ApiError {
+    fn from(err: crate::services::ptc::PtcError) -> Self {
+        use crate::services::ptc::PtcError;
+        match &err {
+            PtcError::DockerNotAvailable(_)
+            | PtcError::AttachFailed(_)
+            | PtcError::RunnerNotReady(_) => ApiError::service_unavailable(err.to_string()),
+
+            PtcError::SessionNotFound(_) | PtcError::ExecutionStateNotFound(_) => {
+                ApiError::bad_request(err.to_string())
+            }
+
+            PtcError::SessionExpired(_) => ApiError {
+                status: axum::http::StatusCode::GONE,
+                error_type: "invalid_request_error".to_string(),
+                message: err.to_string(),
+            },
+
+            PtcError::InvalidToolResult(_) => ApiError::bad_request(err.to_string()),
+
+            PtcError::MaxIterationsExceeded(_) => ApiError::rate_limited(err.to_string()),
+
+            PtcError::PermissionDenied(_) => ApiError {
+                status: axum::http::StatusCode::FORBIDDEN,
+                error_type: "permission_error".to_string(),
+                message: err.to_string(),
+            },
+
+            PtcError::ExecutionTimeout(_) => ApiError {
+                status: axum::http::StatusCode::GATEWAY_TIMEOUT,
+                error_type: "timeout_error".to_string(),
+                message: err.to_string(),
+            },
+
+            _ => ApiError::internal_error(err.to_string()),
+        }
+    }
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -47,6 +91,7 @@ pub async fn handle_ptc_request(
     request: &MessageRequest,
     target_model_id: &str,
     request_id: &str,
+    key_info: &ApiKeyInfo,
 ) -> Result<MessageResponse, ApiError> {
     let ptc = get_ptc_service(state)?;
 
@@ -57,10 +102,11 @@ pub async fn handle_ptc_request(
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
 
+    let owner_hash = owner_key_hash(key_info);
     let session_id = ptc
-        .create_session(&tool_names)
+        .create_session(&tool_names, &owner_hash)
         .await
-        .map_err(|e| ApiError::internal_error(format!("PTC session creation failed: {e}")))?;
+        .map_err(ApiError::from)?;
 
     tracing::info!(request_id, session_id, "PTC session created");
 
@@ -94,8 +140,15 @@ pub async fn handle_ptc_continuation(
     target_model_id: &str,
     request_id: &str,
     container_id: &str,
+    key_info: &ApiKeyInfo,
 ) -> Result<MessageResponse, ApiError> {
     let ptc = get_ptc_service(state)?;
+
+    // Validate ownership: the caller must be the same API key that created the session
+    let owner_hash = owner_key_hash(key_info);
+    ptc.validate_ownership(container_id, &owner_hash)
+        .await
+        .map_err(ApiError::from)?;
 
     // Find session by container ID
     let session_id = ptc
@@ -117,6 +170,11 @@ pub async fn handle_ptc_continuation(
         ));
     }
 
+    // Validate tool_use_id format
+    for (id, _, _) in &tool_results {
+        validate_tool_use_id(id)?;
+    }
+
     // Build results JSON for the sandbox
     let results_json = serde_json::json!({
         "results": tool_results.iter().map(|(id, content, is_error)| {
@@ -132,7 +190,7 @@ pub async fn handle_ptc_continuation(
     let msg = ptc
         .send_tool_results_via_channel(&session_id, &results_json)
         .await
-        .map_err(|e| ApiError::internal_error(format!("Failed to send tool results: {e}")))?;
+        .map_err(ApiError::from)?;
 
     match msg {
         ContainerMessage::ToolCall(calls) => {
@@ -175,6 +233,16 @@ fn get_ptc_service(state: &AppState) -> Result<&Arc<PtcService>, ApiError> {
     state.ptc_service.as_ref().ok_or_else(|| {
         ApiError::service_unavailable("PTC service not available. Ensure Docker is running.")
     })
+}
+
+/// Derive the owner identifier from the API key info.
+/// Uses the HMAC hash stored in the database (stable, unique per key).
+fn owner_key_hash(key_info: &ApiKeyInfo) -> String {
+    if key_info.is_master {
+        "__master__".to_string()
+    } else {
+        key_info.raw_api_key.clone()
+    }
 }
 
 async fn get_bedrock(
@@ -334,7 +402,7 @@ async fn process_claude_response(
     let msg = ptc
         .run_code_via_channel(session_id, &code)
         .await
-        .map_err(|e| ApiError::internal_error(format!("Sandbox execution failed: {e}")))?;
+        .map_err(ApiError::from)?;
 
     match msg {
         ContainerMessage::ToolCall(calls) => {
@@ -489,7 +557,7 @@ async fn finalize_with_claude_from_state(
     let exec_state = ptc
         .take_execution_state(session_id)
         .await
-        .map_err(|e| ApiError::internal_error(format!("Missing execution state: {e}")))?;
+        .map_err(ApiError::from)?;
 
     // Reconstruct conversation: original messages + saved assistant content + tool_result
     let mut messages = exec_state.original_messages;
@@ -579,6 +647,33 @@ async fn add_container_info(
             expires_at: expires_at.to_rfc3339(),
         });
     }
+}
+
+/// Validate tool_use_id format.
+/// Accepts: toolu_<alphanumeric> (standard Anthropic format)
+/// Also accepts srvtoolu_ prefix for server-generated IDs.
+fn validate_tool_use_id(id: &str) -> Result<(), ApiError> {
+    let suffix = if let Some(s) = id.strip_prefix("srvtoolu_") {
+        s
+    } else if let Some(s) = id.strip_prefix("toolu_") {
+        s
+    } else {
+        return Err(ApiError::bad_request(format!(
+            "Invalid tool_use_id format: '{id}'. Expected 'toolu_<id>' or 'srvtoolu_<id>'"
+        )));
+    };
+
+    if !suffix.is_empty()
+        && suffix
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Ok(());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "Invalid tool_use_id format: '{id}'. Expected 'toolu_<id>' or 'srvtoolu_<id>'"
+    )))
 }
 
 /// Extract tool results from request messages.

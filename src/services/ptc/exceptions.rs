@@ -83,6 +83,10 @@ pub enum PtcError {
     #[error("Execution state not found for session: {0}")]
     ExecutionStateNotFound(String),
 
+    /// Permission denied (ownership validation failed)
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
     /// Internal error
     #[error("Internal PTC error: {0}")]
     Internal(String),
@@ -108,6 +112,7 @@ impl PtcError {
             PtcError::InvalidToolResult(_) => 400,
             PtcError::ExecutionTimeout(_) => 504,
             PtcError::MaxIterationsExceeded(_) => 429,
+            PtcError::PermissionDenied(_) => 403,
             PtcError::AttachFailed(_) | PtcError::RunnerNotReady(_) => 503,
             PtcError::UnexpectedMessage(_) => 500,
             _ => 500,

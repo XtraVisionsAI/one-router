@@ -48,6 +48,8 @@ pub struct PtcSession {
     pub id: String,
     /// Container information
     pub container: ContainerInfo,
+    /// HMAC hash of the API key that owns this session
+    pub owner_key_hash: String,
     /// Session creation time
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Last activity time
@@ -246,6 +248,26 @@ impl PtcService {
         sessions.values().any(|s| s.container.id == container_id)
     }
 
+    /// Validate that the caller owns the session associated with this container.
+    pub async fn validate_ownership(
+        &self,
+        container_id: &str,
+        caller_key_hash: &str,
+    ) -> PtcResult<()> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .values()
+            .find(|s| s.container.id == container_id)
+            .ok_or_else(|| PtcError::SessionNotFound(container_id.to_string()))?;
+
+        if session.owner_key_hash != caller_key_hash {
+            return Err(PtcError::PermissionDenied(
+                "Container does not belong to this API key".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Get session by container ID
     pub async fn get_session_by_container(&self, container_id: &str) -> Option<String> {
         let sessions = self.sessions.read().await;
@@ -290,7 +312,11 @@ impl PtcService {
     ///
     /// Sets up the runner script, attaches to the container, starts it,
     /// and waits for the runner's `__READY__` signal.
-    pub async fn create_session(&self, tool_names: &[String]) -> PtcResult<String> {
+    pub async fn create_session(
+        &self,
+        tool_names: &[String],
+        owner_key_hash: &str,
+    ) -> PtcResult<String> {
         let session_id = format!("ptc_sess_{}", uuid::Uuid::new_v4());
 
         // 1. Create container (not started yet — CMD is runner.py)
@@ -342,6 +368,7 @@ impl PtcService {
         let session = PtcSession {
             id: session_id.clone(),
             container,
+            owner_key_hash: owner_key_hash.to_string(),
             created_at: chrono::Utc::now(),
             last_activity: chrono::Utc::now(),
             pending_tool_calls: Vec::new(),
@@ -437,6 +464,26 @@ impl PtcService {
                 tokio::spawn(async move {
                     let _ = sandbox.stop_and_remove(&container_id).await;
                 });
+            }
+        }
+
+        count
+    }
+
+    /// Clean up ALL sessions (used during graceful shutdown).
+    /// Returns the number of sessions cleaned up.
+    pub async fn cleanup_all_sessions(&self) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let all_ids: Vec<String> = sessions.keys().cloned().collect();
+        let count = all_ids.len();
+
+        for session_id in all_ids {
+            if let Some(session) = sessions.remove(&session_id) {
+                if let Some(handle) = self.container_handles.lock().await.remove(&session_id) {
+                    handle.shutdown();
+                }
+                self.execution_states.write().await.remove(&session_id);
+                let _ = self.sandbox.stop_and_remove(&session.container.id).await;
             }
         }
 

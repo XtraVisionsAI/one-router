@@ -2,6 +2,10 @@
 //!
 //! This module handles the creation and management of Docker containers
 //! for secure code execution in the PTC (Programmatic Tool Calling) system.
+//!
+//! The `CodeExecutor` trait provides a backend-agnostic interface for code execution
+//! that can be shared between PTC (long-lived sessions) and Web Tools Dynamic Filtering
+//! (one-shot execution).
 
 use super::exceptions::{PtcError, PtcResult};
 use super::runner;
@@ -19,6 +23,50 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+
+// ============================================================================
+// Code Executor Trait (shared abstraction)
+// ============================================================================
+
+/// Trait for one-shot code execution (run-and-discard).
+/// Used by Web Tools Dynamic Filtering and other features that need
+/// code execution without long-lived sessions.
+#[async_trait::async_trait]
+pub trait CodeExecutor: Send + Sync {
+    async fn execute(&self, code: &str, language: &str) -> Result<ExecutionResult, PtcError>;
+}
+
+/// One-shot code executor using Docker containers (creates and destroys per call).
+pub struct OneshotExecutor {
+    sandbox: Arc<SandboxExecutor>,
+}
+
+impl OneshotExecutor {
+    pub fn new(sandbox: Arc<SandboxExecutor>) -> Self {
+        Self { sandbox }
+    }
+}
+
+#[async_trait::async_trait]
+impl CodeExecutor for OneshotExecutor {
+    async fn execute(&self, code: &str, language: &str) -> Result<ExecutionResult, PtcError> {
+        let cmd: Vec<&str> = match language {
+            "python" | "py" => vec!["python", "-c", code],
+            "bash" | "sh" => vec!["bash", "-c", code],
+            _ => vec!["python", "-c", code],
+        };
+
+        let container = self.sandbox.create_container(None).await?;
+        self.sandbox.start_container(&container.id).await?;
+
+        let result = self.sandbox.exec_command(&container.id, cmd).await;
+
+        // Always clean up
+        let _ = self.sandbox.stop_and_remove(&container.id).await;
+
+        result
+    }
+}
 
 // ============================================================================
 // Configuration

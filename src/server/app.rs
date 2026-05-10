@@ -59,12 +59,7 @@ impl App {
             tracing::info!("Credential encryption enabled (AES-256-GCM)");
         }
 
-        // 3-5. Build dynamic config (backends + settings + web tools)
-        let dynamic = Arc::new(RwLock::new(
-            build_dynamic_config(&database, &encryptor, &settings).await,
-        ));
-
-        // 6. Initialize PTC service
+        // 3. Initialize PTC service (before dynamic config, for code executor sharing)
         let ptc_service = match PtcService::new().await {
             Ok(service) => Some(Arc::new(service)),
             Err(e) => {
@@ -73,7 +68,12 @@ impl App {
             }
         };
 
-        // 7. Initialize services
+        // 4-5. Build dynamic config (backends + settings + web tools)
+        let dynamic = Arc::new(RwLock::new(
+            build_dynamic_config(&database, &encryptor, &settings, ptc_service.as_ref()).await,
+        ));
+
+        // 6. Initialize services
         let model_mapping = Arc::new(ModelMappingService::new(database.clone()));
         let usage_tracker = Arc::new(UsageTracker::new(database.clone(), model_mapping.clone()));
 
@@ -120,9 +120,19 @@ impl App {
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
+        let ptc_service = self.state.ptc_service.clone();
+
         axum::serve(listener, router)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
+
+        // Clean up PTC containers on shutdown
+        if let Some(ptc) = ptc_service {
+            let count = ptc.cleanup_all_sessions().await;
+            if count > 0 {
+                tracing::info!(count, "Cleaned up PTC containers on shutdown");
+            }
+        }
 
         Ok(())
     }
@@ -453,6 +463,7 @@ async fn build_dynamic_config(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
     encryptor: &Encryptor,
     settings: &Settings,
+    ptc_service: Option<&Arc<PtcService>>,
 ) -> DynamicConfig {
     let bedrock = match init_bedrock_from_backends(database, encryptor).await {
         Ok(Some(service)) => {
@@ -531,13 +542,40 @@ async fn build_dynamic_config(
             .await
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(settings.web_fetch_max_content_kb);
+        let fetch_provider_setting = load_string_setting(database, "web_fetch_provider").await;
 
         let search = provider
             .as_deref()
             .zip(api_key.as_deref())
             .and_then(|(p, k)| build_search_provider(p, k))
             .map(|p| Arc::from(p) as Arc<dyn crate::services::web_tools::search::SearchProvider>);
-        Some(Arc::new(WebToolExecutor::new(search, max_kb, 10)))
+
+        // Build fetch provider: "tavily" uses Tavily Extract API, default uses direct HTTP
+        let fetch_provider: Arc<dyn crate::services::web_tools::fetch::FetchProvider> =
+            if fetch_provider_setting.as_deref() == Some("tavily") {
+                if let Some(ref key) = api_key {
+                    Arc::new(
+                        crate::services::web_tools::fetch::TavilyExtractProvider::new(key.clone()),
+                    )
+                } else {
+                    tracing::warn!("web_fetch_provider=tavily but no API key configured, falling back to direct");
+                    Arc::new(crate::services::web_tools::fetch::ReqwestFetchProvider::new(max_kb))
+                }
+            } else {
+                Arc::new(crate::services::web_tools::fetch::ReqwestFetchProvider::new(max_kb))
+            };
+
+        let mut executor = WebToolExecutor::with_fetch(search, fetch_provider, max_kb, 10);
+
+        // Attach code executor for Dynamic Filtering if Docker (PTC) is available
+        if let Some(ptc) = ptc_service {
+            let sandbox = ptc.sandbox().clone();
+            let code_exec: Arc<dyn crate::services::ptc::sandbox::CodeExecutor> =
+                Arc::new(crate::services::ptc::sandbox::OneshotExecutor::new(sandbox));
+            executor = executor.with_code_executor(code_exec);
+        }
+
+        Some(Arc::new(executor))
     };
 
     tracing::info!(
@@ -565,7 +603,13 @@ async fn build_dynamic_config(
 /// Reload all dynamic config (backends + settings) from the database.
 /// Called by admin API after changes to backends or system settings.
 pub async fn reload_dynamic_config(state: &AppState) {
-    let new_config = build_dynamic_config(&state.database, &state.encryptor, &state.settings).await;
+    let new_config = build_dynamic_config(
+        &state.database,
+        &state.encryptor,
+        &state.settings,
+        state.ptc_service.as_ref(),
+    )
+    .await;
     let mut dynamic = state.dynamic.write().await;
     *dynamic = new_config;
     tracing::info!("Dynamic config reloaded");
