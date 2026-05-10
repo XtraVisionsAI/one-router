@@ -77,7 +77,7 @@ Infrastructure env vars — all other config lives in the database (`system_sett
 | `PORT` | `8000` | HTTP listen port |
 | `HOST` | `0.0.0.0` | HTTP bind host |
 | `LOG_LEVEL` | `info` | Logging level |
-| `MASTER_API_KEY` | _(auto-generated)_ | Admin key — auto-generated and saved to `.env` on first run |
+| `MASTER_API_KEY` | _(auto-generated)_ | Admin-only key — used for `/admin` UI login and admin API. Cannot call business endpoints (`/v1/*`). Auto-generated and saved to `.env` on first run |
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
 | `CONTAINER` | _(unset)_ | Set to `true` in Docker — requires MASTER_API_KEY and ENCRYPTION_KEY to be provided explicitly |
 
@@ -426,6 +426,9 @@ Multiple credentials per backend are supported. Strategies:
 - Database migrations run automatically on startup. Standalone scripts in `scripts/migrations/`.
 - API keys are HMAC-SHA256 hashed. Admin routes use key `name` as identifier, not the key itself.
 - Master and ephemeral keys record usage with identifiers `__master__` / `__ephemeral__` (no budget management). Master key `cost_rate` is `1.0`.
+- **Auth model:** Master key is admin-only (rejected by `/v1/*` middleware). Ephemeral key (debug builds only) can call both admin and business APIs. Database-stored API keys can only call `/v1/*` business endpoints.
+- **Admin UI auth:** POST `/admin/api/login` with `{"key": "..."}` → returns HttpOnly `admin_session` cookie. Admin middleware accepts either cookie or master/ephemeral key in header.
+- API keys are created via `POST /admin/api/keys` (admin auth required). Plaintext returned once. Stored as HMAC-SHA256 hash.
 - Credential `record_success()` auto-re-enables a disabled credential — no need to wait for `try_recover_credential()`.
 - Web tools (web_search/web_fetch) are detected **before** provider routing. Anthropic/OpenAI passthrough natively support them (transparent). Bedrock/Gemini use `WebToolExecutor` proxy-side execution.
 - Server tool versions are exact-matched (`SUPPORTED_WEB_SEARCH_VERSIONS` / `SUPPORTED_WEB_FETCH_VERSIONS`). Unsupported versions return `invalid_request_error`.

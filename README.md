@@ -29,7 +29,8 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Smart Model Mapping** — maps model names across providers (e.g. `gpt-4o` -> Claude Sonnet, `claude-*` -> Bedrock), with exact match, wildcard, and configurable priority
 - **Backend Pool & Load Balancing** — each backend record is an independent service instance; multiple instances of the same type are load-balanced with round-robin, weighted, random, or failover strategies
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
-- **API Key Management** — issue API keys with per-key rate limits, budget caps, and service tiers
+- **API Key Management** — issue API keys with per-key rate limits, budget caps, and service tiers; master key is admin-only (cannot call business APIs)
+- **Admin Session Auth** — admin UI uses HttpOnly cookie sessions via login endpoint; no key stored in browser
 - **Streaming Support** — full SSE streaming for both OpenAI and Anthropic protocols
 - **Extended Thinking** — per-model extended thinking support with style hints (Claude, Nova 2, Kimi)
 - **Tool Use & PTC** — tool calling support including Programmatic Tool Calling with sandboxed code execution
@@ -74,7 +75,7 @@ cargo build --release
 ./target/release/one-router
 ```
 
-On startup, One Router prints an **ephemeral API key** for immediate use:
+On startup (debug builds only), One Router prints an **ephemeral API key** for immediate use:
 
 ```
 ============================================================
@@ -91,6 +92,8 @@ On startup, One Router prints an **ephemeral API key** for immediate use:
     export ANTHROPIC_BASE_URL="http://0.0.0.0:8000"
 ============================================================
 ```
+
+> **Production:** The ephemeral key is not generated. Use the Admin UI (`/admin`) to log in with your master key and create API keys for `/v1/*` business endpoints.
 
 ## Usage
 
@@ -292,7 +295,7 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
 
 ## Admin Web UI
 
-One Router includes a built-in admin UI at **`/admin`**. Open it in a browser and sign in with your master key or ephemeral key.
+One Router includes a built-in admin UI at **`/admin`**. Open it in a browser and sign in with your master key or ephemeral key (debug builds). Authentication uses HttpOnly session cookies — no key is stored in the browser after login.
 
 | Page | What you can do |
 |---|---|
@@ -317,7 +320,7 @@ One Router uses environment variables for infrastructure config. All runtime set
 | `PORT` | `8000` | HTTP listen port |
 | `HOST` | `0.0.0.0` | HTTP bind host |
 | `LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `MASTER_API_KEY` | _(auto-generated)_ | Admin API key — auto-generated and saved to `.env` on first bare-metal run |
+| `MASTER_API_KEY` | _(auto-generated)_ | Admin-only key — for `/admin` UI login and admin API. Cannot call `/v1/*` business endpoints. Auto-generated and saved to `.env` on first bare-metal run |
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
 
 **First-run behavior:**
