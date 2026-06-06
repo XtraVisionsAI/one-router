@@ -22,6 +22,9 @@ const CLAUDE_CAPS: &str = r#"{"thinking":{"enabled":true,"style":"claude"},"docu
 /// Capabilities JSON for Gemini models (no thinking support).
 const GEMINI_CAPS: &str = r#"{"thinking":{"enabled":false,"style":"claude"},"document":{"enabled":true},"tool_use":{"enabled":true},"ptc":{"enabled":false}}"#;
 
+/// Capabilities JSON for OpenAI GPT models on Bedrock (no thinking, no document).
+const OPENAI_GPT_CAPS: &str = r#"{"thinking":{"enabled":false,"style":"claude"},"document":{"enabled":false},"tool_use":{"enabled":true},"ptc":{"enabled":false}}"#;
+
 /// Default model mappings (source model ID -> target provider model ID).
 pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
     let now = unix_now();
@@ -132,21 +135,6 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
-            source_model_id: "claude-3-opus-20240229".into(),
-            target_model_id: "anthropic.claude-3-opus-20240229-v1:0".into(),
-            provider: "bedrock".into(),
-            display_name: "Claude 3 Opus".into(),
-            input_price: 15.0,
-            output_price: 75.0,
-            cache_read_price: 1.50,
-            cache_write_price: 18.75,
-            priority: 0,
-            status: "active".into(),
-            created_at: now,
-            updated_at: None,
-            capabilities: Some(CLAUDE_CAPS.to_string()),
-        },
-        ModelMappingRecord {
             source_model_id: "claude-opus-4-5-20251101".into(),
             target_model_id: "global.anthropic.claude-opus-4-5-20251101-v1:0".into(),
             provider: "bedrock".into(),
@@ -237,6 +225,36 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             capabilities: Some(CLAUDE_CAPS.to_string()),
         },
         ModelMappingRecord {
+            source_model_id: "claude-opus-4-7".into(),
+            target_model_id: "global.anthropic.claude-opus-4-7".into(),
+            provider: "bedrock".into(),
+            display_name: "Claude Opus 4.7".into(),
+            input_price: 5.0,
+            output_price: 25.0,
+            cache_read_price: 0.50,
+            cache_write_price: 6.25,
+            priority: 0,
+            status: "active".into(),
+            created_at: now,
+            updated_at: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
+        },
+        ModelMappingRecord {
+            source_model_id: "claude-opus-4-8".into(),
+            target_model_id: "global.anthropic.claude-opus-4-8".into(),
+            provider: "bedrock".into(),
+            display_name: "Claude Opus 4.8".into(),
+            input_price: 5.0,
+            output_price: 25.0,
+            cache_read_price: 0.50,
+            cache_write_price: 6.25,
+            priority: 0,
+            status: "active".into(),
+            created_at: now,
+            updated_at: None,
+            capabilities: Some(CLAUDE_CAPS.to_string()),
+        },
+        ModelMappingRecord {
             source_model_id: "claude-haiku-4-5-20251001".into(),
             target_model_id: "global.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
             provider: "bedrock".into(),
@@ -284,7 +302,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-latest".into(),
-            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
+            target_model_id: "global.anthropic.claude-opus-4-8".into(),
             provider: "bedrock".into(),
             display_name: "Claude Opus 4 Latest".into(),
             input_price: 5.0,
@@ -321,21 +339,6 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             output_price: 4.0,
             cache_read_price: 0.08,
             cache_write_price: 1.0,
-            priority: 0,
-            status: "active".into(),
-            created_at: now,
-            updated_at: None,
-            capabilities: Some(CLAUDE_CAPS.to_string()),
-        },
-        ModelMappingRecord {
-            source_model_id: "claude-3-opus-latest".into(),
-            target_model_id: "anthropic.claude-3-opus-20240229-v1:0".into(),
-            provider: "bedrock".into(),
-            display_name: "Claude 3 Opus Latest".into(),
-            input_price: 15.0,
-            output_price: 75.0,
-            cache_read_price: 1.50,
-            cache_write_price: 18.75,
             priority: 0,
             status: "active".into(),
             created_at: now,
@@ -586,9 +589,9 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "o1".into(),
-            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
+            target_model_id: "global.anthropic.claude-opus-4-8".into(),
             provider: "bedrock".into(),
-            display_name: "O1 → Opus 4.6".into(),
+            display_name: "O1 → Opus 4.8".into(),
             input_price: 5.0,
             output_price: 25.0,
             cache_read_price: 0.50,
@@ -601,9 +604,9 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         },
         ModelMappingRecord {
             source_model_id: "o1-preview".into(),
-            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
+            target_model_id: "global.anthropic.claude-opus-4-8".into(),
             provider: "bedrock".into(),
-            display_name: "O1 Preview → Opus 4.6".into(),
+            display_name: "O1 Preview → Opus 4.8".into(),
             input_price: 5.0,
             output_price: 25.0,
             cache_read_price: 0.50,
@@ -628,6 +631,22 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+        },
+        // ── OpenAI GPT models on Bedrock (native, via Mantle/Converse) ────────
+        ModelMappingRecord {
+            source_model_id: "gpt-5.5".into(),
+            target_model_id: "openai.gpt-5.5".into(),
+            provider: "bedrock".into(),
+            display_name: "GPT-5.5".into(),
+            input_price: 5.0,
+            output_price: 30.0,
+            cache_read_price: 0.0,
+            cache_write_price: 0.0,
+            priority: 10,
+            status: "active".into(),
+            created_at: now,
+            updated_at: None,
+            capabilities: Some(OPENAI_GPT_CAPS.to_string()),
         },
         // ── Embedding models (Bedrock InvokeModel) ──────────────────────────
         // Cohere Embed v3
@@ -835,9 +854,9 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
         // Wildcard catch-all: any o1-* model not matched above
         ModelMappingRecord {
             source_model_id: "o1-*".into(),
-            target_model_id: "global.anthropic.claude-opus-4-6-v1".into(),
+            target_model_id: "global.anthropic.claude-opus-4-8".into(),
             provider: "bedrock".into(),
-            display_name: "O1 Wildcard (default to Opus 4.6)".into(),
+            display_name: "O1 Wildcard (default to Opus 4.8)".into(),
             input_price: 5.0,
             output_price: 25.0,
             cache_read_price: 0.50,
