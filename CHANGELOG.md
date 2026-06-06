@@ -1,3 +1,13 @@
+## v0.22.0 (2026-06-06)
+
+### Feat
+
+- **seed**: add GPT-5.5, Claude Opus 4.7/4.8; remove retired models
+
+### Fix
+
+- **seed**: correct Bedrock model ID for Claude Sonnet 4.6
+
 ## v0.21.0 (2026-05-10)
 
 ### Feat
