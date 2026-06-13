@@ -132,19 +132,19 @@
       </div>
 
       <div class="flex gap-4">
-        <NFormItem label="Input Price (per 1K)" class="flex-1">
+        <NFormItem label="Input Price (per 1M)" class="flex-1">
           <NInputNumber v-model:value="form.input_price" :precision="4" :min="0" class="w-full" />
         </NFormItem>
-        <NFormItem label="Output Price (per 1K)" class="flex-1">
+        <NFormItem label="Output Price (per 1M)" class="flex-1">
           <NInputNumber v-model:value="form.output_price" :precision="4" :min="0" class="w-full" />
         </NFormItem>
       </div>
 
       <div class="flex gap-4">
-        <NFormItem label="Cache Read Price (per 1K)" class="flex-1">
+        <NFormItem label="Cache Read Price (per 1M)" class="flex-1">
           <NInputNumber v-model:value="form.cache_read_price" :precision="4" :min="0" class="w-full" />
         </NFormItem>
-        <NFormItem label="Cache Write Price (per 1K)" class="flex-1">
+        <NFormItem label="Cache Write Price (per 1M)" class="flex-1">
           <NInputNumber v-model:value="form.cache_write_price" :precision="4" :min="0" class="w-full" />
         </NFormItem>
       </div>
