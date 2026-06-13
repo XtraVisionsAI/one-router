@@ -1,3 +1,9 @@
+## v0.22.1 (2026-06-13)
+
+### Fix
+
+- **ui**: correct pricing label from "per 1K" to "per 1M"
+
 ## v0.22.0 (2026-06-06)
 
 ### Feat
