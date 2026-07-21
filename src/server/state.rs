@@ -105,10 +105,11 @@ impl DynamicConfig {
                 false,
             );
         }
-        for target in self.failover_chains.targets_for(source_model) {
-            if self.provider_available(&target.provider) {
-                return (target.provider.clone(), target.model.clone(), true);
-            }
+        if let Some(target) = self
+            .failover_chains
+            .select_available(source_model, |p| self.provider_available(p))
+        {
+            return (target.provider.clone(), target.model.clone(), true);
         }
         (
             primary_provider.to_string(),

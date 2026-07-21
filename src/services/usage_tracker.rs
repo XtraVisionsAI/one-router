@@ -178,6 +178,21 @@ impl UsageTracker {
         Ok(false)
     }
 
+    /// Compute the cost for a request.
+    ///
+    /// Pricing is keyed on `model` — the **source model id the client sent**
+    /// (`request.model`), looked up in its `model_mappings` row. Consequences:
+    ///
+    /// - **Failover**: a request that failed over to a backup provider/model is
+    ///   still billed at the *requested* model's rate (the backup's backend id
+    ///   has no source mapping row of its own). This is intentional — the client
+    ///   is charged for the model it asked for, regardless of which backend
+    ///   served it.
+    /// - **Application inference-profile ARN sent as the model**: priced from
+    ///   that ARN's mapping row if it has prices; otherwise the DEFAULT_* rates
+    ///   apply. The underlying foundation model resolved for routing is **not**
+    ///   used to derive pricing — set prices on the ARN's mapping row for
+    ///   accurate billing.
     async fn calculate_cost(
         &self,
         model: &str,

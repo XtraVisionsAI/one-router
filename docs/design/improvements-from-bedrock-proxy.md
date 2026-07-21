@@ -318,3 +318,12 @@ request  (attrs: gen_ai.system, gen_ai.request.model, provider, protocol, stream
 **流式 span**：`async_stream::stream!` 内边转发边累积 token/usage，在流结束（`message_delta`/`[DONE]`）时 `span.set_attribute` 记录最终 usage 再 `end()`；不可在首个 chunk 就 end。
 
 **落地顺序建议**：① OTLP init + root span 中间件（复用现有 `track_http_metrics` 的位置）→ ② backend_call span + usage 属性 → ③ web_tool / failover 子 span → ④ session 聚合。每步可独立合入。
+
+## 复盘补丁（2026-07-21 二次核实后修复）
+
+对「已知局限」逐条回源核实,修了两条,更正了两条:
+
+- **#3 error 计量贯通（已修）**：`record_usage` 所有调用点均硬编码 `success=true`,后端失败直接 `return Err` 从不记账,导致 `onerouter_requests_total{status="error"}` 恒不触发。修复:在两个 handler 路由后的中心 `match result` 的 `Err` 分支记 `record_request(provider, protocol, false)`（此处 provider 已知,失败已归因到实际失败的后端;failover 后即备用 provider）。早期 4xx（鉴权/限流/模型未找到）仍只由 HTTP 直方图按状态类覆盖。
+- **#5 failover 切换逻辑补测（已修）**：把选目标逻辑抽成纯函数 `FailoverChains::select_available(source, is_available_predicate)`,`DynamicConfig::apply_failover` 调它并传 `|p| self.provider_available(p)`。纯函数用 mock 谓词单测了:跳过不健康的首个目标、多健康时按配置顺序取首个、全不健康/无链时返回 None。
+- **#2 计价口径（更正为「按设计」并文档化,未改代码）**：计价按 `request.model`（客户端传的**源** model）查其 mapping 行价格。① failover 后仍按**所请求模型**计价(备用后端 id 没有自己的源 mapping 行)—— 这是**有意为之**:客户端为其请求的模型付费,与实际由哪个后端服务无关,可预测。② 裸 application-inference-profile ARN 作 model 传入时:该 ARN 的 mapping 行配了价就用,否则落 DEFAULT;解析出的底层基础模型**不**参与计价。已在 `calculate_cost` doc 注释写明。原「一律落兜底价」的说法是夸大。
+- **#6 seed 幂等（更正,非问题）**：`seed_defaults()` 每次启动对缺失 key 补插,已有部署重启即获得 `failover_chains` 行(空=禁用)。作废。

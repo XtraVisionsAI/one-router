@@ -387,7 +387,13 @@ pub async fn chat_completions(
             );
             Ok(ChatCompletionApiResponse::Stream(wrapped))
         }
-        Err(_) => result,
+        Err(_) => {
+            // Backend/routing failure after provider is known. record_usage only
+            // runs on success, so record the error outcome here to keep
+            // onerouter_requests_total{status="error"} meaningful.
+            crate::observability::metrics::record_request(&resolved.provider, "openai", false);
+            result
+        }
     }
 }
 

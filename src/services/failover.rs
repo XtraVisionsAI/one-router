@@ -95,6 +95,23 @@ impl FailoverChains {
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
+
+    /// Select the first failover target for `source_model` whose provider passes
+    /// `is_available`. Returns `None` when no chain is configured or no target is
+    /// available. Kept free of pool types so the selection logic is unit-testable
+    /// with a mock predicate (the live check is `DynamicConfig::provider_available`).
+    pub fn select_available<F>(
+        &self,
+        source_model: &str,
+        is_available: F,
+    ) -> Option<&FailoverTarget>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.targets_for(source_model)
+            .iter()
+            .find(|t| is_available(&t.provider))
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +161,39 @@ mod tests {
         assert_eq!(targets[0].model, "gpt-x");
         // A chain that becomes empty after filtering is removed entirely.
         assert!(chains.targets_for("empty-after-filter").is_empty());
+    }
+
+    #[test]
+    fn test_select_available_picks_first_healthy_in_order() {
+        let raw = r#"{
+            "m": [
+                {"provider": "anthropic", "model": "a"},
+                {"provider": "bedrock",   "model": "b"},
+                {"provider": "openai",    "model": "c"}
+            ]
+        }"#;
+        let chains = FailoverChains::from_json(raw);
+
+        // Only bedrock healthy → skip the unhealthy first target, pick bedrock.
+        let picked = chains
+            .select_available("m", |p| p == "bedrock")
+            .expect("a target should be selected");
+        assert_eq!(picked.provider, "bedrock");
+        assert_eq!(picked.model, "b");
+
+        // Multiple healthy → first in configured order wins (anthropic before openai).
+        let picked = chains
+            .select_available("m", |p| p == "anthropic" || p == "openai")
+            .unwrap();
+        assert_eq!(picked.provider, "anthropic");
+    }
+
+    #[test]
+    fn test_select_available_none_when_all_unhealthy_or_no_chain() {
+        let chains = FailoverChains::from_json(r#"{"m":[{"provider":"openai","model":"c"}]}"#);
+        // No provider healthy → None.
+        assert!(chains.select_available("m", |_| false).is_none());
+        // Unknown source model → None even if the predicate is permissive.
+        assert!(chains.select_available("other", |_| true).is_none());
     }
 }
