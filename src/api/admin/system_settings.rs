@@ -201,6 +201,6 @@ mod tests {
 
     #[test]
     fn validate_unknown_key_passes() {
-        assert!(validate_setting("some_future_key", "any_value").is_err() == false);
+        assert!(validate_setting("some_future_key", "any_value").is_ok());
     }
 }

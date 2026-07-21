@@ -35,6 +35,15 @@ impl PromptCacheMode {
             _ => Self::Passthrough,
         }
     }
+
+    /// The TTL string this mode applies (`"5m"` / `"1h"`), or `None` for
+    /// `Disable`/`Passthrough`. Used for TTL-aware cache-write billing.
+    pub fn ttl_str(&self) -> Option<&str> {
+        match self {
+            Self::Ttl(t) => Some(t.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Apply a [`PromptCacheMode`] to a [`MessageRequest`], returning a modified clone.

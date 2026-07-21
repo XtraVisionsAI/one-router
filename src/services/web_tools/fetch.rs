@@ -1,3 +1,4 @@
+use super::ssrf;
 use super::WebToolError;
 use async_trait::async_trait;
 
@@ -21,17 +22,14 @@ pub struct FetchResult {
 }
 
 pub struct ReqwestFetchProvider {
-    client: reqwest::Client,
+    timeout: std::time::Duration,
 }
 
 impl ReqwestFetchProvider {
     pub fn new(_max_content_kb: u64) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent("one-router/web-fetch 1.0")
-            .build()
-            .expect("Failed to build reqwest client");
-        Self { client }
+        Self {
+            timeout: std::time::Duration::from_secs(15),
+        }
     }
 }
 
@@ -44,48 +42,36 @@ impl FetchProvider for ReqwestFetchProvider {
         blocked_domains: Option<&[String]>,
         max_content_kb: u64,
     ) -> Result<FetchResult, WebToolError> {
-        check_domain_filters(url, allowed_domains, blocked_domains)?;
-
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| WebToolError::FetchError(e.to_string()))?;
-
-        let status_code = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("text/html")
-            .to_string();
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| WebToolError::FetchError(e.to_string()))?;
-
+        // SSRF-guarded GET that re-validates every redirect hop against the
+        // domain filters and IP rules, pinning the connection to the validated
+        // address (DNS-rebinding defense).
         let max_bytes = (max_content_kb * 1024) as usize;
-        let bytes = if bytes.len() > max_bytes {
-            &bytes[..max_bytes]
-        } else {
-            &bytes[..]
-        };
+        let result = ssrf::safe_get_bytes(
+            url,
+            max_bytes,
+            self.timeout,
+            "one-router/web-fetch 1.0",
+            |u| {
+                check_domain_filters(u.as_str(), allowed_domains, blocked_domains)
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .await
+        .map_err(WebToolError::FetchError)?;
 
-        let content = if content_type.contains("html") {
-            strip_html(std::str::from_utf8(bytes).unwrap_or(""))
+        let content = if result.content_type.contains("html") {
+            strip_html(std::str::from_utf8(&result.bytes).unwrap_or(""))
         } else {
-            std::str::from_utf8(bytes)
+            std::str::from_utf8(&result.bytes)
                 .unwrap_or("[binary content]")
                 .to_string()
         };
 
         Ok(FetchResult {
-            url: url.to_string(),
+            url: result.final_url,
             content,
-            content_type,
-            status_code,
+            content_type: result.content_type,
+            status_code: 200,
         })
     }
 }

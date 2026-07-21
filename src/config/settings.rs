@@ -206,6 +206,66 @@ impl Settings {
     pub fn server_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    /// Lightweight startup configuration health check. Returns human-readable
+    /// warnings for risky configuration; never blocks startup. Callers should
+    /// log each returned string at `warn` level.
+    pub fn security_warnings(&self) -> Vec<String> {
+        const WEAK_KEYS: &[&str] = &[
+            "changeme",
+            "password",
+            "secret",
+            "test",
+            "admin",
+            "master",
+            "sk-master",
+            "1234",
+            "12345678",
+            "your-master-key",
+            "sk-your-master-key",
+        ];
+
+        let mut warnings = Vec::new();
+        let is_container = env::var("CONTAINER")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        if let Some(key) = &self.master_api_key {
+            let lower = key.to_ascii_lowercase();
+            if WEAK_KEYS.iter().any(|w| lower == *w || lower.contains(w)) {
+                warnings.push(
+                    "MASTER_API_KEY matches a well-known weak value; set a strong, random key."
+                        .to_string(),
+                );
+            }
+            if key.len() < 16 {
+                warnings.push(format!(
+                    "MASTER_API_KEY is short ({} chars); use at least 32 random characters.",
+                    key.len()
+                ));
+            }
+        }
+
+        if let Some(key) = &self.encryption_key {
+            if key.len() < 32 {
+                warnings.push(format!(
+                    "ENCRYPTION_KEY is short ({} chars); a full-entropy 32+ char key is recommended.",
+                    key.len()
+                ));
+            }
+        }
+
+        // In a container the entry keys must be provided explicitly (load()
+        // already aborts if missing); flag the auto-generated fallback used on
+        // bare metal so operators know it is not persisted across restarts here.
+        if !is_container && self.encryption_key.is_none() {
+            warnings.push(
+                "ENCRYPTION_KEY not set; a key will be auto-generated. Set it explicitly in production.".to_string(),
+            );
+        }
+
+        warnings
+    }
 }
 
 /// Append key=value lines to the .env file, creating it if it doesn't exist.
@@ -248,6 +308,48 @@ mod tests {
             ephemeral_api_key: None,
         };
         assert_eq!(settings.server_addr(), "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_security_warnings_flags_weak_master_key() {
+        let settings = Settings {
+            database: "sqlite://./test.db".into(),
+            port: 8000,
+            host: "0.0.0.0".into(),
+            log_level: "info".into(),
+            master_api_key: Some("changeme".into()),
+            encryption_key: Some("a".repeat(32)),
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_max_content_kb: 512,
+            app_version: "0.1.0".into(),
+            ephemeral_api_key: None,
+        };
+        let warnings = settings.security_warnings();
+        assert!(warnings.iter().any(|w| w.contains("MASTER_API_KEY")));
+    }
+
+    #[test]
+    fn test_security_warnings_strong_key_clean() {
+        let settings = Settings {
+            database: "sqlite://./test.db".into(),
+            port: 8000,
+            host: "0.0.0.0".into(),
+            log_level: "info".into(),
+            master_api_key: Some("sk-9f3c1a7e5b2d4f60a8c1e3d5b7f9a1c3".into()),
+            encryption_key: Some("a".repeat(32)),
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_max_content_kb: 512,
+            app_version: "0.1.0".into(),
+            ephemeral_api_key: None,
+        };
+        // No master/encryption warnings for strong keys. (An ENCRYPTION_KEY-set
+        // config emits no auto-generation warning.)
+        assert!(!settings
+            .security_warnings()
+            .iter()
+            .any(|w| w.contains("MASTER_API_KEY")));
     }
 
     #[test]

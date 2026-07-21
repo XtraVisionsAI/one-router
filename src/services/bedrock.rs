@@ -353,6 +353,38 @@ impl BedrockService {
         lower.contains("claude") || lower.contains("anthropic")
     }
 
+    /// Resolve an application inference profile ARN to its underlying model ARN
+    /// for routing/pricing decisions. Non-ARN model IDs are returned unchanged
+    /// with no network call. Application-inference-profile ARNs are resolved via
+    /// the Bedrock control plane (cached); resolution failure is a hard error so
+    /// the request is never routed against a guess.
+    ///
+    /// The returned value is only for routing/pricing classification — the actual
+    /// Bedrock invocation must still use the original profile ARN.
+    pub async fn resolve_routing_model_id(&self, model_id: &str) -> Result<String, BedrockError> {
+        use crate::services::inference_profile::{
+            is_application_inference_profile, resolve_model_id, ResolverCreds,
+        };
+        if !is_application_inference_profile(model_id) {
+            return Ok(model_id.to_string());
+        }
+        let creds = {
+            let cred = self
+                .pool
+                .get_next()
+                .ok_or_else(|| BedrockError::Unknown("No available credentials".to_string()))?;
+            ResolverCreds {
+                region: cred.region().to_string(),
+                access_key_id: cred.access_key_id().unwrap_or_default().to_string(),
+                secret_access_key: cred.secret_access_key().unwrap_or_default().to_string(),
+                session_token: cred.session_token().map(|s| s.to_string()),
+            }
+        };
+        resolve_model_id(model_id, &creds)
+            .await
+            .map_err(BedrockError::Unknown)
+    }
+
     /// Call Bedrock OpenAI-compatible endpoint (Bedrock Mantle) for non-Claude models.
     /// Uses the same AWS credentials as Converse API but calls /v1/chat/completions.
     pub async fn chat_completions(
@@ -818,9 +850,40 @@ fn build_invoke_model_body(
                 }
             }
         }
+
+        // Auto-inject the beta flag required by `defer_loading` tools. Clients
+        // frequently omit the `advanced-tool-use-2025-11-20` beta header, and
+        // Bedrock InvokeModel then rejects the request with "Extra inputs are
+        // not permitted". If any tool sets `defer_loading: true`, ensure the
+        // beta is present in the request body's `anthropic_beta` list.
+        let has_defer_loading = obj
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|t| t.get("defer_loading") == Some(&serde_json::Value::Bool(true)))
+            });
+        if has_defer_loading {
+            ensure_anthropic_beta(obj, "advanced-tool-use-2025-11-20");
+        }
     }
 
     serde_json::to_vec(&body).map_err(|e| BedrockError::Serialization(e.to_string()))
+}
+
+/// Ensure `anthropic_beta` (a JSON array on the request body) contains `beta`,
+/// creating the array if absent and de-duplicating.
+fn ensure_anthropic_beta(obj: &mut serde_json::Map<String, serde_json::Value>, beta: &str) {
+    let arr = obj
+        .entry("anthropic_beta".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(list) = arr.as_array_mut() {
+        let present = list.iter().any(|v| v.as_str() == Some(beta));
+        if !present {
+            list.push(serde_json::json!(beta));
+        }
+    }
 }
 
 // ============================================================================
@@ -1352,6 +1415,40 @@ impl BedrockError {
 #[cfg(test)]
 mod tests {
     use super::BedrockService;
+
+    #[test]
+    fn test_ensure_anthropic_beta() {
+        // Creates the array when absent.
+        let mut obj = serde_json::Map::new();
+        super::ensure_anthropic_beta(&mut obj, "advanced-tool-use-2025-11-20");
+        assert_eq!(
+            obj["anthropic_beta"],
+            serde_json::json!(["advanced-tool-use-2025-11-20"])
+        );
+        // De-duplicates on repeat.
+        super::ensure_anthropic_beta(&mut obj, "advanced-tool-use-2025-11-20");
+        assert_eq!(obj["anthropic_beta"].as_array().unwrap().len(), 1);
+        // Appends a distinct value.
+        super::ensure_anthropic_beta(&mut obj, "other-beta");
+        assert_eq!(obj["anthropic_beta"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_defer_loading_injects_beta() {
+        use crate::schemas::anthropic::MessageRequest;
+        let mut req = MessageRequest::new("claude", vec![], 100);
+        req.tools = Some(vec![serde_json::json!({
+            "name": "big_tool",
+            "description": "x",
+            "defer_loading": true
+        })]);
+        let body = super::build_invoke_model_body(&req, "model", false, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["anthropic_beta"],
+            serde_json::json!(["advanced-tool-use-2025-11-20"])
+        );
+    }
 
     #[test]
     fn test_is_claude_model_claude() {

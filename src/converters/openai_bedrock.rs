@@ -420,12 +420,14 @@ pub fn convert_response(
             prompt_tokens: u.input_tokens(),
             completion_tokens: u.output_tokens(),
             total_tokens: u.input_tokens() + u.output_tokens(),
+            prompt_tokens_details: None,
             completion_tokens_details: None,
         })
         .unwrap_or(CompletionUsage {
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
+            prompt_tokens_details: None,
             completion_tokens_details: None,
         });
 

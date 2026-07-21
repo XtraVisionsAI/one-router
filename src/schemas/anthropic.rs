@@ -68,12 +68,23 @@ impl TextContent {
 }
 
 /// Image source data.
+///
+/// Supports both `base64` sources (`media_type` + `data`) and `url` sources
+/// (`url`). URL sources are resolved to base64 by the proxy before reaching
+/// backends that only accept inline bytes (Bedrock/Gemini).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImageSource {
     #[serde(rename = "type")]
-    pub source_type: String, // "base64"
-    pub media_type: String, // "image/jpeg", "image/png", "image/gif", "image/webp"
-    pub data: String,       // base64 encoded
+    pub source_type: String, // "base64" | "url"
+    /// base64 sources: "image/jpeg", "image/png", "image/gif", "image/webp"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// base64 sources: base64-encoded bytes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// url sources: the image URL
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// Image content block.

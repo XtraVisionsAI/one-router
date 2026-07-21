@@ -30,7 +30,10 @@ pub fn create_router(state: AppState) -> Router {
     let health_routes = Router::new()
         .route("/health", get(health::health_check))
         .route("/ready", get(health::readiness))
-        .route("/liveness", get(health::liveness));
+        .route("/liveness", get(health::liveness))
+        // Prometheus scrape endpoint (unauthenticated by convention; aggregate
+        // counters only, no API keys or request content). Protect at network layer.
+        .route("/metrics", get(health::metrics));
 
     // Create middleware state
     let auth_state = AuthState::new(state.settings.clone(), state.database.clone());
@@ -156,8 +159,22 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/admin/api", admin_api_routes) // protected admin endpoints
         .nest("/admin", admin_static_routes) // broader wildcard second
         .fallback(move |request: Request<Body>| async move { fallback_handler(request) })
+        .layer(middleware::from_fn(track_http_metrics))
         .layer(create_cors_layer())
         .with_state(state)
+}
+
+/// Middleware: record every HTTP request's duration into the Prometheus
+/// histogram, bucketed by response status class. Applied to the whole router so
+/// it covers business, admin and health routes uniformly.
+async fn track_http_metrics(request: Request<Body>, next: middleware::Next) -> Response {
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    crate::observability::metrics::observe_http(
+        response.status().as_u16(),
+        start.elapsed().as_secs_f64(),
+    );
+    response
 }
 
 /// Fallback handler for unknown routes

@@ -43,6 +43,11 @@ impl App {
         let settings_arc = Arc::new(settings.clone());
         let start_time = Instant::now();
 
+        // 0. Startup configuration health check (warn-only, never blocks).
+        for warning in settings.security_warnings() {
+            tracing::warn!(target: "config_check", "{warning}");
+        }
+
         // 1. Create database backend
         tracing::info!(database = %settings.database, "Initializing database backend");
         let database = database::create_database(&settings.database).await?;
@@ -530,6 +535,12 @@ async fn build_dynamic_config(
     let prompt_cache_mode = load_prompt_cache_mode(database).await;
     let rate_limit_rpm = load_rate_limit_rpm(database).await;
     let default_capabilities = load_default_capabilities(database).await;
+    let failover_chains = {
+        let raw = load_string_setting(database, "failover_chains")
+            .await
+            .unwrap_or_default();
+        crate::services::failover::FailoverChains::from_json(&raw)
+    };
 
     let web_tool_executor = {
         let provider = load_string_setting(database, "web_search_provider")
@@ -597,6 +608,7 @@ async fn build_dynamic_config(
         prompt_cache_mode,
         rate_limit_rpm,
         default_capabilities,
+        failover_chains,
     }
 }
 

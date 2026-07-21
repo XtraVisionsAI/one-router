@@ -514,12 +514,14 @@ impl GeminiToOpenAIConverter {
                 prompt_tokens: u.prompt_token_count,
                 completion_tokens: u.candidates_token_count,
                 total_tokens: u.total_token_count,
+                prompt_tokens_details: None,
                 completion_tokens_details: None,
             },
             None => CompletionUsage {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: None,
                 completion_tokens_details: None,
             },
         }
@@ -606,6 +608,7 @@ impl GeminiToOpenAIConverter {
                 prompt_tokens: u.prompt_token_count,
                 completion_tokens: u.candidates_token_count,
                 total_tokens: u.total_token_count,
+                prompt_tokens_details: None,
                 completion_tokens_details: None,
             }),
             system_fingerprint: None,

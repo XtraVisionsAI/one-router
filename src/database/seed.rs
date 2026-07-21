@@ -977,5 +977,19 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             ),
             updated_at: None,
         },
+        SystemSettingRecord {
+            key: "failover_chains".into(),
+            value: "".into(),
+            description: "Model-level failover chains (JSON). When the provider a source \
+                          model resolves to has no healthy credential, fall over to the first \
+                          backup provider/model with a healthy pool. Keyed by source model id; \
+                          each target names a backend provider and model directly. Empty = disabled. \
+                          Example: {\"claude-sonnet-4-5\":[{\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5-20250929\"}]}"
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"text","label":"Failover Chains (JSON)","group":"General","sort_order":30,"placeholder":"{\"src-model\":[{\"provider\":\"anthropic\",\"model\":\"...\"}]}"}"#.into(),
+            ),
+            updated_at: None,
+        },
     ]
 }

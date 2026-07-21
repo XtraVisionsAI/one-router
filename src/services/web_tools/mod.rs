@@ -1,6 +1,7 @@
 pub mod executor;
 pub mod fetch;
 pub mod search;
+pub mod ssrf;
 
 // Supported server tool versions (exact match required)
 pub const SUPPORTED_WEB_SEARCH_VERSIONS: &[&str] = &["web_search_20250305", "web_search_20260209"];

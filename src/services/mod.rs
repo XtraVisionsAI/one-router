@@ -3,7 +3,10 @@
 pub mod backend_pool;
 pub mod bedrock;
 pub mod capabilities;
+pub mod failover;
 pub mod gemini;
+pub mod image_url_fetcher;
+pub mod inference_profile;
 pub mod model_mapping;
 pub mod passthrough;
 pub mod ptc;

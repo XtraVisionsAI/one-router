@@ -202,7 +202,12 @@ mod request {
                                 parts.push(Part::text(text));
                             }
                             ContentBlock::Image { source, .. } => {
-                                parts.push(Part::inline_data(&source.media_type, &source.data));
+                                // URL sources are resolved to base64 upstream;
+                                // fall back to empty rather than panicking.
+                                parts.push(Part::inline_data(
+                                    source.media_type.as_deref().unwrap_or("image/png"),
+                                    source.data.as_deref().unwrap_or(""),
+                                ));
                             }
                             ContentBlock::ToolUse {
                                 id: _, name, input, ..

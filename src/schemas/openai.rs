@@ -353,7 +353,12 @@ pub struct AssistantMessage {
 /// Token usage statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionUsage {
-    /// Tokens in the prompt
+    /// Tokens in the prompt.
+    ///
+    /// Note: per the OpenAI spec this figure **includes** cached tokens (see
+    /// `prompt_tokens_details.cached_tokens`). Billing must subtract the cached
+    /// portion to avoid charging it at both the full input rate and the
+    /// cache-read rate.
     pub prompt_tokens: i32,
 
     /// Tokens in the completion
@@ -362,9 +367,37 @@ pub struct CompletionUsage {
     /// Total tokens used
     pub total_tokens: i32,
 
+    /// Detailed prompt token breakdown (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+
     /// Detailed completion token breakdown (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl CompletionUsage {
+    /// Number of prompt tokens served from cache (0 when unreported).
+    pub fn cached_tokens(&self) -> i32 {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0)
+    }
+
+    /// Non-cached prompt tokens — `prompt_tokens` with the cached portion
+    /// removed. Use this as the billable input token count so cached tokens
+    /// are priced only once (at the cache-read rate).
+    pub fn uncached_prompt_tokens(&self) -> i32 {
+        (self.prompt_tokens - self.cached_tokens()).max(0)
+    }
+}
+
+/// Detailed prompt token breakdown
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<i32>,
 }
 
 /// Detailed completion token breakdown
@@ -596,6 +629,31 @@ pub fn current_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_usage_cached_token_split() {
+        // prompt_tokens includes cached_tokens per the OpenAI spec.
+        let usage: CompletionUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,
+                "prompt_tokens_details":{"cached_tokens":800}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.cached_tokens(), 800);
+        assert_eq!(usage.uncached_prompt_tokens(), 200);
+    }
+
+    #[test]
+    fn test_usage_no_cache_details() {
+        let usage = CompletionUsage {
+            prompt_tokens: 500,
+            completion_tokens: 30,
+            total_tokens: 530,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        assert_eq!(usage.cached_tokens(), 0);
+        assert_eq!(usage.uncached_prompt_tokens(), 500);
+    }
 
     #[test]
     fn test_message_content_text() {

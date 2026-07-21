@@ -20,6 +20,26 @@ const DEFAULT_OUTPUT_PRICE: f64 = 15.0;
 const DEFAULT_CACHE_READ_PRICE: f64 = 0.30;
 const DEFAULT_CACHE_WRITE_PRICE: f64 = 3.75;
 
+/// Multiplier applied to the base input price for 1-hour cache writes.
+/// Anthropic prices a 1h cache write at 2× the base input token rate
+/// (vs. ~1.25× for the default 5-minute TTL).
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
+
+/// Resolve the per-token cache-write price given the effective TTL.
+/// 1-hour writes are priced at 2× the base input rate; every other TTL
+/// (5-minute default, unknown, or none) uses the model's stored write price.
+fn cache_write_price_for_ttl(
+    input_price: f64,
+    stored_write_price: f64,
+    cache_ttl: Option<&str>,
+) -> f64 {
+    if cache_ttl == Some("1h") {
+        input_price * CACHE_WRITE_1H_MULTIPLIER
+    } else {
+        stored_write_price
+    }
+}
+
 /// Service for tracking API usage statistics.
 #[derive(Clone)]
 pub struct UsageTracker {
@@ -48,6 +68,7 @@ impl UsageTracker {
         success: bool,
         provider: &str,
         protocol: &str,
+        cache_ttl: Option<&str>,
     ) -> Result<bool, UsageError> {
         let timestamp = Utc::now();
 
@@ -111,8 +132,23 @@ impl UsageTracker {
             protocol: Some(protocol.to_string()),
         };
 
-        let cost = self.calculate_cost(model, usage, key_info.cost_rate).await;
+        let cost = self
+            .calculate_cost(model, usage, key_info.cost_rate, cache_ttl)
+            .await;
         record.cost = cost;
+
+        // Prometheus metrics — bounded labels only (provider/protocol/model),
+        // never the API key. See `observability::metrics`.
+        crate::observability::metrics::record_request(provider, protocol, success);
+        crate::observability::metrics::record_tokens(
+            provider,
+            model,
+            record.input_tokens,
+            record.output_tokens,
+            record.cached_tokens,
+            record.cache_write_tokens,
+        );
+        crate::observability::metrics::record_cost(provider, model, cost);
 
         self.storage
             .usage()
@@ -142,7 +178,13 @@ impl UsageTracker {
         Ok(false)
     }
 
-    async fn calculate_cost(&self, model: &str, usage: &Usage, cost_rate: f64) -> f64 {
+    async fn calculate_cost(
+        &self,
+        model: &str,
+        usage: &Usage,
+        cost_rate: f64,
+        cache_ttl: Option<&str>,
+    ) -> f64 {
         let (input_price, output_price, cache_read_price, cache_write_price) =
             match self.model_mapping.get_pricing(model).await {
                 Some(prices) if prices.0 > 0.0 || prices.1 > 0.0 => prices,
@@ -162,9 +204,13 @@ impl UsageTracker {
             .map(|t| (t as f64) * cache_read_price / 1_000_000.0)
             .unwrap_or(0.0);
 
+        // 1-hour cache writes are priced at 2× the base input rate; the default
+        // (5-minute) TTL uses the model's stored cache-write price (~1.25× input).
+        let effective_write_price =
+            cache_write_price_for_ttl(input_price, cache_write_price, cache_ttl);
         let cache_write_cost = usage
             .cache_creation_input_tokens
-            .map(|t| (t as f64) * cache_write_price / 1_000_000.0)
+            .map(|t| (t as f64) * effective_write_price / 1_000_000.0)
             .unwrap_or(0.0);
 
         let base_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
@@ -203,5 +249,18 @@ mod tests {
         assert!(is_new_month(Some("2026-02"), "2026-03"));
         assert!(!is_new_month(Some("2026-03"), "2026-03"));
         assert!(is_new_month(None, "2026-03"));
+    }
+
+    #[test]
+    fn test_cache_write_price_for_ttl() {
+        // 1h → 2× input price, regardless of stored write price.
+        assert_eq!(cache_write_price_for_ttl(3.0, 3.75, Some("1h")), 6.0);
+        // 5m / unknown / none → stored write price.
+        assert_eq!(cache_write_price_for_ttl(3.0, 3.75, Some("5m")), 3.75);
+        assert_eq!(cache_write_price_for_ttl(3.0, 3.75, None), 3.75);
+        assert_eq!(
+            cache_write_price_for_ttl(3.0, 3.75, Some("passthrough")),
+            3.75
+        );
     }
 }

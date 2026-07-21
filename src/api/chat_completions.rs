@@ -160,6 +160,8 @@ struct UsageContext {
     provider: String,
     /// Shared state for streaming usage — handlers write, entry wrapper reads.
     stream_usage: Arc<tokio::sync::Mutex<StreamUsage>>,
+    /// Effective cache TTL (per-key override or global mode) for TTL-aware billing.
+    cache_ttl: Option<String>,
 }
 
 /// Wrap an SSE stream so that after the inner stream completes, usage is
@@ -174,6 +176,7 @@ fn wrap_stream_with_usage_recording(
     request_id: String,
     provider: String,
     protocol: &'static str,
+    cache_ttl: Option<String>,
 ) -> SseStream {
     use futures::StreamExt;
     let stream = async_stream::stream! {
@@ -190,7 +193,7 @@ fn wrap_stream_with_usage_recording(
         };
         drop(u);
         if let Err(e) = tracker
-            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true, &provider, protocol)
+            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true, &provider, protocol, cache_ttl.as_deref())
             .await
         {
             tracing::warn!(error = %e, "Failed to record streaming usage");
@@ -215,13 +218,13 @@ pub async fn chat_completions(
         crate::middleware::auth::ApiKeyInfo,
     >,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    Json(mut request): Json<ChatCompletionRequest>,
 ) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
     let start_time = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
     // Resolve model via model mapping (seed / database)
-    let resolved = match state.model_mapping.resolve(&request.model).await {
+    let mut resolved = match state.model_mapping.resolve(&request.model).await {
         Ok(r) => r,
         Err(_) => {
             return Err(OpenAIApiError::bad_request(format!(
@@ -231,8 +234,55 @@ pub async fn chat_completions(
         }
     };
 
+    // Credential-exhaustion failover (see `services::failover`). Applied before
+    // the provider-dependent branches below (image inlining, dispatch).
+    {
+        let dynamic = state.dynamic.read().await;
+        if !dynamic.failover_chains.is_empty() {
+            let (provider, model, switched) = dynamic.apply_failover(
+                &request.model,
+                &resolved.provider,
+                &resolved.target_model_id,
+            );
+            if switched {
+                tracing::warn!(
+                    request_id = %request_id,
+                    source_model = %request.model,
+                    from_provider = %resolved.provider,
+                    to_provider = %provider,
+                    to_model = %model,
+                    "Failover: primary provider unavailable, switched to backup"
+                );
+                resolved.provider = provider;
+                resolved.target_model_id = model;
+                resolved.capabilities = None;
+            }
+        }
+    }
+
+    // Bedrock/Gemini image blocks require inline base64; OpenAI passthrough
+    // handles external image URLs natively. Download and inline any external
+    // image URLs before conversion for the non-OpenAI providers.
+    if matches!(resolved.provider.as_str(), "bedrock" | "gemini") {
+        crate::services::image_url_fetcher::resolve_openai_image_urls(&mut request)
+            .await
+            .map_err(OpenAIApiError::bad_request)?;
+    }
+
     // Build usage tracking context for handlers
     let stream_usage = Arc::new(tokio::sync::Mutex::new(StreamUsage::default()));
+    // Resolve the effective cache TTL for billing: per-key override wins,
+    // otherwise the global prompt_cache mode's TTL (5m/1h) if any.
+    let effective_cache_ttl = match key_info.cache_ttl.clone() {
+        Some(ttl) => Some(ttl),
+        None => state
+            .dynamic
+            .read()
+            .await
+            .prompt_cache_mode
+            .ttl_str()
+            .map(|s| s.to_string()),
+    };
     let usage_ctx = UsageContext {
         tracker: state.usage_tracker.clone(),
         key_info: key_info.clone(),
@@ -240,6 +290,7 @@ pub async fn chat_completions(
         request_id: request_id.clone(),
         provider: resolved.provider.clone(),
         stream_usage: stream_usage.clone(),
+        cache_ttl: effective_cache_ttl.clone(),
     };
 
     // Route based on provider
@@ -290,10 +341,16 @@ pub async fn chat_completions(
     // Record usage for non-streaming responses; wrap streams for deferred recording
     match result {
         Ok(ChatCompletionApiResponse::Json(ref json_resp)) => {
-            let usage = crate::schemas::anthropic::Usage::new(
-                json_resp.usage.prompt_tokens,
+            // OpenAI's prompt_tokens includes cached tokens; split them out so
+            // the cached portion is billed at the cache-read rate, not full input.
+            let mut usage = crate::schemas::anthropic::Usage::new(
+                json_resp.usage.uncached_prompt_tokens(),
                 json_resp.usage.completion_tokens,
             );
+            let cached = json_resp.usage.cached_tokens();
+            if cached > 0 {
+                usage.cache_read_input_tokens = Some(cached);
+            }
             let ctx = usage_ctx;
             tokio::spawn(async move {
                 if let Err(e) = ctx
@@ -306,6 +363,7 @@ pub async fn chat_completions(
                         true,
                         &ctx.provider,
                         "openai",
+                        ctx.cache_ttl.as_deref(),
                     )
                     .await
                 {
@@ -324,6 +382,7 @@ pub async fn chat_completions(
                 request_id,
                 resolved.provider.clone(),
                 "openai",
+                effective_cache_ttl.clone(),
             );
             Ok(ChatCompletionApiResponse::Stream(wrapped))
         }
@@ -370,8 +429,15 @@ async fn handle_bedrock_request(
         ));
     }
 
+    // Resolve application inference profile ARNs to the underlying model for the
+    // routing decision. The invocation below still uses the original ARN.
+    let routing_model_id = bedrock
+        .resolve_routing_model_id(target_model_id)
+        .await
+        .map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
+
     // ── Claude path: OpenAI → Anthropic → InvokeModel ──────────────────────
-    if crate::services::BedrockService::is_claude_model(target_model_id) {
+    if crate::services::BedrockService::is_claude_model(&routing_model_id) {
         use crate::converters::anthropic_openai::OpenAIToAnthropicConverter;
 
         let converter = OpenAIToAnthropicConverter::new();
@@ -779,6 +845,7 @@ async fn create_openai_streaming_response(
                                 prompt_tokens: total_input_tokens,
                                 completion_tokens: total_output_tokens,
                                 total_tokens: total_input_tokens + total_output_tokens,
+                                prompt_tokens_details: None,
                                 completion_tokens_details: None,
                             }),
                         };
@@ -1332,6 +1399,7 @@ async fn proxy_openai_sse_stream(
         let mut got_done = false;
         let mut prompt_tokens: i32 = 0;
         let mut completion_tokens: i32 = 0;
+        let mut cached_tokens: i32 = 0;
 
         'outer: loop {
             match response.chunk().await {
@@ -1357,6 +1425,15 @@ async fn proxy_openai_sse_stream(
                                         }
                                         if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
                                             completion_tokens = v as i32;
+                                        }
+                                        // OpenAI reports cached prompt tokens under
+                                        // prompt_tokens_details.cached_tokens (included in prompt_tokens).
+                                        if let Some(v) = usage
+                                            .get("prompt_tokens_details")
+                                            .and_then(|d| d.get("cached_tokens"))
+                                            .and_then(|v| v.as_i64())
+                                        {
+                                            cached_tokens = v as i32;
                                         }
                                     }
                                 }
@@ -1392,8 +1469,13 @@ async fn proxy_openai_sse_stream(
 
         {
             let mut u = usage_ctx.stream_usage.lock().await;
-            u.input_tokens = prompt_tokens;
+            // Split cached tokens out of the billable input count (OpenAI's
+            // prompt_tokens includes them) so they bill at the cache-read rate.
+            u.input_tokens = (prompt_tokens - cached_tokens).max(0);
             u.output_tokens = completion_tokens;
+            if cached_tokens > 0 {
+                u.cache_read_input_tokens = Some(cached_tokens);
+            }
         }
     };
 

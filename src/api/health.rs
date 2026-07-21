@@ -53,3 +53,17 @@ pub async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<Readi
 pub async fn liveness() -> Json<LivenessResponse> {
     Json(LivenessResponse { alive: true })
 }
+
+/// Prometheus scrape endpoint. Returns the text exposition format.
+///
+/// Unauthenticated by design (standard for Prometheus scrape targets); protect
+/// at the network layer. It exposes only aggregate counters (tokens, cost,
+/// request counts) with bounded labels — never API keys or request content.
+pub async fn metrics() -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    let body = crate::observability::metrics::gather();
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    )
+}

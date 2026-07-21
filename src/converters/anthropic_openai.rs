@@ -920,6 +920,7 @@ impl OpenAIToAnthropicConverter {
             prompt_tokens: response.usage.input_tokens,
             completion_tokens: response.usage.output_tokens,
             total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+            prompt_tokens_details: None,
             completion_tokens_details: None,
         };
 
@@ -1173,6 +1174,7 @@ impl OpenAIToAnthropicConverter {
                                 prompt_tokens: input_tokens,
                                 completion_tokens: output_tokens,
                                 total_tokens: input_tokens + output_tokens,
+                                prompt_tokens_details: None,
                                 completion_tokens_details: None,
                             })
                         } else {

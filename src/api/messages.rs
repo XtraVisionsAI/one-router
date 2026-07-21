@@ -150,13 +150,13 @@ pub async fn create_message(
     State(state): State<AppState>,
     Extension(key_info): Extension<ApiKeyInfo>,
     headers: HeaderMap,
-    Json(request): Json<MessageRequest>,
+    Json(mut request): Json<MessageRequest>,
 ) -> Result<MessageApiResponse, ApiError> {
     let start_time = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
     // Resolve model via data-driven routing
-    let resolved = match state.model_mapping.resolve(&request.model).await {
+    let mut resolved = match state.model_mapping.resolve(&request.model).await {
         Ok(r) => r,
         Err(_) => {
             return Err(ApiError::bad_request(format!(
@@ -165,6 +165,46 @@ pub async fn create_message(
             )))
         }
     };
+
+    // Credential-exhaustion failover: if the resolved provider has no healthy
+    // credential and a failover chain is configured for this source model,
+    // switch to the first available backup provider/model. Must happen before
+    // the provider-dependent branches below (image inlining, web tools, dispatch).
+    {
+        let dynamic = state.dynamic.read().await;
+        if !dynamic.failover_chains.is_empty() {
+            let (provider, model, switched) = dynamic.apply_failover(
+                &request.model,
+                &resolved.provider,
+                &resolved.target_model_id,
+            );
+            if switched {
+                tracing::warn!(
+                    request_id = %request_id,
+                    source_model = %request.model,
+                    from_provider = %resolved.provider,
+                    to_provider = %provider,
+                    to_model = %model,
+                    "Failover: primary provider unavailable, switched to backup"
+                );
+                resolved.provider = provider;
+                resolved.target_model_id = model;
+                // The failover target names a backend model directly (not routed
+                // through model_mapping), so per-model capabilities do not apply;
+                // fall back to the gateway default capabilities.
+                resolved.capabilities = None;
+            }
+        }
+    }
+
+    // Bedrock/Gemini image blocks require inline base64; the Anthropic/OpenAI
+    // passthroughs accept url image sources natively. Download and inline any
+    // url image sources before conversion for the non-passthrough providers.
+    if matches!(resolved.provider.as_str(), "bedrock" | "gemini") {
+        crate::services::image_url_fetcher::resolve_anthropic_image_urls(&mut request)
+            .await
+            .map_err(ApiError::bad_request)?;
+    }
 
     tracing::info!(
         request_id = %request_id,
@@ -228,7 +268,16 @@ pub async fn create_message(
             let provider = resolved.provider.clone();
             tokio::spawn(async move {
                 if let Err(e) = tracker
-                    .record_usage(&key, &rid, &model, &usage, true, &provider, "anthropic")
+                    .record_usage(
+                        &key,
+                        &rid,
+                        &model,
+                        &usage,
+                        true,
+                        &provider,
+                        "anthropic",
+                        key.cache_ttl.as_deref(),
+                    )
                     .await
                 {
                     tracing::warn!(error = %e, "Failed to record PTC usage");
@@ -253,6 +302,18 @@ pub async fn create_message(
 
     // Build usage tracking context for handlers
     let stream_usage = Arc::new(tokio::sync::Mutex::new(StreamUsage::default()));
+    // Resolve the effective cache TTL for billing: per-key override wins,
+    // otherwise the global prompt_cache mode's TTL (5m/1h) if any.
+    let effective_cache_ttl = match key_info.cache_ttl.clone() {
+        Some(ttl) => Some(ttl),
+        None => state
+            .dynamic
+            .read()
+            .await
+            .prompt_cache_mode
+            .ttl_str()
+            .map(|s| s.to_string()),
+    };
     let usage_ctx = UsageContext {
         tracker: state.usage_tracker.clone(),
         key_info: key_info.clone(),
@@ -260,6 +321,7 @@ pub async fn create_message(
         request_id: request_id.clone(),
         provider: resolved.provider.clone(),
         stream_usage: stream_usage.clone(),
+        cache_ttl: effective_cache_ttl.clone(),
     };
 
     // ========================================================================
@@ -331,6 +393,7 @@ pub async fn create_message(
                 request_id,
                 resolved.provider.clone(),
                 "anthropic",
+                effective_cache_ttl.clone(),
             );
             return Ok(MessageApiResponse::Stream(wrapped));
         }
@@ -359,6 +422,7 @@ pub async fn create_message(
                     true,
                     &ctx.provider,
                     "anthropic",
+                    ctx.cache_ttl.as_deref(),
                 )
                 .await
             {
@@ -435,6 +499,7 @@ pub async fn create_message(
                         true,
                         &ctx.provider,
                         "anthropic",
+                        ctx.cache_ttl.as_deref(),
                     )
                     .await
                 {
@@ -453,6 +518,7 @@ pub async fn create_message(
                 request_id,
                 resolved.provider.clone(),
                 "anthropic",
+                effective_cache_ttl.clone(),
             );
             Ok(MessageApiResponse::Stream(wrapped))
         }
@@ -479,6 +545,8 @@ struct UsageContext {
     provider: String,
     /// Shared state for streaming usage — handlers write, entry wrapper reads.
     stream_usage: Arc<tokio::sync::Mutex<StreamUsage>>,
+    /// Effective cache TTL (per-key override or global mode) for TTL-aware billing.
+    cache_ttl: Option<String>,
 }
 
 /// Wrap an SSE stream so that after the inner stream completes, usage is
@@ -493,6 +561,7 @@ fn wrap_stream_with_usage_recording(
     request_id: String,
     provider: String,
     protocol: &'static str,
+    cache_ttl: Option<String>,
 ) -> SseStream {
     use futures::StreamExt;
     let stream = async_stream::stream! {
@@ -509,7 +578,7 @@ fn wrap_stream_with_usage_recording(
         };
         drop(u);
         if let Err(e) = tracker
-            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true, &provider, protocol)
+            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true, &provider, protocol, cache_ttl.as_deref())
             .await
         {
             tracing::warn!(error = %e, "Failed to record streaming usage");
@@ -538,8 +607,15 @@ async fn handle_bedrock_request(
 
     let bedrock_model = target_model_id;
 
+    // Resolve application inference profile ARNs to the underlying model for the
+    // routing decision. The invocation below still uses the original ARN.
+    let routing_model_id = bedrock
+        .resolve_routing_model_id(target_model_id)
+        .await
+        .map_err(|e| ApiError::from_bedrock_error(&e))?;
+
     // Non-Claude models → Bedrock OpenAI Compat endpoint (Bedrock Mantle)
-    if !crate::services::BedrockService::is_claude_model(target_model_id) {
+    if !crate::services::BedrockService::is_claude_model(&routing_model_id) {
         tracing::debug!(
             request_id = %request_id,
             target_model = %target_model_id,
@@ -1553,8 +1629,8 @@ fn print_request_prompts(request_id: &str, request: &MessageRequest) {
                         ContentBlock::Image { source, .. } => {
                             output.push_str(&format!(
                                 "[Image: {} bytes, type: {}]",
-                                source.data.len(),
-                                source.media_type
+                                source.data.as_deref().map(|d| d.len()).unwrap_or(0),
+                                source.media_type.as_deref().unwrap_or("url")
                             ));
                         }
                         ContentBlock::ToolUse {

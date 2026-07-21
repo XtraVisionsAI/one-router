@@ -108,6 +108,7 @@ Managed via Admin UI or `PUT /admin/api/settings/:key`. Changes take effect **im
 | `web_search_api_key` | _(empty)_ | API key for web search provider |
 | `web_fetch_max_content_kb` | `512` | Max content size (KB) for web_fetch tool |
 | `web_fetch_provider` | _(empty)_ | Fetch method: `tavily` (Tavily Extract API) / empty (direct HTTP) |
+| `failover_chains` | _(empty)_ | Model-level failover chains (JSON). `{"<source_model>":[{"provider":"...","model":"..."}]}`. When the resolved provider has no healthy credential, fall over to the first backup provider/model with a healthy pool. Empty = disabled |
 
 ---
 
@@ -122,7 +123,7 @@ src/
 │   ├── embeddings.rs            # POST /v1/embeddings
 │   ├── images.rs                # POST /v1/images/generations
 │   ├── rerank.rs                # POST /v1/rerank
-│   ├── health.rs                # GET /health /ready /liveness
+│   ├── health.rs                # GET /health /ready /liveness /metrics
 │   ├── models.rs                # GET /v1/models
 │   ├── usage.rs                 # GET /v1/usage
 │   ├── ptc_handler.rs           # PTC orchestration
@@ -161,7 +162,10 @@ src/
 │   ├── model_mapping.rs         # Model ID resolution with moka cache
 │   ├── usage_tracker.rs         # Token usage recording with per-model pricing
 │   ├── capabilities.rs          # Model capability system
+│   ├── failover.rs              # Model-level credential-exhaustion failover chains
 │   ├── service_tier.rs          # Service tier resolution
+│   ├── inference_profile.rs     # Bedrock application inference profile ARN resolution
+│   ├── image_url_fetcher.rs     # Image URL → base64 (SSRF-guarded)
 │   ├── update.rs                # Self-update from GitHub Releases
 │   ├── backend_pool/            # Credential pool & load balancing
 │   ├── ptc/                     # Programmatic Tool Calling (Docker sandbox)
@@ -186,6 +190,8 @@ src/
 │   ├── auth.rs                  # API key auth (HMAC hash lookup)
 │   ├── admin_auth.rs            # Admin key auth
 │   └── rate_limit.rs            # Rate limiting (governor)
+├── observability/
+│   └── metrics.rs               # Prometheus registry + /metrics (bounded labels, no api_key)
 ├── error/
 │   └── types.rs                 # ApiError enum
 ├── config/
@@ -438,3 +444,5 @@ Multiple credentials per backend are supported. Strategies:
 - `WebToolBackend` trait abstracts the LLM call in the web tool loop — `BedrockService` and `GeminiWebToolBackend` implement it.
 - `CodeExecutor` trait (in `ptc/sandbox.rs`) provides one-shot code execution. `OneshotExecutor` creates a container per call. Used by Dynamic Filtering (`web_search_20260209`).
 - Bedrock `invoke_model_messages` auto-retries without `service_tier` if the initial call fails with a tier-related ValidationError.
+- **Failover** (`services/failover.rs`): configured via the `failover_chains` setting. `DynamicConfig::apply_failover` runs right after `resolve()` in both handlers — if the resolved provider has no healthy credential (`provider_available` → `PoolStats::is_healthy()`), it switches to the first backup provider/model with a healthy pool. Credential-*exhaustion* failover only (not per-response retry). Exempt from the cache-affinity lock (the primary is unusable, so no cache benefit is lost). Failover targets bypass model_mapping and use default capabilities.
+- **Metrics** (`observability/metrics.rs`): unauthenticated `GET /metrics` (Prometheus text format). Counters recorded from `UsageTracker::record_usage` + an HTTP-duration middleware. Labels are bounded (`provider`/`protocol`/`model`/`direction`/`status`) — the API key is **never** a label.

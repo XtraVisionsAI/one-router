@@ -9,6 +9,7 @@ pub mod converters;
 pub mod database;
 pub mod error;
 pub mod middleware;
+pub mod observability;
 pub mod schemas;
 pub mod server;
 pub mod services;
