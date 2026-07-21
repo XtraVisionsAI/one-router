@@ -30,6 +30,8 @@ struct Metrics {
     tokens_total: IntCounterVec,
     /// Cumulative cost in USD, labeled by provider and model.
     cost_usd_total: CounterVec,
+    /// Failover switches, labeled by the from/to provider.
+    failover_total: IntCounterVec,
     /// HTTP request duration in seconds, labeled by status class (2xx/4xx/5xx).
     http_request_duration: HistogramVec,
 }
@@ -65,6 +67,15 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let failover_total = IntCounterVec::new(
+            Opts::new(
+                "onerouter_failover_total",
+                "Credential-exhaustion failover switches, by from/to provider",
+            ),
+            &["from", "to"],
+        )
+        .expect("valid metric");
+
         let http_request_duration = HistogramVec::new(
             HistogramOpts::new(
                 "onerouter_http_request_duration_seconds",
@@ -87,6 +98,9 @@ impl Metrics {
             .register(Box::new(cost_usd_total.clone()))
             .expect("register cost_usd_total");
         registry
+            .register(Box::new(failover_total.clone()))
+            .expect("register failover_total");
+        registry
             .register(Box::new(http_request_duration.clone()))
             .expect("register http_request_duration");
 
@@ -95,6 +109,7 @@ impl Metrics {
             requests_total,
             tokens_total,
             cost_usd_total,
+            failover_total,
             http_request_duration,
         }
     }
@@ -147,6 +162,14 @@ pub fn record_cost(provider: &str, model: &str, cost: f64) {
     }
 }
 
+/// Record one credential-exhaustion failover switch (primary → backup provider).
+pub fn record_failover(from_provider: &str, to_provider: &str) {
+    metrics()
+        .failover_total
+        .with_label_values(&[from_provider, to_provider])
+        .inc();
+}
+
 /// Observe an HTTP request duration, bucketed by status class (2xx/4xx/5xx).
 pub fn observe_http(status: u16, elapsed_secs: f64) {
     let class = match status {
@@ -184,12 +207,14 @@ mod tests {
         record_request("bedrock", "anthropic", false);
         record_tokens("bedrock", "claude-x", 100, 50, 10, 0);
         record_cost("bedrock", "claude-x", 0.0123);
+        record_failover("bedrock", "anthropic");
         observe_http(200, 0.42);
 
         let out = gather();
         assert!(out.contains("onerouter_requests_total"));
         assert!(out.contains("onerouter_tokens_total"));
         assert!(out.contains("onerouter_cost_usd_total"));
+        assert!(out.contains("onerouter_failover_total"));
         assert!(out.contains("onerouter_http_request_duration_seconds"));
         // provider/status labels are present; api_key is never a label.
         assert!(out.contains("provider=\"bedrock\""));

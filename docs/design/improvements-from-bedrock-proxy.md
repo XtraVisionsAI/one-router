@@ -267,7 +267,7 @@ Request (root span)
 | F2 Beta header 自动注入 | `bedrock.rs::build_invoke_model_body`（`defer_loading` → `advanced-tool-use-2025-11-20`） |
 | F4 Prometheus /metrics | `observability/metrics.rs` + `GET /metrics`（无鉴权，label 只用 provider/protocol/model/direction/status，**刻意不含 api_key**——不照抄参考的高基数反模式） |
 | F7 启动配置体检 | `config/settings.rs::security_warnings()`（弱 key 黑名单等，仅警告） |
-| F3/R1 模型级 failover 链 | `services/failover.rs` + `DynamicConfig::{provider_available, apply_failover}`；配置存 `failover_chains` 设置项（JSON，热加载）；触发条件 = 主 provider 池无健康凭证（`PoolStats::is_healthy()`）。**关键实现细节：`get_next()` 永不返回 None（最后兜底返回首个凭证），故健康信号用 `healthy_count>0` 而非 `get_next().is_some()`。** 空/未知 provider 按 handler 语义归一到 bedrock |
+| F3/R1 模型级 failover 链 | `services/failover.rs` + `DynamicConfig::{provider_available, apply_failover}`；配置存 `failover_chains` 设置项（JSON，热加载）；触发条件 = 主 provider 池无健康凭证（`PoolStats::is_healthy()`）。**关键实现细节：`get_next()` 永不返回 None（最后兜底返回首个凭证），故健康信号用 `healthy_count>0` 而非 `get_next().is_some()`。** 空/未知 provider 按 handler 语义归一到 bedrock。**PTC 请求跳过 failover**（Bedrock/Docker 专属，前置 `is_ptc` 判定）。每次切换计入 `onerouter_failover_total{from,to}` |
 
 **R1 与 cache-affinity 红线的关系（已裁定）**：耗尽式 failover **豁免**红线 #1。红线针对的是「为省钱主动换模型」，而 failover 触发时主 provider 已不可用，其缓存前缀本就无法命中，不存在被牺牲的缓存收益——只是把硬 503 换成可用后端。此豁免在 `services/failover.rs` 模块注释中明确记录。
 

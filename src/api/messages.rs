@@ -166,11 +166,26 @@ pub async fn create_message(
         }
     };
 
+    // Extract beta headers for feature flags.
+    let beta_header = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // PTC requests are Bedrock/Docker-specific and must NOT be failed over to a
+    // different provider; detect PTC up front so failover can skip it.
+    let is_ptc = state
+        .ptc_service
+        .as_ref()
+        .map(|svc| svc.is_ptc_request(&request, beta_header.as_deref()))
+        .unwrap_or(false);
+
     // Credential-exhaustion failover: if the resolved provider has no healthy
     // credential and a failover chain is configured for this source model,
     // switch to the first available backup provider/model. Must happen before
     // the provider-dependent branches below (image inlining, web tools, dispatch).
-    {
+    // Skipped for PTC (see above).
+    if !is_ptc {
         let dynamic = state.dynamic.read().await;
         if !dynamic.failover_chains.is_empty() {
             let (provider, model, switched) = dynamic.apply_failover(
@@ -187,6 +202,7 @@ pub async fn create_message(
                     to_model = %model,
                     "Failover: primary provider unavailable, switched to backup"
                 );
+                crate::observability::metrics::record_failover(&resolved.provider, &provider);
                 resolved.provider = provider;
                 resolved.target_model_id = model;
                 // The failover target names a backend model directly (not routed
@@ -225,72 +241,64 @@ pub async fn create_message(
         print_request_prompts(&request_id, &request);
     }
 
-    // Extract beta headers for feature flags
-    let beta_header = headers
-        .get("anthropic-beta")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    // PTC detection: check before normal routing (see `is_ptc` above).
+    // `is_ptc` is only true when ptc_service is configured.
+    if is_ptc {
+        tracing::info!(request_id, "Detected PTC request");
 
-    // PTC detection: check before normal routing
-    if let Some(ref ptc_svc) = state.ptc_service {
-        if ptc_svc.is_ptc_request(&request, beta_header.as_deref()) {
-            tracing::info!(request_id, "Detected PTC request");
+        let ptc_result = if let Some(ref container_id) = request.container {
+            crate::api::ptc_handler::handle_ptc_continuation(
+                &state,
+                &request,
+                &resolved.target_model_id,
+                &request_id,
+                container_id,
+                &key_info,
+            )
+            .await
+        } else {
+            crate::api::ptc_handler::handle_ptc_request(
+                &state,
+                &request,
+                &resolved.target_model_id,
+                &request_id,
+                &key_info,
+            )
+            .await
+        };
 
-            let ptc_result = if let Some(ref container_id) = request.container {
-                crate::api::ptc_handler::handle_ptc_continuation(
-                    &state,
-                    &request,
-                    &resolved.target_model_id,
-                    &request_id,
-                    container_id,
-                    &key_info,
+        let response = ptc_result?;
+
+        // Record usage
+        let usage = response.usage.clone();
+        let tracker = state.usage_tracker.clone();
+        let key = key_info.clone();
+        let model = request.model.clone();
+        let rid = request_id.clone();
+        let provider = resolved.provider.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tracker
+                .record_usage(
+                    &key,
+                    &rid,
+                    &model,
+                    &usage,
+                    true,
+                    &provider,
+                    "anthropic",
+                    key.cache_ttl.as_deref(),
                 )
                 .await
-            } else {
-                crate::api::ptc_handler::handle_ptc_request(
-                    &state,
-                    &request,
-                    &resolved.target_model_id,
-                    &request_id,
-                    &key_info,
-                )
-                .await
-            };
-
-            let response = ptc_result?;
-
-            // Record usage
-            let usage = response.usage.clone();
-            let tracker = state.usage_tracker.clone();
-            let key = key_info.clone();
-            let model = request.model.clone();
-            let rid = request_id.clone();
-            let provider = resolved.provider.clone();
-            tokio::spawn(async move {
-                if let Err(e) = tracker
-                    .record_usage(
-                        &key,
-                        &rid,
-                        &model,
-                        &usage,
-                        true,
-                        &provider,
-                        "anthropic",
-                        key.cache_ttl.as_deref(),
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "Failed to record PTC usage");
-                }
-            });
-
-            if request.stream {
-                return Ok(MessageApiResponse::Stream(response_to_sse_stream(response)));
+            {
+                tracing::warn!(error = %e, "Failed to record PTC usage");
             }
-            return Ok(MessageApiResponse::Json(Json(response)));
-        }
-    }
+        });
 
+        if request.stream {
+            return Ok(MessageApiResponse::Stream(response_to_sse_stream(response)));
+        }
+        return Ok(MessageApiResponse::Json(Json(response)));
+    }
     // Route to appropriate backend based on resolved provider
     let default_capabilities = state.dynamic.read().await.default_capabilities.clone();
     let effective_caps = resolved

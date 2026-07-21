@@ -253,6 +253,7 @@ pub async fn chat_completions(
                     to_model = %model,
                     "Failover: primary provider unavailable, switched to backup"
                 );
+                crate::observability::metrics::record_failover(&resolved.provider, &provider);
                 resolved.provider = provider;
                 resolved.target_model_id = model;
                 resolved.capabilities = None;
