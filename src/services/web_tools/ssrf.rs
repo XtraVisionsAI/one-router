@@ -45,6 +45,8 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || o[0] == 0 // 0.0.0.0/8 "this network"
                 || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64.0.0/10 carrier-grade NAT
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol assignments
+                || (o[0] == 198 && (o[1] & 0xFE) == 18) // 198.18.0.0/15 benchmarking
+                || o[0] >= 240 // 240.0.0.0/4 reserved/future use (incl. 255.255.255.255)
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
@@ -259,6 +261,10 @@ mod tests {
         assert!(forbidden("192.168.1.1"));
         assert!(forbidden("100.64.0.1")); // CGNAT
         assert!(forbidden("0.0.0.0"));
+        assert!(forbidden("198.18.0.1")); // benchmarking 198.18.0.0/15
+        assert!(forbidden("198.19.255.255")); // benchmarking (upper half)
+        assert!(forbidden("240.0.0.1")); // reserved 240.0.0.0/4
+        assert!(forbidden("255.255.255.255")); // broadcast / reserved
         assert!(forbidden("::1"));
         assert!(forbidden("fc00::1")); // unique local
         assert!(forbidden("fe80::1")); // link-local

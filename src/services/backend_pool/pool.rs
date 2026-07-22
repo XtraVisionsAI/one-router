@@ -239,6 +239,31 @@ impl<C: Credential> CredentialPool<C> {
         false
     }
 
+    /// Record a rate-limit (HTTP 429) for a credential.
+    ///
+    /// Unlike [`record_failure`](Self::record_failure), a 429 disables the
+    /// credential *immediately* rather than after `max_failures` consecutive
+    /// failures. A rate-limited credential is unusable right now regardless of
+    /// how many prior failures it had, so eager cooldown lets failover switch to
+    /// a healthy pool without burning `max_failures - 1` more doomed requests.
+    /// The credential re-enters rotation after `retry_after_secs` via
+    /// [`try_recover_credential`](Self::try_recover_credential), or immediately
+    /// on the next `record_success`.
+    ///
+    /// Always returns `true` (the credential is now disabled).
+    pub fn record_rate_limited(&self, name: &str) -> bool {
+        if let Some(cred) = self.credentials.iter().find(|c| c.name() == name) {
+            cred.record_failure();
+            cred.disable();
+            tracing::warn!(
+                credential = name,
+                "Credential disabled due to rate limit (429), cooling down"
+            );
+            return true;
+        }
+        false
+    }
+
     /// Manually disable a credential
     pub fn disable(&self, name: &str) {
         if let Some(cred) = self.credentials.iter().find(|c| c.name() == name) {
@@ -395,6 +420,27 @@ mod tests {
         // Pool should now use secondary
         let selected = pool.get_next().unwrap();
         assert_eq!(selected.name(), "secondary");
+    }
+
+    #[test]
+    fn test_record_rate_limited_disables_immediately() {
+        // max_failures=5, but a single 429 should disable the credential right away.
+        let pool = CredentialPool::new(
+            create_test_credentials(),
+            PoolConfig::new(LoadBalanceStrategy::Failover).with_max_failures(5),
+        );
+
+        assert!(pool.record_rate_limited("primary"));
+        assert!(!pool.get_by_name("primary").unwrap().is_enabled());
+
+        // Failover to secondary.
+        let selected = pool.get_next().unwrap();
+        assert_eq!(selected.name(), "secondary");
+
+        // A later success re-enables and clears the cooldown.
+        pool.record_success("primary");
+        assert!(pool.get_by_name("primary").unwrap().is_enabled());
+        assert_eq!(pool.get_by_name("primary").unwrap().failure_count(), 0);
     }
 
     #[test]

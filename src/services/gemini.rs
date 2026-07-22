@@ -182,6 +182,11 @@ impl GeminiService {
         self.credential_pool.record_failure(credential_name)
     }
 
+    /// Record a rate-limit (429) — disables the credential immediately for cooldown.
+    pub fn record_rate_limited(&self, credential_name: &str) -> bool {
+        self.credential_pool.record_rate_limited(credential_name)
+    }
+
     /// Get pool statistics
     pub fn pool_stats(&self) -> crate::services::backend_pool::PoolStats {
         self.credential_pool.stats()
@@ -240,7 +245,14 @@ impl GeminiService {
                     let error_text = resp.text().await.unwrap_or_default();
 
                     // Record failure for rate limit or server errors
-                    if status.as_u16() == 429 || status.as_u16() >= 500 {
+                    if status.as_u16() == 429 {
+                        // Rate limit: cool down immediately so failover can switch pools.
+                        self.record_rate_limited(&credential_name);
+                        tracing::warn!(
+                            credential = %credential_name,
+                            "Credential rate-limited (429), cooling down"
+                        );
+                    } else if status.as_u16() >= 500 {
                         let disabled = self.record_failure(&credential_name);
                         if disabled {
                             tracing::warn!(
@@ -325,7 +337,14 @@ impl GeminiService {
                 if !status.is_success() {
                     let error_text = resp.text().await.unwrap_or_default();
 
-                    if status.as_u16() == 429 || status.as_u16() >= 500 {
+                    if status.as_u16() == 429 {
+                        // Rate limit: cool down immediately so failover can switch pools.
+                        self.record_rate_limited(&credential_name);
+                        tracing::warn!(
+                            credential = %credential_name,
+                            "Credential rate-limited (429), cooling down"
+                        );
+                    } else if status.as_u16() >= 500 {
                         let disabled = self.record_failure(&credential_name);
                         if disabled {
                             tracing::warn!(
@@ -409,7 +428,14 @@ impl GeminiService {
                     let error_text = resp.text().await.unwrap_or_default();
 
                     // Record failure for rate limit or server errors
-                    if status.as_u16() == 429 || status.as_u16() >= 500 {
+                    if status.as_u16() == 429 {
+                        // Rate limit: cool down immediately so failover can switch pools.
+                        self.record_rate_limited(&credential_name);
+                        tracing::warn!(
+                            credential = %credential_name,
+                            "Credential rate-limited (429), cooling down"
+                        );
+                    } else if status.as_u16() >= 500 {
                         let disabled = self.record_failure(&credential_name);
                         if disabled {
                             tracing::warn!(

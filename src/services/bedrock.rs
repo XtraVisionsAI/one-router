@@ -88,6 +88,23 @@ impl BedrockService {
         self.pool.record_failure(name);
     }
 
+    /// Record a rate-limit (throttle) — disables the credential immediately for cooldown.
+    pub fn record_rate_limited(&self, name: &str) {
+        self.pool.record_rate_limited(name);
+    }
+
+    /// Record a credential failure from a Bedrock error, using eager cooldown for
+    /// throttling: a `ThrottlingException` disables the credential immediately (like
+    /// an HTTP 429) so failover can switch to a healthy pool, rather than burning
+    /// `max_failures` doomed requests on a throttled credential.
+    fn record_bedrock_error(&self, name: &str, err: &BedrockError) {
+        if matches!(err, BedrockError::Throttled(_)) {
+            self.record_rate_limited(name);
+        } else {
+            self.record_failure(name);
+        }
+    }
+
     pub fn pool_stats(&self) -> crate::services::backend_pool::PoolStats {
         self.pool.stats()
     }
@@ -135,8 +152,9 @@ impl BedrockService {
         }
 
         let result = converse_request.send().await.map_err(|e| {
-            self.record_failure(&cred_name);
-            BedrockError::from_converse_error(e)
+            let err = BedrockError::from_converse_error(e);
+            self.record_bedrock_error(&cred_name, &err);
+            err
         })?;
 
         self.record_success(&cred_name);
@@ -176,8 +194,9 @@ impl BedrockService {
         }
 
         let result = converse_request.send().await.map_err(|e| {
-            self.record_failure(&cred_name);
-            BedrockError::from_converse_stream_error(e)
+            let err = BedrockError::from_converse_stream_error(e);
+            self.record_bedrock_error(&cred_name, &err);
+            err
         })?;
 
         // Note: success/failure for streaming is tracked by the caller
@@ -211,8 +230,9 @@ impl BedrockService {
             .send()
             .await
             .map_err(|e| {
-                self.record_failure(&cred_name);
-                BedrockError::from_invoke_model_error(e)
+                let err = BedrockError::from_invoke_model_error(e);
+                self.record_bedrock_error(&cred_name, &err);
+                err
             })?;
 
         self.record_success(&cred_name);
@@ -284,8 +304,9 @@ impl BedrockService {
                         .send()
                         .await
                         .map_err(|e2| {
-                            self.record_failure(&cred_name);
-                            BedrockError::from_invoke_model_error(e2)
+                            let err2 = BedrockError::from_invoke_model_error(e2);
+                            self.record_bedrock_error(&cred_name, &err2);
+                            err2
                         })?;
                     self.record_success(&cred_name);
                     let response_bytes = retry_result.body().as_ref();
@@ -298,7 +319,7 @@ impl BedrockService {
                         ))
                     })
                 } else {
-                    self.record_failure(&cred_name);
+                    self.record_bedrock_error(&cred_name, &err);
                     Err(err)
                 }
             }
@@ -336,8 +357,9 @@ impl BedrockService {
             .send()
             .await
             .map_err(|e| {
-                self.record_failure(&cred_name);
-                BedrockError::from_invoke_model_stream_error(e)
+                let err = BedrockError::from_invoke_model_stream_error(e);
+                self.record_bedrock_error(&cred_name, &err);
+                err
             })?;
 
         Ok(InvokeModelStreamResponse {
@@ -499,7 +521,9 @@ impl BedrockService {
         })?;
 
         let status = response.status().as_u16();
-        if status == 429 || status >= 500 {
+        if status == 429 {
+            self.record_rate_limited(&cred_name);
+        } else if status >= 500 {
             self.record_failure(&cred_name);
         } else {
             self.record_success(&cred_name);
@@ -627,7 +651,11 @@ impl BedrockService {
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            self.record_failure(&cred_name);
+            if status == 429 {
+                self.record_rate_limited(&cred_name);
+            } else {
+                self.record_failure(&cred_name);
+            }
             let text = response.text().await.unwrap_or_default();
             return Err(BedrockError::Unknown(format!(
                 "Bedrock Mantle stream error {status}: {text}"

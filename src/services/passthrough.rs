@@ -141,6 +141,10 @@ impl PassthroughService {
         self.credential_pool.record_failure(credential_name)
     }
 
+    pub fn record_rate_limited(&self, credential_name: &str) -> bool {
+        self.credential_pool.record_rate_limited(credential_name)
+    }
+
     pub fn pool_stats(&self) -> crate::services::backend_pool::PoolStats {
         self.credential_pool.stats()
     }
@@ -224,7 +228,15 @@ impl PassthroughService {
         match response {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                if status == 401 || status == 403 || status == 429 || status >= 500 {
+                if status == 429 {
+                    // Rate limit: cool the credential down immediately so failover
+                    // can switch to a healthy pool instead of retrying a throttled key.
+                    self.record_rate_limited(&credential_name);
+                    tracing::warn!(
+                        credential = %credential_name,
+                        "Passthrough credential rate-limited (429), cooling down"
+                    );
+                } else if status == 401 || status == 403 || status >= 500 {
                     let disabled = self.record_failure(&credential_name);
                     if disabled {
                         tracing::warn!(
