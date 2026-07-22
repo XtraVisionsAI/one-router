@@ -262,6 +262,8 @@ mod request {
                             }
                             ContentBlock::ServerToolUse { .. }
                             | ContentBlock::ServerToolResult { .. } => {}
+                            // Fallback audit markers carry no model-visible content.
+                            ContentBlock::Fallback { .. } => {}
                         }
                     }
 
@@ -467,6 +469,7 @@ mod response {
                 model: model.to_string(),
                 stop_reason: Some(stop_reason),
                 stop_sequence: None,
+                stop_details: None,
                 usage,
                 container: None,
             })

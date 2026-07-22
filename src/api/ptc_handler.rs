@@ -298,6 +298,7 @@ fn build_ptc_request(request: &MessageRequest) -> MessageRequest {
         metadata: request.metadata.clone(),
         container: None,
         service_tier: request.service_tier.clone(),
+        fallback_credit_token: request.fallback_credit_token.clone(),
     }
 }
 
@@ -598,6 +599,7 @@ async fn finalize_with_claude_from_state(
         metadata: exec_state.original_metadata,
         container: None,
         service_tier: exec_state.original_service_tier,
+        fallback_credit_token: None,
     };
 
     let mut final_response = bedrock
@@ -630,6 +632,7 @@ fn build_continuation_request(
         metadata: original_request.metadata.clone(),
         container: None,
         service_tier: original_request.service_tier.clone(),
+        fallback_credit_token: original_request.fallback_credit_token.clone(),
     }
 }
 

@@ -364,6 +364,7 @@ impl AnthropicToOpenAIConverter {
             model: original_model.to_string(),
             stop_reason: Some(stop_reason),
             stop_sequence: None,
+            stop_details: None,
             usage,
             container: None,
         })
@@ -710,6 +711,7 @@ impl OpenAIToAnthropicConverter {
             metadata: None,
             container: None,
             service_tier: None,
+            fallback_credit_token: None,
         })
     }
 
@@ -914,6 +916,9 @@ impl OpenAIToAnthropicConverter {
             StopReason::ToolUse => "tool_calls".to_string(),
             StopReason::StopSequence => "stop".to_string(),
             StopReason::PauseTurn => "stop".to_string(),
+            StopReason::Refusal => "content_filter".to_string(),
+            StopReason::Compaction => "stop".to_string(),
+            StopReason::ModelContextWindowExceeded => "length".to_string(),
         });
 
         let usage = CompletionUsage {

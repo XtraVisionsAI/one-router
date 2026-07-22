@@ -266,6 +266,16 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: Vec<serde_json::Value>,
     },
+    /// Fallback audit marker (refusal-fallback SDK middleware). Marks where one
+    /// model declined and another continued. Client-side bookkeeping — preserved
+    /// on passthrough, stripped before forwarding to Bedrock.
+    #[serde(rename = "fallback")]
+    Fallback {
+        #[serde(rename = "from", default, skip_serializing_if = "Option::is_none")]
+        from_model: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<serde_json::Value>,
+    },
 }
 
 impl ContentBlock {
@@ -546,6 +556,12 @@ pub struct MessageRequest {
     // Service tier override (request-level, takes priority over API key tier)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>, // "auto" | "flex" | "priority" | "reserved"
+
+    // Fallback credit redemption (fallback-credit-2026-06-09 beta): opaque token
+    // from a prior refusal's `stop_details`, echoed on the retry request so the
+    // backend reprices it against the refused request. Forwarded verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_credit_token: Option<String>,
 }
 
 fn default_max_tokens() -> i32 {
@@ -571,6 +587,7 @@ impl MessageRequest {
             metadata: None,
             container: None,
             service_tier: None,
+            fallback_credit_token: None,
         }
     }
 
@@ -628,6 +645,13 @@ pub enum StopReason {
     StopSequence,
     ToolUse,
     PauseTurn,
+    /// Model declined to respond (refusal-fallback beta). Carries a
+    /// `fallback_credit_token` in the response's `stop_details`.
+    Refusal,
+    /// Context compaction was triggered (compact-2026-01-12 beta).
+    Compaction,
+    /// Prompt exceeded the model's context window.
+    ModelContextWindowExceeded,
 }
 
 impl std::fmt::Display for StopReason {
@@ -638,6 +662,11 @@ impl std::fmt::Display for StopReason {
             StopReason::StopSequence => write!(f, "stop_sequence"),
             StopReason::ToolUse => write!(f, "tool_use"),
             StopReason::PauseTurn => write!(f, "pause_turn"),
+            StopReason::Refusal => write!(f, "refusal"),
+            StopReason::Compaction => write!(f, "compaction"),
+            StopReason::ModelContextWindowExceeded => {
+                write!(f, "model_context_window_exceeded")
+            }
         }
     }
 }
@@ -655,6 +684,11 @@ pub struct MessageResponse {
     pub stop_reason: Option<StopReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
+    /// Structured stop info — e.g. refusal category/explanation and the
+    /// `fallback_credit_token` under the fallback-credit-2026-06-09 beta.
+    /// Passed through verbatim from the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<serde_json::Value>,
     pub usage: Usage,
     /// PTC container info for session reuse
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -684,6 +718,7 @@ impl MessageResponse {
             model: model.into(),
             stop_reason: Some(StopReason::EndTurn),
             stop_sequence: None,
+            stop_details: None,
             usage,
             container: None,
         }
@@ -872,6 +907,60 @@ mod tests {
         let msg = Message::user("Hello");
         assert_eq!(msg.role, "user");
         assert!(matches!(msg.content, MessageContent::Text(ref t) if t == "Hello"));
+    }
+
+    #[test]
+    fn test_fallback_block_deserializes() {
+        // A `fallback` audit-marker block in message history must not break
+        // request deserialization (refusal-fallback beta).
+        let json = r#"{"type":"fallback","from":{"model":"a"},"to":{"model":"b"}}"#;
+        let block: ContentBlock = serde_json::from_str(json).unwrap();
+        match &block {
+            ContentBlock::Fallback { from_model, to } => {
+                assert!(from_model.is_some());
+                assert!(to.is_some());
+            }
+            _ => panic!("expected Fallback block"),
+        }
+        // Round-trips with the `from` alias preserved.
+        let out = serde_json::to_string(&block).unwrap();
+        assert!(out.contains("\"type\":\"fallback\""));
+        assert!(out.contains("\"from\""));
+    }
+
+    #[test]
+    fn test_refusal_stop_reason_and_stop_details_deserialize() {
+        // A refusal response carries a new stop_reason and structured stop_details
+        // (with the fallback_credit_token). Both must parse, not 500.
+        let json = r#"{
+            "id":"msg_1","type":"message","role":"assistant",
+            "content":[],"model":"claude","stop_reason":"refusal",
+            "stop_details":{"type":"refusal","fallback_credit_token":"tok_abc"},
+            "usage":{"input_tokens":1,"output_tokens":0}
+        }"#;
+        let resp: MessageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.stop_reason, Some(StopReason::Refusal));
+        assert_eq!(
+            resp.stop_details.as_ref().unwrap()["fallback_credit_token"],
+            "tok_abc"
+        );
+        // stop_details is echoed back on serialization.
+        assert!(serde_json::to_string(&resp)
+            .unwrap()
+            .contains("fallback_credit_token"));
+    }
+
+    #[test]
+    fn test_fallback_credit_token_request_roundtrip() {
+        let json =
+            r#"{"model":"claude","messages":[],"max_tokens":10,"fallback_credit_token":"tok_x"}"#;
+        let req: MessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.fallback_credit_token.as_deref(), Some("tok_x"));
+        // Absent when None (skip_serializing_if).
+        let bare = MessageRequest::new("m", vec![], 10);
+        assert!(!serde_json::to_string(&bare)
+            .unwrap()
+            .contains("fallback_credit_token"));
     }
 
     #[test]

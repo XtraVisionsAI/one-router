@@ -854,6 +854,20 @@ fn build_invoke_model_body(
         obj.remove("stream");
         obj.remove("container");
 
+        // Strip `fallback` audit-marker blocks from message content. They are
+        // client-side bookkeeping (refusal-fallback SDK middleware) that Bedrock
+        // does not understand and rejects. The `fallback_credit_token` field on
+        // the request body is kept — Bedrock reprices the retry against it.
+        if let Some(serde_json::Value::Array(messages)) = obj.get_mut("messages") {
+            for message in messages.iter_mut() {
+                if let Some(serde_json::Value::Array(blocks)) =
+                    message.as_object_mut().and_then(|m| m.get_mut("content"))
+                {
+                    blocks.retain(|b| b.get("type").and_then(|t| t.as_str()) != Some("fallback"));
+                }
+            }
+        }
+
         // Set or remove service_tier based on backend config
         if let Some(tier) = effective_service_tier {
             obj.insert("service_tier".to_string(), serde_json::json!(tier));
@@ -1492,6 +1506,34 @@ mod tests {
         let body = super::build_invoke_model_body(&req, "model", false, None).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v.get("anthropic_beta").is_none());
+    }
+
+    #[test]
+    fn test_fallback_block_stripped_token_kept() {
+        use crate::schemas::anthropic::{ContentBlock, Message, MessageContent, MessageRequest};
+        // A message carrying a `fallback` audit marker alongside real text: the
+        // marker is stripped before Bedrock, the text stays, and the request-level
+        // fallback_credit_token is forwarded verbatim.
+        let mut req = MessageRequest::new("claude", vec![], 100);
+        req.fallback_credit_token = Some("tok_credit".to_string());
+        req.messages = vec![Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Fallback {
+                    from_model: Some(serde_json::json!({"model": "a"})),
+                    to: Some(serde_json::json!({"model": "b"})),
+                },
+                ContentBlock::text("hello"),
+            ]),
+        }];
+
+        let body = super::build_invoke_model_body(&req, "model", false, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(v["fallback_credit_token"], "tok_credit");
+        let blocks = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "fallback block should be stripped");
+        assert_eq!(blocks[0]["type"], "text");
     }
 
     #[test]

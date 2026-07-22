@@ -24,8 +24,8 @@ use crate::converters::{
 };
 use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::{
-    ContentBlock, ErrorResponse, MessageContent, MessageRequest, MessageResponse, StopReason,
-    SystemContent, ToolResultValue,
+    ContentBlock, ErrorResponse, MessageContent, MessageRequest, MessageResponse, SystemContent,
+    ToolResultValue,
 };
 use crate::server::state::AppState;
 use crate::services::{BedrockError, Credential};
@@ -1425,13 +1425,7 @@ async fn create_gemini_streaming_response(
 
                             // Check for finish reason
                             if let Some(reason) = finish_reason_opt {
-                                stop_reason = match reason {
-                                    StopReason::EndTurn => "end_turn".to_string(),
-                                    StopReason::MaxTokens => "max_tokens".to_string(),
-                                    StopReason::StopSequence => "stop_sequence".to_string(),
-                                    StopReason::ToolUse => "tool_use".to_string(),
-                                    StopReason::PauseTurn => "pause_turn".to_string(),
-                                };
+                                stop_reason = reason.to_string();
                             }
 
                             // Update usage if available
@@ -1871,6 +1865,7 @@ mod tests {
             model: "claude-haiku".into(),
             stop_reason: Some(StopReason::EndTurn),
             stop_sequence: None,
+            stop_details: None,
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -1897,6 +1892,7 @@ mod tests {
             model: "claude-haiku".into(),
             stop_reason: Some(StopReason::EndTurn),
             stop_sequence: None,
+            stop_details: None,
             usage: Usage {
                 input_tokens: 20,
                 output_tokens: 10,
