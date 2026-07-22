@@ -11,7 +11,7 @@ use axum::{
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api::{
-    admin, chat_completions, embeddings, health, images, messages, models, rerank, usage,
+    admin, chat_completions, embeddings, health, images, messages, models, rerank, responses, usage,
 };
 use crate::middleware::{
     admin_auth::{require_admin_key, AdminAuthState},
@@ -66,6 +66,19 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/chat/completions",
             post(chat_completions::chat_completions),
+        )
+        .route("/responses", post(responses::create_response))
+        .route(
+            "/responses/:response_id",
+            get(responses::get_response).delete(responses::delete_response),
+        )
+        .route(
+            "/responses/:response_id/cancel",
+            post(responses::cancel_response),
+        )
+        .route(
+            "/responses/:response_id/input_items",
+            get(responses::list_input_items),
         )
         .route("/embeddings", post(embeddings::create_embeddings))
         .route("/rerank", post(rerank::create_rerank))

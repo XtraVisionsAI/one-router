@@ -123,6 +123,7 @@ src/
 ├── api/
 │   ├── messages.rs              # POST /v1/messages  (Anthropic protocol)
 │   ├── chat_completions.rs      # POST /v1/chat/completions  (OpenAI protocol)
+│   ├── responses.rs             # POST /v1/responses  (OpenAI Responses API / Codex)
 │   ├── embeddings.rs            # POST /v1/embeddings
 │   ├── images.rs                # POST /v1/images/generations
 │   ├── rerank.rs                # POST /v1/rerank
@@ -144,12 +145,14 @@ src/
 │   ├── anthropic_openai.rs      # Anthropic ↔ OpenAI
 │   ├── openai_bedrock.rs        # OpenAI ↔ Bedrock
 │   ├── openai_gemini.rs         # OpenAI ↔ Gemini
+│   ├── responses_chat.rs        # OpenAI Responses ↔ Chat Completions / Anthropic (web_search)
 │   ├── cache_transform.rs       # Prompt cache mode control
 │   ├── capability_filter.rs     # Model capability filtering
 │   └── sdk_utils.rs             # serde_json::Value ↔ aws_smithy Document
 ├── schemas/
 │   ├── anthropic.rs             # Anthropic request/response structs
 │   ├── openai.rs                # OpenAI request/response structs
+│   ├── responses.rs             # OpenAI Responses API request/response structs
 │   ├── bedrock.rs               # Bedrock structs
 │   ├── gemini.rs                # Gemini structs
 │   ├── embeddings.rs            # Embedding structs
@@ -168,6 +171,7 @@ src/
 │   ├── capabilities.rs          # Model capability system
 │   ├── failover.rs              # Model-level credential-exhaustion failover chains
 │   ├── pricing_sync.rs          # LiteLLM price-table sync (updates model_mappings prices)
+│   ├── responses_context.rs     # In-memory Responses context store (owner + TTL + capacity)
 │   ├── service_tier.rs          # Service tier resolution
 │   ├── inference_profile.rs     # Bedrock application inference profile ARN resolution
 │   ├── image_url_fetcher.rs     # Image URL → base64 (SSRF-guarded)
@@ -233,9 +237,21 @@ src/
 | `gemini` | Google Gemini | `openai_gemini` |
 | `anthropic` | Anthropic API | `anthropic_openai` (reverse) |
 
----
+### POST /v1/responses (OpenAI Responses API input — Codex CLI)
 
-## Architecture
+Translated to Chat Completions internally, then routed through the same 4-way
+`x-provider` matrix as `/v1/chat/completions`. Not a native backend protocol.
+
+| Path | Internal target | Converter |
+|---|---|---|
+| No hosted tools | `ChatCompletionRequest` → chat pipeline (`dispatch_chat`) → `ResponsesResponse` | `responses_chat` |
+| Hosted `web_search` | Anthropic `MessageRequest` → `WebToolExecutor` (Bedrock/Gemini) → `ResponsesResponse` | `responses_chat` |
+
+Streaming is **replay-based**: compute the full response non-streaming, then
+replay it as the named Responses SSE event sequence (each frame carries an
+`event:` line + `sequence_number` — Codex rejects streams without them).
+Aux endpoints: `GET/DELETE /v1/responses/:id`, `POST /v1/responses/:id/cancel`,
+`GET /v1/responses/:id/input_items`.
 
 ```
 HTTP Request
@@ -453,3 +469,4 @@ Multiple credentials per backend are supported. Strategies:
 - **Metrics** (`observability/metrics.rs`): unauthenticated `GET /metrics` (Prometheus text format). Counters recorded from `UsageTracker::record_usage` + an HTTP-duration middleware. Labels are bounded (`provider`/`protocol`/`model`/`direction`/`status`/`from`/`to`) — the API key is **never** a label.
 - **Pricing sync** (`services/pricing_sync.rs`): pulls the LiteLLM price table and **updates existing `model_mappings` rows' inline prices** (never creates mappings — one-router prices per source→target mapping, not in a separate table). Covers all 4 backends: a mapping's `provider` selects the LiteLLM namespace, its `target_model_id` is matched (Bedrock region-prefix fallback). Per-token source costs are stored ×1e6 (per-1M). Rows with `pricing_source = "manual"` are pinned (skipped unless `overwrite_manual`); `"litellm"` (default) rows are overwritten. A `None` source field never nulls out a stored price. Admin: `POST/GET /admin/api/pricing/sync` (`dry_run` query for preview). Background job gated on `pricing_sync_enabled` (re-reads settings each iteration; interval `pricing_sync_interval_hours`). `run_sync` invalidates the model-mapping cache on change.
 - **Refusal-fallback passthrough** (fallback-credit-2026-06-09 beta): `MessageRequest.fallback_credit_token` and `MessageResponse.stop_details` are carried verbatim; `StopReason` includes `Refusal`/`Compaction`/`ModelContextWindowExceeded` (a refusal response no longer fails to deserialize). The `fallback` content block (`ContentBlock::Fallback`) is client-side audit bookkeeping — preserved on Anthropic/OpenAI passthrough but **stripped in `build_invoke_model_body` before Bedrock** (Bedrock rejects it); the credit token stays on the request body. Claude InvokeModel streaming already forwards `stop_details` since it relays native SSE bytes.
+- **Responses API** (`api/responses.rs`, `converters/responses_chat.rs`, `services/responses_context.rs`): `POST /v1/responses` translates the OpenAI Responses protocol to `ChatCompletionRequest`, runs it through the shared `dispatch_chat` seam (extracted from `chat_completions.rs` — resolve + failover + route, no usage recording), then converts `ChatCompletionResponse` → `ResponsesResponse`. Hosted `web_search`/`web_search_preview` tools fork to an Anthropic `MessageRequest` + `WebToolExecutor` (web tools are only wired on the `/v1/messages` side). Streaming is **replay-based**: `build_responses_events` (pure, unit-tested) produces the ordered `(event_type, payload)` sequence, `stream_responses_events` wraps each into an SSE `Event` with an `event:` line + auto-incrementing `sequence_number` (Codex CLI rejects streams lacking either). Context store is **in-memory** (`ResponsesContextStore`: `Arc<RwLock<HashMap>>` + `owner_key_hash` binding + TTL + capacity eviction by monotonic `seq`), swept every 600s by an `app.rs` background task; `previous_response_id` restores prior messages, owner mismatch returns 404 (no existence leak). Usage recorded with protocol tag `"responses"`. Storage on by default (`store != false`).

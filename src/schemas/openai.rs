@@ -600,6 +600,10 @@ impl OpenAIErrorResponse {
     pub fn server_error(message: &str) -> Self {
         Self::new("server_error", message)
     }
+
+    pub fn not_found_error(message: &str) -> Self {
+        Self::new("not_found_error", message)
+    }
 }
 
 // ============================================================================

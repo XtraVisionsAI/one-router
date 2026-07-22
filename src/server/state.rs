@@ -152,6 +152,9 @@ pub struct AppState {
     /// Cached result of the most recent LiteLLM pricing sync (None until first run).
     pub pricing_sync_status: Arc<RwLock<Option<crate::services::pricing_sync::SyncSummary>>>,
 
+    /// In-memory store for OpenAI Responses API `previous_response_id` continuation.
+    pub responses_context: Arc<crate::services::responses_context::ResponsesContextStore>,
+
     /// Active admin sessions (cookie tokens)
     pub sessions: SessionStore,
 

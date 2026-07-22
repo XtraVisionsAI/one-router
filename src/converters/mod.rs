@@ -14,6 +14,7 @@ pub mod cache_transform;
 pub mod capability_filter;
 pub mod openai_bedrock;
 pub mod openai_gemini;
+pub mod responses_chat;
 pub mod sdk_utils;
 
 pub use anthropic_gemini::{

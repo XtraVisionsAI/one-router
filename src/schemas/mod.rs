@@ -9,3 +9,4 @@ pub mod gemini;
 pub mod images;
 pub mod openai;
 pub mod rerank;
+pub mod responses;

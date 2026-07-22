@@ -69,6 +69,13 @@ impl OpenAIApiError {
         }
     }
 
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error: OpenAIErrorResponse::not_found_error(&message.into()),
+        }
+    }
+
     pub fn from_bedrock_error(err: &BedrockError) -> Self {
         match err {
             BedrockError::Throttled(msg) => Self::rate_limited(msg),
@@ -143,25 +150,31 @@ impl IntoResponse for ChatCompletionApiResponse {
 
 /// Shared state for streaming usage — handlers write, entry wrapper reads.
 #[derive(Debug, Default, Clone)]
-struct StreamUsage {
+pub(crate) struct StreamUsage {
     input_tokens: i32,
     output_tokens: i32,
     cache_creation_input_tokens: Option<i32>,
     cache_read_input_tokens: Option<i32>,
 }
 
-/// Context for recording usage, passed to handlers for streaming usage tracking.
+/// Result of routing a chat request to a backend, plus the metadata the caller
+/// needs to record usage. Returned by [`dispatch_chat`] so both the Chat
+/// Completions handler and the Responses handler can reuse backend routing while
+/// recording usage under their own protocol tag.
+pub(crate) struct ChatDispatch {
+    pub response: ChatCompletionApiResponse,
+    pub provider: String,
+    pub stream_usage: Arc<tokio::sync::Mutex<StreamUsage>>,
+    pub cache_ttl: Option<String>,
+}
+
+/// Context passed to backend handlers so streaming handlers can populate the
+/// shared `StreamUsage` as chunks arrive. Usage *recording* is done by the entry
+/// handler (Chat Completions / Responses) so each can tag its own protocol.
 #[derive(Clone)]
 struct UsageContext {
-    tracker: Arc<crate::services::UsageTracker>,
-    key_info: crate::middleware::auth::ApiKeyInfo,
-    model: String,
-    request_id: String,
-    provider: String,
     /// Shared state for streaming usage — handlers write, entry wrapper reads.
     stream_usage: Arc<tokio::sync::Mutex<StreamUsage>>,
-    /// Effective cache TTL (per-key override or global mode) for TTL-aware billing.
-    cache_ttl: Option<String>,
 }
 
 /// Wrap an SSE stream so that after the inner stream completes, usage is
@@ -218,11 +231,95 @@ pub async fn chat_completions(
         crate::middleware::auth::ApiKeyInfo,
     >,
     headers: HeaderMap,
-    Json(mut request): Json<ChatCompletionRequest>,
+    Json(request): Json<ChatCompletionRequest>,
 ) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
     let start_time = Instant::now();
     let request_id = Uuid::new_v4().to_string();
+    let model = request.model.clone();
 
+    let dispatch = dispatch_chat(
+        &state,
+        request,
+        &headers,
+        &key_info,
+        &request_id,
+        start_time,
+    )
+    .await
+    .inspect_err(|_| {
+        // Model resolution / routing failure — status recorded per branch below.
+    })?;
+
+    let ChatDispatch {
+        response,
+        provider,
+        stream_usage,
+        cache_ttl,
+    } = dispatch;
+
+    // Record usage for non-streaming responses; wrap streams for deferred recording.
+    match response {
+        ChatCompletionApiResponse::Json(json_resp) => {
+            // OpenAI's prompt_tokens includes cached tokens; split them out so
+            // the cached portion is billed at the cache-read rate, not full input.
+            let mut usage = crate::schemas::anthropic::Usage::new(
+                json_resp.usage.uncached_prompt_tokens(),
+                json_resp.usage.completion_tokens,
+            );
+            let cached = json_resp.usage.cached_tokens();
+            if cached > 0 {
+                usage.cache_read_input_tokens = Some(cached);
+            }
+            let tracker = state.usage_tracker.clone();
+            let req_id = request_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = tracker
+                    .record_usage(
+                        &key_info,
+                        &req_id,
+                        &model,
+                        &usage,
+                        true,
+                        &provider,
+                        "openai",
+                        cache_ttl.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "Failed to record usage");
+                }
+            });
+            Ok(ChatCompletionApiResponse::Json(json_resp))
+        }
+        ChatCompletionApiResponse::Stream(stream) => {
+            let wrapped = wrap_stream_with_usage_recording(
+                stream,
+                stream_usage,
+                state.usage_tracker.clone(),
+                key_info.clone(),
+                model,
+                request_id,
+                provider,
+                "openai",
+                cache_ttl,
+            );
+            Ok(ChatCompletionApiResponse::Stream(wrapped))
+        }
+    }
+}
+
+/// Resolve the model, apply failover, inline image URLs, and route the request
+/// to the matching backend handler. Returns the raw backend response plus the
+/// metadata needed to record usage. **Does not record usage** — the caller does,
+/// so the Chat Completions and Responses endpoints can tag their own protocol.
+pub(crate) async fn dispatch_chat(
+    state: &AppState,
+    mut request: ChatCompletionRequest,
+    headers: &HeaderMap,
+    key_info: &crate::middleware::auth::ApiKeyInfo,
+    request_id: &str,
+    start_time: Instant,
+) -> Result<ChatDispatch, OpenAIApiError> {
     // Resolve model via model mapping (seed / database)
     let mut resolved = match state.model_mapping.resolve(&request.model).await {
         Ok(r) => r,
@@ -285,114 +382,67 @@ pub async fn chat_completions(
             .map(|s| s.to_string()),
     };
     let usage_ctx = UsageContext {
-        tracker: state.usage_tracker.clone(),
-        key_info: key_info.clone(),
-        model: request.model.clone(),
-        request_id: request_id.clone(),
-        provider: resolved.provider.clone(),
         stream_usage: stream_usage.clone(),
-        cache_ttl: effective_cache_ttl.clone(),
     };
 
     // Route based on provider
     let result = if resolved.provider == "gemini" {
         handle_gemini_backend(
-            &state,
+            state,
             &request,
             &resolved.target_model_id,
-            &request_id,
+            request_id,
             &usage_ctx,
             start_time,
         )
         .await
     } else if resolved.provider == "anthropic" {
         handle_anthropic_backend(
-            &state,
+            state,
             &request,
             &resolved.target_model_id,
-            &request_id,
+            request_id,
             &usage_ctx,
             start_time,
         )
         .await
     } else if resolved.provider == "openai" {
         handle_openai_passthrough(
-            &state,
+            state,
             &request,
             &resolved.target_model_id,
-            &request_id,
-            &headers,
+            request_id,
+            headers,
             &usage_ctx,
             start_time,
         )
         .await
     } else {
         handle_bedrock_request(
-            &state,
+            state,
             &request,
             &resolved.target_model_id,
             &resolved.capabilities,
-            &request_id,
+            request_id,
             &usage_ctx,
             start_time,
         )
         .await
     };
 
-    // Record usage for non-streaming responses; wrap streams for deferred recording
     match result {
-        Ok(ChatCompletionApiResponse::Json(ref json_resp)) => {
-            // OpenAI's prompt_tokens includes cached tokens; split them out so
-            // the cached portion is billed at the cache-read rate, not full input.
-            let mut usage = crate::schemas::anthropic::Usage::new(
-                json_resp.usage.uncached_prompt_tokens(),
-                json_resp.usage.completion_tokens,
-            );
-            let cached = json_resp.usage.cached_tokens();
-            if cached > 0 {
-                usage.cache_read_input_tokens = Some(cached);
-            }
-            let ctx = usage_ctx;
-            tokio::spawn(async move {
-                if let Err(e) = ctx
-                    .tracker
-                    .record_usage(
-                        &ctx.key_info,
-                        &ctx.request_id,
-                        &ctx.model,
-                        &usage,
-                        true,
-                        &ctx.provider,
-                        "openai",
-                        ctx.cache_ttl.as_deref(),
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "Failed to record usage");
-                }
-            });
-            result
-        }
-        Ok(ChatCompletionApiResponse::Stream(stream)) => {
-            let wrapped = wrap_stream_with_usage_recording(
-                stream,
-                stream_usage,
-                state.usage_tracker.clone(),
-                key_info.clone(),
-                request.model.clone(),
-                request_id,
-                resolved.provider.clone(),
-                "openai",
-                effective_cache_ttl.clone(),
-            );
-            Ok(ChatCompletionApiResponse::Stream(wrapped))
-        }
-        Err(_) => {
+        Ok(response) => Ok(ChatDispatch {
+            response,
+            provider: resolved.provider,
+            stream_usage,
+            cache_ttl: effective_cache_ttl,
+        }),
+        Err(e) => {
             // Backend/routing failure after provider is known. record_usage only
             // runs on success, so record the error outcome here to keep
             // onerouter_requests_total{status="error"} meaningful.
             crate::observability::metrics::record_request(&resolved.provider, "openai", false);
-            result
+            Err(e)
         }
     }
 }

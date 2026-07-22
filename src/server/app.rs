@@ -95,6 +95,9 @@ impl App {
             encryptor,
             update_service,
             pricing_sync_status: Arc::new(RwLock::new(None)),
+            responses_context: Arc::new(
+                crate::services::responses_context::ResponsesContextStore::new(),
+            ),
             sessions: Arc::new(RwLock::new(HashSet::new())),
             dynamic,
         };
@@ -165,6 +168,18 @@ impl App {
                     3600
                 };
                 tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+            }
+        });
+
+        // Spawn background sweeper for expired Responses API context entries.
+        let responses_ctx = self.state.responses_context.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                let removed = responses_ctx.sweep_expired().await;
+                if removed > 0 {
+                    tracing::debug!(removed, "Swept expired Responses API context entries");
+                }
             }
         });
         tracing::info!("Starting server on {}", addr);
