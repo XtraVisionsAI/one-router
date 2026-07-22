@@ -271,18 +271,35 @@ Request (root span)
 
 **R1 与 cache-affinity 红线的关系（已裁定）**：耗尽式 failover **豁免**红线 #1。红线针对的是「为省钱主动换模型」，而 failover 触发时主 provider 已不可用，其缓存前缀本就无法命中，不存在被牺牲的缓存收益——只是把硬 503 换成可用后端。此豁免在 `services/failover.rs` 模块注释中明确记录。
 
-## 勘误：第一轮「功能采纳清单」中的 4 项系我方分析臆造，参考仓库并不存在
+## ⚠️ 重大勘误的勘误（2026-07-22）：上面那张「臆造」表本身是错的
 
-对参考仓库（`sample-bedrock-api-proxy`）逐项核实后确认，下列 4 项在其源码中**零匹配**，已从任务清单删除：
+**下面这张表（连同"逐项回源"的教训）是一次基于过期本地副本的误判，现予撤销。以下 4 项在参考仓库里全部真实存在。**
 
-| 臆造项 | 核实结论 |
+事情经过：本地副本 `/Users/chenhao/Workbase/test/sample-bedrock-api-proxy` 的文件停留在 ~2026-04-01，而上游仓库持续更新到 2026-07。二次分析时我对着这份**过期副本**grep，"确认"这 4 项不存在，进而删任务、写下面这张"臆造"表——甚至声称 `pricing_sync_service.py` 是我编造的文件名。全错。
+
+对**权威 GitHub 源**（`gh api` / 新 clone，HEAD 2026-07-13）复核结果：
+
+| 被误判为"臆造"的项 | 真实位置（fresh clone 核实） |
 |---|---|
-| F1 LiteLLM 价格自动同步 | `litellm` 仅作为 `uv.lock` 间接依赖出现，无任何价格同步逻辑 |
-| F6 AgentCore Gateway WebSearch | 搜索 provider 只有 Tavily / Brave；"AgentCore" 仅 README 里作为部署环境提及 |
-| fallback_credit 双向透传 | 全仓库零匹配（该 Anthropic beta 特性系臆造） |
-| Responses API + Codex 兼容 | 无 `/v1/responses` 端点 |
+| F1 LiteLLM 价格自动同步 | **`app/services/pricing_sync_service.py`**（355 行，docstring 明写 "sync from the LiteLLM price table"，拉 BerriAI/litellm 价表，synced 行标 `pricing_source="litellm"`）；全仓库 `litellm` 匹配 13 处 |
+| F6 AgentCore Gateway WebSearch | **`app/services/web_search/providers.py:201` `AgentCoreSearchProvider`**（"Amazon Bedrock AgentCore Gateway Web Search"）；匹配 28 处 |
+| fallback_credit / refusal | `app/schemas/anthropic.py`、`app/services/bedrock_service.py`、`app/api/openai_passthrough/chat_responses_adapter.py`；匹配 3~4 处 |
+| Responses API + Codex | 整个 **`app/api/openai_passthrough/`** 包（`chat_responses_adapter.py`/`router.py`/`streaming.py`/`context_store.py`/`usage_extractor.py`）；`responses` 匹配 74 处、`codex` 7 处 |
 
-> 教训：对比分析产出的「借鉴清单」必须逐项回源核对，不能凭对同类项目的先验直接列项。
+> **真正的教训**（替换下面那条错的）：核对参考实现前，必须先确认本地副本与上游同步（检查 `.git`/`git log`/`pushedAt`）；当本地副本与自己先前的分析冲突时，**先怀疑副本是否过期**，而不是推翻先前分析。宁可直接查权威 GitHub 源。此外这份本地副本当时**根本没有 `.git`**，无法验证时序——已换成 fresh clone。
+
+已重新登记为真实待实现任务（会话任务 #17 #18 #19 #20）。已实现的 S1–S5 / F2 / F4 / F3 不受影响（那些功能在参考仓库确实存在，实现有效）。
+
+### ~~勘误：第一轮「功能采纳清单」中的 4 项系我方分析臆造，参考仓库并不存在~~（作废，见上）
+
+~~对参考仓库逐项核实后确认，下列 4 项在其源码中零匹配，已从任务清单删除：~~
+
+| ~~臆造项~~（实为真实） | ~~核实结论~~（基于过期副本，错误） |
+|---|---|
+| F1 LiteLLM 价格自动同步 | ~~`litellm` 仅作为 `uv.lock` 间接依赖出现，无任何价格同步逻辑~~ → 实为 `pricing_sync_service.py` |
+| F6 AgentCore Gateway WebSearch | ~~搜索 provider 只有 Tavily / Brave~~ → 实有 `AgentCoreSearchProvider` |
+| fallback_credit 双向透传 | ~~全仓库零匹配~~ → 实存在于 schemas/bedrock_service/adapter |
+| Responses API + Codex 兼容 | ~~无 `/v1/responses` 端点~~ → 实有整个 `openai_passthrough/` 包 |
 
 ## F8 / O1：OpenTelemetry 分布式追踪（暂缓，本节即设计稿）
 
