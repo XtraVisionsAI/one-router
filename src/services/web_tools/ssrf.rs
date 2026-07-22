@@ -125,9 +125,25 @@ pub struct SafeGetResult {
     pub final_url: String,
 }
 
+/// What to do when a response body exceeds `max_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OversizePolicy {
+    /// Truncate to `max_bytes`. Correct for text (web_fetch): partial content is
+    /// still usable.
+    Truncate,
+    /// Reject with an error. Correct for binary content (images): a truncated
+    /// body is corrupt but can still pass a magic-byte sniff, so it must not be
+    /// forwarded.
+    Reject,
+}
+
 /// Perform an SSRF-guarded HTTP GET, following redirects manually so every hop
 /// is re-validated (via `check_hop`, plus IP checks) and the connection is
-/// pinned to the validated address. Reads at most `max_bytes`.
+/// pinned to the validated address.
+///
+/// Bodies larger than `max_bytes` are truncated or rejected per `oversize`. When
+/// rejecting, a declared `Content-Length` over the cap short-circuits before the
+/// body is read.
 ///
 /// `check_hop` is called for each URL before it is fetched; return `Err` to
 /// reject the hop (used for caller-specific domain filtering).
@@ -136,6 +152,7 @@ pub async fn safe_get_bytes(
     max_bytes: usize,
     timeout: Duration,
     user_agent: &str,
+    oversize: OversizePolicy,
     mut check_hop: impl FnMut(&reqwest::Url) -> Result<(), String>,
 ) -> Result<SafeGetResult, String> {
     let mut current: reqwest::Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
@@ -183,9 +200,30 @@ pub async fn safe_get_bytes(
             .unwrap_or("application/octet-stream")
             .to_string();
         let final_url = current.to_string();
+
+        // When rejecting oversize, short-circuit on a declared Content-Length
+        // over the cap so an oversized body is never buffered.
+        if oversize == OversizePolicy::Reject {
+            if let Some(len) = response.content_length() {
+                if len as usize > max_bytes {
+                    return Err(format!(
+                        "response body exceeds maximum size ({len} > {max_bytes} bytes)"
+                    ));
+                }
+            }
+        }
+
         let full = response.bytes().await.map_err(|e| e.to_string())?;
         let bytes = if full.len() > max_bytes {
-            full[..max_bytes].to_vec()
+            match oversize {
+                OversizePolicy::Truncate => full[..max_bytes].to_vec(),
+                OversizePolicy::Reject => {
+                    return Err(format!(
+                        "response body exceeds maximum size ({} > {max_bytes} bytes)",
+                        full.len()
+                    ));
+                }
+            }
         } else {
             full.to_vec()
         };

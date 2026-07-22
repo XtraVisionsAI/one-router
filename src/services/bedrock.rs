@@ -851,21 +851,23 @@ fn build_invoke_model_body(
             }
         }
 
-        // Auto-inject the beta flag required by `defer_loading` tools. Clients
-        // frequently omit the `advanced-tool-use-2025-11-20` beta header, and
-        // Bedrock InvokeModel then rejects the request with "Extra inputs are
-        // not permitted". If any tool sets `defer_loading: true`, ensure the
-        // beta is present in the request body's `anthropic_beta` list.
+        // Auto-inject the beta flags required by `defer_loading` tools. Clients
+        // frequently omit the beta header, and Bedrock InvokeModel then rejects
+        // the request with "tools.X.custom.defer_loading: Extra inputs are not
+        // permitted". Bedrock does NOT accept the aggregate Anthropic beta name
+        // `advanced-tool-use-2025-11-20`; it expects the granular Bedrock-native
+        // betas the aggregate maps to. The reference proxy translates the
+        // aggregate to exactly these two before sending to Bedrock, so we inject
+        // them directly. Fire whenever a tool *carries* a `defer_loading` field
+        // (true or false) — even `defer_loading: false` is an extra input that
+        // Bedrock rejects without the beta.
         let has_defer_loading = obj
             .get("tools")
             .and_then(|t| t.as_array())
-            .is_some_and(|tools| {
-                tools
-                    .iter()
-                    .any(|t| t.get("defer_loading") == Some(&serde_json::Value::Bool(true)))
-            });
+            .is_some_and(|tools| tools.iter().any(|t| t.get("defer_loading").is_some()));
         if has_defer_loading {
-            ensure_anthropic_beta(obj, "advanced-tool-use-2025-11-20");
+            ensure_anthropic_beta(obj, "tool-examples-2025-10-29");
+            ensure_anthropic_beta(obj, "tool-search-tool-2025-10-19");
         }
     }
 
@@ -1436,18 +1438,32 @@ mod tests {
     #[test]
     fn test_defer_loading_injects_beta() {
         use crate::schemas::anthropic::MessageRequest;
+        // Fires on presence of a defer_loading field (even `false`), and injects
+        // the Bedrock-native beta names (not the aggregate `advanced-tool-use-*`).
+        for defer in [serde_json::json!(true), serde_json::json!(false)] {
+            let mut req = MessageRequest::new("claude", vec![], 100);
+            req.tools = Some(vec![serde_json::json!({
+                "name": "big_tool",
+                "description": "x",
+                "defer_loading": defer
+            })]);
+            let body = super::build_invoke_model_body(&req, "model", false, None).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                v["anthropic_beta"],
+                serde_json::json!(["tool-examples-2025-10-29", "tool-search-tool-2025-10-19"])
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_defer_loading_no_beta() {
+        use crate::schemas::anthropic::MessageRequest;
         let mut req = MessageRequest::new("claude", vec![], 100);
-        req.tools = Some(vec![serde_json::json!({
-            "name": "big_tool",
-            "description": "x",
-            "defer_loading": true
-        })]);
+        req.tools = Some(vec![serde_json::json!({"name": "t", "description": "x"})]);
         let body = super::build_invoke_model_body(&req, "model", false, None).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            v["anthropic_beta"],
-            serde_json::json!(["advanced-tool-use-2025-11-20"])
-        );
+        assert!(v.get("anthropic_beta").is_none());
     }
 
     #[test]

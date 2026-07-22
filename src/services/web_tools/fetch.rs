@@ -51,6 +51,7 @@ impl FetchProvider for ReqwestFetchProvider {
             max_bytes,
             self.timeout,
             "one-router/web-fetch 1.0",
+            ssrf::OversizePolicy::Truncate,
             |u| {
                 check_domain_filters(u.as_str(), allowed_domains, blocked_domains)
                     .map_err(|e| e.to_string())

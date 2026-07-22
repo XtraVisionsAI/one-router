@@ -82,6 +82,9 @@ pub async fn fetch_image(url: &str) -> Result<FetchedImage, String> {
         MAX_IMAGE_BYTES,
         FETCH_TIMEOUT,
         "one-router/image-fetch 1.0",
+        // Reject oversized images rather than truncate — a truncated image is
+        // corrupt but can still pass the magic-byte sniff below.
+        ssrf::OversizePolicy::Reject,
         |_| Ok(()),
     )
     .await
