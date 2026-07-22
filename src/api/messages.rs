@@ -486,6 +486,7 @@ pub async fn create_message(
                 key_info.cache_ttl.as_deref(),
                 &usage_ctx,
                 start_time,
+                beta_header.as_deref(),
             )
             .await
         }
@@ -612,6 +613,7 @@ async fn handle_bedrock_request(
     key_cache_ttl: Option<&str>,
     usage_ctx: &UsageContext,
     start_time: Instant,
+    beta_header: Option<&str>,
 ) -> Result<MessageApiResponse, ApiError> {
     let bedrock = state.dynamic.read().await.bedrock.clone().ok_or_else(|| {
         ApiError::service_unavailable(
@@ -700,7 +702,7 @@ async fn handle_bedrock_request(
     // Streaming via InvokeModelWithResponseStream
     if request.stream {
         let stream_response = bedrock
-            .invoke_model_messages_stream(&transformed_request, bedrock_model)
+            .invoke_model_messages_stream(&transformed_request, bedrock_model, beta_header)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Bedrock InvokeModel streaming failed");
@@ -779,7 +781,7 @@ async fn handle_bedrock_request(
 
     // Non-streaming via InvokeModel
     let response = bedrock
-        .invoke_model_messages(&transformed_request, bedrock_model)
+        .invoke_model_messages(&transformed_request, bedrock_model, beta_header)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Bedrock InvokeModel API call failed");

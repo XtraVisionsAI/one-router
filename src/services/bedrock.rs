@@ -247,6 +247,7 @@ impl BedrockService {
         &self,
         request: &crate::schemas::anthropic::MessageRequest,
         model_id: &str,
+        beta_header: Option<&str>,
     ) -> Result<crate::schemas::anthropic::MessageResponse, BedrockError> {
         let (cred_name, client) = self.get_client();
         let cred_name = cred_name.to_string();
@@ -262,7 +263,13 @@ impl BedrockService {
             request.service_tier.as_deref(),
             "bedrock",
         );
-        let body = build_invoke_model_body(request, model_id, false, effective_tier.as_deref())?;
+        let body = build_invoke_model_body(
+            request,
+            model_id,
+            false,
+            effective_tier.as_deref(),
+            beta_header,
+        )?;
 
         let result = client
             .invoke_model()
@@ -294,7 +301,8 @@ impl BedrockService {
                         credential = %cred_name,
                         "Service tier not supported, retrying without tier"
                     );
-                    let fallback_body = build_invoke_model_body(request, model_id, false, None)?;
+                    let fallback_body =
+                        build_invoke_model_body(request, model_id, false, None, beta_header)?;
                     let retry_result = client
                         .invoke_model()
                         .model_id(model_id)
@@ -331,6 +339,7 @@ impl BedrockService {
         &self,
         request: &crate::schemas::anthropic::MessageRequest,
         model_id: &str,
+        beta_header: Option<&str>,
     ) -> Result<InvokeModelStreamResponse, BedrockError> {
         let (cred_name, client) = self.get_client();
         let cred_name = cred_name.to_string();
@@ -346,7 +355,13 @@ impl BedrockService {
             request.service_tier.as_deref(),
             "bedrock",
         );
-        let body = build_invoke_model_body(request, model_id, true, effective_tier.as_deref())?;
+        let body = build_invoke_model_body(
+            request,
+            model_id,
+            true,
+            effective_tier.as_deref(),
+            beta_header,
+        )?;
 
         let result = client
             .invoke_model_with_response_stream()
@@ -834,9 +849,10 @@ impl InvokeModelStreamResponse {
 /// - Sets or removes `service_tier` based on the resolved effective tier.
 fn build_invoke_model_body(
     request: &crate::schemas::anthropic::MessageRequest,
-    _model_id: &str,
+    model_id: &str,
     _streaming: bool,
     effective_service_tier: Option<&str>,
+    beta_header: Option<&str>,
 ) -> Result<Vec<u8>, BedrockError> {
     let mut body =
         serde_json::to_value(request).map_err(|e| BedrockError::Serialization(e.to_string()))?;
@@ -910,6 +926,14 @@ fn build_invoke_model_body(
         if has_defer_loading {
             ensure_anthropic_beta(obj, "tool-examples-2025-10-29");
             ensure_anthropic_beta(obj, "tool-search-tool-2025-10-19");
+        }
+
+        // Merge the resolved inbound `anthropic-beta` header into the body's
+        // `anthropic_beta` array (blocklist-filtered / mapping-expanded /
+        // passed through — see `beta_headers`). De-dupes against the
+        // defer_loading injection above via `ensure_anthropic_beta`.
+        for beta in crate::services::beta_headers::resolve_bedrock_betas(beta_header, model_id) {
+            ensure_anthropic_beta(obj, &beta);
         }
     }
 
@@ -1489,7 +1513,7 @@ mod tests {
                 "description": "x",
                 "defer_loading": defer
             })]);
-            let body = super::build_invoke_model_body(&req, "model", false, None).unwrap();
+            let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(
                 v["anthropic_beta"],
@@ -1503,9 +1527,30 @@ mod tests {
         use crate::schemas::anthropic::MessageRequest;
         let mut req = MessageRequest::new("claude", vec![], 100);
         req.tools = Some(vec![serde_json::json!({"name": "t", "description": "x"})]);
-        let body = super::build_invoke_model_body(&req, "model", false, None).unwrap();
+        let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v.get("anthropic_beta").is_none());
+    }
+
+    #[test]
+    fn test_inbound_beta_header_expanded_into_body() {
+        use crate::schemas::anthropic::MessageRequest;
+        let req = MessageRequest::new("claude", vec![], 100);
+        // Claude model: aggregate expands to the two native betas; a blocklisted
+        // beta in the same header is dropped.
+        let body = super::build_invoke_model_body(
+            &req,
+            "anthropic.claude-3-sonnet",
+            false,
+            None,
+            Some("advanced-tool-use-2025-11-20, redact-thinking-2026-02-12"),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["anthropic_beta"],
+            serde_json::json!(["tool-examples-2025-10-29", "tool-search-tool-2025-10-19"])
+        );
     }
 
     #[test]
@@ -1527,7 +1572,7 @@ mod tests {
             ]),
         }];
 
-        let body = super::build_invoke_model_body(&req, "model", false, None).unwrap();
+        let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(v["fallback_credit_token"], "tok_credit");

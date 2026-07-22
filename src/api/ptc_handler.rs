@@ -116,7 +116,7 @@ pub async fn handle_ptc_request(
     // 3. Call Claude
     let bedrock = get_bedrock(state).await?;
     let response = bedrock
-        .invoke_model_messages(&modified_request, target_model_id)
+        .invoke_model_messages(&modified_request, target_model_id, None)
         .await
         .map_err(|e| ApiError::internal_error(format!("Bedrock call failed: {e}")))?;
 
@@ -536,7 +536,7 @@ async fn call_claude_with_code_result(
     let continuation = build_continuation_request(original_request, messages);
 
     let mut final_response = bedrock
-        .invoke_model_messages(&continuation, target_model_id)
+        .invoke_model_messages(&continuation, target_model_id, None)
         .await
         .map_err(|e| ApiError::internal_error(format!("Bedrock finalization failed: {e}")))?;
 
@@ -603,7 +603,7 @@ async fn finalize_with_claude_from_state(
     };
 
     let mut final_response = bedrock
-        .invoke_model_messages(&continuation, target_model_id)
+        .invoke_model_messages(&continuation, target_model_id, None)
         .await
         .map_err(|e| ApiError::internal_error(format!("Bedrock finalization failed: {e}")))?;
 

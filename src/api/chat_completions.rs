@@ -512,7 +512,7 @@ async fn handle_bedrock_request(
 
         if request.stream {
             let stream_response = bedrock
-                .invoke_model_messages_stream(&anthropic_req, target_model_id)
+                .invoke_model_messages_stream(&anthropic_req, target_model_id, None)
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Bedrock InvokeModel streaming failed");
@@ -604,7 +604,7 @@ async fn handle_bedrock_request(
 
         // Non-streaming
         let response = bedrock
-            .invoke_model_messages(&anthropic_req, target_model_id)
+            .invoke_model_messages(&anthropic_req, target_model_id, None)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Bedrock InvokeModel call failed");

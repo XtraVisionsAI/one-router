@@ -38,7 +38,7 @@ impl WebToolBackend for BedrockService {
         request: &MessageRequest,
         model: &str,
     ) -> Result<MessageResponse, WebToolError> {
-        self.invoke_model_messages(request, model)
+        self.invoke_model_messages(request, model, None)
             .await
             .map_err(|e| WebToolError::BackendError(e.to_string()))
     }

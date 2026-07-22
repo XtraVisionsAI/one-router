@@ -2,6 +2,7 @@
 
 pub mod backend_pool;
 pub mod bedrock;
+pub mod beta_headers;
 pub mod capabilities;
 pub mod failover;
 pub mod gemini;
