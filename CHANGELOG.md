@@ -1,3 +1,21 @@
+## v0.23.0 (2026-07-22)
+
+### Feat
+
+- **metrics**: add in-flight gauge, auth-failures counter, build-info
+- **bedrock**: map/blocklist/passthrough anthropic-beta header into InvokeModel body
+- **responses**: add OpenAI Responses API + Codex compatibility
+- **anthropic**: refusal-fallback passthrough (fallback-credit-2026-06-09)
+- **pricing**: LiteLLM price-table auto-sync
+- **ssrf,failover**: block reserved IP ranges and cool down on 429
+- adopt correctness/security/observability improvements from bedrock-proxy analysis
+
+### Fix
+
+- **bedrock,ssrf**: correct defer_loading beta value and reject oversized images
+- **metrics,failover**: count error outcomes, test switch logic, document pricing
+- **failover**: skip PTC requests and add failover metric
+
 ## v0.22.1 (2026-06-13)
 
 ### Fix
