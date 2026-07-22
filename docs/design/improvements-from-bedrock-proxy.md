@@ -344,3 +344,163 @@ request  (attrs: gen_ai.system, gen_ai.request.model, provider, protocol, stream
 - **#5 failover 切换逻辑补测（已修）**：把选目标逻辑抽成纯函数 `FailoverChains::select_available(source, is_available_predicate)`,`DynamicConfig::apply_failover` 调它并传 `|p| self.provider_available(p)`。纯函数用 mock 谓词单测了:跳过不健康的首个目标、多健康时按配置顺序取首个、全不健康/无链时返回 None。
 - **#2 计价口径（更正为「按设计」并文档化,未改代码）**：计价按 `request.model`（客户端传的**源** model）查其 mapping 行价格。① failover 后仍按**所请求模型**计价(备用后端 id 没有自己的源 mapping 行)—— 这是**有意为之**:客户端为其请求的模型付费,与实际由哪个后端服务无关,可预测。② 裸 application-inference-profile ARN 作 model 传入时:该 ARN 的 mapping 行配了价就用,否则落 DEFAULT;解析出的底层基础模型**不**参与计价。已在 `calculate_cost` doc 注释写明。原「一律落兜底价」的说法是夸大。
 - **#6 seed 幂等（更正,非问题）**：`seed_defaults()` 每次启动对缺失 key 补插,已有部署重启即获得 `failover_chains` 行(空=禁用)。作废。
+
+---
+
+# 2026-07-22 剩余两项设计（#18 AgentCore / #14 OpenTelemetry）
+
+参考仓库对比清单在 F1–F9 中，one-router 已落地 S1–S5 / F1(#17) / F2(#21) / F3 / F4(#22) / F5(#19) / F7 / F9(#20)。**尚未实现的只剩两项**：`#18` AgentCore Gateway WebSearch（F6）与 `#14` OpenTelemetry 分布式追踪（F8/O1）。本节把这两项的可执行设计沉淀下来（均**暂不落地**，仅设计稿）。
+
+---
+
+## 一、#18 AgentCore Gateway WebSearch provider（F6，中等工程量）
+
+### 目标与定位
+
+在现有 `tavily` / `brave` 之外增加第三个搜索 provider `agentcore`。它走 **AWS 账单**、**无需第三方搜索 API key**（用调用方的 AWS 凭证 / IAM role），面向已在 AWS 上部署的用户。代价是：**仅 us-east-1**、**不支持域名/位置过滤**、**必须先部署一个 AgentCore Gateway**。
+
+### 与 Tavily/Brave 的关键差异（决定了实现复杂度）
+
+| 维度 | Tavily/Brave | AgentCore |
+|---|---|---|
+| 传输 | HTTPS + api_key / 订阅头 | HTTPS POST，**MCP over JSON-RPC 2.0** |
+| 鉴权 | 字符串 api_key | **AWS SigV4**（service = `bedrock-agentcore`） |
+| 工具发现 | 无 | 先 `tools/list` 拿命名空间化工具名 `{target}___WebSearch`，缓存 |
+| 调用 | 单次请求 | `tools/call`（`params.name` = 解析出的工具名，`arguments={query,maxResults}`） |
+| 响应 | 直接 JSON | 可能是**SSE 帧**（取最后一个 `data:` 帧）且结果**双重 JSON 编码**（MCP text content block 里再套一层 JSON 字符串） |
+| 域名过滤 | 原生 / 客户端 | **不支持**（参考实现直接丢弃 allowed/blocked_domains） |
+| 区域 | 任意 | **仅 us-east-1** |
+| 前置部署 | 无 | 需 IAM role + Gateway + web-search target |
+
+参考实现：`sample-bedrock-api-proxy/app/services/web_search/providers.py:201-434`（`AgentCoreSearchProvider`）。关键常量 `TOOL_NAME="WebSearch"`、`SERVICE_NAME="bedrock-agentcore"`；query 截断 200 字符；`maxResults` clamp 到 `1..=25`；**丢弃无 url 的结果**。
+
+### one-router 侧需要改造的点（6 处，已核实现状）
+
+1. **构造链要求非空 api_key** —— `web_tools/search.rs:196` `build_search_provider(provider, api_key)` 在 `api_key.is_empty()` 时返回 `None`；`server/app.rs:607-623` 用 `provider.zip(api_key).and_then(build_search_provider)`，无 key ⇒ 无 provider。AgentCore 无 key，**这两处都要加旁路分支**。
+2. **AWS 凭证获取** —— provider 需要 AWS creds 做 SigV4。web_tools 目前完全不接触 AWS 凭证。
+3. **校验白名单** —— `api/admin/system_settings.rs:60` 只接受 `"" | "tavily" | "brave"`；`database/seed.rs:1010` 的 UI select 同理。要加 `"agentcore"`。
+4. **新设置项** —— `agentcore_gateway_url`、`agentcore_gateway_region`（默认 `us-east-1`）。
+5. **工具名解析 + 缓存** —— 首次 `tools/list` 往返，按「精确 `WebSearch` → 以 `___WebSearch` 结尾 → 以 `WebSearch` 结尾」优先级选，缓存进 provider（`tokio::sync::OnceCell<String>` 或 `Mutex<Option<String>>`）。
+6. **响应解析** —— 兼容直接 JSON 与 SSE（扫 `data:` 行、忽略 `[DONE]`、解析最后一帧）；再从 `result.content[].text` 里 `serde_json::from_str` 出内层 `{results:[...]}`。
+
+`SearchResult`（`search.rs:14`）目前是 `{title,url,snippet}`，**无 date 字段**。AgentCore 返回 `publishedDate/page_age` 可丢弃（保持 trait 简单），或后续统一给 `SearchResult` 加可选 `page_age` —— 建议本期丢弃，不改 trait。
+
+### 凭证来源（设计决策）
+
+AgentCore Gateway target 用 `GATEWAY_IAM_ROLE` 凭证类型，语义就是「用运行环境的 AWS 身份走账单」。因此**推荐用 `aws_config` 默认凭证链**（环境的 IAM role / 实例 profile / 静态 key）构造 provider 凭证，而不是把 Bedrock 凭证池的 key 穿进 web_tools —— 这样与「走 AWS 账单」语义一致、且不给 web_tools 引入对 backend pool 的耦合。启动时在 `app.rs` 用 `aws_config::defaults(...).load()` 拿到 `SdkConfig`，从中取 `credentials_provider` 传给 provider（provider 内每次签名前 `provide_credentials().await` 取当前 frozen creds，兼容临时凭证轮换）。
+
+> 备选：若要求与 Bedrock 完全同源的凭证，可复用 `bedrock.rs:407-419` 的 `ResolverCreds` 模式从 backend pool 取。默认方案更简单，除非有强需求否则不采。
+
+### SigV4 签名 —— 复用现成模式
+
+`services/inference_profile.rs:88-142` 已有「用 `aws-sigv4` crate 手签 + `reqwest` 发」的成熟范式（控制面 `GetInferenceProfile`）。AgentCore 几乎照搬，仅三处改动：
+
+- method `"GET"` → `"POST"`；
+- service name `"bedrock"` → `"bedrock-agentcore"`；
+- `SignableBody::Bytes(&[])` → `SignableBody::Bytes(&payload)`（JSON-RPC body 必须纳入签名）。
+
+依赖已齐（`Cargo.toml`：`aws-sigv4 = "1.3.7"`、`aws-credential-types`、`aws-config`），**无需新增 crate**。
+
+### 实现骨架（`services/web_tools/search.rs` 内新增）
+
+```rust
+pub struct AgentCoreSearchProvider {
+    gateway_url: String,
+    region: String,
+    creds: aws_credential_types::provider::SharedCredentialsProvider,
+    client: reqwest::Client,               // Accept: application/json, text/event-stream
+    resolved_tool: tokio::sync::OnceCell<String>,
+}
+
+impl AgentCoreSearchProvider {
+    async fn signed_post(&self, body: &[u8]) -> Result<String, WebToolError> {
+        // 1. creds.provide_credentials().await  → Identity
+        // 2. v4::SigningParams { name: "bedrock-agentcore", region, time: now }
+        // 3. SignableRequest::new("POST", &self.gateway_url, headers, SignableBody::Bytes(body))
+        // 4. sign(...) → 把 signing_instructions.headers() 灌进 reqwest POST
+        // 5. resp.error_for_status()? → 返回 body 文本（可能是 SSE）
+    }
+
+    fn json_from_response_text(text: &str) -> Result<serde_json::Value, WebToolError> {
+        // 直接 JSON 优先；否则扫 "data:" 行、跳过 [DONE]、解析最后一帧
+    }
+
+    async fn resolve_tool_name(&self) -> Result<String, WebToolError> {
+        // tools/list → 按 WebSearch / ___WebSearch 后缀优先级选；OnceCell 缓存
+    }
+}
+
+#[async_trait]
+impl SearchProvider for AgentCoreSearchProvider {
+    async fn search(
+        &self,
+        query: &str,
+        _allowed_domains: Option<&[String]>,   // AgentCore 不支持，忽略
+        _blocked_domains: Option<&[String]>,
+        max_results: usize,
+    ) -> Result<Vec<SearchResult>, WebToolError> {
+        let tool = self.resolve_tool_name().await?;
+        let req = serde_json::json!({
+            "jsonrpc":"2.0","id": /* 用调用序号或固定串（脚本禁 Uuid::new_v4? 运行时可用） */,
+            "method":"tools/call",
+            "params":{"name": tool,
+                      "arguments":{"query": &query[..query.len().min(200)],
+                                   "maxResults": max_results.clamp(1,25)}}
+        });
+        let text = self.signed_post(serde_json::to_vec(&req)?.as_slice()).await?;
+        let payload = Self::json_from_response_text(&text)?;
+        // payload.error → SearchApiError；result.isError → SearchApiError
+        // result.content[].{type=="text"}.text → serde_json::from_str → {results:[...]}
+        // map 每条：url/title 缺省 ""、snippet 取 text/content/snippet、丢弃无 url、截 max_results
+    }
+}
+```
+
+### 选择/构造链改造（`server/app.rs`）
+
+```rust
+let search: Option<Arc<dyn SearchProvider>> = match provider.as_deref() {
+    Some("agentcore") => {
+        let url = /* 读 agentcore_gateway_url 设置 */;
+        let region = /* agentcore_gateway_region，默认 us-east-1 */;
+        // 非 us-east-1 或缺 url → 记 warn 并返回 None（与"未配置"一致，API 层照常拒 web_search）
+        let sdk = aws_config::defaults(BehaviorVersion::latest()).region(region).load().await;
+        build_agentcore_provider(url, region, sdk.credentials_provider()?)   // 不走 api_key
+    }
+    Some(p) => provider.zip(api_key).and_then(|(p,k)| build_search_provider(p,k))
+                       .map(|b| Arc::from(b)),
+    None => None,
+};
+```
+
+`build_search_provider` 的 tavily/brave 分支保持不变；AgentCore 单独走一条不需要 api_key 的构造路径。
+
+### 部署前提（必须文档化给用户）
+
+AgentCore Gateway **不是开箱即用**，需一次性在 us-east-1 部署（参考脚本 `sample-bedrock-api-proxy/scripts/create_agentcore.sh`）：
+1. 建 IAM service role，信任 `bedrock-agentcore.amazonaws.com`，允许 `bedrock-agentcore:InvokeGateway` + `InvokeWebSearch`；
+2. 控制面 `bedrock-agentcore-control create-gateway --protocol-type MCP --authorizer-type AWS_IAM`，等 `READY`；
+3. 建 web-search target（`connectorId="web-search"`，`credentialProviderType=GATEWAY_IAM_ROLE`）；
+4. 拿到 gateway URL（形如 `https://{GATEWAY_ID}.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp`）→ 写入 `agentcore_gateway_url` 设置。
+
+one-router 侧**不做**部署编排，只消费已建好的 Gateway URL。README/部署文档需说明这一前置步骤。
+
+### 设计注意 / 红线
+
+- **仅 us-east-1**：region 非 us-east-1 时构造应失败或降级为「未配置」，不要静默发到错区域。
+- **临时凭证**：每次签名前重新 `provide_credentials()`，勿缓存 frozen creds（IAM role 会轮换）。
+- **工具名缓存**：`OnceCell` 缓存 `tools/list` 结果，避免每次搜索多一次往返；但 Gateway 重建后工具名可能变——可接受（重启进程即重解析），或加长 TTL。
+- **脚本运行时限制**：本 provider 是运行时代码（非 workflow 脚本），`Uuid::new_v4()` 可用；JSON-RPC `id` 用 uuid 或自增计数皆可。
+- **域名过滤语义**：AgentCore 不支持 allowed/blocked_domains。若请求带了这些参数，与参考实现一致**静默忽略**（不报错）；如需严格可在结果侧套用 Brave 那套 `domain_matches` 客户端过滤（`search.rs:192-215`）作为可选增强。
+
+---
+
+## 二、#14 OpenTelemetry 分布式追踪（F8/O1，大工程量）
+
+**本项设计稿已在上文 §「F8 / O1：OpenTelemetry 分布式追踪（暂缓，本节即设计稿）」给出**（依赖版本、启用条件、span 层次、GenAI 语义约定属性、session 聚合键派生、流式 span 处理、分步落地顺序）。此处仅登记「仍然有效」并补 F4 落地后的两点增量：
+
+- **init 位置已就绪**：`observability/` 模块树已随 F4 建立（`observability/metrics.rs`）。OTel init 放同级 `observability/tracing.rs`，`app.rs` 启动时按 `OTEL_EXPORTER_OTLP_ENDPOINT` 是否设置决定装载 `tracing-opentelemetry` layer。
+- **root span 中间件可与 metrics 中间件并置**：F4 已加 `track_http_metrics`（`server/routes.rs`，router-wide，含 in-flight inc/dec）。OTel 的 request root span 应在**同一位置**创建（或合并进同一 `from_fn` 中间件），避免两个全局中间件各自遍历请求。span 内可顺带读取 `onerouter_inflight_requests` 语义无关，但两者生命周期对齐（span start=inflight.inc、span end=inflight.dec+observe_http）便于维护。
+- **与 metrics 的 label 一致性**：span 属性用 GenAI 语义约定（`gen_ai.system`/`gen_ai.request.model`/`gen_ai.usage.*`），metrics label 用 `provider`/`protocol`/`model` —— 两套命名有意不同（OTel 有官方语义约定，Prometheus 保持现有短名），不要为对齐而改动已上线的 metrics label。
+
+其余 span 层次、流式累积、session 归属红线（红线 #3）等**完全沿用上文 §F8/O1 设计**，不重复。落地顺序仍建议：① OTLP init + root span → ② backend_call span + usage 属性 → ③ web_tool/failover 子 span → ④ session 聚合，每步独立可合入。
