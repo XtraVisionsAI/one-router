@@ -113,6 +113,17 @@ pub enum AuthError {
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
+        // Record the auth failure before the match — covers every path,
+        // including the early return in the InactiveKey arm. Reason labels are
+        // bounded to the four variant names.
+        let reason = match &self {
+            AuthError::MissingApiKey => "missing_key",
+            AuthError::InvalidApiKey => "invalid_key",
+            AuthError::InactiveKey { .. } => "inactive_key",
+            AuthError::InternalError(_) => "internal_error",
+        };
+        crate::observability::metrics::record_auth_failure(reason);
+
         let (status, error_type, message) = match self {
             AuthError::MissingApiKey => (
                 StatusCode::UNAUTHORIZED,

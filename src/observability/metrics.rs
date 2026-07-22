@@ -14,7 +14,8 @@
 //! we intentionally do not copy that.)
 
 use prometheus::{
-    CounterVec, Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+    CounterVec, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use std::sync::OnceLock;
 
@@ -34,6 +35,10 @@ struct Metrics {
     failover_total: IntCounterVec,
     /// HTTP request duration in seconds, labeled by status class (2xx/4xx/5xx).
     http_request_duration: HistogramVec,
+    /// Requests currently being processed (in-flight), across all routes.
+    inflight_requests: IntGauge,
+    /// Authentication failures, labeled by reason.
+    auth_failures_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -88,6 +93,34 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let inflight_requests = IntGauge::new(
+            "onerouter_inflight_requests",
+            "Requests currently being processed (in-flight)",
+        )
+        .expect("valid metric");
+
+        let auth_failures_total = IntCounterVec::new(
+            Opts::new(
+                "onerouter_auth_failures_total",
+                "Authentication failures, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("valid metric");
+
+        let build_info = IntGaugeVec::new(
+            Opts::new(
+                "onerouter_build_info",
+                "Build info (always 1); version carried as a label",
+            ),
+            &["version"],
+        )
+        .expect("valid metric");
+        // Fixed value 1; the version label carries the useful information.
+        build_info
+            .with_label_values(&[env!("CARGO_PKG_VERSION")])
+            .set(1);
+
         registry
             .register(Box::new(requests_total.clone()))
             .expect("register requests_total");
@@ -103,6 +136,17 @@ impl Metrics {
         registry
             .register(Box::new(http_request_duration.clone()))
             .expect("register http_request_duration");
+        registry
+            .register(Box::new(inflight_requests.clone()))
+            .expect("register inflight_requests");
+        registry
+            .register(Box::new(auth_failures_total.clone()))
+            .expect("register auth_failures_total");
+        // build_info is register-and-forget: the registry holds the clone, the
+        // value never changes, and nothing reads it back.
+        registry
+            .register(Box::new(build_info))
+            .expect("register build_info");
 
         Self {
             registry,
@@ -111,6 +155,8 @@ impl Metrics {
             cost_usd_total,
             failover_total,
             http_request_duration,
+            inflight_requests,
+            auth_failures_total,
         }
     }
 }
@@ -185,6 +231,24 @@ pub fn observe_http(status: u16, elapsed_secs: f64) {
         .observe(elapsed_secs);
 }
 
+/// Increment the in-flight request gauge (call on request entry).
+pub fn inc_inflight() {
+    metrics().inflight_requests.inc();
+}
+
+/// Decrement the in-flight request gauge (call on request completion).
+pub fn dec_inflight() {
+    metrics().inflight_requests.dec();
+}
+
+/// Record one authentication failure, bucketed by reason.
+pub fn record_auth_failure(reason: &str) {
+    metrics()
+        .auth_failures_total
+        .with_label_values(&[reason])
+        .inc();
+}
+
 /// Encode all metrics in the Prometheus text exposition format.
 pub fn gather() -> String {
     let m = metrics();
@@ -209,6 +273,9 @@ mod tests {
         record_cost("bedrock", "claude-x", 0.0123);
         record_failover("bedrock", "anthropic");
         observe_http(200, 0.42);
+        inc_inflight();
+        dec_inflight();
+        record_auth_failure("invalid_key");
 
         let out = gather();
         assert!(out.contains("onerouter_requests_total"));
@@ -216,6 +283,12 @@ mod tests {
         assert!(out.contains("onerouter_cost_usd_total"));
         assert!(out.contains("onerouter_failover_total"));
         assert!(out.contains("onerouter_http_request_duration_seconds"));
+        assert!(out.contains("onerouter_inflight_requests"));
+        assert!(out.contains("onerouter_auth_failures_total"));
+        assert!(out.contains("reason=\"invalid_key\""));
+        // build_info is always present with the crate version label.
+        assert!(out.contains("onerouter_build_info"));
+        assert!(out.contains(concat!("version=\"", env!("CARGO_PKG_VERSION"), "\"")));
         // provider/status labels are present; api_key is never a label.
         assert!(out.contains("provider=\"bedrock\""));
         assert!(!out.contains("api_key"));

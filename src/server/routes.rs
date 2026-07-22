@@ -185,7 +185,9 @@ pub fn create_router(state: AppState) -> Router {
 /// it covers business, admin and health routes uniformly.
 async fn track_http_metrics(request: Request<Body>, next: middleware::Next) -> Response {
     let start = std::time::Instant::now();
+    crate::observability::metrics::inc_inflight();
     let response = next.run(request).await;
+    crate::observability::metrics::dec_inflight();
     crate::observability::metrics::observe_http(
         response.status().as_u16(),
         start.elapsed().as_secs_f64(),
