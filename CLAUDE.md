@@ -109,6 +109,9 @@ Managed via Admin UI or `PUT /admin/api/settings/:key`. Changes take effect **im
 | `web_fetch_max_content_kb` | `512` | Max content size (KB) for web_fetch tool |
 | `web_fetch_provider` | _(empty)_ | Fetch method: `tavily` (Tavily Extract API) / empty (direct HTTP) |
 | `failover_chains` | _(empty)_ | Model-level failover chains (JSON). `{"<source_model>":[{"provider":"...","model":"..."}]}`. When the resolved provider has no healthy credential, fall over to the first backup provider/model with a healthy pool. Empty = disabled |
+| `pricing_sync_enabled` | `false` | Auto-sync model pricing from the LiteLLM price table. When on, a background job periodically overwrites the prices of mappings whose `pricing_source` is `litellm`; rows marked `manual` are never touched |
+| `pricing_sync_url` | _(BerriAI raw JSON)_ | Source URL for the LiteLLM `model_prices_and_context_window.json`. Must be https |
+| `pricing_sync_interval_hours` | `24` | Background pricing-sync interval (hours, min 1) |
 
 ---
 
@@ -134,7 +137,8 @@ src/
 │       ├── system_settings.rs   # System settings CRUD
 │       ├── admin_usage.rs       # Admin usage analytics
 │       ├── status.rs            # Server status
-│       └── update.rs            # Self-update API
+│       ├── update.rs            # Self-update API
+│       └── pricing.rs           # LiteLLM pricing-sync API (trigger + status)
 ├── converters/
 │   ├── anthropic_gemini.rs      # Anthropic ↔ Gemini
 │   ├── anthropic_openai.rs      # Anthropic ↔ OpenAI
@@ -163,6 +167,7 @@ src/
 │   ├── usage_tracker.rs         # Token usage recording with per-model pricing
 │   ├── capabilities.rs          # Model capability system
 │   ├── failover.rs              # Model-level credential-exhaustion failover chains
+│   ├── pricing_sync.rs          # LiteLLM price-table sync (updates model_mappings prices)
 │   ├── service_tier.rs          # Service tier resolution
 │   ├── inference_profile.rs     # Bedrock application inference profile ARN resolution
 │   ├── image_url_fetcher.rs     # Image URL → base64 (SSRF-guarded)
@@ -446,3 +451,4 @@ Multiple credentials per backend are supported. Strategies:
 - Bedrock `invoke_model_messages` auto-retries without `service_tier` if the initial call fails with a tier-related ValidationError.
 - **Failover** (`services/failover.rs`): configured via the `failover_chains` setting. `DynamicConfig::apply_failover` runs right after `resolve()` in both handlers — if the resolved provider has no healthy credential (`provider_available` → `PoolStats::is_healthy()`), it switches to the first backup provider/model with a healthy pool. Credential-*exhaustion* failover only (not per-response retry). **PTC requests skip failover** (Bedrock/Docker-specific — detected up front via `is_ptc`). Exempt from the cache-affinity lock (the primary is unusable, so no cache benefit is lost). Failover targets bypass model_mapping and use default capabilities. Each switch increments `onerouter_failover_total{from,to}`.
 - **Metrics** (`observability/metrics.rs`): unauthenticated `GET /metrics` (Prometheus text format). Counters recorded from `UsageTracker::record_usage` + an HTTP-duration middleware. Labels are bounded (`provider`/`protocol`/`model`/`direction`/`status`/`from`/`to`) — the API key is **never** a label.
+- **Pricing sync** (`services/pricing_sync.rs`): pulls the LiteLLM price table and **updates existing `model_mappings` rows' inline prices** (never creates mappings — one-router prices per source→target mapping, not in a separate table). Covers all 4 backends: a mapping's `provider` selects the LiteLLM namespace, its `target_model_id` is matched (Bedrock region-prefix fallback). Per-token source costs are stored ×1e6 (per-1M). Rows with `pricing_source = "manual"` are pinned (skipped unless `overwrite_manual`); `"litellm"` (default) rows are overwritten. A `None` source field never nulls out a stored price. Admin: `POST/GET /admin/api/pricing/sync` (`dry_run` query for preview). Background job gated on `pricing_sync_enabled` (re-reads settings each iteration; interval `pricing_sync_interval_hours`). `run_sync` invalidates the model-mapping cache on change.

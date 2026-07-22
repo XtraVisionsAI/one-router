@@ -83,6 +83,7 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             created_at BIGINT NOT NULL,
             updated_at BIGINT,
             capabilities TEXT,
+            pricing_source TEXT DEFAULT 'litellm',
             PRIMARY KEY (source_model_id, provider)
         )",
     )
@@ -96,6 +97,13 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
     sqlx::query("ALTER TABLE model_mappings ADD COLUMN IF NOT EXISTS capabilities TEXT")
         .execute(pool)
         .await?;
+
+    // Migration: add pricing_source column if not already present
+    sqlx::query(
+        "ALTER TABLE model_mappings ADD COLUMN IF NOT EXISTS pricing_source TEXT DEFAULT 'litellm'",
+    )
+    .execute(pool)
+    .await?;
 
     // Index for efficient wildcard (prefix) matching on source_model_id
     sqlx::query(

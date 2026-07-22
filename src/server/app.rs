@@ -94,6 +94,7 @@ impl App {
             ptc_service,
             encryptor,
             update_service,
+            pricing_sync_status: Arc::new(RwLock::new(None)),
             sessions: Arc::new(RwLock::new(HashSet::new())),
             dynamic,
         };
@@ -121,6 +122,51 @@ impl App {
             }
         });
 
+        // Spawn background LiteLLM pricing sync (gated on `pricing_sync_enabled`).
+        // Settings are re-read each iteration so toggling takes effect without restart.
+        let pricing_state = self.state.clone();
+        tokio::spawn(async move {
+            // Stagger after the update checker's initial run.
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            loop {
+                let db = &pricing_state.database;
+                let enabled = load_bool_setting(db, "pricing_sync_enabled", false).await;
+                let interval_hours = load_string_setting(db, "pricing_sync_interval_hours")
+                    .await
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|h| *h >= 1)
+                    .unwrap_or(24);
+
+                if enabled {
+                    let url = load_string_setting(db, "pricing_sync_url")
+                        .await
+                        .unwrap_or_else(|| {
+                            crate::services::pricing_sync::DEFAULT_PRICING_SYNC_URL.to_string()
+                        });
+                    match crate::services::pricing_sync::run_sync(
+                        pricing_state.database.clone(),
+                        pricing_state.model_mapping.clone(),
+                        &url,
+                        crate::services::pricing_sync::SyncOptions::default(),
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            *pricing_state.pricing_sync_status.write().await = Some(summary);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "Background pricing sync failed"),
+                    }
+                }
+
+                let sleep_secs = if enabled {
+                    interval_hours.saturating_mul(3600)
+                } else {
+                    // Disabled: re-check the toggle hourly.
+                    3600
+                };
+                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+            }
+        });
         tracing::info!("Starting server on {}", addr);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;

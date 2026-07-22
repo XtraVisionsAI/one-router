@@ -9,6 +9,7 @@ pub mod image_url_fetcher;
 pub mod inference_profile;
 pub mod model_mapping;
 pub mod passthrough;
+pub mod pricing_sync;
 pub mod ptc;
 pub mod service_tier;
 pub mod update;

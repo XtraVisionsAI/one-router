@@ -55,6 +55,9 @@ pub struct UpsertMappingRequest {
     /// JSON-encoded ModelCapabilities. None means use defaults.
     #[serde(default)]
     pub capabilities: Option<String>,
+    /// Pricing origin: "litellm" (auto-synced) or "manual" (pinned). Defaults to "litellm".
+    #[serde(default = "default_pricing_source")]
+    pub pricing_source: String,
 }
 
 fn default_priority() -> i32 {
@@ -63,6 +66,10 @@ fn default_priority() -> i32 {
 
 fn default_status() -> String {
     "active".to_string()
+}
+
+fn default_pricing_source() -> String {
+    "litellm".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +174,7 @@ pub async fn create_mapping(
         created_at: now,
         updated_at: None,
         capabilities: body.capabilities,
+        pricing_source: body.pricing_source,
     };
 
     match state.database.model_mapping().upsert_mapping(&record).await {
@@ -244,6 +252,7 @@ pub async fn update_mapping(
         created_at: existing.created_at,
         updated_at: Some(now),
         capabilities: body.capabilities,
+        pricing_source: body.pricing_source,
     };
 
     match state.database.model_mapping().upsert_mapping(&record).await {

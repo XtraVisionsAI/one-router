@@ -84,6 +84,10 @@ pub struct ModelMappingRecord {
     pub updated_at: Option<i64>,
     /// JSON-encoded ModelCapabilities. None means use defaults (all enabled).
     pub capabilities: Option<String>,
+    /// Pricing origin: `"litellm"` (auto-synced from the LiteLLM price table,
+    /// overwritten on each sync) or `"manual"` (pinned — never touched by sync).
+    /// Defaults to `"litellm"`.
+    pub pricing_source: String,
 }
 
 // ============================================================================

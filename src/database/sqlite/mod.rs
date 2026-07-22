@@ -171,6 +171,7 @@ impl SqliteBackend {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER,
                 capabilities TEXT,
+                pricing_source TEXT DEFAULT 'litellm',
                 PRIMARY KEY (source_model_id, provider)
             )",
         )
@@ -190,6 +191,12 @@ impl SqliteBackend {
 
         // Migration: add capabilities column if not already present
         sqlx::query("ALTER TABLE model_mappings ADD COLUMN capabilities TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+
+        // Migration: add pricing_source column if not already present
+        sqlx::query("ALTER TABLE model_mappings ADD COLUMN pricing_source TEXT DEFAULT 'litellm'")
             .execute(&self.pool)
             .await
             .ok();
@@ -988,7 +995,7 @@ impl ModelMappingStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities \
+             priority, status, created_at, updated_at, capabilities, pricing_source \
              FROM model_mappings WHERE source_model_id = ? ORDER BY priority DESC",
         )
         .bind(source_model_id)
@@ -1011,6 +1018,9 @@ impl ModelMappingStore for SqliteBackend {
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 capabilities: r.get("capabilities"),
+                pricing_source: r
+                    .get::<Option<String>, _>("pricing_source")
+                    .unwrap_or_else(|| "litellm".to_string()),
             })
             .collect();
 
@@ -1025,7 +1035,7 @@ impl ModelMappingStore for SqliteBackend {
         let row = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities \
+             priority, status, created_at, updated_at, capabilities, pricing_source \
              FROM model_mappings WHERE source_model_id = ? AND provider = ?",
         )
         .bind(source_model_id)
@@ -1048,6 +1058,9 @@ impl ModelMappingStore for SqliteBackend {
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 capabilities: r.get("capabilities"),
+                pricing_source: r
+                    .get::<Option<String>, _>("pricing_source")
+                    .unwrap_or_else(|| "litellm".to_string()),
             })),
             None => Ok(None),
         }
@@ -1057,7 +1070,7 @@ impl ModelMappingStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities \
+             priority, status, created_at, updated_at, capabilities, pricing_source \
              FROM model_mappings ORDER BY provider, priority DESC, source_model_id",
         )
         .fetch_all(&self.pool)
@@ -1079,6 +1092,9 @@ impl ModelMappingStore for SqliteBackend {
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 capabilities: r.get("capabilities"),
+                pricing_source: r
+                    .get::<Option<String>, _>("pricing_source")
+                    .unwrap_or_else(|| "litellm".to_string()),
             })
             .collect();
 
@@ -1091,8 +1107,8 @@ impl ModelMappingStore for SqliteBackend {
             "INSERT INTO model_mappings \
              (source_model_id, target_model_id, provider, display_name, \
               input_price, output_price, cache_read_price, cache_write_price, \
-              priority, status, created_at, updated_at, capabilities) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+              priority, status, created_at, updated_at, capabilities, pricing_source) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(source_model_id, provider) DO UPDATE SET \
              target_model_id = excluded.target_model_id, \
              display_name = excluded.display_name, \
@@ -1103,7 +1119,8 @@ impl ModelMappingStore for SqliteBackend {
              priority = excluded.priority, \
              status = excluded.status, \
              updated_at = excluded.updated_at, \
-             capabilities = excluded.capabilities",
+             capabilities = excluded.capabilities, \
+             pricing_source = excluded.pricing_source",
         )
         .bind(&record.source_model_id)
         .bind(&record.target_model_id)
@@ -1118,6 +1135,7 @@ impl ModelMappingStore for SqliteBackend {
         .bind(record.created_at)
         .bind(now)
         .bind(&record.capabilities)
+        .bind(&record.pricing_source)
         .execute(&self.pool)
         .await?;
 
@@ -1138,7 +1156,7 @@ impl ModelMappingStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities \
+             priority, status, created_at, updated_at, capabilities, pricing_source \
              FROM model_mappings WHERE source_model_id LIKE '%*%' AND status = 'active' \
              ORDER BY priority DESC",
         )
@@ -1161,6 +1179,9 @@ impl ModelMappingStore for SqliteBackend {
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 capabilities: r.get("capabilities"),
+                pricing_source: r
+                    .get::<Option<String>, _>("pricing_source")
+                    .unwrap_or_else(|| "litellm".to_string()),
             })
             .collect();
 

@@ -43,6 +43,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-5-sonnet-latest".into(),
@@ -58,6 +59,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-sonnet-20240229".into(),
@@ -73,6 +75,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4-20250514".into(),
@@ -88,6 +91,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4".into(),
@@ -103,6 +107,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-5-haiku-20241022".into(),
@@ -118,6 +123,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-haiku-20240307".into(),
@@ -133,6 +139,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-5-20251101".into(),
@@ -148,6 +155,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-5".into(),
@@ -163,6 +171,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4-6-20260313".into(),
@@ -178,6 +187,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-sonnet-4-6".into(),
@@ -193,6 +203,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-6-20260313".into(),
@@ -208,6 +219,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-6".into(),
@@ -223,6 +235,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-7".into(),
@@ -238,6 +251,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-8".into(),
@@ -253,6 +267,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-haiku-4-5-20251001".into(),
@@ -268,6 +283,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-haiku-4-5".into(),
@@ -283,6 +299,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         // -latest aliases (Claude)
         ModelMappingRecord {
@@ -299,6 +316,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-opus-4-latest".into(),
@@ -314,6 +332,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-haiku-4-latest".into(),
@@ -329,6 +348,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "claude-3-5-haiku-latest".into(),
@@ -344,6 +364,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         // Gemini exact mappings (passthrough: target = source)
         ModelMappingRecord {
@@ -360,6 +381,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(GEMINI_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gemini-2.5-pro".into(),
@@ -375,6 +397,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(GEMINI_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gemini-2.0-flash".into(),
@@ -390,6 +413,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(GEMINI_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gemini-2.0-flash-lite".into(),
@@ -405,6 +429,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(GEMINI_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gemini-1.5-pro".into(),
@@ -420,6 +445,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(GEMINI_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gemini-1.5-flash".into(),
@@ -435,6 +461,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(GEMINI_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         // OpenAI-compatible exact mappings (GPT → Bedrock Claude)
         ModelMappingRecord {
@@ -451,6 +478,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-2024-05-13".into(),
@@ -466,6 +494,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-2024-08-06".into(),
@@ -481,6 +510,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-mini".into(),
@@ -496,6 +526,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4o-mini-2024-07-18".into(),
@@ -511,6 +542,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4".into(),
@@ -526,6 +558,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4-turbo".into(),
@@ -541,6 +574,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-4-turbo-preview".into(),
@@ -556,6 +590,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-3.5-turbo".into(),
@@ -571,6 +606,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "gpt-3.5-turbo-16k".into(),
@@ -586,6 +622,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "o1".into(),
@@ -601,6 +638,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "o1-preview".into(),
@@ -616,6 +654,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "o1-mini".into(),
@@ -631,6 +670,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         // ── OpenAI GPT models on Bedrock (native, via Mantle/Converse) ────────
         ModelMappingRecord {
@@ -647,6 +687,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(OPENAI_GPT_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         // ── Embedding models (Bedrock InvokeModel) ──────────────────────────
         // Cohere Embed v3
@@ -664,6 +705,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "cohere.embed-multilingual-v3".into(),
@@ -679,6 +721,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         // Titan Embed
         ModelMappingRecord {
@@ -695,6 +738,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "amazon.titan-embed-text-v1".into(),
@@ -710,6 +754,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         // OpenAI text-embedding aliases → Titan Embed v2
         ModelMappingRecord {
@@ -726,6 +771,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "text-embedding-3-large".into(),
@@ -741,6 +787,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "text-embedding-ada-002".into(),
@@ -756,6 +803,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         // ── Rerank models (Bedrock InvokeModel) ─────────────────────────────
         ModelMappingRecord {
@@ -772,6 +820,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "rerank-english-v3.0".into(),
@@ -787,6 +836,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         ModelMappingRecord {
             source_model_id: "rerank-multilingual-v3.0".into(),
@@ -802,6 +852,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: None,
+            pricing_source: "litellm".into(),
         },
         // Wildcard catch-all: any claude-* model not matched above
         ModelMappingRecord {
@@ -818,6 +869,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         // Wildcard catch-all: any gemini-* model not matched above
         ModelMappingRecord {
@@ -834,6 +886,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(GEMINI_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         // Wildcard catch-all: any gpt-* model not matched above
         ModelMappingRecord {
@@ -850,6 +903,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
         // Wildcard catch-all: any o1-* model not matched above
         ModelMappingRecord {
@@ -866,6 +920,7 @@ pub fn default_model_mappings() -> Vec<ModelMappingRecord> {
             created_at: now,
             updated_at: None,
             capabilities: Some(CLAUDE_CAPS.to_string()),
+            pricing_source: "litellm".into(),
         },
     ]
 }
@@ -988,6 +1043,41 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
                 .into(),
             ui_schema: Some(
                 r#"{"type":"text","label":"Failover Chains (JSON)","group":"General","sort_order":30,"placeholder":"{\"src-model\":[{\"provider\":\"anthropic\",\"model\":\"...\"}]}"}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "pricing_sync_enabled".into(),
+            value: "false".into(),
+            description: "Automatically sync model pricing from the LiteLLM price table. \
+                          When enabled, a background job periodically overwrites the prices of \
+                          model mappings whose pricing_source is 'litellm'. Rows marked 'manual' \
+                          are never touched."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"bool","label":"LiteLLM Price Sync","group":"Pricing","sort_order":10}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "pricing_sync_url".into(),
+            value: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json".into(),
+            description: "Source URL for the LiteLLM price table \
+                          (model_prices_and_context_window.json). Must be https."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"text","label":"Price Table URL","group":"Pricing","sort_order":20}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "pricing_sync_interval_hours".into(),
+            value: "24".into(),
+            description: "How often (in hours) the background pricing sync runs when enabled. \
+                          Minimum 1."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"text","label":"Sync Interval (hours)","group":"Pricing","sort_order":30}"#.into(),
             ),
             updated_at: None,
         },

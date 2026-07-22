@@ -137,6 +137,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/update", get(admin::update::get_update_status))
         .route("/update", post(admin::update::trigger_update))
         .route("/update/check", post(admin::update::check_for_update))
+        // LiteLLM pricing sync
+        .route("/pricing/sync", get(admin::pricing::get_sync_status))
+        .route("/pricing/sync", post(admin::pricing::trigger_sync))
         .layer(middleware::from_fn_with_state(
             admin_auth_state,
             require_admin_key,

@@ -682,7 +682,7 @@ impl ModelMappingStore for PostgresBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities \
+             priority, status, created_at, updated_at, capabilities, pricing_source \
              FROM model_mappings WHERE source_model_id = $1 ORDER BY priority DESC",
         )
         .bind(source_model_id)
@@ -705,6 +705,11 @@ impl ModelMappingStore for PostgresBackend {
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 capabilities: r.get("capabilities"),
+                pricing_source: r
+                    .try_get::<Option<String>, _>("pricing_source")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "litellm".to_string()),
             })
             .collect();
 
@@ -719,7 +724,7 @@ impl ModelMappingStore for PostgresBackend {
         let row = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities \
+             priority, status, created_at, updated_at, capabilities, pricing_source \
              FROM model_mappings WHERE source_model_id = $1 AND provider = $2",
         )
         .bind(source_model_id)
@@ -742,6 +747,11 @@ impl ModelMappingStore for PostgresBackend {
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 capabilities: r.get("capabilities"),
+                pricing_source: r
+                    .try_get::<Option<String>, _>("pricing_source")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "litellm".to_string()),
             })),
             None => Ok(None),
         }
@@ -751,7 +761,7 @@ impl ModelMappingStore for PostgresBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities \
+             priority, status, created_at, updated_at, capabilities, pricing_source \
              FROM model_mappings ORDER BY provider, priority DESC, source_model_id",
         )
         .fetch_all(&self.pool)
@@ -773,6 +783,11 @@ impl ModelMappingStore for PostgresBackend {
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 capabilities: r.get("capabilities"),
+                pricing_source: r
+                    .try_get::<Option<String>, _>("pricing_source")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "litellm".to_string()),
             })
             .collect();
 
@@ -785,8 +800,8 @@ impl ModelMappingStore for PostgresBackend {
             "INSERT INTO model_mappings \
              (source_model_id, target_model_id, provider, display_name, \
               input_price, output_price, cache_read_price, cache_write_price, \
-              priority, status, created_at, updated_at, capabilities) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+              priority, status, created_at, updated_at, capabilities, pricing_source) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
              ON CONFLICT(source_model_id, provider) DO UPDATE SET \
              target_model_id = EXCLUDED.target_model_id, \
              display_name = EXCLUDED.display_name, \
@@ -797,7 +812,8 @@ impl ModelMappingStore for PostgresBackend {
              priority = EXCLUDED.priority, \
              status = EXCLUDED.status, \
              updated_at = EXCLUDED.updated_at, \
-             capabilities = EXCLUDED.capabilities",
+             capabilities = EXCLUDED.capabilities, \
+             pricing_source = EXCLUDED.pricing_source",
         )
         .bind(&record.source_model_id)
         .bind(&record.target_model_id)
@@ -812,6 +828,7 @@ impl ModelMappingStore for PostgresBackend {
         .bind(record.created_at)
         .bind(now)
         .bind(&record.capabilities)
+        .bind(&record.pricing_source)
         .execute(&self.pool)
         .await?;
 
@@ -832,7 +849,7 @@ impl ModelMappingStore for PostgresBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities \
+             priority, status, created_at, updated_at, capabilities, pricing_source \
              FROM model_mappings WHERE source_model_id LIKE '%*%' AND status = 'active' \
              ORDER BY priority DESC",
         )
@@ -855,6 +872,11 @@ impl ModelMappingStore for PostgresBackend {
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 capabilities: r.get("capabilities"),
+                pricing_source: r
+                    .try_get::<Option<String>, _>("pricing_source")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "litellm".to_string()),
             })
             .collect();
 

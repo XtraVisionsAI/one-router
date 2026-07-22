@@ -149,6 +149,9 @@ pub struct AppState {
     /// Self-update service
     pub update_service: Arc<UpdateService>,
 
+    /// Cached result of the most recent LiteLLM pricing sync (None until first run).
+    pub pricing_sync_status: Arc<RwLock<Option<crate::services::pricing_sync::SyncSummary>>>,
+
     /// Active admin sessions (cookie tokens)
     pub sessions: SessionStore,
 
