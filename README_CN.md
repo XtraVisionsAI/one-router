@@ -23,11 +23,14 @@ One Router 是一个用 Rust 编写的高性能 API 网关，让你通过**一�
 
 - **双协议支持** — 同时接受 OpenAI (`/v1/chat/completions`) 和 Anthropic (`/v1/messages`) 请求格式
 - **多后端路由** — 路由至 AWS Bedrock、Google Gemini、Anthropic API 和 OpenAI API，自动完成协议转换
+- **OpenAI Responses API** — `/v1/responses` 端点，兼容 OpenAI Responses 协议与 Codex CLI，支持命名事件 SSE 流式输出，并通过 `previous_response_id` 实现有状态多轮对话
 - **Embedding 与 Rerank** — OpenAI 兼容的 `/v1/embeddings` 和 Cohere 兼容的 `/v1/rerank`，由 Bedrock 提供支持（Cohere Embed、Titan Embed、Nova Embed、Cohere Rerank）
 - **文生图** — OpenAI 兼容的 `/v1/images/generations`，路由至 OpenAI DALL-E、AWS Bedrock（Stability AI SDXL、Amazon Nova Canvas、Titan Image Generator）或 Google Gemini
 - **用量查询 API** — 通过 `GET /v1/usage`（按小时或模型聚合统计）和 `GET /v1/usage/records`（分页原始记录）查询自己的 token 用量和费用历史
 - **智能模型映射** — 跨提供商映射模型名称（如 `gpt-4o` → Claude Sonnet、`claude-*` → Bedrock），支持精确匹配、通配符和优先级配置
 - **后端池与负载均衡** — 每个后端记录是独立的服务实例，同类型多实例通过轮询、加权、随机或故障转移策略做负载均衡
+- **模型级故障转移** — 可配置的 failover 链，当主 provider 无健康凭证时自动切换到备用 provider/模型
+- **价格自动同步** — 可选地按计划从 LiteLLM 价表同步各模型价格；手动定价的映射会被固定，不会被覆盖
 - **可插拔存储** — SQLite（零配置）、PostgreSQL 或 DynamoDB — 一个环境变量切换
 - **API Key 管理** — 发放 API Key，支持独立的速率限制、预算上限和服务等级；Master key 仅限管理用途（不能调用业务 API）
 - **Admin 会话认证** — 管理界面使用 HttpOnly cookie 会话登录，浏览器不存储任何密钥
@@ -42,7 +45,9 @@ One Router 是一个用 Rust 编写的高性能 API 网关，让你通过**一�
 - **自更新** — 通过 CLI（`one-router update`）或 Admin API 从 GitHub Releases 检查并应用更新
 - **热重载** — 通过 Admin 界面修改后端配置和系统设置后即时生效，无需重启
 - **CLI 配置** — 通过命令行参数覆盖任意设置（`--port`、`--database`、`--log-level`）
-- **健康检查** — 内置 `/health`、`/ready`、`/liveness` 端点- **多架构 Docker** — 提供 `linux/amd64` 和 `linux/arm64` 镜像
+- **健康检查** — 内置 `/health`、`/ready`、`/liveness` 端点
+- **Prometheus 指标** — 无鉴权的 `/metrics` 端点，暴露请求/token/费用计数器、HTTP 时延直方图、并发请求 gauge、认证失败计数器和构建信息（API Key 永不作为 label）
+- **多架构 Docker** — 提供 `linux/amd64` 和 `linux/arm64` 镜像
 - **灵活部署** — Docker、AWS App Runner 或裸机部署
 
 ## 快速开始
@@ -78,7 +83,7 @@ cargo build --release
 
 ```
 ============================================================
-  One Router v0.20.1
+  One Router v0.22.1
 ============================================================
   Database:  sqlite://./data/gateway.db
   Listen:    0.0.0.0:8000
@@ -147,6 +152,26 @@ curl http://localhost:8000/v1/chat/completions \
   -H "content-type: application/json" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
 ```
+
+### OpenAI Responses API（Codex CLI）
+
+One Router 暴露 `/v1/responses`，即 Codex CLI 及新一代客户端使用的 OpenAI Responses 协议。请求会被翻译到与 `/v1/chat/completions` 相同的后端，因此任意 provider 均可使用。
+
+```bash
+# 非流式
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer sk-ephemeral-xxxxxxxxxxxx" \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o","input":"写一首关于大海的俳句。"}'
+
+# 流式 —— 命名 SSE 事件（response.created / response.output_text.delta / response.completed）
+curl -N http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer sk-ephemeral-xxxxxxxxxxxx" \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o","input":"你好！","stream":true}'
+```
+
+多轮对话是有状态的：把上一次响应的 `id` 作为 `previous_response_id` 传入即可续接（已存储的响应绑定创建它的 API Key）。若要让 Codex CLI 接入 One Router，将其 base URL 设为 `http://localhost:8000/v1` 并使用你的 API Key。
 
 ### Embeddings（OpenAI SDK）
 
@@ -372,9 +397,11 @@ DATABASE=dynamodb://us-east-1
   OpenAI SDK ──────►  /v1/embeddings                     │──► AWS Bedrock
   Cohere SDK ──────►  /v1/rerank                         │──► AWS Bedrock
   OpenAI SDK ──────►  /v1/images/generations             │──► OpenAI / Bedrock / Gemini
+  Codex CLI ───────►  /v1/responses                      │──► （翻译到 chat 后端）
                     │                                      │
                ─────►  GET /v1/usage                     │  （用量聚合统计）
                ─────►  GET /v1/usage/records             │  （分页原始记录）
+               ─────►  GET /metrics                       │  （Prometheus 指标）
                     │                                      │
   浏览器 ──────────►  GET /admin                         │  （Admin 管理界面）
                ─────►  /admin/api/*                      │  （Admin REST API）
@@ -463,16 +490,17 @@ Bedrock 和 Gemini 仅返回 `b64_json` 格式；OpenAI 透传同时支持 `url`
 
 ```
 src/
-├── api/                 # HTTP 处理器（messages、chat_completions、embeddings、rerank、images、models、usage、health、admin）
+├── api/                 # HTTP 处理器（messages、chat_completions、responses、embeddings、rerank、images、models、usage、health、admin）
 ├── config/              # 配置与 AWS 设置
-├── converters/          # 协议转换器（Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic）
+├── converters/          # 协议转换器（Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic；Responses ↔ Chat）
 ├── database/            # 存储后端（SQLite、PostgreSQL、DynamoDB）
 │   ├── sqlite/
 │   ├── postgres/
 │   └── dynamodb/
 ├── error/               # 错误类型
 ├── middleware/           # 认证与限流中间件
-├── schemas/             # 请求/响应 Schema（Anthropic、OpenAI、Bedrock、Gemini、Embeddings、Rerank、Images）
+├── observability/       # Prometheus 指标注册表与 /metrics
+├── schemas/             # 请求/响应 Schema（Anthropic、OpenAI、Responses、Bedrock、Gemini、Embeddings、Rerank、Images）
 ├── server/              # 应用启动、路由、状态管理
 ├── services/            # 业务逻辑
 │   ├── backend_pool/    # 后端实例池与负载均衡
@@ -481,6 +509,9 @@ src/
 │   ├── bedrock.rs       # AWS Bedrock 服务（Claude 用 InvokeModel；非 Claude /v1/chat/completions 用 Converse；非 Claude /v1/messages 用 Bedrock Mantle）
 │   ├── gemini.rs        # Google Gemini 服务
 │   ├── passthrough.rs   # Anthropic & OpenAI 透传服务
+│   ├── failover.rs      # 模型级凭证耗尽故障转移
+│   ├── pricing_sync.rs  # LiteLLM 价表同步
+│   ├── responses_context.rs # Responses 对话内存存储
 │   ├── model_mapping.rs # 模型解析与缓存
 │   └── usage_tracker.rs # 用量与成本追踪
 └── utils/

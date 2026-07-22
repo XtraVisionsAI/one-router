@@ -23,11 +23,14 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 
 - **Dual Protocol Support** — accepts both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) request formats
 - **Multi-Backend Routing** — routes to AWS Bedrock, Google Gemini, Anthropic API, and OpenAI API with automatic protocol conversion
+- **OpenAI Responses API** — `/v1/responses` endpoint compatible with the OpenAI Responses protocol and the Codex CLI, with named-event SSE streaming and stateful multi-turn conversations via `previous_response_id`
 - **Embeddings & Rerank** — OpenAI-compatible `/v1/embeddings` and Cohere-compatible `/v1/rerank` backed by Bedrock (Cohere Embed, Titan Embed, Nova Embed, Cohere Rerank)
 - **Image Generation** — OpenAI-compatible `/v1/images/generations` routed to OpenAI DALL-E, AWS Bedrock (Stability AI SDXL, Amazon Nova Canvas, Titan Image Generator), or Google Gemini
 - **Usage Query API** — query your token usage and cost history via `GET /v1/usage` (aggregated, grouped by hour or model) and `GET /v1/usage/records` (paginated raw records)
 - **Smart Model Mapping** — maps model names across providers (e.g. `gpt-4o` -> Claude Sonnet, `claude-*` -> Bedrock), with exact match, wildcard, and configurable priority
 - **Backend Pool & Load Balancing** — each backend record is an independent service instance; multiple instances of the same type are load-balanced with round-robin, weighted, random, or failover strategies
+- **Model-Level Failover** — configurable failover chains switch a model to a backup provider/model when the primary provider has no healthy credential
+- **Automatic Pricing Sync** — optionally sync per-model pricing from the LiteLLM price table on a schedule; mappings priced manually are pinned and never overwritten
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
 - **API Key Management** — issue API keys with per-key rate limits, budget caps, and service tiers; master key is admin-only (cannot call business APIs)
 - **Admin Session Auth** — admin UI uses HttpOnly cookie sessions via login endpoint; no key stored in browser
@@ -43,6 +46,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Hot-Reload** — backend and settings changes via Admin UI take effect immediately without restart
 - **CLI Configuration** — override any setting via command-line flags (`--port`, `--database`, `--log-level`)
 - **Health Endpoints** — built-in `/health`, `/ready`, `/liveness` endpoints
+- **Prometheus Metrics** — unauthenticated `/metrics` endpoint exposing request/token/cost counters, an HTTP latency histogram, an in-flight-requests gauge, an auth-failure counter, and build info (the API key is never a label)
 - **Multi-Arch Docker** — ships `linux/amd64` and `linux/arm64` images
 - **Deploy Anywhere** — Docker, AWS App Runner, or bare metal
 
@@ -79,7 +83,7 @@ On startup (debug builds only), One Router prints an **ephemeral API key** for i
 
 ```
 ============================================================
-  One Router v0.20.1
+  One Router v0.22.1
 ============================================================
   Database:  sqlite://./data/gateway.db
   Listen:    0.0.0.0:8000
@@ -148,6 +152,26 @@ curl http://localhost:8000/v1/chat/completions \
   -H "content-type: application/json" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
 ```
+
+### OpenAI Responses API (Codex CLI)
+
+One Router exposes `/v1/responses`, the OpenAI Responses protocol used by the Codex CLI and newer clients. Requests are translated to the same backends as `/v1/chat/completions`, so any provider works.
+
+```bash
+# Non-streaming
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer sk-ephemeral-xxxxxxxxxxxx" \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o","input":"Write a haiku about the sea."}'
+
+# Streaming — named SSE events (response.created / response.output_text.delta / response.completed)
+curl -N http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer sk-ephemeral-xxxxxxxxxxxx" \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o","input":"Hello!","stream":true}'
+```
+
+Multi-turn conversations are stateful: pass a prior response's `id` as `previous_response_id` to continue where it left off (stored responses are bound to the API key that created them). To point the Codex CLI at One Router, set its base URL to `http://localhost:8000/v1` and use your API key.
 
 ### Embeddings (OpenAI SDK)
 
@@ -369,9 +393,11 @@ Backend credentials are managed via the Admin UI at `/admin` -> Backends page. C
   OpenAI SDK ──────►  /v1/embeddings                     │──► AWS Bedrock
   Cohere SDK ──────►  /v1/rerank                         │──► AWS Bedrock
   OpenAI SDK ──────►  /v1/images/generations             │──► OpenAI / Bedrock / Gemini
+  Codex CLI ───────►  /v1/responses                      │──► (translated to chat backends)
                     │                                      │
                ─────►  GET /v1/usage                     │  (aggregated usage stats)
                ─────►  GET /v1/usage/records             │  (paginated raw records)
+               ─────►  GET /metrics                       │  (Prometheus metrics)
                     │                                      │
   Browser ─────────►  GET /admin                         │  (Admin Web UI)
                ─────►  /admin/api/*                      │  (Admin REST API)
@@ -460,16 +486,17 @@ For model mappings with no explicit capabilities, the **Settings -> default capa
 
 ```
 src/
-├── api/                 # HTTP handlers (messages, chat_completions, embeddings, rerank, images, models, usage, health, admin)
+├── api/                 # HTTP handlers (messages, chat_completions, responses, embeddings, rerank, images, models, usage, health, admin)
 ├── config/              # Settings & AWS config
-├── converters/          # Protocol converters (Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic)
+├── converters/          # Protocol converters (Anthropic/OpenAI ↔ Bedrock/Gemini/OpenAI/Anthropic; Responses ↔ Chat)
 ├── database/            # Storage backends (SQLite, PostgreSQL, DynamoDB)
 │   ├── sqlite/
 │   ├── postgres/
 │   └── dynamodb/
 ├── error/               # Error types
 ├── middleware/           # Auth & rate limiting
-├── schemas/             # Request/response schemas (Anthropic, OpenAI, Bedrock, Gemini, Embeddings, Rerank, Images)
+├── observability/       # Prometheus metrics registry & /metrics
+├── schemas/             # Request/response schemas (Anthropic, OpenAI, Responses, Bedrock, Gemini, Embeddings, Rerank, Images)
 ├── server/              # App bootstrap, routing, state
 ├── services/            # Business logic
 │   ├── backend_pool/    # Backend instance pool & load balancing
@@ -478,6 +505,9 @@ src/
 │   ├── bedrock.rs       # AWS Bedrock service (InvokeModel for Claude; Converse for non-Claude /v1/chat/completions; Bedrock Mantle for non-Claude /v1/messages)
 │   ├── gemini.rs        # Google Gemini service
 │   ├── passthrough.rs   # Anthropic & OpenAI passthrough service
+│   ├── failover.rs      # Model-level credential-exhaustion failover
+│   ├── pricing_sync.rs  # LiteLLM price-table sync
+│   ├── responses_context.rs # In-memory Responses conversation store
 │   ├── model_mapping.rs # Model resolution with caching
 │   └── usage_tracker.rs # Usage & cost tracking
 └── utils/
