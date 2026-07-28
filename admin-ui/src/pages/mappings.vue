@@ -1,13 +1,16 @@
 <script setup lang="ts">
+  import type { PricingSyncSummary } from '@/api/pricing'
   import type { ModelMapping } from '@/api/types'
   import { NButton, NTag, useDialog, useMessage } from 'naive-ui'
   import { h } from 'vue'
   import { useMappingsApi } from '@/api/mappings'
+  import { usePricingApi } from '@/api/pricing'
   import MappingModal from '@/components/MappingModal.vue'
 
   const message = useMessage()
   const dialog = useDialog()
   const api = useMappingsApi()
+  const pricingApi = usePricingApi()
 
   const allMappings = ref<ModelMapping[]>([])
   const loading = ref(true)
@@ -78,12 +81,106 @@
     return v % 1 === 0 ? `${v}` : `${v}`
   }
 
+  // ── LiteLLM price sync ──────────────────────────────────────
+  const syncing = ref(false)
+  const lastSync = ref<PricingSyncSummary | null>(null)
+
+  async function loadSyncStatus() {
+    try {
+      const res = await pricingApi.status()
+      lastSync.value = res.last_sync
+    } catch {
+      // non-fatal: status display only
+    }
+  }
+
+  function syncSummaryText(s: PricingSyncSummary) {
+    const parts = [`${s.updated.length} updated`, `${s.unchanged} unchanged`]
+    if (s.skipped_manual.length) parts.push(`${s.skipped_manual.length} manual pinned`)
+    if (s.not_found.length) parts.push(`${s.not_found.length} not in price table`)
+    return parts.join(' · ')
+  }
+
+  function fmtSyncTime(unixSecs: number | null) {
+    if (!unixSecs) return ''
+    return ` (${new Date(unixSecs * 1000).toLocaleString()})`
+  }
+
+  function renderSyncPreview(preview: PricingSyncSummary) {
+    const sample = preview.updated.slice(0, 8)
+    return h('div', { class: 'text-sm' }, [
+      h('p', { class: 'text-slate-400' }, syncSummaryText(preview)),
+      ...(sample.length
+        ? [
+            h('p', { class: 'text-slate-500 text-xs mt-3 mb-1' }, 'Will update:'),
+            h(
+              'ul',
+              { class: 'font-mono text-xs text-slate-300 space-y-0.5' },
+              sample.map((m) => h('li', m))
+            ),
+            ...(preview.updated.length > sample.length
+              ? [
+                  h(
+                    'p',
+                    { class: 'text-slate-500 text-xs mt-1' },
+                    `…and ${preview.updated.length - sample.length} more`
+                  )
+                ]
+              : [])
+          ]
+        : [h('p', { class: 'text-slate-500 text-xs mt-2' }, 'All prices are already up to date.')])
+    ])
+  }
+
+  async function openSyncPreview() {
+    syncing.value = true
+    try {
+      const preview = await pricingApi.sync({ dryRun: true })
+      const count = preview.updated.length
+      dialog.info({
+        title: 'Sync Prices from LiteLLM',
+        content: () => renderSyncPreview(preview),
+        positiveText: count > 0 ? `Apply ${count} update${count > 1 ? 's' : ''}` : 'Apply',
+        negativeText: 'Cancel',
+        onPositiveClick: applySync
+      })
+    } catch (e: any) {
+      message.error(e.message)
+    } finally {
+      syncing.value = false
+    }
+  }
+
+  async function applySync() {
+    syncing.value = true
+    try {
+      const summary = await pricingApi.sync()
+      lastSync.value = summary
+      message.success(`Prices synced: ${syncSummaryText(summary)}`)
+      await load()
+    } catch (e: any) {
+      message.error(e.message)
+    } finally {
+      syncing.value = false
+    }
+  }
+
   function renderPricing(row: ModelMapping) {
     const { input_price, output_price, cache_read_price, cache_write_price } = row
+    const manualMark =
+      row.pricing_source === 'manual'
+        ? [
+            h('span', {
+              class: 'i-carbon-locked inline-block text-amber-400/80 mr-1 align-[-2px]',
+              title: 'Manual pricing — pinned, not overwritten by LiteLLM sync'
+            })
+          ]
+        : []
     if (input_price === 0 && output_price === 0 && cache_read_price === 0 && cache_write_price === 0) {
-      return h('span', { class: 'text-slate-600' }, '—')
+      return h('span', { class: 'text-slate-600' }, [...manualMark, '—'])
     }
     return h('span', { class: 'font-mono text-[11px] text-slate-400 whitespace-nowrap' }, [
+      ...manualMark,
       h('span', { class: 'text-slate-300' }, `$${fmtPrice(input_price)}`),
       h('span', { class: 'text-slate-600 mx-0.5' }, '/'),
       h('span', { class: 'text-slate-300' }, `$${fmtPrice(output_price)}`),
@@ -92,9 +189,9 @@
             h('span', { class: 'text-slate-700 mx-1' }, '·'),
             h('span', { class: 'text-slate-500' }, `c$${fmtPrice(cache_read_price)}`),
             h('span', { class: 'text-slate-700 mx-0.5' }, '/'),
-            h('span', { class: 'text-slate-500' }, `$${fmtPrice(cache_write_price)}`),
+            h('span', { class: 'text-slate-500' }, `$${fmtPrice(cache_write_price)}`)
           ]
-        : []),
+        : [])
     ])
   }
 
@@ -144,17 +241,26 @@
     }
   ]
 
-  onMounted(load)
+  onMounted(() => {
+    load()
+    loadSyncStatus()
+  })
 </script>
 
 <template>
   <div>
     <div class="flex items-center justify-between mb-4">
       <h1 class="text-xl font-semibold text-slate-100">Model Mappings</h1>
-      <n-button type="primary" @click="openCreate">
-        <template #icon><span class="i-carbon-add" /></template>
-        Add Mapping
-      </n-button>
+      <div class="flex gap-2">
+        <n-button :loading="syncing" @click="openSyncPreview">
+          <template #icon><span class="i-carbon-currency-dollar" /></template>
+          Sync Prices
+        </n-button>
+        <n-button type="primary" @click="openCreate">
+          <template #icon><span class="i-carbon-add" /></template>
+          Add Mapping
+        </n-button>
+      </div>
     </div>
 
     <div class="flex gap-3 mb-4 flex-wrap items-center">
@@ -175,6 +281,9 @@
             ? `${allMappings.length} mappings`
             : `${filtered.length} / ${allMappings.length}`
         }}
+      </span>
+      <span v-if="lastSync" class="text-slate-500 text-xs ml-auto">
+        Last price sync{{ fmtSyncTime(lastSync.synced_at) }}: {{ syncSummaryText(lastSync) }}
       </span>
     </div>
 

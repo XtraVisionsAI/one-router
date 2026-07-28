@@ -125,6 +125,8 @@ pub struct SyncSummary {
     pub unchanged: usize,
     pub source_models: usize,
     pub dry_run: bool,
+    /// Unix seconds when the sync finished. Stamped by `run_sync`; `None` from pure `reconcile`.
+    pub synced_at: Option<i64>,
 }
 
 /// Convert a LiteLLM per-token cost to USD per 1M tokens. Rejects negatives.
@@ -365,7 +367,7 @@ pub async fn run_sync(
         .await
         .map_err(|e| format!("failed to list model mappings: {e}"))?;
 
-    let (summary, to_write) = reconcile(&mappings, &index, &opts);
+    let (mut summary, to_write) = reconcile(&mappings, &index, &opts);
 
     if !opts.dry_run && !to_write.is_empty() {
         for rec in &to_write {
@@ -377,6 +379,8 @@ pub async fn run_sync(
         }
         model_mapping.invalidate_all().await;
     }
+
+    summary.synced_at = Some(chrono::Utc::now().timestamp());
 
     tracing::info!(
         source_models = summary.source_models,

@@ -72,7 +72,7 @@ export const defaultCapabilities = (): ModelCapabilities => ({
   thinking: { enabled: true, style: 'claude' },
   document: { enabled: true },
   tool_use: { enabled: true },
-  ptc: { enabled: false },
+  ptc: { enabled: false }
 })
 
 export interface ModelMapping {
@@ -86,6 +86,7 @@ export interface ModelMapping {
   output_price: number
   cache_read_price: number
   cache_write_price: number
+  pricing_source: string
   capabilities?: ModelCapabilities | null
 }
 
@@ -100,6 +101,7 @@ export interface UpsertMappingBody {
   output_price: number
   cache_read_price: number
   cache_write_price: number
+  pricing_source: string
   capabilities?: string | null
 }
 

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-  import type { ModelMapping, UpsertMappingBody, ModelCapabilities } from '@/api/types'
-  import { defaultCapabilities } from '@/api/types'
+  import type { ModelCapabilities, ModelMapping, UpsertMappingBody } from '@/api/types'
   import { useMessage } from 'naive-ui'
   import { useMappingsApi } from '@/api/mappings'
+  import { defaultCapabilities } from '@/api/types'
 
   const props = defineProps<{
     show: boolean
@@ -34,6 +34,7 @@
     output_price: 0,
     cache_read_price: 0,
     cache_write_price: 0,
+    pricing_source: 'litellm'
   })
   const saving = ref(false)
 
@@ -52,6 +53,7 @@
           output_price: props.existing?.output_price ?? 0,
           cache_read_price: props.existing?.cache_read_price ?? 0,
           cache_write_price: props.existing?.cache_write_price ?? 0,
+          pricing_source: props.existing?.pricing_source ?? 'litellm'
         }
         caps.value = props.existing?.capabilities
           ? { ...defaultCapabilities(), ...props.existing.capabilities }
@@ -74,7 +76,7 @@
     try {
       const body: UpsertMappingBody = {
         ...form.value,
-        capabilities: JSON.stringify(caps.value),
+        capabilities: JSON.stringify(caps.value)
       }
       if (isEdit.value) {
         await api.update(props.existing!.source_model_id, props.existing!.provider, body)
@@ -148,6 +150,21 @@
           <NInputNumber v-model:value="form.cache_write_price" :precision="4" :min="0" class="w-full" />
         </NFormItem>
       </div>
+
+      <NFormItem label="Pricing Source">
+        <div class="w-full">
+          <NSelect
+            v-model:value="form.pricing_source"
+            :options="[
+              { label: 'Auto — synced from LiteLLM price table', value: 'litellm' },
+              { label: 'Manual — pinned, never overwritten by sync', value: 'manual' }
+            ]"
+          />
+          <p v-if="form.pricing_source === 'litellm'" class="text-xs text-slate-500 mt-1">
+            Prices above may be overwritten when LiteLLM price sync runs. Choose Manual to pin them.
+          </p>
+        </div>
+      </NFormItem>
 
       <!-- Capabilities -->
       <NDivider title-placement="left">
