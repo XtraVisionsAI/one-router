@@ -1,3 +1,9 @@
+## v0.24.0 (2026-07-28)
+
+### Feat
+
+- **admin-ui**: pricing sync UI on mappings page
+
 ## v0.23.0 (2026-07-22)
 
 ### Feat
