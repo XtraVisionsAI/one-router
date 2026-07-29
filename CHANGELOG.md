@@ -1,3 +1,9 @@
+## v0.25.1 (2026-07-29)
+
+### Fix
+
+- **admin-ui**: parse capabilities JSON when editing a mapping
+
 ## v0.25.0 (2026-07-29)
 
 ### Feat
