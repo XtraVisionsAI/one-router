@@ -65,8 +65,10 @@ pub enum ThinkingStyle {
     Claude,
     /// Amazon Nova 2 `reasoningConfig` format.
     Nova2,
-    /// Moonshot Kimi `reasoning_effort` format.
+    /// Moonshot Kimi `reasoning_effort` format (only "high" is supported).
     Kimi,
+    /// OpenAI-style `reasoning_effort` passthrough (GPT-OSS, o-series, GPT-5).
+    Effort,
 }
 
 impl ModelCapabilities {
@@ -119,6 +121,15 @@ mod tests {
         assert_eq!(caps.thinking.style, ThinkingStyle::Nova2);
         assert!(!caps.document.enabled);
         assert!(!caps.tool_use.enabled);
+    }
+
+    #[test]
+    fn from_json_effort_style() {
+        let caps = ModelCapabilities::from_json(Some(
+            r#"{"thinking": {"enabled": true, "style": "effort"}}"#,
+        ));
+        assert!(caps.thinking.enabled);
+        assert_eq!(caps.thinking.style, ThinkingStyle::Effort);
     }
 
     #[test]

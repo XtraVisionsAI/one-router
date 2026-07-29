@@ -62,7 +62,7 @@ export interface UpdateKeyBody {
 // ── Model Mappings ────────────────────────────────────────────
 
 export interface ModelCapabilities {
-  thinking: { enabled: boolean; style: 'claude' | 'nova2' | 'kimi' }
+  thinking: { enabled: boolean; style: 'claude' | 'nova2' | 'kimi' | 'effort' }
   document: { enabled: boolean }
   tool_use: { enabled: boolean }
   ptc: { enabled: boolean }

@@ -627,8 +627,11 @@ async fn handle_bedrock_request(
     }
 
     // ── Non-Claude path: OpenAI → Bedrock Converse ─────────────────────────
-    let converse_request = openai_bedrock::convert_request(request, target_model_id)
-        .map_err(|e| OpenAIApiError::from_conversion_error(&e))?;
+    let default_caps = state.dynamic.read().await.default_capabilities.clone();
+    let effective_caps = caps.as_ref().unwrap_or(&default_caps);
+    let converse_request =
+        openai_bedrock::convert_request(request, target_model_id, effective_caps)
+            .map_err(|e| OpenAIApiError::from_conversion_error(&e))?;
 
     if request.stream {
         let include_usage = request
@@ -722,6 +725,8 @@ async fn create_openai_streaming_response(
                                     choices: vec![ChunkChoice {
                                         index: 0,
                                         delta: ChunkDelta {
+                                            reasoning: None,
+                                            reasoning_content: None,
                                             role: Some(ChatRole::Assistant),
                                             content: None,
                                             tool_calls: None,
@@ -752,6 +757,8 @@ async fn create_openai_streaming_response(
                                     choices: vec![ChunkChoice {
                                         index: 0,
                                         delta: ChunkDelta {
+                                            reasoning: None,
+                                            reasoning_content: None,
                                             role: None,
                                             content: None,
                                             tool_calls: Some(vec![ToolCallDelta {
@@ -791,8 +798,36 @@ async fn create_openai_streaming_response(
                                             choices: vec![ChunkChoice {
                                                 index: 0,
                                                 delta: ChunkDelta {
+                                                    reasoning: None,
+                                                    reasoning_content: None,
                                                     role: None,
                                                     content: Some(text.to_string()),
+                                                    tool_calls: None,
+                                                },
+                                                finish_reason: None,
+                                                logprobs: None,
+                                            }],
+                                            system_fingerprint: None,
+                                            usage: None,
+                                        };
+                                        let json = serde_json::to_string(&chunk).unwrap_or_default();
+                                        yield Ok(Event::default().data(json));
+                                    }
+                                    aws_sdk_bedrockruntime::types::ContentBlockDelta::ReasoningContent(
+                                        aws_sdk_bedrockruntime::types::ReasoningContentBlockDelta::Text(text),
+                                    ) => {
+                                        let chunk = ChatCompletionChunk {
+                                            id: completion_id.clone(),
+                                            object: "chat.completion.chunk".to_string(),
+                                            created,
+                                            model: model_id.clone(),
+                                            choices: vec![ChunkChoice {
+                                                index: 0,
+                                                delta: ChunkDelta {
+                                                    reasoning: None,
+                                                    reasoning_content: Some(text.to_string()),
+                                                    role: None,
+                                                    content: None,
                                                     tool_calls: None,
                                                 },
                                                 finish_reason: None,
@@ -815,6 +850,8 @@ async fn create_openai_streaming_response(
                                             choices: vec![ChunkChoice {
                                                 index: 0,
                                                 delta: ChunkDelta {
+                                                    reasoning: None,
+                                                    reasoning_content: None,
                                                     role: None,
                                                     content: None,
                                                     tool_calls: Some(vec![ToolCallDelta {

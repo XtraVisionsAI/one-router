@@ -273,6 +273,13 @@ pub fn responses_to_chat_request(
         logprobs: None,
         top_logprobs: None,
         service_tier: req.service_tier.clone(),
+        // Responses `reasoning: {"effort": "..."}` → Chat Completions reasoning_effort
+        reasoning_effort: req
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.get("effort"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 
@@ -732,6 +739,8 @@ mod tests {
                     role: ChatRole::Assistant,
                     content: content.map(String::from),
                     tool_calls,
+                    reasoning: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".into()),
                 logprobs: None,

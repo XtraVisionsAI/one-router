@@ -20,6 +20,7 @@ use crate::schemas::openai::{
     Choice, CompletionUsage, FunctionCall, ToolCall,
 };
 use crate::services::ConverseRequest;
+use crate::services::{ModelCapabilities, ThinkingStyle};
 
 // ============================================================================
 // Error Types
@@ -62,9 +63,14 @@ fn bedrock_cache_point() -> CachePointBlock {
 }
 
 /// Convert an OpenAI ChatCompletionRequest to a Bedrock ConverseRequest.
+///
+/// `caps` supplies the target model's thinking capability + style, used to
+/// format `reasoning_effort` for the specific model family (Nova 2 / Kimi /
+/// effort-style models like GPT-OSS).
 pub fn convert_request(
     request: &crate::schemas::openai::ChatCompletionRequest,
     bedrock_model: &str,
+    caps: &ModelCapabilities,
 ) -> Result<ConverseRequest, OpenAIConversionError> {
     // Split system and chat messages
     let (system_messages, chat_messages): (Vec<_>, Vec<_>) = request
@@ -89,16 +95,27 @@ pub fn convert_request(
             .map_err(|e| OpenAIConversionError::InvalidMessage(e.to_string()))?;
     }
 
+    // Reasoning: honored only when the model's thinking capability is enabled.
+    let reasoning_effort = request
+        .reasoning_effort
+        .as_deref()
+        .filter(|_| caps.thinking.enabled);
+    let nova2_reasoning = reasoning_effort.is_some() && caps.thinking.style == ThinkingStyle::Nova2;
+
     // Build inference config
     let max_tokens = request
         .max_completion_tokens
         .or(request.max_tokens)
         .unwrap_or(4096);
 
-    let mut inference_config = InferenceConfiguration::builder().max_tokens(max_tokens);
+    let mut inference_config = InferenceConfiguration::builder();
 
-    if let Some(temp) = request.temperature {
-        inference_config = inference_config.temperature(temp.clamp(0.0, 1.0));
+    // Nova 2 rejects temperature and maxTokens when reasoning is enabled.
+    if !nova2_reasoning {
+        inference_config = inference_config.max_tokens(max_tokens);
+        if let Some(temp) = request.temperature {
+            inference_config = inference_config.temperature(temp.clamp(0.0, 1.0));
+        }
     }
     if let Some(top_p) = request.top_p {
         inference_config = inference_config.top_p(top_p);
@@ -110,6 +127,24 @@ pub fn convert_request(
     let mut converse_req = ConverseRequest::new(bedrock_model.to_string())
         .with_messages(sdk_messages)
         .with_inference_config(inference_config.build());
+
+    // Reasoning config in additionalModelRequestFields, per model family
+    if let Some(effort) = reasoning_effort {
+        let fields = match caps.thinking.style {
+            ThinkingStyle::Nova2 => serde_json::json!({
+                "reasoningConfig": {"type": "enabled", "maxReasoningEffort": effort}
+            }),
+            // Kimi only supports "high"
+            ThinkingStyle::Kimi => serde_json::json!({"reasoning_effort": "high"}),
+            // Effort-style models (GPT-OSS etc.) take the value as-is. Claude
+            // style never reaches this non-Claude path via routing, but a
+            // mapping configured that way gets the same passthrough.
+            ThinkingStyle::Effort | ThinkingStyle::Claude => {
+                serde_json::json!({"reasoning_effort": effort})
+            }
+        };
+        converse_req = converse_req.with_additional_fields(json_to_document(&fields));
+    }
 
     // Convert system messages
     if !system_messages.is_empty() {
@@ -385,6 +420,7 @@ pub fn convert_response(
 
     // Convert content blocks
     let mut text_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
     let mut tool_calls = Vec::new();
 
     if let Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) = output.output() {
@@ -392,6 +428,11 @@ pub fn convert_response(
             match block {
                 SdkContentBlock::Text(text) => {
                     text_parts.push(text.clone());
+                }
+                SdkContentBlock::ReasoningContent(
+                    aws_sdk_bedrockruntime::types::ReasoningContentBlock::ReasoningText(rt),
+                ) => {
+                    reasoning_parts.push(rt.text().to_string());
                 }
                 SdkContentBlock::ToolUse(tool_use) => {
                     let input_json = document_to_json(tool_use.input());
@@ -441,6 +482,12 @@ pub fn convert_response(
         choices: vec![Choice {
             index: 0,
             message: AssistantMessage {
+                reasoning: None,
+                reasoning_content: if reasoning_parts.is_empty() {
+                    None
+                } else {
+                    Some(reasoning_parts.join(""))
+                },
                 role: ChatRole::Assistant,
                 content: if content.is_empty() {
                     None
@@ -504,6 +551,7 @@ mod tests {
             logprobs: None,
             top_logprobs: None,
             service_tier: None,
+            reasoning_effort: None,
         }
     }
 
@@ -530,7 +578,12 @@ mod tests {
     #[test]
     fn system_gets_cache_point_injected() {
         let req = make_request(vec![system_msg("You are helpful."), user_msg("Hello")]);
-        let result = convert_request(&req, "anthropic.claude-3-5-sonnet").unwrap();
+        let result = convert_request(
+            &req,
+            "anthropic.claude-3-5-sonnet",
+            &ModelCapabilities::default(),
+        )
+        .unwrap();
         let system = result.system.unwrap();
         assert_eq!(system.len(), 2);
         assert!(matches!(system[0], SystemContentBlock::Text(_)));
@@ -540,10 +593,100 @@ mod tests {
     #[test]
     fn last_user_message_gets_cache_point_injected() {
         let req = make_request(vec![user_msg("Hello")]);
-        let result = convert_request(&req, "anthropic.claude-3-5-sonnet").unwrap();
+        let result = convert_request(
+            &req,
+            "anthropic.claude-3-5-sonnet",
+            &ModelCapabilities::default(),
+        )
+        .unwrap();
         let messages = result.messages;
         let last_content = messages.last().unwrap().content();
         let last_block = last_content.last().unwrap();
         assert!(last_block.is_cache_point());
+    }
+
+    // ---- reasoning_effort → additionalModelRequestFields ----
+
+    fn caps_with(style: ThinkingStyle) -> ModelCapabilities {
+        let mut caps = ModelCapabilities::default();
+        caps.thinking.enabled = true;
+        caps.thinking.style = style;
+        caps
+    }
+
+    #[test]
+    fn nova2_reasoning_uses_reasoning_config_and_drops_temp_max_tokens() {
+        let mut req = make_request(vec![user_msg("Hello")]);
+        req.reasoning_effort = Some("medium".to_string());
+        req.temperature = Some(0.5);
+
+        let result = convert_request(
+            &req,
+            "us.amazon.nova-2-lite-v1:0",
+            &caps_with(ThinkingStyle::Nova2),
+        )
+        .unwrap();
+
+        let fields = document_to_json(&result.additional_model_request_fields.unwrap());
+        assert_eq!(fields["reasoningConfig"]["type"], "enabled");
+        assert_eq!(fields["reasoningConfig"]["maxReasoningEffort"], "medium");
+
+        // Nova 2 rejects temperature and maxTokens when reasoning is enabled
+        let inference = result.inference_config.unwrap();
+        assert!(inference.temperature().is_none());
+        assert!(inference.max_tokens().is_none());
+    }
+
+    #[test]
+    fn kimi_reasoning_forces_high_effort() {
+        let mut req = make_request(vec![user_msg("Hello")]);
+        req.reasoning_effort = Some("low".to_string());
+
+        let result = convert_request(
+            &req,
+            "moonshot.kimi-k2-thinking-v1:0",
+            &caps_with(ThinkingStyle::Kimi),
+        )
+        .unwrap();
+
+        let fields = document_to_json(&result.additional_model_request_fields.unwrap());
+        assert_eq!(fields["reasoning_effort"], "high");
+        // Non-Nova2 models keep max_tokens
+        assert!(result.inference_config.unwrap().max_tokens().is_some());
+    }
+
+    #[test]
+    fn effort_style_passes_through_and_disabled_caps_strip_reasoning() {
+        let mut req = make_request(vec![user_msg("Hello")]);
+        req.reasoning_effort = Some("low".to_string());
+
+        // "effort" style (GPT-OSS etc.) passes the value through as-is
+        let result = convert_request(
+            &req,
+            "openai.gpt-oss-120b-1:0",
+            &caps_with(ThinkingStyle::Effort),
+        )
+        .unwrap();
+        let fields = document_to_json(&result.additional_model_request_fields.unwrap());
+        assert_eq!(fields["reasoning_effort"], "low");
+
+        // Claude style on this non-Claude path behaves the same
+        let result = convert_request(
+            &req,
+            "openai.gpt-oss-120b-1:0",
+            &caps_with(ThinkingStyle::Claude),
+        )
+        .unwrap();
+        let fields = document_to_json(&result.additional_model_request_fields.unwrap());
+        assert_eq!(fields["reasoning_effort"], "low");
+
+        // Thinking capability disabled → no additional fields at all
+        let result = convert_request(
+            &req,
+            "openai.gpt-oss-120b-1:0",
+            &ModelCapabilities::default(),
+        )
+        .unwrap();
+        assert!(result.additional_model_request_fields.is_none());
     }
 }

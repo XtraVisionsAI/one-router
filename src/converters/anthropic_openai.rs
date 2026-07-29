@@ -8,7 +8,7 @@
 
 use crate::schemas::anthropic::{
     ContentBlock, Message, MessageContent, MessageRequest, MessageResponse, StopReason,
-    SystemContent, Usage,
+    SystemContent, ThinkingConfig, Usage,
 };
 use crate::schemas::openai::{
     AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
@@ -51,6 +51,22 @@ pub enum AnthropicOpenAIError {
 // ============================================================================
 // Anthropic → OpenAI Request Converter
 // ============================================================================
+
+/// Map an Anthropic thinking config to an OpenAI-style `reasoning_effort` level.
+///
+/// Budget thresholds follow the reference bedrock proxy: >10000 → "high",
+/// <1000 → "low", otherwise (or when no budget is given) "medium".
+pub fn thinking_to_reasoning_effort(thinking: &ThinkingConfig) -> Option<String> {
+    if thinking.thinking_type != "enabled" {
+        return None;
+    }
+    let effort = match thinking.budget_tokens {
+        Some(b) if b > 10_000 => "high",
+        Some(b) if b < 1_000 => "low",
+        _ => "medium",
+    };
+    Some(effort.to_string())
+}
 
 /// Converts Anthropic Messages API requests to OpenAI Chat Completions format.
 #[derive(Debug, Clone, Default)]
@@ -130,6 +146,12 @@ impl AnthropicToOpenAIConverter {
             logprobs: None,
             top_logprobs: None,
             service_tier: None,
+            // capability_filter already strips `thinking` when the model's
+            // thinking capability is disabled, so Some here means enabled.
+            reasoning_effort: request
+                .thinking
+                .as_ref()
+                .and_then(thinking_to_reasoning_effort),
         })
     }
 
@@ -376,6 +398,16 @@ impl AnthropicToOpenAIConverter {
     ) -> Result<Vec<ContentBlock>, AnthropicOpenAIError> {
         let mut blocks = Vec::new();
 
+        // Reasoning text (Mantle "reasoning" / DeepSeek-style "reasoning_content")
+        // becomes a thinking block, placed before the text like Anthropic does.
+        // Proxy-side reasoning has no signature.
+        if let Some(reasoning) = choice.message.reasoning_text() {
+            blocks.push(ContentBlock::Thinking {
+                thinking: reasoning.to_string(),
+                signature: None,
+            });
+        }
+
         if let Some(ref text) = choice.message.content {
             if !text.is_empty() {
                 blocks.push(ContentBlock::Text {
@@ -415,6 +447,10 @@ impl AnthropicToOpenAIConverter {
     ///
     /// Returns `None` if the chunk should be skipped (e.g., empty delta).
     /// Returns a vec of (event_type, data_json) pairs to emit.
+    ///
+    /// Content blocks are opened lazily with dynamically assigned indexes so a
+    /// reasoning ("thinking") block can precede — or interleave with — the text
+    /// block, matching native Anthropic streams.
     pub fn convert_stream_chunk_to_anthropic(
         &self,
         chunk: &ChatCompletionChunk,
@@ -439,23 +475,58 @@ impl AnthropicToOpenAIConverter {
                 }
             });
             events.push(("message_start".to_string(), msg_start.to_string()));
-
-            // Emit content_block_start for index 0 (text block)
-            let cb_start = serde_json::json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""}
-            });
-            events.push(("content_block_start".to_string(), cb_start.to_string()));
         }
 
         for choice in &chunk.choices {
+            // Reasoning delta → thinking block. Interleaved models can emit
+            // reasoning → text → reasoning; each re-entry opens a fresh block.
+            if let Some(reasoning) = choice.delta.reasoning_text() {
+                if state.thinking_index.is_none() {
+                    if let Some(ti) = state.text_index.take() {
+                        events.push(Self::content_block_stop(ti));
+                    }
+                    let idx = state.next_block_index;
+                    state.next_block_index += 1;
+                    state.thinking_index = Some(idx);
+                    let cb_start = serde_json::json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {"type": "thinking", "thinking": ""}
+                    });
+                    events.push(("content_block_start".to_string(), cb_start.to_string()));
+                }
+                let delta = serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": state.thinking_index.unwrap(),
+                    "delta": {"type": "thinking_delta", "thinking": reasoning}
+                });
+                events.push(("content_block_delta".to_string(), delta.to_string()));
+            }
+
             // Text delta
             if let Some(ref text) = choice.delta.content {
                 if !text.is_empty() {
+                    if let Some(ti) = state.thinking_index.take() {
+                        events.push(Self::content_block_stop(ti));
+                    }
+                    let text_index = match state.text_index {
+                        Some(i) => i,
+                        None => {
+                            let idx = state.next_block_index;
+                            state.next_block_index += 1;
+                            state.text_index = Some(idx);
+                            let cb_start = serde_json::json!({
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": {"type": "text", "text": ""}
+                            });
+                            events.push(("content_block_start".to_string(), cb_start.to_string()));
+                            idx
+                        }
+                    };
                     let delta = serde_json::json!({
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": text_index,
                         "delta": {"type": "text_delta", "text": text}
                     });
                     events.push(("content_block_delta".to_string(), delta.to_string()));
@@ -465,32 +536,41 @@ impl AnthropicToOpenAIConverter {
             // Tool call deltas
             if let Some(ref tool_calls) = choice.delta.tool_calls {
                 for tc_delta in tool_calls {
-                    let block_index = tc_delta.index + 1; // index 0 is text block
+                    // Model went reasoning → tool_call with no intermediate text
+                    if let Some(ti) = state.thinking_index.take() {
+                        events.push(Self::content_block_stop(ti));
+                    }
 
                     // If this tool call hasn't started yet, emit content_block_start
-                    if !state.tool_call_started.contains(&tc_delta.index) {
-                        state.tool_call_started.insert(tc_delta.index);
-                        let tc_id = tc_delta.id.clone().unwrap_or_else(|| {
-                            format!("toolu_{}", Uuid::new_v4().to_string().replace("-", ""))
-                        });
-                        let tc_name = tc_delta
-                            .function
-                            .as_ref()
-                            .and_then(|f| f.name.clone())
-                            .unwrap_or_default();
+                    let block_index = match state.tool_call_indices.get(&tc_delta.index) {
+                        Some(i) => *i,
+                        None => {
+                            let idx = state.next_block_index;
+                            state.next_block_index += 1;
+                            state.tool_call_indices.insert(tc_delta.index, idx);
+                            let tc_id = tc_delta.id.clone().unwrap_or_else(|| {
+                                format!("toolu_{}", Uuid::new_v4().to_string().replace("-", ""))
+                            });
+                            let tc_name = tc_delta
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.clone())
+                                .unwrap_or_default();
 
-                        let cb_start = serde_json::json!({
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tc_id,
-                                "name": tc_name,
-                                "input": {}
-                            }
-                        });
-                        events.push(("content_block_start".to_string(), cb_start.to_string()));
-                    }
+                            let cb_start = serde_json::json!({
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": tc_id,
+                                    "name": tc_name,
+                                    "input": {}
+                                }
+                            });
+                            events.push(("content_block_start".to_string(), cb_start.to_string()));
+                            idx
+                        }
+                    };
 
                     // Emit input_json_delta for arguments
                     if let Some(ref func) = tc_delta.function {
@@ -520,21 +600,18 @@ impl AnthropicToOpenAIConverter {
                     _ => "end_turn",
                 };
 
-                // Close text block (index 0)
-                let cb_stop = serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": 0
-                });
-                events.push(("content_block_stop".to_string(), cb_stop.to_string()));
-
-                // Close any open tool call blocks
-                for tc_idx in state.tool_call_started.iter() {
-                    let block_index = tc_idx + 1;
-                    let cb_stop = serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": block_index
-                    });
-                    events.push(("content_block_stop".to_string(), cb_stop.to_string()));
+                // Close any open blocks
+                if let Some(ti) = state.thinking_index.take() {
+                    events.push(Self::content_block_stop(ti));
+                }
+                if let Some(ti) = state.text_index.take() {
+                    events.push(Self::content_block_stop(ti));
+                }
+                let mut tool_indices: Vec<i32> =
+                    state.tool_call_indices.values().copied().collect();
+                tool_indices.sort_unstable();
+                for block_index in tool_indices {
+                    events.push(Self::content_block_stop(block_index));
                 }
 
                 let usage_out = chunk
@@ -542,7 +619,6 @@ impl AnthropicToOpenAIConverter {
                     .as_ref()
                     .map(|u| u.completion_tokens)
                     .unwrap_or(0);
-                let usage_in = chunk.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
 
                 let msg_delta = serde_json::json!({
                     "type": "message_delta",
@@ -554,8 +630,6 @@ impl AnthropicToOpenAIConverter {
                 });
                 events.push(("message_delta".to_string(), msg_delta.to_string()));
 
-                let _ = usage_in; // suppress warning
-
                 let msg_stop = serde_json::json!({"type": "message_stop"});
                 events.push(("message_stop".to_string(), msg_stop.to_string()));
             }
@@ -563,13 +637,30 @@ impl AnthropicToOpenAIConverter {
 
         events
     }
+
+    fn content_block_stop(index: i32) -> (String, String) {
+        (
+            "content_block_stop".to_string(),
+            serde_json::json!({"type": "content_block_stop", "index": index}).to_string(),
+        )
+    }
 }
 
 /// Mutable state for converting an OpenAI SSE stream to Anthropic format.
+///
+/// Blocks are opened lazily with dynamic indexes so reasoning ("thinking")
+/// output can precede or interleave with text and tool blocks.
 #[derive(Default)]
 pub struct OpenAIToAnthropicStreamState {
     pub message_started: bool,
-    pub tool_call_started: std::collections::HashSet<i32>,
+    /// Next content block index to assign.
+    pub next_block_index: i32,
+    /// Currently open thinking block, if any.
+    pub thinking_index: Option<i32>,
+    /// The text block's index once opened.
+    pub text_index: Option<i32>,
+    /// OpenAI tool_call index → Anthropic content block index.
+    pub tool_call_indices: std::collections::HashMap<i32, i32>,
 }
 
 // ============================================================================
@@ -937,6 +1028,8 @@ impl OpenAIToAnthropicConverter {
             choices: vec![Choice {
                 index: 0,
                 message: AssistantMessage {
+                    reasoning: None,
+                    reasoning_content: None,
                     role: ChatRole::Assistant,
                     content,
                     tool_calls: if tool_calls.is_empty() {
@@ -997,6 +1090,8 @@ impl OpenAIToAnthropicConverter {
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: ChunkDelta {
+                                    reasoning: None,
+                                    reasoning_content: None,
                                     role: Some(ChatRole::Assistant),
                                     content: None,
                                     tool_calls: None,
@@ -1041,6 +1136,8 @@ impl OpenAIToAnthropicConverter {
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: ChunkDelta {
+                                    reasoning: None,
+                                    reasoning_content: None,
                                     role: None,
                                     content: None,
                                     tool_calls: Some(vec![ToolCallDelta {
@@ -1086,6 +1183,8 @@ impl OpenAIToAnthropicConverter {
                                     choices: vec![ChunkChoice {
                                         index: 0,
                                         delta: ChunkDelta {
+                                            reasoning: None,
+                                            reasoning_content: None,
                                             role: None,
                                             content: Some(text),
                                             tool_calls: None,
@@ -1119,6 +1218,8 @@ impl OpenAIToAnthropicConverter {
                                         choices: vec![ChunkChoice {
                                             index: 0,
                                             delta: ChunkDelta {
+                                                reasoning: None,
+                                                reasoning_content: None,
                                                 role: None,
                                                 content: None,
                                                 tool_calls: Some(vec![ToolCallDelta {
@@ -1272,6 +1373,7 @@ mod tests {
             logprobs: None,
             top_logprobs: None,
             service_tier: None,
+            reasoning_effort: None,
         };
         let result = converter
             .convert_request(&request, "claude-3-5-sonnet-20241022")
@@ -1320,6 +1422,7 @@ mod tests {
             logprobs: None,
             top_logprobs: None,
             service_tier: None,
+            reasoning_effort: None,
         };
         let result = converter
             .convert_request(&request, "claude-3-5-sonnet-20241022")
@@ -1352,6 +1455,7 @@ mod tests {
             logprobs: None,
             top_logprobs: None,
             service_tier: None,
+            reasoning_effort: None,
         };
         let result = converter.convert_request(&request, "claude-3-5-sonnet-20241022");
         assert!(result.is_err());
@@ -1388,6 +1492,7 @@ mod openai_to_anthropic_cache_tests {
             logprobs: None,
             top_logprobs: None,
             service_tier: None,
+            reasoning_effort: None,
         }
     }
 
@@ -1446,5 +1551,212 @@ mod openai_to_anthropic_cache_tests {
             }
             MessageContent::Text(_) => panic!("Expected Blocks variant after cache injection"),
         }
+    }
+
+    // ---- thinking → reasoning_effort ----
+
+    fn thinking(budget: Option<i32>) -> ThinkingConfig {
+        ThinkingConfig {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: budget,
+        }
+    }
+
+    #[test]
+    fn thinking_budget_maps_to_effort_levels() {
+        assert_eq!(
+            thinking_to_reasoning_effort(&thinking(Some(20_000))).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            thinking_to_reasoning_effort(&thinking(Some(4_096))).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            thinking_to_reasoning_effort(&thinking(Some(512))).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            thinking_to_reasoning_effort(&thinking(None)).as_deref(),
+            Some("medium")
+        );
+        let disabled = ThinkingConfig {
+            thinking_type: "disabled".to_string(),
+            budget_tokens: None,
+        };
+        assert_eq!(thinking_to_reasoning_effort(&disabled), None);
+    }
+
+    #[test]
+    fn anthropic_request_thinking_becomes_reasoning_effort() {
+        let mut req = MessageRequest::new("gpt-oss", vec![Message::user("hi")], 1024);
+        req.thinking = Some(thinking(Some(16_000)));
+
+        let converter = AnthropicToOpenAIConverter::new();
+        let result = converter
+            .convert_request(&req, "openai.gpt-oss-120b-1:0")
+            .unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
+
+        req.thinking = None;
+        let result = converter
+            .convert_request(&req, "openai.gpt-oss-120b-1:0")
+            .unwrap();
+        assert_eq!(result.reasoning_effort, None);
+    }
+
+    // ---- streaming reasoning → thinking block ----
+
+    fn chunk_with_delta(delta: ChunkDelta, finish: Option<&str>) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "chatcmpl-x".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "gpt-oss".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta,
+                finish_reason: finish.map(String::from),
+                logprobs: None,
+            }],
+            system_fingerprint: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn stream_reasoning_opens_thinking_block_before_text() {
+        let converter = AnthropicToOpenAIConverter::new();
+        let mut state = OpenAIToAnthropicStreamState::default();
+
+        // reasoning delta first
+        let events = converter.convert_stream_chunk_to_anthropic(
+            &chunk_with_delta(
+                ChunkDelta {
+                    reasoning: Some("let me think".to_string()),
+                    ..Default::default()
+                },
+                None,
+            ),
+            &mut state,
+        );
+        let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        assert!(events[1].1.contains("\"thinking\""));
+        assert!(events[1].1.contains("\"index\":0"));
+        assert!(events[2].1.contains("thinking_delta"));
+
+        // then text: thinking closes, text opens at index 1
+        let events = converter.convert_stream_chunk_to_anthropic(
+            &chunk_with_delta(
+                ChunkDelta {
+                    content: Some("answer".to_string()),
+                    ..Default::default()
+                },
+                None,
+            ),
+            &mut state,
+        );
+        let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        assert!(events[0].1.contains("\"index\":0"));
+        assert!(events[1].1.contains("\"text\""));
+        assert!(events[1].1.contains("\"index\":1"));
+
+        // finish: text closes, message_delta + message_stop
+        let events = converter.convert_stream_chunk_to_anthropic(
+            &chunk_with_delta(ChunkDelta::default(), Some("stop")),
+            &mut state,
+        );
+        let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["content_block_stop", "message_delta", "message_stop"]
+        );
+        assert!(events[0].1.contains("\"index\":1"));
+    }
+
+    #[test]
+    fn stream_without_reasoning_keeps_text_at_index_zero() {
+        let converter = AnthropicToOpenAIConverter::new();
+        let mut state = OpenAIToAnthropicStreamState::default();
+
+        let events = converter.convert_stream_chunk_to_anthropic(
+            &chunk_with_delta(
+                ChunkDelta {
+                    content: Some("hi".to_string()),
+                    ..Default::default()
+                },
+                None,
+            ),
+            &mut state,
+        );
+        let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        assert!(events[1].1.contains("\"text\""));
+        assert!(events[1].1.contains("\"index\":0"));
+    }
+
+    #[test]
+    fn response_reasoning_becomes_thinking_block() {
+        let converter = AnthropicToOpenAIConverter::new();
+        let response = ChatCompletionResponse {
+            id: "chatcmpl-x".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "gpt-oss".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: AssistantMessage {
+                    role: ChatRole::Assistant,
+                    content: Some("answer".to_string()),
+                    tool_calls: None,
+                    reasoning: Some("hidden chain".to_string()),
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: CompletionUsage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            },
+            system_fingerprint: None,
+        };
+
+        let result = converter.convert_response(&response, "gpt-oss").unwrap();
+        assert_eq!(result.content.len(), 2);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Thinking { thinking, signature: None } if thinking == "hidden chain"
+        ));
+        assert!(matches!(
+            &result.content[1],
+            ContentBlock::Text { text, .. } if text == "answer"
+        ));
     }
 }

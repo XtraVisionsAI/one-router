@@ -487,6 +487,8 @@ impl GeminiToOpenAIConverter {
         };
 
         Ok(AssistantMessage {
+            reasoning: None,
+            reasoning_content: None,
             role: ChatRole::Assistant,
             content,
             tool_calls: if tool_calls.is_empty() {
@@ -536,6 +538,8 @@ impl GeminiToOpenAIConverter {
         let id = format!("chatcmpl-{}", Uuid::new_v4().to_string().replace("-", ""));
 
         let mut delta = ChunkDelta {
+            reasoning: None,
+            reasoning_content: None,
             role: None,
             content: None,
             tool_calls: None,
@@ -716,6 +720,7 @@ mod tests {
             logprobs: None,
             top_logprobs: None,
             service_tier: None,
+            reasoning_effort: None,
         };
         let config = converter.convert_generation_config(&request);
         assert_eq!(config.temperature, Some(0.7));

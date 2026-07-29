@@ -89,6 +89,11 @@ pub struct ChatCompletionRequest {
     /// Service tier for the request
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+
+    /// Reasoning effort for reasoning-capable models: "low" / "medium" / "high"
+    /// (OpenAI o-series & GPT-5, Bedrock Mantle GPT-OSS / Kimi, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Stream options
@@ -348,6 +353,25 @@ pub struct AssistantMessage {
     /// Tool calls
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+
+    /// Reasoning text from reasoning-capable models.
+    /// Bedrock Mantle uses "reasoning"; other OpenAI-compatible backends
+    /// (DeepSeek-style) use "reasoning_content".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+impl AssistantMessage {
+    /// Reasoning text regardless of which field name the backend used.
+    pub fn reasoning_text(&self) -> Option<&str> {
+        self.reasoning
+            .as_deref()
+            .or(self.reasoning_content.as_deref())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Token usage statistics
@@ -470,6 +494,24 @@ pub struct ChunkDelta {
     /// Tool calls delta
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+
+    /// Reasoning text delta ("reasoning" on Bedrock Mantle,
+    /// "reasoning_content" on DeepSeek-style backends)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+impl ChunkDelta {
+    /// Reasoning delta text regardless of which field name the backend used.
+    pub fn reasoning_text(&self) -> Option<&str> {
+        self.reasoning
+            .as_deref()
+            .or(self.reasoning_content.as_deref())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Tool call delta in streaming

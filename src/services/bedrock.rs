@@ -1029,9 +1029,14 @@ fn openai_sse_to_anthropic_sse(
     async_stream::stream! {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let mut buffer = String::new();
-        let mut text_block_started = false;
-        // tool_block_ids: ordered list of tool call IDs seen so far (index = block_index - 1)
-        let mut tool_block_ids: Vec<String> = Vec::new();
+        // Content blocks are opened lazily with dynamic indexes so a thinking
+        // (reasoning) block can precede — or interleave with — the text block.
+        let mut next_block_index: usize = 0;
+        let mut thinking_index: Option<usize> = None;
+        let mut text_index: Option<usize> = None;
+        // OpenAI tool_call index → Anthropic content block index
+        let mut tool_block_indices: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
         let mut input_tokens: i32 = 0;
         let mut output_tokens: i32 = 0;
         let mut stop_reason = "end_turn".to_string();
@@ -1106,15 +1111,60 @@ fn openai_sse_to_anthropic_sse(
                     };
                 }
 
-                // text content
-                if let Some(text) = delta["content"].as_str() {
-                    if !text.is_empty() {
-                        if !text_block_started {
-                            text_block_started = true;
+                // reasoning delta ("reasoning" on Mantle, "reasoning_content" on
+                // DeepSeek-style backends) → thinking block. Interleaved models
+                // can emit reasoning → text → reasoning; each re-entry opens a
+                // fresh thinking block.
+                let reasoning_delta = delta["reasoning"]
+                    .as_str()
+                    .or_else(|| delta["reasoning_content"].as_str());
+                if let Some(reasoning) = reasoning_delta {
+                    if !reasoning.is_empty() {
+                        if thinking_index.is_none() {
+                            if let Some(idx) = text_index.take() {
+                                yield Ok(Event::default().event("content_block_stop").data(
+                                    serde_json::json!({"type": "content_block_stop", "index": idx}).to_string()
+                                ));
+                            }
+                            let idx = next_block_index;
+                            next_block_index += 1;
+                            thinking_index = Some(idx);
                             yield Ok(Event::default().event("content_block_start").data(
                                 serde_json::json!({
                                     "type": "content_block_start",
-                                    "index": 0,
+                                    "index": idx,
+                                    "content_block": {"type": "thinking", "thinking": ""}
+                                })
+                                .to_string(),
+                            ));
+                        }
+                        yield Ok(Event::default().event("content_block_delta").data(
+                            serde_json::json!({
+                                "type": "content_block_delta",
+                                "index": thinking_index.unwrap(),
+                                "delta": {"type": "thinking_delta", "thinking": reasoning}
+                            })
+                            .to_string(),
+                        ));
+                    }
+                }
+
+                // text content
+                if let Some(text) = delta["content"].as_str() {
+                    if !text.is_empty() {
+                        if let Some(idx) = thinking_index.take() {
+                            yield Ok(Event::default().event("content_block_stop").data(
+                                serde_json::json!({"type": "content_block_stop", "index": idx}).to_string()
+                            ));
+                        }
+                        if text_index.is_none() {
+                            let idx = next_block_index;
+                            next_block_index += 1;
+                            text_index = Some(idx);
+                            yield Ok(Event::default().event("content_block_start").data(
+                                serde_json::json!({
+                                    "type": "content_block_start",
+                                    "index": idx,
                                     "content_block": {"type": "text", "text": ""}
                                 })
                                 .to_string(),
@@ -1123,7 +1173,7 @@ fn openai_sse_to_anthropic_sse(
                         yield Ok(Event::default().event("content_block_delta").data(
                             serde_json::json!({
                                 "type": "content_block_delta",
-                                "index": 0,
+                                "index": text_index.unwrap(),
                                 "delta": {"type": "text_delta", "text": text}
                             })
                             .to_string(),
@@ -1135,13 +1185,19 @@ fn openai_sse_to_anthropic_sse(
                 if let Some(tool_calls) = delta["tool_calls"].as_array() {
                     for tc in tool_calls {
                         let tc_index = tc["index"].as_u64().unwrap_or(0) as usize;
-                        // block_index: text block is 0, tool blocks start at 1
-                        let block_index = tc_index + 1;
 
                         if let Some(id) = tc["id"].as_str() {
+                            // Model went reasoning → tool_call with no text in between
+                            if let Some(idx) = thinking_index.take() {
+                                yield Ok(Event::default().event("content_block_stop").data(
+                                    serde_json::json!({"type": "content_block_stop", "index": idx}).to_string()
+                                ));
+                            }
                             // New tool call — open a content block
                             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                            tool_block_ids.push(id.to_string());
+                            let block_index = next_block_index;
+                            next_block_index += 1;
+                            tool_block_indices.insert(tc_index, block_index);
                             yield Ok(Event::default().event("content_block_start").data(
                                 serde_json::json!({
                                     "type": "content_block_start",
@@ -1158,14 +1214,16 @@ fn openai_sse_to_anthropic_sse(
                         }
                         if let Some(args) = tc["function"]["arguments"].as_str() {
                             if !args.is_empty() {
-                                yield Ok(Event::default().event("content_block_delta").data(
-                                    serde_json::json!({
-                                        "type": "content_block_delta",
-                                        "index": block_index,
-                                        "delta": {"type": "input_json_delta", "partial_json": args}
-                                    })
-                                    .to_string(),
-                                ));
+                                if let Some(&block_index) = tool_block_indices.get(&tc_index) {
+                                    yield Ok(Event::default().event("content_block_delta").data(
+                                        serde_json::json!({
+                                            "type": "content_block_delta",
+                                            "index": block_index,
+                                            "delta": {"type": "input_json_delta", "partial_json": args}
+                                        })
+                                        .to_string(),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1174,14 +1232,19 @@ fn openai_sse_to_anthropic_sse(
         }
 
         // Close open content blocks
-        if text_block_started {
+        if let Some(idx) = thinking_index.take() {
             yield Ok(Event::default().event("content_block_stop").data(
-                serde_json::json!({"type": "content_block_stop", "index": 0}).to_string()
+                serde_json::json!({"type": "content_block_stop", "index": idx}).to_string()
             ));
         }
-        for (i, _id) in tool_block_ids.iter().enumerate() {
+        if let Some(idx) = text_index.take() {
             yield Ok(Event::default().event("content_block_stop").data(
-                serde_json::json!({"type": "content_block_stop", "index": i + 1}).to_string()
+                serde_json::json!({"type": "content_block_stop", "index": idx}).to_string()
+            ));
+        }
+        for (_tc_index, block_index) in tool_block_indices {
+            yield Ok(Event::default().event("content_block_stop").data(
+                serde_json::json!({"type": "content_block_stop", "index": block_index}).to_string()
             ));
         }
 

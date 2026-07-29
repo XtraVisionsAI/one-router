@@ -179,11 +179,12 @@
             v-if="caps.thinking.enabled"
             v-model:value="caps.thinking.style"
             size="small"
-            style="width: 110px"
+            style="width: 130px"
             :options="[
               { label: 'Claude', value: 'claude' },
               { label: 'Nova 2', value: 'nova2' },
-              { label: 'Kimi', value: 'kimi' }
+              { label: 'Kimi', value: 'kimi' },
+              { label: 'GPT (effort)', value: 'effort' }
             ]"
           />
         </div>

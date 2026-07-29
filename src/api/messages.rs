@@ -643,8 +643,15 @@ async fn handle_bedrock_request(
         let openai_req = converter
             .convert_request(request, target_model_id)
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        let openai_json = serde_json::to_value(&openai_req)
+        let mut openai_json = serde_json::to_value(&openai_req)
             .map_err(|e| ApiError::internal_error(e.to_string()))?;
+        // Mantle-only extension: ask the backend to stream reasoning text back.
+        // Not sent to the real OpenAI API (it rejects unknown parameters).
+        if openai_req.reasoning_effort.is_some() {
+            if let Some(obj) = openai_json.as_object_mut() {
+                obj.insert("include_reasoning".to_string(), serde_json::json!(true));
+            }
+        }
 
         if request.stream {
             let sse_stream = bedrock
