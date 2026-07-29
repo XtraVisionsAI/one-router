@@ -87,7 +87,8 @@ export interface ModelMapping {
   cache_read_price: number
   cache_write_price: number
   pricing_source: string
-  capabilities?: ModelCapabilities | null
+  /** JSON-encoded ModelCapabilities as returned by the API. null = gateway defaults. */
+  capabilities?: string | null
 }
 
 export interface UpsertMappingBody {

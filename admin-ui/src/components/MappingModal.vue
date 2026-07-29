@@ -55,12 +55,31 @@
           cache_write_price: props.existing?.cache_write_price ?? 0,
           pricing_source: props.existing?.pricing_source ?? 'litellm'
         }
-        caps.value = props.existing?.capabilities
-          ? { ...defaultCapabilities(), ...props.existing.capabilities }
-          : defaultCapabilities()
+        caps.value = parseCapabilities(props.existing?.capabilities)
       }
     }
   )
+
+  /**
+   * The API returns capabilities as a JSON string (null = gateway defaults).
+   * Parse it and deep-merge per capability so partial JSON (e.g. thinking
+   * without style) still yields a fully-populated object for the controls.
+   */
+  function parseCapabilities(json?: string | null): ModelCapabilities {
+    const defaults = defaultCapabilities()
+    if (!json) return defaults
+    try {
+      const parsed = JSON.parse(json)
+      return {
+        thinking: { ...defaults.thinking, ...(parsed.thinking ?? {}) },
+        document: { ...defaults.document, ...(parsed.document ?? {}) },
+        tool_use: { ...defaults.tool_use, ...(parsed.tool_use ?? {}) },
+        ptc: { ...defaults.ptc, ...(parsed.ptc ?? {}) }
+      }
+    } catch {
+      return defaults
+    }
+  }
 
   async function save() {
     if (!form.value.source_model_id.trim()) {
