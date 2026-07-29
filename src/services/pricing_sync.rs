@@ -67,7 +67,7 @@ impl ProviderNs {
     /// The `litellm_provider` values that belong to this namespace.
     fn from_litellm_provider(litellm_provider: &str) -> Option<Self> {
         match litellm_provider {
-            "bedrock" | "bedrock_converse" => Some(Self::Bedrock),
+            "bedrock" | "bedrock_converse" | "bedrock_mantle" => Some(Self::Bedrock),
             "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::OpenAI),
             "gemini" | "vertex_ai-language-models" | "vertex_ai" => Some(Self::Gemini),
@@ -430,6 +430,13 @@ mod tests {
                 "input_cost_per_token": 0.000003,
                 "output_cost_per_token": 0.000015
             },
+            "bedrock_mantle/openai.gpt-5.5": {
+                "litellm_provider": "bedrock_mantle",
+                "mode": "responses",
+                "input_cost_per_token": 0.0000055,
+                "output_cost_per_token": 0.000033,
+                "cache_read_input_token_cost": 0.00000055
+            },
             "gemini/gemini-1.5-pro": {
                 "litellm_provider": "gemini",
                 "mode": "chat",
@@ -507,6 +514,18 @@ mod tests {
         .expect("region-prefixed bedrock id should match");
         assert_eq!(p.input, Some(3.0));
         assert_eq!(p.output, Some(15.0));
+    }
+
+    #[test]
+    fn test_match_bedrock_mantle_namespace() {
+        let index = build_index(&sample_table());
+        // bedrock_mantle entries index under the Bedrock namespace, with the
+        // `bedrock_mantle/` key prefix normalized away.
+        let p = match_prices(&index, "bedrock", "openai.gpt-5.5")
+            .expect("bedrock_mantle entry should match a bedrock mapping");
+        assert_eq!(p.input, Some(5.5));
+        assert_eq!(p.output, Some(33.0));
+        assert_eq!(p.cache_read, Some(0.55));
     }
 
     #[test]
