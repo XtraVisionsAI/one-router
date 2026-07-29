@@ -1,3 +1,14 @@
+## v0.25.0 (2026-07-29)
+
+### Feat
+
+- **reasoning**: thinking support for non-Claude models (Nova 2 / Kimi / GPT)
+- **pricing-sync**: import embedding-mode prices from the LiteLLM table
+
+### Fix
+
+- **pricing-sync**: accept bedrock_mantle as a Bedrock namespace provider
+
 ## v0.24.0 (2026-07-28)
 
 ### Feat
