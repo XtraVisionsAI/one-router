@@ -100,10 +100,10 @@ impl DatabaseService for PostgresBackend {
         self
     }
 
-    async fn initialize(&self, encryption_key: Option<&str>) -> Result<()> {
+    async fn initialize(&self, encryption_key: Option<&str>, seed_mode: SeedMode) -> Result<()> {
         self.run_migrations().await?;
         self.backfill_key_hashes(encryption_key).await?;
-        self.seed_defaults().await?;
+        self.seed_defaults(seed_mode).await?;
         Ok(())
     }
 

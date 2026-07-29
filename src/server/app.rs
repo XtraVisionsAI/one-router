@@ -54,7 +54,7 @@ impl App {
 
         // 2. Initialize database (auto-create tables + seed defaults + backfill key hashes)
         database
-            .initialize(settings.encryption_key.as_deref())
+            .initialize(settings.encryption_key.as_deref(), settings.seed_defaults)
             .await?;
         tracing::info!("Database initialized successfully");
 

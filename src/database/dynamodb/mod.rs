@@ -445,10 +445,10 @@ impl DatabaseService for DynamoDbBackend {
         self
     }
 
-    async fn initialize(&self, encryption_key: Option<&str>) -> Result<()> {
+    async fn initialize(&self, encryption_key: Option<&str>, seed_mode: SeedMode) -> Result<()> {
         migrations::create_tables(self).await?;
         self.backfill_key_hashes(encryption_key).await?;
-        self.seed_defaults().await?;
+        self.seed_defaults(seed_mode).await?;
         Ok(())
     }
 

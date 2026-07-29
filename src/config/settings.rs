@@ -41,6 +41,10 @@ pub struct Settings {
     /// Maximum content size in KB for web fetch operations
     pub web_fetch_max_content_kb: u64,
 
+    /// When to seed default model mappings on startup:
+    /// "off" / "empty" (default, first run only) / "missing" (legacy backfill)
+    pub seed_defaults: crate::database::seed::SeedMode,
+
     /// Application version (from Cargo.toml)
     pub app_version: String,
 
@@ -80,6 +84,13 @@ impl Settings {
             .and_then(|v| v.parse().ok())
             .unwrap_or(512);
 
+        let seed_defaults = match env::var("SEED_DEFAULTS") {
+            Ok(v) if !v.is_empty() => v
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!("Invalid SEED_DEFAULTS: {e}"))?,
+            _ => crate::database::seed::SeedMode::default(),
+        };
+
         let mut settings = Self {
             database,
             port,
@@ -90,6 +101,7 @@ impl Settings {
             web_search_provider,
             web_search_api_key,
             web_fetch_max_content_kb,
+            seed_defaults,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             ephemeral_api_key: None,
         };
@@ -166,6 +178,7 @@ impl Settings {
     /// Apply CLI argument overrides (highest priority).
     ///
     /// Priority: .env file < environment variable < CLI argument.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_overrides(
         &mut self,
         database: Option<String>,
@@ -174,6 +187,7 @@ impl Settings {
         log_level: Option<String>,
         master_api_key: Option<String>,
         encryption_key: Option<String>,
+        seed_defaults: Option<crate::database::seed::SeedMode>,
     ) {
         if let Some(v) = database {
             self.database = v;
@@ -192,6 +206,9 @@ impl Settings {
         }
         if let Some(v) = encryption_key {
             self.encryption_key = Some(v);
+        }
+        if let Some(v) = seed_defaults {
+            self.seed_defaults = v;
         }
     }
 
@@ -304,6 +321,7 @@ mod tests {
             web_search_provider: None,
             web_search_api_key: None,
             web_fetch_max_content_kb: 512,
+            seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
         };
@@ -322,6 +340,7 @@ mod tests {
             web_search_provider: None,
             web_search_api_key: None,
             web_fetch_max_content_kb: 512,
+            seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
         };
@@ -341,6 +360,7 @@ mod tests {
             web_search_provider: None,
             web_search_api_key: None,
             web_fetch_max_content_kb: 512,
+            seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
         };
@@ -364,6 +384,7 @@ mod tests {
             web_search_provider: None,
             web_search_api_key: None,
             web_fetch_max_content_kb: 512,
+            seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
         };

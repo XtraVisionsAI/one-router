@@ -59,6 +59,7 @@ Options:
   -l, --log-level <LOG_LEVEL>         Log level
       --master-api-key <KEY>          Master API key for admin access
       --encryption-key <KEY>          Encryption key for credential storage
+      --seed-defaults <MODE>          When to seed default model mappings: off / empty / missing
   -h, --help                          Print help
   -V, --version                       Print version
 ```
@@ -80,6 +81,7 @@ Infrastructure env vars — all other config lives in the database (`system_sett
 | `MASTER_API_KEY` | _(auto-generated)_ | Admin-only key — used for `/admin` UI login and admin API. Cannot call business endpoints (`/v1/*`). Auto-generated and saved to `.env` on first run |
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
 | `CONTAINER` | _(unset)_ | Set to `true` in Docker — requires MASTER_API_KEY and ENCRYPTION_KEY to be provided explicitly |
+| `SEED_DEFAULTS` | `empty` | When to seed default model mappings on startup: `off` (never) / `empty` (only when the mappings table is empty — user deletions stick) / `missing` (legacy: re-insert any missing default on every startup). System settings are always backfilled per key regardless of this mode |
 
 **DATABASE URI formats:**
 - `sqlite:///app/data/gateway.db`

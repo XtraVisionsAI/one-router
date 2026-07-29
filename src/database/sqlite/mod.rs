@@ -430,10 +430,10 @@ impl DatabaseService for SqliteBackend {
         self
     }
 
-    async fn initialize(&self, encryption_key: Option<&str>) -> Result<()> {
+    async fn initialize(&self, encryption_key: Option<&str>, seed_mode: SeedMode) -> Result<()> {
         self.run_migrations().await?;
         self.backfill_key_hashes(encryption_key).await?;
-        self.seed_defaults().await?;
+        self.seed_defaults(seed_mode).await?;
         Ok(())
     }
 
@@ -1416,7 +1416,7 @@ mod tests {
             .await
             .unwrap();
         let backend = SqliteBackend { pool };
-        backend.initialize(None).await.unwrap();
+        backend.initialize(None, SeedMode::Missing).await.unwrap();
         backend
     }
 
@@ -1539,5 +1539,70 @@ mod tests {
             updated.deactivated_reason,
             Some("manual_deactivation".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod seed_mode_tests {
+    use super::*;
+    use crate::database::seed::{self, SeedMode};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn bare_db(seed_mode: SeedMode) -> SqliteBackend {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let backend = SqliteBackend { pool };
+        backend.initialize(None, seed_mode).await.unwrap();
+        backend
+    }
+
+    #[tokio::test]
+    async fn off_never_seeds_mappings() {
+        let db = bare_db(SeedMode::Off).await;
+        assert!(db.model_mapping().list_mappings().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_seeds_first_run_but_respects_deletions() {
+        let db = bare_db(SeedMode::Empty).await;
+        let seeded = db.model_mapping().list_mappings().await.unwrap();
+        assert_eq!(seeded.len(), seed::default_model_mappings().len());
+
+        // Delete one default mapping, re-run seeding → it must NOT come back.
+        let victim = &seeded[0];
+        db.model_mapping()
+            .delete_mapping(&victim.source_model_id, &victim.provider)
+            .await
+            .unwrap();
+        db.seed_defaults(SeedMode::Empty).await.unwrap();
+        assert!(db
+            .model_mapping()
+            .get_mapping(&victim.source_model_id, &victim.provider)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Legacy mode resurrects it.
+        db.seed_defaults(SeedMode::Missing).await.unwrap();
+        assert!(db
+            .model_mapping()
+            .get_mapping(&victim.source_model_id, &victim.provider)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn settings_are_seeded_regardless_of_mode() {
+        let db = bare_db(SeedMode::Off).await;
+        assert!(db
+            .system_settings()
+            .get_setting("rate_limit")
+            .await
+            .unwrap()
+            .is_some());
     }
 }

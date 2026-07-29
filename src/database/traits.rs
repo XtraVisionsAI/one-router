@@ -5,6 +5,7 @@
 
 use super::models::*;
 use super::seed;
+pub use super::seed::SeedMode;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -109,23 +110,34 @@ pub trait DatabaseService: Send + Sync {
 
     /// Initialize storage: create tables + insert default seed data.
     /// `encryption_key` is passed through to enable API key hash backfill.
-    async fn initialize(&self, encryption_key: Option<&str>) -> Result<()>;
+    /// `seed_mode` controls whether/when default model mappings are inserted.
+    async fn initialize(&self, encryption_key: Option<&str>, seed_mode: SeedMode) -> Result<()>;
 
     /// Quick health check (e.g., SELECT 1).
     async fn health_check(&self) -> bool;
 
-    /// Seed default model mappings and system settings (insert-if-not-exists).
+    /// Seed default model mappings (per `seed_mode`) and system settings.
+    ///
+    /// Settings are always backfilled per key (new releases add new keys);
+    /// `seed_mode` only governs the model mappings.
     ///
     /// Called by `initialize()` after schema migration.
-    async fn seed_defaults(&self) -> Result<()> {
-        for mapping in seed::default_model_mappings() {
-            if self
-                .model_mapping()
-                .get_mapping(&mapping.source_model_id, &mapping.provider)
-                .await?
-                .is_none()
-            {
-                self.model_mapping().upsert_mapping(&mapping).await?;
+    async fn seed_defaults(&self, seed_mode: SeedMode) -> Result<()> {
+        let seed_mappings = match seed_mode {
+            SeedMode::Off => false,
+            SeedMode::Missing => true,
+            SeedMode::Empty => self.model_mapping().list_mappings().await?.is_empty(),
+        };
+        if seed_mappings {
+            for mapping in seed::default_model_mappings() {
+                if self
+                    .model_mapping()
+                    .get_mapping(&mapping.source_model_id, &mapping.provider)
+                    .await?
+                    .is_none()
+                {
+                    self.model_mapping().upsert_mapping(&mapping).await?;
+                }
             }
         }
         for setting in seed::default_system_settings() {
@@ -143,7 +155,7 @@ pub trait DatabaseService: Send + Sync {
                 _ => {}
             }
         }
-        tracing::info!("Seed data applied");
+        tracing::info!(seed_mode = %seed_mode, mappings_seeded = seed_mappings, "Seed data applied");
         Ok(())
     }
 }

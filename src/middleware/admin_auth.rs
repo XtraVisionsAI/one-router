@@ -111,6 +111,7 @@ mod tests {
             web_search_provider: None,
             web_search_api_key: None,
             web_fetch_max_content_kb: 512,
+            seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.0.0".to_string(),
             ephemeral_api_key: ephemeral.map(|s| s.to_string()),
         }

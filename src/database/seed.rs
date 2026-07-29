@@ -9,6 +9,49 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::models::*;
 
+/// When to seed the default model mappings on startup.
+///
+/// Applies to model mappings only — system settings are always backfilled
+/// per key (new releases introduce new settings keys, and settings rows are
+/// code-defined rather than user-created).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SeedMode {
+    /// Never insert default mappings.
+    Off,
+    /// Insert default mappings only when the mappings table is empty
+    /// (first run). User deletions stick across restarts.
+    #[default]
+    Empty,
+    /// Legacy behavior: re-insert any default mapping that is missing on
+    /// every startup. Deleted default mappings reappear after a restart.
+    Missing,
+}
+
+impl std::str::FromStr for SeedMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "empty" => Ok(Self::Empty),
+            "missing" => Ok(Self::Missing),
+            other => Err(format!(
+                "invalid seed mode '{other}' (expected off, empty, or missing)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for SeedMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Empty => "empty",
+            Self::Missing => "missing",
+        })
+    }
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1082,4 +1125,22 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             updated_at: None,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_mode_parses_case_insensitively() {
+        assert_eq!("off".parse::<SeedMode>().unwrap(), SeedMode::Off);
+        assert_eq!("Empty".parse::<SeedMode>().unwrap(), SeedMode::Empty);
+        assert_eq!("MISSING".parse::<SeedMode>().unwrap(), SeedMode::Missing);
+        assert!("bogus".parse::<SeedMode>().is_err());
+    }
+
+    #[test]
+    fn seed_mode_defaults_to_empty() {
+        assert_eq!(SeedMode::default(), SeedMode::Empty);
+    }
 }

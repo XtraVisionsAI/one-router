@@ -34,6 +34,12 @@ struct Cli {
     #[arg(long)]
     encryption_key: Option<String>,
 
+    /// When to seed default model mappings on startup: off, empty (default,
+    /// first run only), or missing (legacy: re-insert deleted defaults)
+    /// (overrides SEED_DEFAULTS env var)
+    #[arg(long, value_name = "MODE")]
+    seed_defaults: Option<one_router::database::seed::SeedMode>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -68,6 +74,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         cli.log_level,
         cli.master_api_key,
         cli.encryption_key,
+        cli.seed_defaults,
     );
     init_tracing(&settings.log_level);
 
