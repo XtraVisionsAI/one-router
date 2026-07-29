@@ -5,6 +5,7 @@
   import { h } from 'vue'
   import { useMappingsApi } from '@/api/mappings'
   import { usePricingApi } from '@/api/pricing'
+  import ImportLitellmModal from '@/components/ImportLitellmModal.vue'
   import MappingModal from '@/components/MappingModal.vue'
 
   const message = useMessage()
@@ -15,6 +16,7 @@
   const allMappings = ref<ModelMapping[]>([])
   const loading = ref(true)
   const modalShow = ref(false)
+  const importShow = ref(false)
   const editingMapping = ref<ModelMapping | undefined>()
 
   const filterSrc = ref('')
@@ -256,6 +258,10 @@
           <template #icon><span class="i-carbon-currency-dollar" /></template>
           Sync Prices
         </n-button>
+        <n-button @click="importShow = true">
+          <template #icon><span class="i-carbon-download" /></template>
+          Import from LiteLLM
+        </n-button>
         <n-button type="primary" @click="openCreate">
           <template #icon><span class="i-carbon-add" /></template>
           Add Mapping
@@ -298,5 +304,6 @@
     </NDataTable>
 
     <mapping-modal v-model:show="modalShow" :existing="editingMapping" @saved="load" />
+    <import-litellm-modal v-model:show="importShow" @saved="load" />
   </div>
 </template>

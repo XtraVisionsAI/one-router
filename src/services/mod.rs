@@ -8,6 +8,7 @@ pub mod failover;
 pub mod gemini;
 pub mod image_url_fetcher;
 pub mod inference_profile;
+pub mod litellm_catalog;
 pub mod model_mapping;
 pub mod passthrough;
 pub mod pricing_sync;

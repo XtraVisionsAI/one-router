@@ -153,6 +153,9 @@ pub fn create_router(state: AppState) -> Router {
         // LiteLLM pricing sync
         .route("/pricing/sync", get(admin::pricing::get_sync_status))
         .route("/pricing/sync", post(admin::pricing::trigger_sync))
+        // LiteLLM model catalog import
+        .route("/pricing/models", get(admin::pricing::list_models))
+        .route("/pricing/import", post(admin::pricing::import_models))
         .layer(middleware::from_fn_with_state(
             admin_auth_state,
             require_admin_key,

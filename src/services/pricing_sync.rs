@@ -39,14 +39,14 @@ const REGION_PREFIXES: &[&str] = &[
 
 /// Modes imported from the table. Embeddings are per-token like chat (output 0);
 /// image/rerank use non-token pricing (e.g. per-query) and stay manual.
-const SYNCED_MODES: &[&str] = &["chat", "responses", "embedding"];
+pub(crate) const SYNCED_MODES: &[&str] = &["chat", "responses", "embedding"];
 
 /// Two per-1M prices are considered equal within this tolerance (float noise guard).
 const PRICE_EPSILON: f64 = 1e-6;
 
 /// LiteLLM provider namespace, selected from a mapping's `provider`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ProviderNs {
+pub(crate) enum ProviderNs {
     Bedrock,
     Anthropic,
     OpenAI,
@@ -54,7 +54,7 @@ enum ProviderNs {
 }
 
 impl ProviderNs {
-    fn from_mapping_provider(p: &str) -> Option<Self> {
+    pub(crate) fn from_mapping_provider(p: &str) -> Option<Self> {
         match p.to_ascii_lowercase().as_str() {
             "bedrock" => Some(Self::Bedrock),
             "anthropic" => Some(Self::Anthropic),
@@ -65,7 +65,7 @@ impl ProviderNs {
     }
 
     /// The `litellm_provider` values that belong to this namespace.
-    fn from_litellm_provider(litellm_provider: &str) -> Option<Self> {
+    pub(crate) fn from_litellm_provider(litellm_provider: &str) -> Option<Self> {
         match litellm_provider {
             "bedrock" | "bedrock_converse" | "bedrock_mantle" => Some(Self::Bedrock),
             "anthropic" => Some(Self::Anthropic),
@@ -130,7 +130,7 @@ pub struct SyncSummary {
 }
 
 /// Convert a LiteLLM per-token cost to USD per 1M tokens. Rejects negatives.
-fn to_price_per_million(value: Option<&serde_json::Value>) -> Option<f64> {
+pub(crate) fn to_price_per_million(value: Option<&serde_json::Value>) -> Option<f64> {
     let cost = value?.as_f64()?;
     if cost < 0.0 {
         return None;
@@ -139,7 +139,7 @@ fn to_price_per_million(value: Option<&serde_json::Value>) -> Option<f64> {
 }
 
 /// Strip a leading Bedrock region prefix (`us.`, `eu.`, …), if present.
-fn strip_region_prefix(model_id: &str) -> &str {
+pub(crate) fn strip_region_prefix(model_id: &str) -> &str {
     for prefix in REGION_PREFIXES {
         if let Some(rest) = model_id.strip_prefix(prefix) {
             return rest;
@@ -150,7 +150,7 @@ fn strip_region_prefix(model_id: &str) -> &str {
 
 /// Normalize a LiteLLM key or target model id: drop a leading `provider/` segment
 /// (`bedrock/…`, `gemini/…`, `vertex_ai/…`) and lowercase.
-fn normalize_model_id(id: &str) -> String {
+pub(crate) fn normalize_model_id(id: &str) -> String {
     let base = match id.rsplit_once('/') {
         Some((_, rest)) => rest,
         None => id,
@@ -306,7 +306,7 @@ pub fn reconcile(
 }
 
 /// Download and parse the LiteLLM price table. https-only, timeout- and size-capped.
-async fn fetch_litellm(url: &str) -> Result<serde_json::Value, String> {
+pub(crate) async fn fetch_litellm(url: &str) -> Result<serde_json::Value, String> {
     let parsed: reqwest::Url = url
         .parse()
         .map_err(|e| format!("invalid pricing_sync_url: {e}"))?;

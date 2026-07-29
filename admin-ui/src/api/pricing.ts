@@ -25,6 +25,42 @@ export function usePricingApi() {
       if (opts?.overwriteManual) params.set('overwrite_manual', 'true')
       const qs = params.toString()
       return request<PricingSyncSummary>('POST', `/pricing/sync${qs ? `?${qs}` : ''}`)
-    }
+    },
+
+    /** Browse importable LiteLLM entries for a provider */
+    models: (provider: string, q: string) => {
+      const params = new URLSearchParams({ provider })
+      if (q) params.set('q', q)
+      return request<{ data: ImportCandidate[] }>('GET', `/pricing/models?${params}`)
+    },
+
+    /** Create mappings from selected LiteLLM entries */
+    import: (provider: string, items: { key: string; source_model_id?: string }[]) =>
+      request<ImportSummary>('POST', '/pricing/import', { provider, items })
   }
+}
+
+/** One importable LiteLLM table entry with derived mapping fields */
+export interface ImportCandidate {
+  key: string
+  target_model_id: string
+  suggested_source_id: string
+  mode: string
+  input_price: number
+  output_price: number
+  cache_read_price: number | null
+  cache_write_price: number | null
+  supports_reasoning: boolean
+  supports_function_calling: boolean
+  max_input_tokens: number | null
+  max_output_tokens: number | null
+  capabilities: string
+  /** A mapping with (suggested_source_id, provider) already exists */
+  exists: boolean
+}
+
+export interface ImportSummary {
+  created: string[]
+  skipped_existing: string[]
+  not_found: string[]
 }
