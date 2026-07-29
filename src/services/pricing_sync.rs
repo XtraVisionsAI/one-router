@@ -37,9 +37,9 @@ const REGION_PREFIXES: &[&str] = &[
     "us.", "eu.", "apac.", "global.", "jp.", "au.", "ca.", "sa.", "us-gov.",
 ];
 
-/// Only chat-style entries are imported (skips embeddings/image/rerank pricing,
-/// which one-router prices manually).
-const SYNCED_MODES: &[&str] = &["chat", "responses"];
+/// Modes imported from the table. Embeddings are per-token like chat (output 0);
+/// image/rerank use non-token pricing (e.g. per-query) and stay manual.
+const SYNCED_MODES: &[&str] = &["chat", "responses", "embedding"];
 
 /// Two per-1M prices are considered equal within this tolerance (float noise guard).
 const PRICE_EPSILON: f64 = 1e-6;
@@ -437,6 +437,19 @@ mod tests {
                 "output_cost_per_token": 0.000033,
                 "cache_read_input_token_cost": 0.00000055
             },
+            "cohere.embed-v4:0": {
+                "litellm_provider": "bedrock",
+                "mode": "embedding",
+                "input_cost_per_token": 0.00000012,
+                "output_cost_per_token": 0.0
+            },
+            "cohere.rerank-v3-5:0": {
+                "litellm_provider": "bedrock",
+                "mode": "rerank",
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+                "input_cost_per_query": 0.002
+            },
             "gemini/gemini-1.5-pro": {
                 "litellm_provider": "gemini",
                 "mode": "chat",
@@ -482,9 +495,13 @@ mod tests {
     #[test]
     fn test_build_index_filters_by_mode_and_provider() {
         let index = build_index(&sample_table());
-        // embedding mode is excluded; sample_spec skipped.
+        // embedding mode is per-token priced and included; sample_spec skipped.
         assert!(index
             .get(ProviderNs::OpenAI, "text-embedding-3-small")
+            .is_some());
+        // rerank mode is per-query priced and excluded.
+        assert!(index
+            .get(ProviderNs::Bedrock, "cohere.rerank-v3-5:0")
             .is_none());
         assert!(index.get(ProviderNs::OpenAI, "gpt-4o").is_some());
         assert!(index
@@ -492,6 +509,15 @@ mod tests {
             .is_some());
         // gemini/ prefix normalized away.
         assert!(index.get(ProviderNs::Gemini, "gemini-1.5-pro").is_some());
+    }
+
+    #[test]
+    fn test_match_bedrock_embedding() {
+        let index = build_index(&sample_table());
+        let p = match_prices(&index, "bedrock", "cohere.embed-v4:0")
+            .expect("bedrock embedding entry should match");
+        assert_eq!(p.input, Some(0.12));
+        assert_eq!(p.output, Some(0.0));
     }
 
     #[test]
