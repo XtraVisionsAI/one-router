@@ -1,3 +1,13 @@
+## v0.27.0 (2026-07-30)
+
+### Feat
+
+- **bedrock**: Mantle Responses support for Responses-only GPT-5.x models
+
+### Perf
+
+- **bedrock**: reuse a shared HTTP client for Mantle requests
+
 ## v0.26.0 (2026-07-30)
 
 ### Feat
