@@ -1,3 +1,10 @@
+## v0.26.0 (2026-07-30)
+
+### Feat
+
+- **admin**: import models from the LiteLLM price table
+- **seed**: configurable default-mapping seed mode (off/empty/missing)
+
 ## v0.25.1 (2026-07-29)
 
 ### Fix
