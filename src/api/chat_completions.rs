@@ -493,6 +493,21 @@ async fn handle_bedrock_request(
         .await
         .map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
 
+    // Responses-only models (GPT-5.x) → Mantle Responses API. They have no
+    // Converse or Mantle chat-completions form.
+    if BedrockService::is_mantle_responses_model(&routing_model_id) {
+        return handle_mantle_responses_chat(
+            bedrock,
+            request,
+            target_model_id,
+            caps,
+            state,
+            request_id,
+            usage_ctx,
+        )
+        .await;
+    }
+
     // ── Claude path: OpenAI → Anthropic → InvokeModel ──────────────────────
     if crate::services::BedrockService::is_claude_model(&routing_model_id) {
         use crate::converters::anthropic_openai::OpenAIToAnthropicConverter;
@@ -670,6 +685,113 @@ async fn handle_bedrock_request(
     );
 
     Ok(ChatCompletionApiResponse::Json(Json(response)))
+}
+
+// ============================================================================
+// Mantle Responses Handler (Chat Completions ↔ Responses-only models)
+// ============================================================================
+
+/// Handle a Chat Completions request for a Responses-only Bedrock model
+/// (GPT-5.x) via the Mantle Responses API: convert the chat request into a raw
+/// Responses body, call the Mantle endpoint, and convert the result (object or
+/// SSE frames) back into Chat Completions shapes.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mantle_responses_chat(
+    bedrock: Arc<BedrockService>,
+    request: &ChatCompletionRequest,
+    target_model_id: &str,
+    caps: &Option<crate::services::ModelCapabilities>,
+    state: &AppState,
+    request_id: &str,
+    usage_ctx: &UsageContext,
+) -> Result<ChatCompletionApiResponse, OpenAIApiError> {
+    use crate::converters::responses_chat::{
+        chat_to_responses_request, responses_to_chat_response, ResponsesToChatStreamState,
+    };
+
+    // reasoning_effort is gated by the thinking capability, mirroring the
+    // capability filtering applied on the other Bedrock paths.
+    let default_caps = state.dynamic.read().await.default_capabilities.clone();
+    let effective_caps = caps.as_ref().unwrap_or(&default_caps);
+    let mut request = request.clone();
+    if !effective_caps.thinking.enabled {
+        request.reasoning_effort = None;
+    }
+
+    let body = chat_to_responses_request(&request, target_model_id);
+
+    tracing::debug!(
+        request_id = %request_id,
+        target_model = %target_model_id,
+        stream = request.stream,
+        "Routing to Bedrock Mantle Responses endpoint (OpenAI protocol)"
+    );
+
+    if !request.stream {
+        let response_json = bedrock.mantle_responses(&body).await.map_err(|e| {
+            tracing::error!(error = %e, "Bedrock Mantle Responses call failed");
+            OpenAIApiError::from_bedrock_error(&e)
+        })?;
+        let response = responses_to_chat_response(&response_json, &request.model);
+        return Ok(ChatCompletionApiResponse::Json(Json(response)));
+    }
+
+    let byte_stream = bedrock.mantle_responses_stream(&body).await.map_err(|e| {
+        tracing::error!(error = %e, "Bedrock Mantle Responses streaming failed");
+        OpenAIApiError::from_bedrock_error(&e)
+    })?;
+
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .map(|o| o.include_usage)
+        .unwrap_or(false);
+    let source_model = request.model.clone();
+    let stream_usage = usage_ctx.stream_usage.clone();
+    let req_id = request_id.to_string();
+
+    let stream: SseStream = Box::pin(async_stream::stream! {
+        use futures::StreamExt;
+        let mut byte_stream = Box::pin(byte_stream);
+        let mut buffer = String::new();
+        let mut conv_state = ResponsesToChatStreamState::new(source_model, include_usage);
+
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(request_id = %req_id, error = %e, "Mantle Responses stream chunk error");
+                    break;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buffer.find("\n\n") {
+                let frame = buffer[..pos].to_string();
+                buffer.drain(..pos + 2);
+                if let Some((event_type, payload)) =
+                    crate::api::responses::parse_sse_frame(&frame)
+                {
+                    for chunk_json in conv_state.convert_frame(&event_type, &payload) {
+                        yield Ok(Event::default().data(chunk_json));
+                    }
+                }
+            }
+        }
+        yield Ok(Event::default().data("[DONE]"));
+
+        {
+            let mut u = stream_usage.lock().await;
+            // Split cached tokens out of the billable input count (OpenAI's
+            // prompt_tokens includes them) so they bill at the cache-read rate.
+            u.input_tokens = (conv_state.prompt_tokens - conv_state.cached_tokens).max(0);
+            u.output_tokens = conv_state.completion_tokens;
+            if conv_state.cached_tokens > 0 {
+                u.cache_read_input_tokens = Some(conv_state.cached_tokens);
+            }
+        }
+    });
+
+    Ok(ChatCompletionApiResponse::Stream(stream))
 }
 
 // ============================================================================

@@ -390,6 +390,23 @@ impl BedrockService {
         lower.contains("claude") || lower.contains("anthropic")
     }
 
+    /// Determine if a Bedrock model is only reachable through the Mantle
+    /// Responses API (`/v1/responses`). The GPT-5.x family has no Converse form
+    /// and Mantle's `/v1/chat/completions` rejects it (LiteLLM lists these under
+    /// `bedrock_mantle/` with mode `responses`). `openai.gpt-oss-*` supports
+    /// Converse and intentionally does not match.
+    ///
+    /// Hardcoded prefix list (same precedent as the `beta_headers` blocklist).
+    /// Keyed on the resolved target model id so the answer stays correct for
+    /// failover targets, which bypass per-model capabilities.
+    pub fn is_mantle_responses_model(target_model_id: &str) -> bool {
+        const RESPONSES_ONLY_PREFIXES: [&str; 1] = ["openai.gpt-5"];
+        let lower = target_model_id.to_lowercase();
+        RESPONSES_ONLY_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+    }
+
     /// Resolve an application inference profile ARN to its underlying model ARN
     /// for routing/pricing decisions. Non-ARN model IDs are returned unchanged
     /// with no network call. Application-inference-profile ARNs are resolved via
@@ -422,13 +439,17 @@ impl BedrockService {
             .map_err(BedrockError::Unknown)
     }
 
-    /// Call Bedrock OpenAI-compatible endpoint (Bedrock Mantle) for non-Claude models.
-    /// Uses the same AWS credentials as Converse API but calls /v1/chat/completions.
-    pub async fn chat_completions(
+    /// Sign and send a POST to the Bedrock OpenAI-compatible (Mantle) endpoint.
+    /// Picks a credential from the pool, SigV4-signs the body, and sends it.
+    /// Records a pool failure when the request cannot be sent; HTTP-status
+    /// accounting (429/5xx/success) is left to the caller. Returns the name of
+    /// the credential used together with the response.
+    async fn mantle_post(
         &self,
-        openai_request: &serde_json::Value,
-        _target_model_id: &str,
-    ) -> Result<serde_json::Value, BedrockError> {
+        host_kind: MantleHost,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<(String, reqwest::Response), BedrockError> {
         use aws_credential_types::Credentials as AwsCreds;
         use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
         use aws_sigv4::sign::v4;
@@ -449,11 +470,6 @@ impl BedrockService {
             )
         };
 
-        let url = format!("https://bedrock-runtime.{region}.amazonaws.com/v1/chat/completions");
-
-        let body = serde_json::to_vec(openai_request)
-            .map_err(|e| BedrockError::Serialization(e.to_string()))?;
-
         const BEDROCK_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024; // 4MB
         if body.len() > BEDROCK_MAX_REQUEST_BYTES {
             return Err(BedrockError::Serialization(format!(
@@ -470,6 +486,9 @@ impl BedrockService {
             );
         }
 
+        let host = host_kind.host(&region);
+        let url = format!("https://{host}{path}");
+
         // Build AWS Identity for signing
         let aws_creds = AwsCreds::new(
             access_key_id.as_deref().unwrap_or(""),
@@ -480,16 +499,12 @@ impl BedrockService {
         );
         let identity: aws_smithy_runtime_api::client::identity::Identity = aws_creds.into();
 
-        let host = format!("bedrock-runtime.{region}.amazonaws.com");
-        let signing_settings = SigningSettings::default();
-        let now = std::time::SystemTime::now();
-
         let signing_params = v4::SigningParams::builder()
             .identity(&identity)
             .region(region.as_str())
             .name("bedrock")
-            .time(now)
-            .settings(signing_settings)
+            .time(std::time::SystemTime::now())
+            .settings(SigningSettings::default())
             .build()
             .map_err(|e| BedrockError::Unknown(e.to_string()))?
             .into();
@@ -511,15 +526,19 @@ impl BedrockService {
             .map_err(|e| BedrockError::Unknown(e.to_string()))?
             .into_parts();
 
-        // Apply signed headers to reqwest request
+        // Apply signed headers to reqwest request. Do NOT set `host` manually:
+        // reqwest derives it from the URL, and a second value makes AWS see a
+        // doubled host header ("a,a") that breaks signature validation.
         let client = reqwest::Client::new();
         let mut req_builder = client
             .post(&url)
             .header("content-type", "application/json")
-            .header("host", &host)
             .body(body);
 
         for (name, value) in signing_instructions.headers() {
+            if name.eq_ignore_ascii_case("host") {
+                continue;
+            }
             req_builder = req_builder.header(name, value);
         }
 
@@ -534,6 +553,23 @@ impl BedrockService {
             self.record_failure(&cred_name);
             BedrockError::Unknown(e.to_string())
         })?;
+
+        Ok((cred_name, response))
+    }
+
+    /// Call Bedrock OpenAI-compatible endpoint (Bedrock Mantle) for non-Claude models.
+    /// Uses the same AWS credentials as Converse API but calls /v1/chat/completions.
+    pub async fn chat_completions(
+        &self,
+        openai_request: &serde_json::Value,
+        _target_model_id: &str,
+    ) -> Result<serde_json::Value, BedrockError> {
+        let body = serde_json::to_vec(openai_request)
+            .map_err(|e| BedrockError::Serialization(e.to_string()))?;
+
+        let (cred_name, response) = self
+            .mantle_post(MantleHost::Runtime, "/openai/v1/chat/completions", body)
+            .await?;
 
         let status = response.status().as_u16();
         if status == 429 {
@@ -570,99 +606,16 @@ impl BedrockService {
         impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send,
         BedrockError,
     > {
-        use aws_credential_types::Credentials as AwsCreds;
-        use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
-        use aws_sigv4::sign::v4;
-
-        // Gather credential info (same as chat_completions)
-        let (cred_name, region, access_key_id, secret_access_key, session_token, has_access_key) = {
-            let cred = self
-                .pool
-                .get_next()
-                .ok_or_else(|| BedrockError::Unknown("No available credentials".to_string()))?;
-            (
-                cred.name().to_string(),
-                cred.region().to_string(),
-                cred.access_key_id().map(|s| s.to_string()),
-                cred.secret_access_key().map(|s| s.to_string()),
-                cred.session_token().map(|s| s.to_string()),
-                cred.uses_access_key(),
-            )
-        };
-
         // Force stream: true in the request
         let mut streaming_request = openai_request.clone();
         streaming_request["stream"] = serde_json::json!(true);
 
-        let url = format!("https://bedrock-runtime.{region}.amazonaws.com/v1/chat/completions");
         let body = serde_json::to_vec(&streaming_request)
             .map_err(|e| BedrockError::Serialization(e.to_string()))?;
 
-        if !has_access_key {
-            tracing::warn!(
-                credential = %cred_name,
-                "Credential does not have explicit access keys; Bedrock Mantle SigV4 signing may fail."
-            );
-        }
-
-        // SigV4 sign (same pattern as chat_completions)
-        let aws_creds = AwsCreds::new(
-            access_key_id.as_deref().unwrap_or(""),
-            secret_access_key.as_deref().unwrap_or(""),
-            session_token.clone(),
-            None,
-            "one-router",
-        );
-        let identity: aws_smithy_runtime_api::client::identity::Identity = aws_creds.into();
-        let host = format!("bedrock-runtime.{region}.amazonaws.com");
-        let signing_settings = SigningSettings::default();
-        let signing_params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(region.as_str())
-            .name("bedrock")
-            .time(std::time::SystemTime::now())
-            .settings(signing_settings)
-            .build()
-            .map_err(|e| BedrockError::Unknown(e.to_string()))?
-            .into();
-
-        let headers_to_sign = [
-            ("host", host.as_str()),
-            ("content-type", "application/json"),
-        ];
-        let signable = SignableRequest::new(
-            "POST",
-            url.as_str(),
-            headers_to_sign.iter().map(|(k, v)| (*k, *v)),
-            SignableBody::Bytes(&body),
-        )
-        .map_err(|e| BedrockError::Unknown(e.to_string()))?;
-
-        let (signing_instructions, _) = sign(signable, &signing_params)
-            .map_err(|e| BedrockError::Unknown(e.to_string()))?
-            .into_parts();
-
-        let client = reqwest::Client::new();
-        let mut req_builder = client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("host", &host)
-            .body(body);
-        for (name, value) in signing_instructions.headers() {
-            req_builder = req_builder.header(name, value);
-        }
-
-        tracing::debug!(
-            credential = %cred_name,
-            region = %region,
-            url = %url,
-            "Calling Bedrock OpenAI Compat endpoint (Mantle) streaming"
-        );
-
-        let response = req_builder.send().await.map_err(|e| {
-            self.record_failure(&cred_name);
-            BedrockError::Unknown(e.to_string())
-        })?;
+        let (cred_name, response) = self
+            .mantle_post(MantleHost::Runtime, "/openai/v1/chat/completions", body)
+            .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -682,6 +635,118 @@ impl BedrockService {
         let byte_stream = response.bytes_stream();
         let sse_stream = openai_sse_to_anthropic_sse(byte_stream, cred_name, stream_usage);
         Ok(sse_stream)
+    }
+
+    /// Call the Bedrock Mantle Responses API (`/v1/responses`), non-streaming.
+    /// For Responses-only models (see [`Self::is_mantle_responses_model`]) the
+    /// request body is the OpenAI Responses protocol, passed through verbatim.
+    pub async fn mantle_responses(
+        &self,
+        responses_request: &serde_json::Value,
+    ) -> Result<serde_json::Value, BedrockError> {
+        let mut request = responses_request.clone();
+        request["stream"] = serde_json::json!(false);
+        let body =
+            serde_json::to_vec(&request).map_err(|e| BedrockError::Serialization(e.to_string()))?;
+
+        let (cred_name, response) = self
+            .mantle_post(MantleHost::Mantle, "/openai/v1/responses", body)
+            .await?;
+
+        let status = response.status().as_u16();
+        if status == 429 {
+            self.record_rate_limited(&cred_name);
+        } else if status >= 500 {
+            self.record_failure(&cred_name);
+        } else {
+            self.record_success(&cred_name);
+        }
+
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(mantle_http_error(status, text));
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|e| BedrockError::Deserialization(e.to_string()))
+    }
+
+    /// Call the Bedrock Mantle Responses API (`/v1/responses`) streaming.
+    /// Returns the raw SSE byte stream — already Responses-protocol SSE with
+    /// `event:` lines and `sequence_number`s; the caller relays frames.
+    pub async fn mantle_responses_stream(
+        &self,
+        responses_request: &serde_json::Value,
+    ) -> Result<
+        impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send,
+        BedrockError,
+    > {
+        let mut request = responses_request.clone();
+        request["stream"] = serde_json::json!(true);
+        let body =
+            serde_json::to_vec(&request).map_err(|e| BedrockError::Serialization(e.to_string()))?;
+
+        let (cred_name, response) = self
+            .mantle_post(MantleHost::Mantle, "/openai/v1/responses", body)
+            .await?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            if status == 429 {
+                self.record_rate_limited(&cred_name);
+            } else {
+                self.record_failure(&cred_name);
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(mantle_http_error(status, text));
+        }
+        self.record_success(&cred_name);
+
+        Ok(response.bytes_stream())
+    }
+}
+
+/// Which Bedrock OpenAI-compatible host to call. The classic runtime host
+/// serves `/openai/v1/chat/completions`; the dedicated Mantle host serves the
+/// Responses API (the GPT-5.x family lives only there). Both accept SigV4
+/// with service name "bedrock" (verified 2026-07-30). The paths REQUIRE the
+/// `/openai` prefix — without it bedrock-runtime answers HTTP 200 with a coral
+/// `UnknownOperationException` body that then fails response parsing.
+enum MantleHost {
+    Runtime,
+    Mantle,
+}
+
+impl MantleHost {
+    fn host(&self, region: &str) -> String {
+        match self {
+            MantleHost::Runtime => format!("bedrock-runtime.{region}.amazonaws.com"),
+            MantleHost::Mantle => format!("bedrock-mantle.{region}.api.aws"),
+        }
+    }
+}
+
+/// Map a Mantle HTTP error to a typed BedrockError, extracting the OpenAI-style
+/// `error.message` when the body is a JSON error object so the client sees the
+/// upstream message instead of a wrapped blob.
+fn mantle_http_error(status: u16, body: String) -> BedrockError {
+    let message = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")?
+                .get("message")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or(body);
+    match status {
+        429 => BedrockError::Throttled(message),
+        400..=499 => BedrockError::ValidationError(message),
+        _ => BedrockError::Unknown(format!(
+            "Bedrock Mantle responses error {status}: {message}"
+        )),
     }
 }
 
@@ -1545,7 +1610,7 @@ impl BedrockError {
 
 #[cfg(test)]
 mod tests {
-    use super::BedrockService;
+    use super::{mantle_http_error, BedrockError, BedrockService};
 
     #[test]
     fn test_ensure_anthropic_beta() {
@@ -1676,6 +1741,57 @@ mod tests {
         // Claude models use Converse API
         assert!(BedrockService::is_claude_model(
             "us.anthropic.claude-sonnet-4-6-v1:0"
+        ));
+    }
+
+    #[test]
+    fn test_is_mantle_responses_model() {
+        // GPT-5.x family is Responses-only on Mantle
+        assert!(BedrockService::is_mantle_responses_model(
+            "openai.gpt-5.6-sol"
+        ));
+        assert!(BedrockService::is_mantle_responses_model(
+            "openai.gpt-5.6-luna"
+        ));
+        assert!(BedrockService::is_mantle_responses_model("openai.gpt-5.4"));
+        assert!(BedrockService::is_mantle_responses_model("OpenAI.GPT-5.5"));
+        // gpt-oss supports Converse; Claude and Nova are unaffected
+        assert!(!BedrockService::is_mantle_responses_model(
+            "openai.gpt-oss-120b-1:0"
+        ));
+        assert!(!BedrockService::is_mantle_responses_model(
+            "global.anthropic.claude-sonnet-5"
+        ));
+        assert!(!BedrockService::is_mantle_responses_model(
+            "us.amazon.nova-2-pro-v1:0"
+        ));
+    }
+
+    #[test]
+    fn test_mantle_http_error_mapping() {
+        // 4xx with an OpenAI-style JSON error body → ValidationError with the
+        // extracted message
+        let err = mantle_http_error(
+            400,
+            r#"{"error":{"message":"The provided model identifier is invalid.","type":"invalid_request_error"}}"#.to_string(),
+        );
+        match err {
+            BedrockError::ValidationError(msg) => {
+                assert_eq!(msg, "The provided model identifier is invalid.")
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+
+        // 429 → Throttled
+        assert!(matches!(
+            mantle_http_error(429, r#"{"error":{"message":"slow down"}}"#.to_string()),
+            BedrockError::Throttled(_)
+        ));
+
+        // 5xx / non-JSON body → Unknown, body carried verbatim
+        assert!(matches!(
+            mantle_http_error(500, "gateway exploded".to_string()),
+            BedrockError::Unknown(_)
         ));
     }
 }

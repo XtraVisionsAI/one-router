@@ -39,6 +39,9 @@ type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 /// JSON or SSE response for the Responses API.
 pub enum ResponsesApiResponse {
     Json(Box<ResponsesResponse>),
+    /// Verbatim upstream response body (Mantle passthrough) — not retyped, so
+    /// fields we don't model are preserved.
+    Raw(Box<serde_json::Value>),
     Stream(SseStream),
 }
 
@@ -46,6 +49,7 @@ impl IntoResponse for ResponsesApiResponse {
     fn into_response(self) -> Response {
         match self {
             ResponsesApiResponse::Json(resp) => Json(*resp).into_response(),
+            ResponsesApiResponse::Raw(value) => Json(*value).into_response(),
             ResponsesApiResponse::Stream(stream) => Sse::new(stream).into_response(),
         }
     }
@@ -69,12 +73,18 @@ impl From<ResponsesContextError> for OpenAIApiError {
 }
 
 /// POST /v1/responses — create a model response (Responses API).
+///
+/// The body is taken as raw JSON so the Mantle passthrough branch can forward
+/// fields we don't model (`include`, `text`, `parallel_tool_calls`, …); the
+/// translation path re-parses it into the typed [`ResponsesRequest`].
 pub async fn create_response(
     State(state): State<AppState>,
     axum::extract::Extension(key_info): axum::extract::Extension<ApiKeyInfo>,
     headers: HeaderMap,
-    Json(request): Json<ResponsesRequest>,
+    Json(raw_request): Json<serde_json::Value>,
 ) -> Result<ResponsesApiResponse, OpenAIApiError> {
+    let request: ResponsesRequest = serde_json::from_value(raw_request.clone())
+        .map_err(|e| OpenAIApiError::bad_request(format!("Invalid request: {e}")))?;
     let owner = owner_key_hash(&key_info);
     let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -96,6 +106,28 @@ pub async fn create_response(
             &request_id,
         )
         .await;
+    }
+
+    // Responses-only Bedrock models (GPT-5.x, Mantle namespace): the input is
+    // already the Responses protocol, so pass it through to Mantle
+    // `/v1/responses` verbatim instead of translating to Chat Completions —
+    // these models have no Converse or Mantle chat-completions form.
+    if let Ok(resolved) = state.model_mapping.resolve(&request.model).await {
+        if resolved.provider == "bedrock"
+            && crate::services::BedrockService::is_mantle_responses_model(&resolved.target_model_id)
+        {
+            return handle_mantle_responses_passthrough(
+                &state,
+                raw_request,
+                &request,
+                &resolved.target_model_id,
+                &key_info,
+                &owner,
+                prev_stored,
+                &request_id,
+            )
+            .await;
+        }
     }
 
     // Main path: Responses → Chat → 4-backend pipeline → Chat response.
@@ -219,6 +251,368 @@ fn record_responses_usage(
                 &provider,
                 "responses",
                 cache_ttl.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to record responses usage");
+        }
+    });
+}
+
+/// Context needed by the SSE relay to record usage and store conversation
+/// state once the upstream `response.completed` frame arrives.
+struct RelayContext {
+    state: AppState,
+    key_info: ApiKeyInfo,
+    request_id: String,
+    source_model: String,
+    owner: String,
+    stored_input: Vec<(String, String)>,
+    store: bool,
+}
+
+/// Bedrock Mantle `/v1/responses` passthrough for Responses-only models
+/// (GPT-5.x). Forwards the caller's raw request body verbatim (model id
+/// rewritten, local-state fields stripped) and relays the upstream response —
+/// natively streamed, not replayed.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mantle_responses_passthrough(
+    state: &AppState,
+    mut upstream: serde_json::Value,
+    request: &ResponsesRequest,
+    target_model_id: &str,
+    key_info: &ApiKeyInfo,
+    owner: &str,
+    prev_stored: Vec<(String, String)>,
+    request_id: &str,
+) -> Result<ResponsesApiResponse, OpenAIApiError> {
+    let source_model = request.model.clone();
+
+    tracing::info!(
+        request_id = %request_id,
+        source_model = %source_model,
+        target_model = %target_model_id,
+        stream = request.stream,
+        "Routing Responses request to Bedrock Mantle /v1/responses (passthrough)"
+    );
+
+    upstream["model"] = serde_json::json!(target_model_id);
+    if let Some(obj) = upstream.as_object_mut() {
+        // previous_response_id points into the local context store; the
+        // restored history is inlined into `input` below instead.
+        obj.remove("previous_response_id");
+        // State lives in the local context store — never double-store upstream.
+        obj.insert("store".to_string(), serde_json::json!(false));
+    }
+
+    if !prev_stored.is_empty() {
+        let mut items: Vec<serde_json::Value> = prev_stored
+            .iter()
+            .map(|(role, text)| serde_json::json!({"role": role, "content": text}))
+            .collect();
+        match upstream.get("input") {
+            Some(serde_json::Value::String(s)) => {
+                items.push(serde_json::json!({"role": "user", "content": s}));
+            }
+            Some(serde_json::Value::Array(arr)) => items.extend(arr.iter().cloned()),
+            _ => {}
+        }
+        upstream["input"] = serde_json::Value::Array(items);
+    }
+
+    // Codex compatibility: `additional_tools` input items are a Codex
+    // extension Mantle rejects ("value did not match any expected variant").
+    // Their tool definitions are equivalent as top-level `tools` entries
+    // (verified against the live endpoint), so merge them there.
+    merge_additional_tools(&mut upstream);
+
+    let bedrock = state
+        .dynamic
+        .read()
+        .await
+        .bedrock
+        .clone()
+        .ok_or_else(|| OpenAIApiError::internal_error("Bedrock backend not configured"))?;
+
+    let mut stored_input = prev_stored;
+    stored_input.extend(stored_from_responses_input(request));
+
+    if !request.stream {
+        let mut response_json = bedrock
+            .mantle_responses(&upstream)
+            .await
+            .map_err(|e| OpenAIApiError::from_bedrock_error(&e))?;
+        response_json["model"] = serde_json::json!(source_model);
+
+        if let Some(usage) = response_json.get("usage") {
+            record_mantle_responses_usage(state, key_info, request_id, &source_model, usage);
+        }
+
+        if request.should_store() {
+            let response_id = response_json
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(generate_response_id);
+            let output_text = extract_output_text(&response_json);
+            if !output_text.is_empty() {
+                stored_input.push(("assistant".to_string(), output_text));
+            }
+            state
+                .responses_context
+                .save(&response_id, owner, stored_input, response_json.clone())
+                .await;
+        }
+
+        return Ok(ResponsesApiResponse::Raw(Box::new(response_json)));
+    }
+
+    // Streaming: relay upstream Responses SSE frames as they arrive (frames
+    // already carry `event:` lines and `sequence_number`s).
+    let byte_stream = bedrock
+        .mantle_responses_stream(&upstream)
+        .await
+        .map_err(|e| OpenAIApiError::from_bedrock_error(&e))?;
+
+    Ok(ResponsesApiResponse::Stream(relay_mantle_responses_sse(
+        byte_stream,
+        RelayContext {
+            state: state.clone(),
+            key_info: key_info.clone(),
+            request_id: request_id.to_string(),
+            source_model,
+            owner: owner.to_string(),
+            stored_input,
+            store: request.should_store(),
+        },
+    )))
+}
+
+/// Relay an upstream Responses SSE byte stream frame by frame, rewriting the
+/// target model id back to the source name. Usage recording and context
+/// storage happen when the `response.completed` frame passes through.
+fn relay_mantle_responses_sse(
+    byte_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    ctx: RelayContext,
+) -> SseStream {
+    use futures::StreamExt;
+    Box::pin(async_stream::stream! {
+        let mut byte_stream = Box::pin(byte_stream);
+        let mut buffer = String::new();
+        let mut completed: Option<serde_json::Value> = None;
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Mantle responses stream chunk error");
+                    break;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buffer.find("\n\n") {
+                let frame = buffer[..pos].to_string();
+                buffer.drain(..pos + 2);
+                if let Some((event_type, mut payload)) = parse_sse_frame(&frame) {
+                    rewrite_model_fields(&mut payload, &ctx.source_model);
+                    if event_type == "response.completed" {
+                        completed = payload.get("response").cloned();
+                    }
+                    yield Ok(Event::default().event(event_type).data(payload.to_string()));
+                }
+            }
+        }
+
+        if let Some(response_json) = completed {
+            if let Some(usage) = response_json.get("usage") {
+                record_mantle_responses_usage(
+                    &ctx.state,
+                    &ctx.key_info,
+                    &ctx.request_id,
+                    &ctx.source_model,
+                    usage,
+                );
+            }
+            if ctx.store {
+                let response_id = response_json
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(generate_response_id);
+                let mut stored_input = ctx.stored_input;
+                let output_text = extract_output_text(&response_json);
+                if !output_text.is_empty() {
+                    stored_input.push(("assistant".to_string(), output_text));
+                }
+                ctx.state
+                    .responses_context
+                    .save(&response_id, &ctx.owner, stored_input, response_json)
+                    .await;
+            }
+        }
+    })
+}
+
+/// Move the tool definitions of Codex's `additional_tools` input items into
+/// the top-level `tools` array and drop the items — Mantle's Responses parser
+/// doesn't know this item type. Requests without such items are untouched.
+fn merge_additional_tools(upstream: &mut serde_json::Value) {
+    let Some(input) = upstream.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let mut extracted: Vec<serde_json::Value> = Vec::new();
+    input.retain(|item| {
+        if item.get("type").and_then(|t| t.as_str()) == Some("additional_tools") {
+            if let Some(tools) = item.get("tools").and_then(|t| t.as_array()) {
+                extracted.extend(tools.iter().cloned());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if extracted.is_empty() {
+        return;
+    }
+    match upstream.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        Some(tools) => tools.extend(extracted),
+        None => upstream["tools"] = serde_json::Value::Array(extracted),
+    }
+}
+
+/// Parse one SSE frame into (event_type, data JSON). Frames without a JSON
+/// data payload are dropped (Responses SSE always carries JSON data).
+/// Line-order-agnostic — Mantle sends `data:` before `event:`. Also used by
+/// the Mantle-Responses branches of `/v1/messages` and `/v1/chat/completions`.
+pub(crate) fn parse_sse_frame(frame: &str) -> Option<(String, serde_json::Value)> {
+    let mut event_type: Option<String> = None;
+    let mut data_lines: Vec<&str> = Vec::new();
+    for line in frame.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_type = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.trim_start());
+        }
+    }
+    let payload: serde_json::Value = serde_json::from_str(&data_lines.join("\n")).ok()?;
+    let event_type = event_type.or_else(|| {
+        payload
+            .get("type")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+    })?;
+    Some((event_type, payload))
+}
+
+/// Rewrite target model ids back to the source model name in a stream payload
+/// (`model` at the top level and under `response`).
+fn rewrite_model_fields(payload: &mut serde_json::Value, source_model: &str) {
+    if payload.get("model").is_some() {
+        payload["model"] = serde_json::json!(source_model);
+    }
+    if let Some(resp) = payload.get_mut("response") {
+        if resp.get("model").is_some() {
+            resp["model"] = serde_json::json!(source_model);
+        }
+    }
+}
+
+/// Extract stored (role, text) pairs from a Responses request's input for the
+/// local context store. Non-message items (function_call etc.) are skipped —
+/// the store keeps plain conversation text only.
+fn stored_from_responses_input(request: &ResponsesRequest) -> Vec<(String, String)> {
+    match &request.input {
+        Some(ResponsesInput::Text(t)) => vec![("user".to_string(), t.clone())],
+        Some(ResponsesInput::Items(items)) => items
+            .iter()
+            .filter_map(|item| {
+                let role = item.get("role")?.as_str()?.to_string();
+                let text = match item.get("content")? {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => return None,
+                };
+                if text.is_empty() {
+                    None
+                } else {
+                    Some((role, text))
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Extract the assistant text from a raw Responses response object —
+/// `output_text` if the upstream sent it, else the concatenated `output_text`
+/// parts of message output items.
+fn extract_output_text(response: &serde_json::Value) -> String {
+    if let Some(t) = response.get("output_text").and_then(|v| v.as_str()) {
+        return t.to_string();
+    }
+    let mut out = String::new();
+    if let Some(items) = response.get("output").and_then(|v| v.as_array()) {
+        for item in items {
+            if item.get("type").and_then(|t| t.as_str()) != Some("message") {
+                continue;
+            }
+            if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                for part in parts {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            out.push_str(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Record usage from a raw Responses `usage` object under the `responses`
+/// protocol tag. Upstream `input_tokens` includes cached tokens (OpenAI
+/// accounting) — deduct them for billing.
+fn record_mantle_responses_usage(
+    state: &AppState,
+    key_info: &ApiKeyInfo,
+    request_id: &str,
+    model: &str,
+    usage: &serde_json::Value,
+) {
+    let as_i32 =
+        |v: Option<&serde_json::Value>| -> i32 { v.and_then(|v| v.as_i64()).unwrap_or(0) as i32 };
+    let input = as_i32(usage.get("input_tokens"));
+    let output = as_i32(usage.get("output_tokens"));
+    let cached = as_i32(
+        usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens")),
+    );
+
+    let mut anth_usage =
+        crate::schemas::anthropic::Usage::new(input.saturating_sub(cached), output);
+    if cached > 0 {
+        anth_usage.cache_read_input_tokens = Some(cached);
+    }
+    let tracker = state.usage_tracker.clone();
+    let key_info = key_info.clone();
+    let request_id = request_id.to_string();
+    let model = model.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = tracker
+            .record_usage(
+                &key_info,
+                &request_id,
+                &model,
+                &anth_usage,
+                true,
+                "bedrock",
+                "responses",
+                None,
             )
             .await
         {
@@ -395,6 +789,17 @@ async fn handle_web_search(
         return Err(OpenAIApiError::bad_request(format!(
             "hosted web_search is only supported for bedrock/gemini providers, not '{}'",
             resolved.provider
+        )));
+    }
+
+    // The Bedrock web-tool backend drives the loop through Claude InvokeModel;
+    // non-Claude Bedrock models (Nova, GPT, …) cannot serve it.
+    if resolved.provider == "bedrock"
+        && !crate::services::BedrockService::is_claude_model(&resolved.target_model_id)
+    {
+        return Err(OpenAIApiError::bad_request(format!(
+            "hosted web_search on Bedrock is only supported for Claude models; '{}' resolves to '{}'",
+            request.model, resolved.target_model_id
         )));
     }
 
@@ -651,5 +1056,132 @@ mod tests {
         assert!(!names.iter().any(|t| t == "response.output_text.delta"));
         assert!(names.iter().any(|t| t == "response.content_part.added"));
         assert!(names.iter().any(|t| t == "response.content_part.done"));
+    }
+
+    #[test]
+    fn test_merge_additional_tools() {
+        let mut upstream = serde_json::json!({
+            "model": "m",
+            "tools": [{"type": "function", "name": "existing"}],
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "custom", "name": "exec"},
+                    {"type": "function", "name": "wait"},
+                ]},
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+        });
+        merge_additional_tools(&mut upstream);
+        let input = upstream["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"].as_str(), Some("message"));
+        let names: Vec<&str> = upstream["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["existing", "exec", "wait"]);
+
+        // No tools field yet → created; no additional_tools → untouched.
+        let mut bare = serde_json::json!({
+            "input": [{"type": "additional_tools", "tools": [{"type": "custom", "name": "x"}]}],
+        });
+        merge_additional_tools(&mut bare);
+        assert_eq!(bare["tools"].as_array().unwrap().len(), 1);
+
+        let mut plain = serde_json::json!({"input": "hello"});
+        merge_additional_tools(&mut plain);
+        assert_eq!(plain["input"].as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn test_parse_sse_frame() {
+        let (event_type, payload) = parse_sse_frame(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}",
+        )
+        .expect("frame parses");
+        assert_eq!(event_type, "response.output_text.delta");
+        assert_eq!(payload["delta"].as_str(), Some("hi"));
+
+        // Missing event line falls back to the payload's type field.
+        let (event_type, _) =
+            parse_sse_frame("data: {\"type\":\"response.completed\",\"response\":{}}")
+                .expect("frame parses");
+        assert_eq!(event_type, "response.completed");
+
+        // Non-JSON data (e.g. [DONE]) and comment-only frames are dropped.
+        assert!(parse_sse_frame("data: [DONE]").is_none());
+        assert!(parse_sse_frame(": keepalive").is_none());
+    }
+
+    #[test]
+    fn test_rewrite_model_fields() {
+        let mut payload = serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "model": "openai.gpt-5.6-sol"},
+        });
+        rewrite_model_fields(&mut payload, "gpt-5.6-sol");
+        assert_eq!(payload["response"]["model"].as_str(), Some("gpt-5.6-sol"));
+
+        // Top-level model too; payloads without a model field stay untouched.
+        let mut top = serde_json::json!({"model": "openai.gpt-5.6-sol"});
+        rewrite_model_fields(&mut top, "gpt-5.6-sol");
+        assert_eq!(top["model"].as_str(), Some("gpt-5.6-sol"));
+
+        let mut none = serde_json::json!({"type": "response.output_text.delta"});
+        rewrite_model_fields(&mut none, "gpt-5.6-sol");
+        assert!(none.get("model").is_none());
+    }
+
+    #[test]
+    fn test_stored_from_responses_input() {
+        // Bare string input → single user turn.
+        let req: ResponsesRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "input": "hello"})).unwrap();
+        assert_eq!(
+            stored_from_responses_input(&req),
+            vec![("user".to_string(), "hello".to_string())]
+        );
+
+        // Item array: messages extracted (string or part-array content),
+        // function_call items skipped.
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "first"},
+                {"type": "function_call", "name": "f", "arguments": "{}"},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "second"}]},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            stored_from_responses_input(&req),
+            vec![
+                ("user".to_string(), "first".to_string()),
+                ("assistant".to_string(), "second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_output_text() {
+        // output[] message items are concatenated (upstream doesn't send the
+        // output_text convenience field on the wire).
+        let resp = serde_json::json!({
+            "id": "resp_1",
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {"type": "message", "content": [
+                    {"type": "output_text", "text": "part one"},
+                    {"type": "output_text", "text": " part two"},
+                ]},
+            ],
+        });
+        assert_eq!(extract_output_text(&resp), "part one part two");
+
+        // Explicit output_text field wins when present.
+        let resp = serde_json::json!({"output_text": "direct", "output": []});
+        assert_eq!(extract_output_text(&resp), "direct");
     }
 }

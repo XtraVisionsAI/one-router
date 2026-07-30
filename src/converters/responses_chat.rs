@@ -579,6 +579,555 @@ pub fn message_response_to_responses(
     }
 }
 
+// ============================================================================
+// Mantle Responses path: Chat Completions ↔ raw Responses
+// ============================================================================
+//
+// Responses-only Bedrock models (GPT-5.x) can also be reached from
+// `/v1/chat/completions`. These functions convert a `ChatCompletionRequest`
+// into a raw Responses request body for the Mantle host and the raw Responses
+// result (object or SSE frames) back into Chat Completions shapes.
+
+use crate::schemas::openai::{
+    current_timestamp, generate_completion_id, ChatCompletionChunk, Choice, ChunkChoice,
+    ChunkDelta, CompletionTokensDetails, CompletionUsage, FunctionCallDelta, PromptTokensDetails,
+    ToolCallDelta,
+};
+
+/// Convert chat message content into Responses user-message content parts.
+fn chat_content_to_input_parts(content: &MessageContent) -> Vec<serde_json::Value> {
+    match content {
+        MessageContent::Text(text) => {
+            vec![serde_json::json!({"type": "input_text", "text": text})]
+        }
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Text { text } => {
+                    serde_json::json!({"type": "input_text", "text": text})
+                }
+                ContentPart::ImageUrl { image_url } => {
+                    serde_json::json!({"type": "input_image", "image_url": image_url.url})
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Convert a `ChatCompletionRequest` into a raw Responses request body for the
+/// Bedrock Mantle `/v1/responses` endpoint. Sampling params (`temperature`,
+/// `top_p`, `stop`, penalties) are dropped — reasoning-only models reject them.
+pub fn chat_to_responses_request(
+    request: &ChatCompletionRequest,
+    target_model_id: &str,
+) -> serde_json::Value {
+    let mut instructions: Vec<String> = Vec::new();
+    let mut input: Vec<serde_json::Value> = Vec::new();
+
+    for msg in &request.messages {
+        match msg.role {
+            ChatRole::System => {
+                if let Some(content) = &msg.content {
+                    let text = content.to_string_content();
+                    if !text.is_empty() {
+                        instructions.push(text);
+                    }
+                }
+            }
+            ChatRole::User => {
+                if let Some(content) = &msg.content {
+                    let parts = chat_content_to_input_parts(content);
+                    if !parts.is_empty() {
+                        input.push(serde_json::json!({
+                            "type": "message", "role": "user", "content": parts,
+                        }));
+                    }
+                }
+            }
+            ChatRole::Assistant => {
+                if let Some(content) = &msg.content {
+                    let text = content.to_string_content();
+                    if !text.is_empty() {
+                        input.push(serde_json::json!({
+                            "type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }));
+                    }
+                }
+                if let Some(tool_calls) = &msg.tool_calls {
+                    for tc in tool_calls {
+                        input.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }));
+                    }
+                }
+            }
+            ChatRole::Tool => {
+                let output = msg
+                    .content
+                    .as_ref()
+                    .map(|c| c.to_string_content())
+                    .unwrap_or_default();
+                input.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": msg.tool_call_id.clone().unwrap_or_default(),
+                    "output": output,
+                }));
+            }
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": target_model_id,
+        "input": input,
+        "store": false,
+        "stream": request.stream,
+    });
+
+    if !instructions.is_empty() {
+        body["instructions"] = serde_json::json!(instructions.join("\n\n"));
+    }
+    if let Some(max) = request.max_completion_tokens.or(request.max_tokens) {
+        body["max_output_tokens"] = serde_json::json!(max);
+    }
+
+    if let Some(tools) = &request.tools {
+        let converted: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                let mut v = serde_json::json!({
+                    "type": "function",
+                    "name": t.function.name,
+                    "parameters": t.function.parameters.clone()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                });
+                if let Some(desc) = &t.function.description {
+                    v["description"] = serde_json::json!(desc);
+                }
+                if let Some(strict) = t.function.strict {
+                    v["strict"] = serde_json::json!(strict);
+                }
+                v
+            })
+            .collect();
+        if !converted.is_empty() {
+            body["tools"] = serde_json::Value::Array(converted);
+        }
+    }
+
+    if let Some(tc) = &request.tool_choice {
+        body["tool_choice"] = match tc {
+            ToolChoice::Mode(mode) => serde_json::json!(mode),
+            ToolChoice::Function { function, .. } => {
+                serde_json::json!({"type": "function", "name": function.name})
+            }
+        };
+    }
+
+    if let Some(effort) = &request.reasoning_effort {
+        body["reasoning"] = serde_json::json!({"effort": effort, "summary": "auto"});
+    }
+
+    if request.temperature.is_some() || request.top_p.is_some() || request.stop.is_some() {
+        tracing::debug!("Dropping sampling params / stop for Mantle Responses model (unsupported)");
+    }
+
+    body
+}
+
+/// Map a raw Responses `usage` object to a Chat `CompletionUsage` (OpenAI
+/// accounting: `prompt_tokens` includes the cached portion).
+fn responses_usage_to_completion(usage: &serde_json::Value) -> CompletionUsage {
+    let as_i32 =
+        |v: Option<&serde_json::Value>| -> i32 { v.and_then(|v| v.as_i64()).unwrap_or(0) as i32 };
+    let input = as_i32(usage.get("input_tokens"));
+    let output = as_i32(usage.get("output_tokens"));
+    let cached = as_i32(
+        usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens")),
+    );
+    let reasoning = as_i32(
+        usage
+            .get("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens")),
+    );
+    CompletionUsage {
+        prompt_tokens: input,
+        completion_tokens: output,
+        total_tokens: input + output,
+        prompt_tokens_details: (cached > 0).then_some(PromptTokensDetails {
+            cached_tokens: Some(cached),
+        }),
+        completion_tokens_details: (reasoning > 0).then_some(CompletionTokensDetails {
+            reasoning_tokens: Some(reasoning),
+        }),
+    }
+}
+
+/// Chat finish_reason for a completed raw Responses object.
+fn responses_finish_reason(response: &serde_json::Value, has_tool_calls: bool) -> &'static str {
+    if has_tool_calls {
+        return "tool_calls";
+    }
+    if response.get("status").and_then(|s| s.as_str()) == Some("incomplete")
+        && response
+            .pointer("/incomplete_details/reason")
+            .and_then(|r| r.as_str())
+            == Some("max_output_tokens")
+    {
+        return "length";
+    }
+    "stop"
+}
+
+/// Convert a completed raw Responses object into a `ChatCompletionResponse`.
+pub fn responses_to_chat_response(
+    response: &serde_json::Value,
+    source_model: &str,
+) -> ChatCompletionResponse {
+    let mut content = String::new();
+    let mut reasoning_content = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+
+    if let Some(items) = response.get("output").and_then(|o| o.as_array()) {
+        for item in items {
+            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "message" => {
+                    if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                        for part in parts {
+                            if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    content.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                }
+                "reasoning" => {
+                    if let Some(parts) = item.get("summary").and_then(|s| s.as_array()) {
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                if !reasoning_content.is_empty() {
+                                    reasoning_content.push_str("\n\n");
+                                }
+                                reasoning_content.push_str(text);
+                            }
+                        }
+                    }
+                }
+                "function_call" => {
+                    tool_calls.push(ToolCall {
+                        id: item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            arguments: item
+                                .get("arguments")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("{}")
+                                .to_string(),
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let finish_reason = responses_finish_reason(response, !tool_calls.is_empty());
+    let usage = response
+        .get("usage")
+        .map(responses_usage_to_completion)
+        .unwrap_or(CompletionUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+
+    ChatCompletionResponse {
+        id: response
+            .get("id")
+            .and_then(|i| i.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(generate_completion_id),
+        object: "chat.completion".to_string(),
+        created: response
+            .get("created_at")
+            .and_then(|c| c.as_i64())
+            .unwrap_or_else(current_timestamp),
+        model: source_model.to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: AssistantMessage {
+                role: ChatRole::Assistant,
+                content: (!content.is_empty()).then_some(content),
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                reasoning: None,
+                reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
+            },
+            finish_reason: Some(finish_reason.to_string()),
+            logprobs: None,
+        }],
+        usage,
+        system_fingerprint: None,
+    }
+}
+
+/// State machine converting Responses SSE frames into OpenAI Chat Completions
+/// SSE chunks (serialized JSON, without the `data: ` prefix or `[DONE]`).
+pub struct ResponsesToChatStreamState {
+    model: String,
+    completion_id: String,
+    created: i64,
+    include_usage: bool,
+    sent_role: bool,
+    next_tool_index: i32,
+    tool_args_streamed: bool,
+    has_tool_calls: bool,
+    finished: bool,
+    /// Usage extracted from the terminal frame (OpenAI accounting), for the
+    /// caller's records.
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub cached_tokens: i32,
+}
+
+impl ResponsesToChatStreamState {
+    pub fn new(model: impl Into<String>, include_usage: bool) -> Self {
+        Self {
+            model: model.into(),
+            completion_id: generate_completion_id(),
+            created: current_timestamp(),
+            include_usage,
+            sent_role: false,
+            next_tool_index: 0,
+            tool_args_streamed: false,
+            has_tool_calls: false,
+            finished: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+        }
+    }
+
+    fn chunk(&self, delta: ChunkDelta, finish_reason: Option<String>) -> String {
+        serde_json::to_string(&ChatCompletionChunk {
+            id: self.completion_id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created: self.created,
+            model: self.model.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta,
+                finish_reason,
+                logprobs: None,
+            }],
+            system_fingerprint: None,
+            usage: None,
+        })
+        .unwrap_or_default()
+    }
+
+    fn role_chunk(&mut self) -> Option<String> {
+        if self.sent_role {
+            return None;
+        }
+        self.sent_role = true;
+        Some(self.chunk(
+            ChunkDelta {
+                role: Some(ChatRole::Assistant),
+                ..Default::default()
+            },
+            None,
+        ))
+    }
+
+    /// Convert one Responses SSE frame into zero or more serialized chunks.
+    pub fn convert_frame(&mut self, event_type: &str, payload: &serde_json::Value) -> Vec<String> {
+        let mut chunks: Vec<String> = Vec::new();
+
+        match event_type {
+            "response.created" => {
+                if let Some(id) = payload.pointer("/response/id").and_then(|i| i.as_str()) {
+                    self.completion_id = id.to_string();
+                }
+                if let Some(created) = payload
+                    .pointer("/response/created_at")
+                    .and_then(|c| c.as_i64())
+                {
+                    self.created = created;
+                }
+                chunks.extend(self.role_chunk());
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(text) = payload.get("delta").and_then(|d| d.as_str()) {
+                    chunks.extend(self.role_chunk());
+                    chunks.push(self.chunk(
+                        ChunkDelta {
+                            reasoning_content: Some(text.to_string()),
+                            ..Default::default()
+                        },
+                        None,
+                    ));
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(text) = payload.get("delta").and_then(|d| d.as_str()) {
+                    chunks.extend(self.role_chunk());
+                    chunks.push(self.chunk(
+                        ChunkDelta {
+                            content: Some(text.to_string()),
+                            ..Default::default()
+                        },
+                        None,
+                    ));
+                }
+            }
+            "response.output_item.added" => {
+                let item = payload.get("item").cloned().unwrap_or_default();
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                    chunks.extend(self.role_chunk());
+                    self.has_tool_calls = true;
+                    self.tool_args_streamed = false;
+                    let index = self.next_tool_index;
+                    self.next_tool_index += 1;
+                    chunks.push(self.chunk(
+                        ChunkDelta {
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index,
+                                id: item
+                                    .get("call_id")
+                                    .or_else(|| item.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from),
+                                tool_type: Some("function".to_string()),
+                                function: Some(FunctionCallDelta {
+                                    name: item
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from),
+                                    arguments: None,
+                                }),
+                            }]),
+                            ..Default::default()
+                        },
+                        None,
+                    ));
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let Some(args) = payload.get("delta").and_then(|d| d.as_str()) {
+                    self.tool_args_streamed = true;
+                    chunks.push(self.arguments_chunk(args));
+                }
+            }
+            "response.output_item.done" => {
+                let item = payload.get("item").cloned().unwrap_or_default();
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_call")
+                    && !self.tool_args_streamed
+                {
+                    // Arguments never streamed as deltas — emit them whole.
+                    if let Some(args) = item
+                        .get("arguments")
+                        .and_then(|a| a.as_str())
+                        .filter(|a| !a.is_empty() && *a != "{}")
+                    {
+                        chunks.push(self.arguments_chunk(args));
+                    }
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                if self.finished {
+                    return chunks;
+                }
+                self.finished = true;
+                chunks.extend(self.role_chunk());
+
+                let response = payload.get("response").cloned().unwrap_or_default();
+                let usage = response
+                    .get("usage")
+                    .map(responses_usage_to_completion)
+                    .unwrap_or(CompletionUsage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        prompt_tokens_details: None,
+                        completion_tokens_details: None,
+                    });
+                self.prompt_tokens = usage.prompt_tokens;
+                self.completion_tokens = usage.completion_tokens;
+                self.cached_tokens = usage.cached_tokens();
+
+                let finish = responses_finish_reason(&response, self.has_tool_calls);
+                chunks.push(self.chunk(ChunkDelta::default(), Some(finish.to_string())));
+
+                if self.include_usage {
+                    let usage_chunk = ChatCompletionChunk {
+                        id: self.completion_id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created: self.created,
+                        model: self.model.clone(),
+                        choices: vec![],
+                        system_fingerprint: None,
+                        usage: Some(usage),
+                    };
+                    chunks.push(serde_json::to_string(&usage_chunk).unwrap_or_default());
+                }
+            }
+            "response.failed" | "error" => {
+                let message = payload
+                    .pointer("/response/error/message")
+                    .or_else(|| payload.pointer("/error/message"))
+                    .or_else(|| payload.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("upstream response failed");
+                chunks.push(
+                    serde_json::to_string(
+                        &crate::schemas::openai::OpenAIErrorResponse::server_error(message),
+                    )
+                    .unwrap_or_default(),
+                );
+            }
+            _ => {}
+        }
+
+        chunks
+    }
+
+    fn arguments_chunk(&self, args: &str) -> String {
+        self.chunk(
+            ChunkDelta {
+                tool_calls: Some(vec![ToolCallDelta {
+                    index: (self.next_tool_index - 1).max(0),
+                    id: None,
+                    tool_type: None,
+                    function: Some(FunctionCallDelta {
+                        name: None,
+                        arguments: Some(args.to_string()),
+                    }),
+                }]),
+                ..Default::default()
+            },
+            None,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,5 +1396,231 @@ mod tests {
         assert_eq!(out.output[1]["type"], "message");
         assert_eq!(out.usage.input_tokens, 20);
         assert_eq!(out.usage.total_tokens, 28);
+    }
+}
+
+#[cfg(test)]
+mod mantle_tests {
+    use super::*;
+    use crate::schemas::openai::ChatMessage;
+
+    fn chat_request(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-5.6-sol".into(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: false,
+            stream_options: None,
+            top_p: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            seed: None,
+            user: None,
+            n: None,
+            logprobs: None,
+            top_logprobs: None,
+            service_tier: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn text_msg(role: ChatRole, text: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: Some(MessageContent::Text(text.into())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn test_chat_to_responses_request_roundtrip_items() {
+        let mut req = chat_request(vec![
+            text_msg(ChatRole::System, "be terse"),
+            text_msg(ChatRole::User, "check SF"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: None,
+                name: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "get_weather".into(),
+                        arguments: "{\"city\":\"SF\"}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: Some(MessageContent::Text("sunny".into())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ]);
+        req.max_tokens = Some(2048);
+        req.temperature = Some(0.3);
+        req.reasoning_effort = Some("high".into());
+        req.tools = Some(vec![Tool {
+            tool_type: "function".into(),
+            function: FunctionDef {
+                name: "get_weather".into(),
+                description: Some("d".into()),
+                parameters: Some(serde_json::json!({"type": "object"})),
+                strict: None,
+            },
+        }]);
+        req.tool_choice = Some(ToolChoice::Mode("auto".into()));
+
+        let body = chat_to_responses_request(&req, "openai.gpt-5.6-sol");
+        assert_eq!(body["model"], "openai.gpt-5.6-sol");
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["tool_choice"], "auto");
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["output"], "sunny");
+
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_responses_to_chat_response_full() {
+        let resp = serde_json::json!({
+            "id": "resp_1",
+            "status": "completed",
+            "created_at": 1234,
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "hmm"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "The answer"}]},
+            ],
+            "usage": {
+                "input_tokens": 100, "output_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 40},
+                "output_tokens_details": {"reasoning_tokens": 12},
+            },
+        });
+        let out = responses_to_chat_response(&resp, "gpt-5.6-sol");
+        assert_eq!(out.id, "resp_1");
+        assert_eq!(out.model, "gpt-5.6-sol");
+        assert_eq!(out.created, 1234);
+        let msg = &out.choices[0].message;
+        assert_eq!(msg.content.as_deref(), Some("The answer"));
+        assert_eq!(msg.reasoning_content.as_deref(), Some("hmm"));
+        assert_eq!(out.choices[0].finish_reason.as_deref(), Some("stop"));
+        // OpenAI accounting: prompt_tokens includes cached tokens.
+        assert_eq!(out.usage.prompt_tokens, 100);
+        assert_eq!(out.usage.cached_tokens(), 40);
+        assert_eq!(
+            out.usage
+                .completion_tokens_details
+                .as_ref()
+                .unwrap()
+                .reasoning_tokens,
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn test_responses_to_chat_response_tool_calls() {
+        let resp = serde_json::json!({
+            "id": "resp_2",
+            "status": "completed",
+            "output": [{
+                "type": "function_call", "call_id": "call_9", "name": "run",
+                "arguments": "{\"cmd\":\"ls\"}",
+            }],
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        });
+        let out = responses_to_chat_response(&resp, "gpt");
+        assert_eq!(out.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+        let tc = &out.choices[0].message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.id, "call_9");
+        assert_eq!(tc.function.name, "run");
+        assert_eq!(tc.function.arguments, "{\"cmd\":\"ls\"}");
+    }
+
+    #[test]
+    fn test_chat_stream_conversion_sequence() {
+        let mut state = ResponsesToChatStreamState::new("gpt-5.6-sol", true);
+        let mut all: Vec<String> = Vec::new();
+
+        all.extend(state.convert_frame(
+            "response.created",
+            &serde_json::json!({"response": {"id": "resp_s", "created_at": 7}}),
+        ));
+        all.extend(state.convert_frame(
+            "response.reasoning_summary_text.delta",
+            &serde_json::json!({"delta": "think"}),
+        ));
+        all.extend(state.convert_frame(
+            "response.output_text.delta",
+            &serde_json::json!({"delta": "Hello"}),
+        ));
+        all.extend(state.convert_frame(
+            "response.output_item.added",
+            &serde_json::json!({"item": {
+                "type": "function_call", "call_id": "call_1", "name": "run",
+            }}),
+        ));
+        all.extend(state.convert_frame(
+            "response.function_call_arguments.delta",
+            &serde_json::json!({"delta": "{\"x\":1}"}),
+        ));
+        all.extend(state.convert_frame(
+            "response.completed",
+            &serde_json::json!({"response": {
+                "status": "completed",
+                "usage": {"input_tokens": 50, "output_tokens": 10,
+                          "input_tokens_details": {"cached_tokens": 20}},
+            }}),
+        ));
+
+        let parsed: Vec<serde_json::Value> = all
+            .iter()
+            .map(|c| serde_json::from_str(c).unwrap())
+            .collect();
+        // role → reasoning → content → tool start → tool args → finish → usage
+        assert_eq!(parsed.len(), 7);
+        assert_eq!(parsed[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(parsed[0]["id"], "resp_s");
+        assert_eq!(
+            parsed[1]["choices"][0]["delta"]["reasoning_content"],
+            "think"
+        );
+        assert_eq!(parsed[2]["choices"][0]["delta"]["content"], "Hello");
+        let tc = &parsed[3]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["index"], 0);
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["function"]["name"], "run");
+        assert_eq!(
+            parsed[4]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"x\":1}"
+        );
+        assert_eq!(parsed[5]["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(parsed[6]["usage"]["prompt_tokens"], 50);
+        assert_eq!(state.prompt_tokens, 50);
+        assert_eq!(state.cached_tokens, 20);
+        assert_eq!(state.completion_tokens, 10);
     }
 }

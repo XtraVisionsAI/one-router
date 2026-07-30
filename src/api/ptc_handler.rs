@@ -93,6 +93,15 @@ pub async fn handle_ptc_request(
     request_id: &str,
     key_info: &ApiKeyInfo,
 ) -> Result<MessageResponse, ApiError> {
+    // PTC drives the loop through Claude InvokeModel — non-Claude Bedrock
+    // models (Nova, GPT, …) cannot serve it.
+    if !crate::services::BedrockService::is_claude_model(target_model_id) {
+        return Err(ApiError::bad_request(format!(
+            "Programmatic Tool Calling is only supported for Claude models; '{}' resolves to '{target_model_id}'",
+            request.model
+        )));
+    }
+
     let ptc = get_ptc_service(state)?;
 
     // 1. Create session with callable tool names

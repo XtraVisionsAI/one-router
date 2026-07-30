@@ -10,6 +10,7 @@
 
 pub mod anthropic_gemini;
 pub mod anthropic_openai;
+pub mod anthropic_responses;
 pub mod cache_transform;
 pub mod capability_filter;
 pub mod openai_bedrock;

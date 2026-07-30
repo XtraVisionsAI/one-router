@@ -355,6 +355,17 @@ pub async fn create_message(
             }
         }
 
+        // The Bedrock web-tool backend drives the loop through Claude
+        // InvokeModel; non-Claude Bedrock models (Nova, GPT, …) cannot serve it.
+        if resolved.provider == "bedrock"
+            && !crate::services::BedrockService::is_claude_model(&resolved.target_model_id)
+        {
+            return Err(ApiError::bad_request(format!(
+                "web_search/web_fetch on Bedrock is only supported for Claude models; '{}' resolves to '{}'",
+                request.model, resolved.target_model_id
+            )));
+        }
+
         let dynamic = state.dynamic.read().await;
         let executor = dynamic.web_tool_executor.clone().ok_or_else(|| {
             ApiError::bad_request(
@@ -630,6 +641,20 @@ async fn handle_bedrock_request(
         .await
         .map_err(|e| ApiError::from_bedrock_error(&e))?;
 
+    // Responses-only models (GPT-5.x) → Mantle Responses API. They have no
+    // Converse or Mantle chat-completions form; one-hop Anthropic ↔ Responses
+    // conversion keeps thinking signatures and tool-call ids intact.
+    if crate::services::BedrockService::is_mantle_responses_model(&routing_model_id) {
+        return handle_mantle_responses_request(
+            bedrock,
+            request,
+            target_model_id,
+            request_id,
+            usage_ctx,
+        )
+        .await;
+    }
+
     // Non-Claude models → Bedrock OpenAI Compat endpoint (Bedrock Mantle)
     if !crate::services::BedrockService::is_claude_model(&routing_model_id) {
         tracing::debug!(
@@ -809,6 +834,89 @@ async fn handle_bedrock_request(
     );
 
     Ok(MessageApiResponse::Json(Json(response)))
+}
+
+/// Handle an Anthropic-protocol request for a Responses-only Bedrock model
+/// (GPT-5.x): one-hop convert to a raw Responses body, call the Mantle
+/// Responses endpoint, and convert the result (object or SSE frames) back to
+/// the Anthropic protocol.
+async fn handle_mantle_responses_request(
+    bedrock: Arc<crate::services::BedrockService>,
+    request: &MessageRequest,
+    target_model_id: &str,
+    request_id: &str,
+    usage_ctx: &UsageContext,
+) -> Result<MessageApiResponse, ApiError> {
+    use crate::converters::anthropic_responses;
+
+    let body = anthropic_responses::anthropic_to_responses_request(request, target_model_id);
+
+    tracing::debug!(
+        request_id = %request_id,
+        target_model = %target_model_id,
+        stream = request.stream,
+        "Routing to Bedrock Mantle Responses endpoint (Anthropic protocol)"
+    );
+
+    if !request.stream {
+        let response_json = bedrock.mantle_responses(&body).await.map_err(|e| {
+            tracing::error!(error = %e, "Bedrock Mantle Responses call failed");
+            ApiError::from_bedrock_error(&e)
+        })?;
+        let response =
+            anthropic_responses::responses_to_anthropic_response(&response_json, &request.model);
+        return Ok(MessageApiResponse::Json(Json(response)));
+    }
+
+    let byte_stream = bedrock.mantle_responses_stream(&body).await.map_err(|e| {
+        tracing::error!(error = %e, "Bedrock Mantle Responses streaming failed");
+        ApiError::from_bedrock_error(&e)
+    })?;
+
+    let source_model = request.model.clone();
+    let stream_usage = usage_ctx.stream_usage.clone();
+    let req_id = request_id.to_string();
+
+    let sse_stream: SseStream = Box::pin(async_stream::stream! {
+        use futures::StreamExt;
+        let mut byte_stream = Box::pin(byte_stream);
+        let mut buffer = String::new();
+        let mut state =
+            anthropic_responses::ResponsesToAnthropicStreamState::new(source_model);
+
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(request_id = %req_id, error = %e, "Mantle Responses stream chunk error");
+                    break;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buffer.find("\n\n") {
+                let frame = buffer[..pos].to_string();
+                buffer.drain(..pos + 2);
+                if let Some((event_type, payload)) =
+                    crate::api::responses::parse_sse_frame(&frame)
+                {
+                    for (evt, data) in state.convert_frame(&event_type, &payload) {
+                        yield Ok(Event::default().event(evt).data(data));
+                    }
+                }
+            }
+        }
+
+        {
+            let mut u = stream_usage.lock().await;
+            u.input_tokens = state.input_tokens;
+            u.output_tokens = state.output_tokens;
+            if state.cache_read_tokens > 0 {
+                u.cache_read_input_tokens = Some(state.cache_read_tokens);
+            }
+        }
+    });
+
+    Ok(MessageApiResponse::Stream(sse_stream))
 }
 
 /// Handle request using Anthropic passthrough backend
