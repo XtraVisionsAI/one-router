@@ -38,6 +38,10 @@ pub struct BedrockService {
     pool: std::sync::Arc<CredentialPool<AwsCredential>>,
     /// Per-credential service tier config (keyed by credential name)
     service_tiers: std::collections::HashMap<String, Option<String>>,
+    /// Shared HTTP client for the Mantle endpoints — reused across requests so
+    /// keep-alive connections avoid a TCP+TLS handshake per call (which costs
+    /// several RTTs when the Bedrock region is far from the gateway).
+    http_client: reqwest::Client,
 }
 
 impl BedrockService {
@@ -51,6 +55,7 @@ impl BedrockService {
             clients,
             pool: std::sync::Arc::new(pool),
             service_tiers,
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -529,8 +534,8 @@ impl BedrockService {
         // Apply signed headers to reqwest request. Do NOT set `host` manually:
         // reqwest derives it from the URL, and a second value makes AWS see a
         // doubled host header ("a,a") that breaks signature validation.
-        let client = reqwest::Client::new();
-        let mut req_builder = client
+        let mut req_builder = self
+            .http_client
             .post(&url)
             .header("content-type", "application/json")
             .body(body);
