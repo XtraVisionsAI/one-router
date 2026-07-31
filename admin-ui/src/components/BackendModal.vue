@@ -21,6 +21,17 @@
 
   const form = ref({ name: '', backend_type: 'bedrock', priority: 0, weight: 1, service_tier: null as string | null })
 
+  // Model filter patterns (comma/semicolon/newline separated in the UI).
+  // Empty = serve all models. `!` prefix excludes, e.g. "*, !openai.*".
+  const modelsText = ref('')
+
+  function parseModels(text: string): string[] {
+    return text
+      .split(/[,;\n]/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+  }
+
   const serviceTierOptions = [
     { label: 'None (do not send)', value: null },
     { label: 'Passthrough (forward request value)', value: 'passthrough' },
@@ -81,6 +92,7 @@
           weight: props.existing?.weight ?? 1,
           service_tier: props.existing?.service_tier ?? null
         }
+        modelsText.value = props.existing?.models?.join(', ') ?? ''
         resetConfigFields()
         // Pool settings are stored as separate DB fields (not encrypted),
         // so we can populate them directly from the existing record.
@@ -199,6 +211,8 @@
       max_failures: pool.value.max_failures,
       retry_after_secs: pool.value.retry_after_secs,
       service_tier: form.value.service_tier,
+      // Always send the parsed filter: an empty box clears it (serve all).
+      models: parseModels(modelsText.value),
     }
 
     // Only include config if we have loaded/entered it
@@ -331,6 +345,18 @@
 
     <NFormItem label="Service Tier">
       <NSelect v-model:value="form.service_tier" :options="serviceTierOptions" clearable placeholder="None" />
+    </NFormItem>
+
+    <NFormItem label="Models Filter">
+      <NInput
+        v-model:value="modelsText"
+        placeholder='(optional) e.g. *, !openai.*  — empty = all models'
+      />
+      <template #feedback>
+        <span class="text-xs text-slate-500">
+          Wildcard patterns matched against target model ids; "!" excludes. Comma/semicolon separated.
+        </span>
+      </template>
     </NFormItem>
 
     <template #footer>

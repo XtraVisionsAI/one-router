@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::database::models::ModelMappingRecord;
 use crate::database::traits::DatabaseService;
 use crate::services::capabilities::ModelCapabilities;
+use crate::utils::glob::{glob_match, pattern_specificity};
 
 /// Error returned when no model mapping matches the requested model.
 #[derive(Debug, Clone)]
@@ -34,40 +35,8 @@ pub struct ResolvedModel {
     pub capabilities: Option<ModelCapabilities>,
 }
 
-/// Simple glob matching: only supports `*` as a wildcard (equivalent to `.*` in regex).
-///
-/// Supported patterns:
-/// - `*` — matches everything
-/// - `claude-*` — prefix match
-/// - `*-latest` — suffix match
-/// - `claude-*-latest` — prefix + suffix match
-/// - `claude-3` — exact match (no wildcard)
-fn glob_match(pattern: &str, input: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return input.starts_with(prefix);
-    }
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return input.ends_with(suffix);
-    }
-    // Middle `*`: split into prefix and suffix
-    if let Some(pos) = pattern.find('*') {
-        let prefix = &pattern[..pos];
-        let suffix = &pattern[pos + 1..];
-        return input.starts_with(prefix)
-            && input.ends_with(suffix)
-            && input.len() >= prefix.len() + suffix.len();
-    }
-    pattern == input
-}
-
-/// Compute the "specificity" of a wildcard pattern for tiebreaking.
-/// Longer non-wildcard prefix = more specific.
-fn pattern_specificity(pattern: &str) -> usize {
-    pattern.find('*').unwrap_or(pattern.len())
-}
+// Simple glob matching and specificity live in `crate::utils::glob`, shared
+// with the per-backend model filter so both features keep one semantics.
 
 /// Service for resolving model IDs with caching.
 pub struct ModelMappingService {
@@ -222,46 +191,4 @@ impl ModelMappingService {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_glob_match_star_only() {
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("*", ""));
-    }
-
-    #[test]
-    fn test_glob_match_prefix() {
-        assert!(glob_match("claude-*", "claude-3-opus"));
-        assert!(glob_match("claude-*", "claude-"));
-        assert!(!glob_match("claude-*", "gemini-pro"));
-    }
-
-    #[test]
-    fn test_glob_match_suffix() {
-        assert!(glob_match("*-latest", "claude-3-latest"));
-        assert!(!glob_match("*-latest", "claude-3-stable"));
-    }
-
-    #[test]
-    fn test_glob_match_middle() {
-        assert!(glob_match("claude-*-latest", "claude-3-latest"));
-        assert!(glob_match("claude-*-latest", "claude-3-5-sonnet-latest"));
-        assert!(!glob_match("claude-*-latest", "claude-3-stable"));
-    }
-
-    #[test]
-    fn test_glob_match_exact() {
-        assert!(glob_match("claude-3", "claude-3"));
-        assert!(!glob_match("claude-3", "claude-3-5"));
-    }
-
-    #[test]
-    fn test_pattern_specificity() {
-        assert!(pattern_specificity("claude-3-*") > pattern_specificity("claude-*"));
-        assert!(pattern_specificity("claude-*") > pattern_specificity("*"));
-        assert_eq!(pattern_specificity("*"), 0);
-    }
-}
+// Glob matching unit tests live in `crate::utils::glob`.

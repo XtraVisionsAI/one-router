@@ -64,23 +64,27 @@ impl BedrockService {
         self.service_tiers.get(name).and_then(|t| t.as_deref())
     }
 
-    /// Get the next available client from the pool.
-    fn get_client(&self) -> (&str, &BedrockRuntimeClient) {
-        if self.clients.len() == 1 {
-            let (name, client) = &self.clients[0];
-            return (name.as_str(), client);
+    /// Get the next available client from the pool that is eligible for the
+    /// given target model id (per-backend model filter). Errors when no
+    /// credential's filter matches the model — a doomed request must not be
+    /// sent (it would 404 and poison the shared credential health).
+    fn get_client_for(
+        &self,
+        target_model_id: &str,
+    ) -> Result<(&str, &BedrockRuntimeClient), BedrockError> {
+        let cred = self
+            .pool
+            .get_next_for_model(target_model_id)
+            .ok_or_else(|| BedrockError::no_backend_serves_model(target_model_id))?;
+        let name = cred.name();
+        if let Some((n, client)) = self.clients.iter().find(|(n, _)| n == name) {
+            return Ok((n.as_str(), client));
         }
-
-        if let Some(cred) = self.pool.get_next() {
-            let name = cred.name();
-            if let Some((_, client)) = self.clients.iter().find(|(n, _)| n == name) {
-                return (name, client);
-            }
-        }
-
-        // Fallback to first client
-        let (name, client) = &self.clients[0];
-        (name.as_str(), client)
+        // Defensive: pool credential without a matching client (should not happen).
+        self.clients
+            .first()
+            .map(|(n, c)| (n.as_str(), c))
+            .ok_or_else(|| BedrockError::Unknown("No Bedrock clients configured".to_string()))
     }
 
     /// Record a successful request for a credential.
@@ -114,6 +118,15 @@ impl BedrockService {
         self.pool.stats()
     }
 
+    /// Pool statistics restricted to credentials eligible for a target model
+    /// (top-rank group of the per-backend model filter).
+    pub fn pool_stats_for_model(
+        &self,
+        target_model_id: &str,
+    ) -> crate::services::backend_pool::PoolStats {
+        self.pool.stats_for_model(target_model_id)
+    }
+
     /// Get health status string for a specific credential by name.
     pub fn credential_health(&self, name: &str) -> Option<String> {
         self.pool.get_by_name(name).map(|c| {
@@ -128,7 +141,7 @@ impl BedrockService {
     }
 
     pub async fn converse(&self, request: ConverseRequest) -> Result<ConverseOutput, BedrockError> {
-        let (cred_name, client) = self.get_client();
+        let (cred_name, client) = self.get_client_for(&request.model_id)?;
         let cred_name = cred_name.to_string();
 
         tracing::debug!(
@@ -170,7 +183,7 @@ impl BedrockService {
         &self,
         request: ConverseRequest,
     ) -> Result<ConverseStreamResponse, BedrockError> {
-        let (cred_name, client) = self.get_client();
+        let (cred_name, client) = self.get_client_for(&request.model_id)?;
         let cred_name = cred_name.to_string();
 
         tracing::debug!(
@@ -217,7 +230,7 @@ impl BedrockService {
         model_id: &str,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, BedrockError> {
-        let (cred_name, client) = self.get_client();
+        let (cred_name, client) = self.get_client_for(model_id)?;
         let cred_name = cred_name.to_string();
 
         tracing::debug!(
@@ -254,7 +267,7 @@ impl BedrockService {
         model_id: &str,
         beta_header: Option<&str>,
     ) -> Result<crate::schemas::anthropic::MessageResponse, BedrockError> {
-        let (cred_name, client) = self.get_client();
+        let (cred_name, client) = self.get_client_for(model_id)?;
         let cred_name = cred_name.to_string();
 
         tracing::debug!(
@@ -346,7 +359,7 @@ impl BedrockService {
         model_id: &str,
         beta_header: Option<&str>,
     ) -> Result<InvokeModelStreamResponse, BedrockError> {
-        let (cred_name, client) = self.get_client();
+        let (cred_name, client) = self.get_client_for(model_id)?;
         let cred_name = cred_name.to_string();
 
         tracing::debug!(
@@ -445,15 +458,17 @@ impl BedrockService {
     }
 
     /// Sign and send a POST to the Bedrock OpenAI-compatible (Mantle) endpoint.
-    /// Picks a credential from the pool, SigV4-signs the body, and sends it.
-    /// Records a pool failure when the request cannot be sent; HTTP-status
-    /// accounting (429/5xx/success) is left to the caller. Returns the name of
-    /// the credential used together with the response.
+    /// Picks a credential eligible for `target_model_id` from the pool (per-
+    /// backend model filter), SigV4-signs the body, and sends it. Records a
+    /// pool failure when the request cannot be sent; HTTP-status accounting
+    /// (429/5xx/success) is left to the caller. Returns the name of the
+    /// credential used together with the response.
     async fn mantle_post(
         &self,
         host_kind: MantleHost,
         path: &str,
         body: Vec<u8>,
+        target_model_id: &str,
     ) -> Result<(String, reqwest::Response), BedrockError> {
         use aws_credential_types::Credentials as AwsCreds;
         use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
@@ -463,8 +478,8 @@ impl BedrockService {
         let (cred_name, region, access_key_id, secret_access_key, session_token, has_access_key) = {
             let cred = self
                 .pool
-                .get_next()
-                .ok_or_else(|| BedrockError::Unknown("No available credentials".to_string()))?;
+                .get_next_for_model(target_model_id)
+                .ok_or_else(|| BedrockError::no_backend_serves_model(target_model_id))?;
             (
                 cred.name().to_string(),
                 cred.region().to_string(),
@@ -567,13 +582,18 @@ impl BedrockService {
     pub async fn chat_completions(
         &self,
         openai_request: &serde_json::Value,
-        _target_model_id: &str,
+        target_model_id: &str,
     ) -> Result<serde_json::Value, BedrockError> {
         let body = serde_json::to_vec(openai_request)
             .map_err(|e| BedrockError::Serialization(e.to_string()))?;
 
         let (cred_name, response) = self
-            .mantle_post(MantleHost::Runtime, "/openai/v1/chat/completions", body)
+            .mantle_post(
+                MantleHost::Runtime,
+                "/openai/v1/chat/completions",
+                body,
+                target_model_id,
+            )
             .await?;
 
         let status = response.status().as_u16();
@@ -605,7 +625,7 @@ impl BedrockService {
     pub async fn chat_completions_stream(
         &self,
         openai_request: &serde_json::Value,
-        _target_model_id: &str,
+        target_model_id: &str,
         stream_usage: Option<Arc<tokio::sync::Mutex<crate::api::messages::StreamUsage>>>,
     ) -> Result<
         impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send,
@@ -619,7 +639,12 @@ impl BedrockService {
             .map_err(|e| BedrockError::Serialization(e.to_string()))?;
 
         let (cred_name, response) = self
-            .mantle_post(MantleHost::Runtime, "/openai/v1/chat/completions", body)
+            .mantle_post(
+                MantleHost::Runtime,
+                "/openai/v1/chat/completions",
+                body,
+                target_model_id,
+            )
             .await?;
 
         let status = response.status().as_u16();
@@ -651,11 +676,18 @@ impl BedrockService {
     ) -> Result<serde_json::Value, BedrockError> {
         let mut request = responses_request.clone();
         request["stream"] = serde_json::json!(false);
+        // The caller has already rewritten `model` to the target model id.
+        let target_model_id = request["model"].as_str().unwrap_or("").to_string();
         let body =
             serde_json::to_vec(&request).map_err(|e| BedrockError::Serialization(e.to_string()))?;
 
         let (cred_name, response) = self
-            .mantle_post(MantleHost::Mantle, "/openai/v1/responses", body)
+            .mantle_post(
+                MantleHost::Mantle,
+                "/openai/v1/responses",
+                body,
+                &target_model_id,
+            )
             .await?;
 
         let status = response.status().as_u16();
@@ -690,11 +722,18 @@ impl BedrockService {
     > {
         let mut request = responses_request.clone();
         request["stream"] = serde_json::json!(true);
+        // The caller has already rewritten `model` to the target model id.
+        let target_model_id = request["model"].as_str().unwrap_or("").to_string();
         let body =
             serde_json::to_vec(&request).map_err(|e| BedrockError::Serialization(e.to_string()))?;
 
         let (cred_name, response) = self
-            .mantle_post(MantleHost::Mantle, "/openai/v1/responses", body)
+            .mantle_post(
+                MantleHost::Mantle,
+                "/openai/v1/responses",
+                body,
+                &target_model_id,
+            )
             .await?;
 
         let status = response.status().as_u16();
@@ -1381,6 +1420,15 @@ pub enum BedrockErrorType {
 }
 
 impl BedrockError {
+    /// No credential's model filter matches this target model — the request
+    /// must not be sent anywhere. Maps to HTTP 503, the same level as
+    /// "No healthy backend available".
+    pub fn no_backend_serves_model(target_model_id: &str) -> Self {
+        BedrockError::ServiceUnavailable(format!(
+            "No bedrock backend serves model '{target_model_id}'; check backends' models filter"
+        ))
+    }
+
     pub fn from_converse_error<R>(err: SdkError<ConverseError, R>) -> Self
     where
         R: std::fmt::Debug,

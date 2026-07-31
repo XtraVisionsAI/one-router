@@ -1119,12 +1119,8 @@ async fn handle_gemini_backend(
                 "Gemini backend is not configured. Add a 'gemini' entry to the backends table.",
             )
         })?;
-    let gemini_instance = gemini_pool
-        .get_next()
-        .ok_or_else(|| OpenAIApiError::internal_error("No healthy Gemini backend available"))?;
-    let gemini_service = &gemini_instance.service;
-
-    // Convert OpenAI request to Gemini format
+    // Convert OpenAI request to Gemini format first — the invoked model id is
+    // what the per-backend model filter matches against.
     let converter = OpenAIToGeminiConverter::new();
     let (gemini_model, gemini_request) = converter
         .convert_request(request)
@@ -1136,6 +1132,15 @@ async fn handle_gemini_backend(
     } else {
         target_model_id.to_string()
     };
+
+    let gemini_instance = gemini_pool
+        .get_next_for_model(&final_model)
+        .ok_or_else(|| {
+            OpenAIApiError::internal_error(format!(
+                "No gemini backend serves model '{final_model}'; check backends' models filter"
+            ))
+        })?;
+    let gemini_service = &gemini_instance.service;
 
     tracing::debug!(
         request_id = %request_id,
@@ -1276,9 +1281,11 @@ async fn handle_anthropic_backend(
                 "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
             )
         })?;
-    let instance = pool
-        .get_next()
-        .ok_or_else(|| OpenAIApiError::internal_error("No healthy Anthropic backend available"))?;
+    let instance = pool.get_next_for_model(target_model_id).ok_or_else(|| {
+        OpenAIApiError::internal_error(format!(
+            "No anthropic backend serves model '{target_model_id}'; check backends' models filter"
+        ))
+    })?;
     let svc = &instance.service;
 
     // Convert OpenAI request to Anthropic format
@@ -1497,9 +1504,11 @@ async fn handle_openai_passthrough(
                 "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
             )
         })?;
-    let instance = pool
-        .get_next()
-        .ok_or_else(|| OpenAIApiError::internal_error("No healthy OpenAI backend available"))?;
+    let instance = pool.get_next_for_model(target_model_id).ok_or_else(|| {
+        OpenAIApiError::internal_error(format!(
+            "No openai backend serves model '{target_model_id}'; check backends' models filter"
+        ))
+    })?;
     let svc = &instance.service;
 
     // Serialize the request and replace model with resolved target model id

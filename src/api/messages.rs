@@ -379,9 +379,14 @@ pub async fn create_message(
                     let gemini_pool = dynamic.gemini_pool.clone().ok_or_else(|| {
                         ApiError::service_unavailable("Gemini backend not configured")
                     })?;
-                    let instance = gemini_pool.get_next().ok_or_else(|| {
-                        ApiError::service_unavailable("No healthy Gemini backend available")
-                    })?;
+                    let instance = gemini_pool
+                        .get_next_for_model(&resolved.target_model_id)
+                        .ok_or_else(|| {
+                            ApiError::service_unavailable(format!(
+                            "No gemini backend serves model '{}'; check backends' models filter",
+                            resolved.target_model_id
+                        ))
+                        })?;
                     Arc::new(crate::services::web_tools::executor::GeminiWebToolBackend {
                         service: instance.service.clone(),
                     })
@@ -940,9 +945,11 @@ async fn handle_anthropic_passthrough(
                 "Anthropic backend is not configured. Add an 'anthropic' entry to the backends table.",
             )
         })?;
-    let instance = pool
-        .get_next()
-        .ok_or_else(|| ApiError::service_unavailable("No healthy Anthropic backend available"))?;
+    let instance = pool.get_next_for_model(target_model_id).ok_or_else(|| {
+        ApiError::service_unavailable(format!(
+            "No anthropic backend serves model '{target_model_id}'; check backends' models filter"
+        ))
+    })?;
     let svc = &instance.service;
 
     // Serialize the request and replace model with the resolved target model id
@@ -1186,9 +1193,11 @@ async fn handle_openai_backend(
                 "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
             )
         })?;
-    let instance = pool
-        .get_next()
-        .ok_or_else(|| ApiError::service_unavailable("No healthy OpenAI backend available"))?;
+    let instance = pool.get_next_for_model(target_model_id).ok_or_else(|| {
+        ApiError::service_unavailable(format!(
+            "No openai backend serves model '{target_model_id}'; check backends' models filter"
+        ))
+    })?;
     let svc = &instance.service;
 
     // Convert Anthropic request to OpenAI format
@@ -1386,16 +1395,22 @@ async fn handle_gemini_request(
         .gemini_pool
         .clone()
         .ok_or_else(|| ApiError::internal_error("Gemini service not available"))?;
-    let gemini_instance = gemini_pool
-        .get_next()
-        .ok_or_else(|| ApiError::service_unavailable("No healthy Gemini backend available"))?;
-    let gemini_service = &gemini_instance.service;
 
-    // Convert Anthropic request to Gemini format
+    // Convert Anthropic request to Gemini format first — the converted model id
+    // is the invoked target, which the per-backend model filter matches against.
     let converter = AnthropicToGeminiConverter::new();
     let (gemini_model, gemini_request) = converter
         .convert_request(request)
         .map_err(|e| ApiError::bad_request(format!("Request conversion error: {e}")))?;
+
+    let gemini_instance = gemini_pool
+        .get_next_for_model(&gemini_model)
+        .ok_or_else(|| {
+            ApiError::service_unavailable(format!(
+                "No gemini backend serves model '{gemini_model}'; check backends' models filter"
+            ))
+        })?;
+    let gemini_service = &gemini_instance.service;
 
     tracing::debug!(
         request_id = %request_id,

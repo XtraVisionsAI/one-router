@@ -38,6 +38,8 @@ pub struct BackendSummary {
     pub max_failures: i32,
     pub retry_after_secs: i64,
     pub service_tier: Option<String>,
+    /// Model filter patterns (None = serves all models)
+    pub models: Option<Vec<String>>,
     pub health_status: String,
     pub config_summary: Value,
 }
@@ -54,6 +56,7 @@ impl BackendSummary {
             max_failures: r.max_failures,
             retry_after_secs: r.retry_after_secs,
             service_tier: r.service_tier.clone(),
+            models: r.models.clone(),
             health_status: health.to_string(),
             config_summary: make_config_summary(&r.backend_type, &r.config),
         }
@@ -204,6 +207,9 @@ pub struct UpsertBackendRequest {
     pub retry_after_secs: i64,
     /// Service tier: None=ignore, "passthrough"=forward, "flex"/"priority"/etc.=override
     pub service_tier: Option<String>,
+    /// Model filter patterns, e.g. `["*", "!openai.*"]`. If omitted on PUT, the
+    /// existing filter is kept; an explicit `[]` clears it (serve all models).
+    pub models: Option<Vec<String>>,
     /// Full config as a JSON object. If omitted on PUT, existing config is kept.
     pub config: Option<Value>,
 }
@@ -222,6 +228,28 @@ fn default_max_failures() -> i32 {
 }
 fn default_retry_after_secs() -> i64 {
     300
+}
+
+/// Validate and normalize the `models` filter from an upsert request.
+/// `Ok(None)` means "serve all models" (an explicit `[]` normalizes to None).
+fn validate_models(models: &Option<Vec<String>>) -> Result<Option<Vec<String>>, String> {
+    let Some(patterns) = models else {
+        return Ok(None);
+    };
+    let problems = crate::services::backend_pool::model_filter::validate_patterns(patterns);
+    if !problems.is_empty() {
+        return Err(format!("Invalid models filter: {}", problems.join("; ")));
+    }
+    let cleaned: Vec<String> = patterns
+        .iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    Ok(if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    })
 }
 
 // ============================================================================
@@ -291,6 +319,17 @@ pub async fn create_backend(
             .into_response();
     };
 
+    let models = match validate_models(&body.models) {
+        Ok(m) => m,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid_request_error", &msg)),
+            )
+                .into_response();
+        }
+    };
+
     let config_json = match serde_json::to_string(&config_val) {
         Ok(s) => s,
         Err(e) => {
@@ -320,6 +359,7 @@ pub async fn create_backend(
         max_failures: body.max_failures,
         retry_after_secs: body.retry_after_secs,
         service_tier: body.service_tier.clone(),
+        models,
         created_at: now,
         updated_at: None,
     };
@@ -395,6 +435,22 @@ pub async fn update_backend(
         existing.config.clone()
     };
 
+    // Models filter: omitted keeps the existing value; explicit [] clears it.
+    let models = if body.models.is_some() {
+        match validate_models(&body.models) {
+            Ok(m) => m,
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("invalid_request_error", &msg)),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        existing.models.clone()
+    };
+
     let now = Utc::now().timestamp();
     let record = BackendRecord {
         name: name.clone(),
@@ -407,6 +463,7 @@ pub async fn update_backend(
         max_failures: body.max_failures,
         retry_after_secs: body.retry_after_secs,
         service_tier: body.service_tier.clone(),
+        models,
         created_at: existing.created_at,
         updated_at: Some(now),
     };

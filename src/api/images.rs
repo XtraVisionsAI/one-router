@@ -95,9 +95,11 @@ async fn handle_openai_images(
                 "OpenAI backend is not configured. Add an 'openai' entry to the backends table.",
             )
         })?;
-    let instance = pool
-        .get_next()
-        .ok_or_else(|| OpenAIApiError::internal_error("No healthy OpenAI backend available"))?;
+    let instance = pool.get_next_for_model(target_model_id).ok_or_else(|| {
+        OpenAIApiError::internal_error(format!(
+            "No openai backend serves model '{target_model_id}'; check backends' models filter"
+        ))
+    })?;
     let svc = &instance.service;
 
     // Replace model with resolved target, forward everything else as-is
@@ -179,8 +181,12 @@ async fn handle_gemini_images(
             )
         })?;
     let gemini_instance = gemini_pool
-        .get_next()
-        .ok_or_else(|| OpenAIApiError::internal_error("No healthy Gemini backend available"))?;
+        .get_next_for_model(target_model_id)
+        .ok_or_else(|| {
+            OpenAIApiError::internal_error(format!(
+                "No gemini backend serves model '{target_model_id}'; check backends' models filter"
+            ))
+        })?;
     let svc = &gemini_instance.service;
 
     let body = json!({

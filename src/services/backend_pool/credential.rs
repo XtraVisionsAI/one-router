@@ -3,6 +3,7 @@
 //! This module defines the `Credential` trait and common credential implementations
 //! for different backend types.
 
+use super::model_filter::{MatchRank, ModelFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
@@ -135,6 +136,20 @@ pub trait Credential: Send + Sync {
     fn reset_health(&self) {
         self.health().reset();
     }
+
+    /// Whether this credential serves the given target model id (eligibility
+    /// step of the per-backend model filter). Default: serves everything.
+    fn serves_model(&self, _target_model_id: &str) -> bool {
+        true
+    }
+
+    /// Ranking key of the best positive filter pattern for this model, used to
+    /// pick the top group among eligible credentials. Only meaningful when
+    /// [`serves_model`](Self::serves_model) returned `true`. Default: the
+    /// implicit `*` catch-all at priority 0.
+    fn model_match_rank(&self, _target_model_id: &str) -> MatchRank {
+        MatchRank::catch_all(0)
+    }
 }
 
 // ============================================================================
@@ -241,6 +256,10 @@ pub struct AwsCredential {
     weight: u32,
     /// Health status
     health: CredentialHealth,
+    /// Model filter (which target model ids this credential serves)
+    filter: ModelFilter,
+    /// Backend priority — tiebreaker between wildcard matches of equal kind
+    priority: i32,
 }
 
 impl AwsCredential {
@@ -260,6 +279,8 @@ impl AwsCredential {
             session_token: None,
             weight,
             health: CredentialHealth::new(),
+            filter: ModelFilter::default(),
+            priority: 0,
         }
     }
 
@@ -280,6 +301,8 @@ impl AwsCredential {
             session_token: None,
             weight,
             health: CredentialHealth::new(),
+            filter: ModelFilter::default(),
+            priority: 0,
         }
     }
 
@@ -294,12 +317,21 @@ impl AwsCredential {
             session_token: None,
             weight: 1,
             health: CredentialHealth::new(),
+            filter: ModelFilter::default(),
+            priority: 0,
         }
     }
 
     /// Set session token for temporary credentials
     pub fn with_session_token(mut self, token: impl Into<String>) -> Self {
         self.session_token = Some(token.into());
+        self
+    }
+
+    /// Attach a model filter and backend priority (per-backend model affinity).
+    pub fn with_model_filter(mut self, models: Option<&[String]>, priority: i32) -> Self {
+        self.filter = ModelFilter::from_patterns(models);
+        self.priority = priority;
         self
     }
 
@@ -355,6 +387,16 @@ impl Credential for AwsCredential {
 
     fn health(&self) -> &CredentialHealth {
         &self.health
+    }
+
+    fn serves_model(&self, target_model_id: &str) -> bool {
+        self.filter.matches(target_model_id)
+    }
+
+    fn model_match_rank(&self, target_model_id: &str) -> MatchRank {
+        self.filter
+            .match_rank(target_model_id, self.priority)
+            .unwrap_or(MatchRank::catch_all(self.priority))
     }
 }
 

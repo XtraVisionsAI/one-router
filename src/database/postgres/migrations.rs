@@ -192,6 +192,11 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Migration: add models column (per-backend model filter, JSON string array)
+    sqlx::query("ALTER TABLE backends ADD COLUMN IF NOT EXISTS models TEXT")
+        .execute(pool)
+        .await?;
+
     // --- feature_flags ---
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS feature_flags (

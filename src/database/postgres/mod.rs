@@ -893,7 +893,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
         let row = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, service_tier, \
+             strategy, max_failures, retry_after_secs, service_tier, models, \
              created_at, updated_at \
              FROM backends WHERE name = $1",
         )
@@ -913,6 +913,7 @@ impl BackendConfigStore for PostgresBackend {
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
                 service_tier: r.get("service_tier"),
+                models: BackendRecord::models_from_json(r.get("models")),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })),
@@ -923,7 +924,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, service_tier, \
+             strategy, max_failures, retry_after_secs, service_tier, models, \
              created_at, updated_at \
              FROM backends WHERE enabled = TRUE ORDER BY priority DESC",
         )
@@ -943,6 +944,7 @@ impl BackendConfigStore for PostgresBackend {
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
                 service_tier: r.get("service_tier"),
+                models: BackendRecord::models_from_json(r.get("models")),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -954,7 +956,7 @@ impl BackendConfigStore for PostgresBackend {
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, service_tier, \
+             strategy, max_failures, retry_after_secs, service_tier, models, \
              created_at, updated_at \
              FROM backends ORDER BY priority DESC",
         )
@@ -974,6 +976,7 @@ impl BackendConfigStore for PostgresBackend {
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
                 service_tier: r.get("service_tier"),
+                models: BackendRecord::models_from_json(r.get("models")),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -987,9 +990,9 @@ impl BackendConfigStore for PostgresBackend {
         sqlx::query(
             "INSERT INTO backends \
              (name, backend_type, config, enabled, priority, weight, \
-              strategy, max_failures, retry_after_secs, service_tier, \
+              strategy, max_failures, retry_after_secs, service_tier, models, \
               created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              ON CONFLICT(name) DO UPDATE SET \
              backend_type = EXCLUDED.backend_type, \
              config = EXCLUDED.config, \
@@ -1000,6 +1003,7 @@ impl BackendConfigStore for PostgresBackend {
              max_failures = EXCLUDED.max_failures, \
              retry_after_secs = EXCLUDED.retry_after_secs, \
              service_tier = EXCLUDED.service_tier, \
+             models = EXCLUDED.models, \
              updated_at = EXCLUDED.updated_at",
         )
         .bind(&record.name)
@@ -1012,6 +1016,7 @@ impl BackendConfigStore for PostgresBackend {
         .bind(record.max_failures)
         .bind(record.retry_after_secs)
         .bind(&record.service_tier)
+        .bind(BackendRecord::models_to_json(&record.models))
         .bind(record.created_at)
         .bind(now)
         .execute(&self.pool)

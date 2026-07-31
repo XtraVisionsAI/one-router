@@ -9,6 +9,7 @@ export interface BackendSummary {
   max_failures: number
   retry_after_secs: number
   service_tier: string | null
+  models: string[] | null
   health_status: string
   config_summary: Record<string, unknown>
 }
@@ -23,6 +24,7 @@ export interface UpsertBackendBody {
   max_failures?: number
   retry_after_secs?: number
   service_tier?: string | null
+  models?: string[]
   config?: Record<string, unknown>
 }
 

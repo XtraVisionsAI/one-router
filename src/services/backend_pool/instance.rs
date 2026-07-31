@@ -4,6 +4,7 @@
 //! and implements the `Credential` trait so it can be managed by `CredentialPool`.
 
 use super::credential::{Credential, CredentialHealth};
+use super::model_filter::{MatchRank, ModelFilter};
 use std::sync::Arc;
 
 /// A backend instance that wraps a service and participates in pool selection.
@@ -16,6 +17,10 @@ pub struct BackendInstance<S> {
     weight: u32,
     service_tier: Option<String>,
     health: CredentialHealth,
+    /// Model filter (which target model ids this backend serves)
+    filter: ModelFilter,
+    /// Backend priority — tiebreaker between wildcard matches of equal kind
+    priority: i32,
 }
 
 impl<S> BackendInstance<S> {
@@ -31,7 +36,16 @@ impl<S> BackendInstance<S> {
             weight,
             service_tier,
             health: CredentialHealth::new(),
+            filter: ModelFilter::default(),
+            priority: 0,
         }
+    }
+
+    /// Attach a model filter and backend priority (per-backend model affinity).
+    pub fn with_model_filter(mut self, models: Option<&[String]>, priority: i32) -> Self {
+        self.filter = ModelFilter::from_patterns(models);
+        self.priority = priority;
+        self
     }
 
     pub fn service_tier(&self) -> Option<&str> {
@@ -50,5 +64,15 @@ impl<S: Send + Sync> Credential for BackendInstance<S> {
 
     fn health(&self) -> &CredentialHealth {
         &self.health
+    }
+
+    fn serves_model(&self, target_model_id: &str) -> bool {
+        self.filter.matches(target_model_id)
+    }
+
+    fn model_match_rank(&self, target_model_id: &str) -> MatchRank {
+        self.filter
+            .match_rank(target_model_id, self.priority)
+            .unwrap_or(MatchRank::catch_all(self.priority))
     }
 }

@@ -96,21 +96,23 @@ impl FailoverChains {
             .unwrap_or(&[])
     }
 
-    /// Select the first failover target for `source_model` whose provider passes
-    /// `is_available`. Returns `None` when no chain is configured or no target is
-    /// available. Kept free of pool types so the selection logic is unit-testable
-    /// with a mock predicate (the live check is `DynamicConfig::provider_available`).
+    /// Select the first failover target for `source_model` whose
+    /// `(provider, model)` passes `is_available`. Returns `None` when no chain
+    /// is configured or no target is available. The target model is passed to
+    /// the predicate so availability can honor per-backend model filters (the
+    /// live check is `DynamicConfig::provider_available`). Kept free of pool
+    /// types so the selection logic is unit-testable with a mock predicate.
     pub fn select_available<F>(
         &self,
         source_model: &str,
         is_available: F,
     ) -> Option<&FailoverTarget>
     where
-        F: Fn(&str) -> bool,
+        F: Fn(&str, &str) -> bool,
     {
         self.targets_for(source_model)
             .iter()
-            .find(|t| is_available(&t.provider))
+            .find(|t| is_available(&t.provider, &t.model))
     }
 }
 
@@ -176,24 +178,41 @@ mod tests {
 
         // Only bedrock healthy → skip the unhealthy first target, pick bedrock.
         let picked = chains
-            .select_available("m", |p| p == "bedrock")
+            .select_available("m", |p, _m| p == "bedrock")
             .expect("a target should be selected");
         assert_eq!(picked.provider, "bedrock");
         assert_eq!(picked.model, "b");
 
         // Multiple healthy → first in configured order wins (anthropic before openai).
         let picked = chains
-            .select_available("m", |p| p == "anthropic" || p == "openai")
+            .select_available("m", |p, _m| p == "anthropic" || p == "openai")
             .unwrap();
         assert_eq!(picked.provider, "anthropic");
+    }
+
+    #[test]
+    fn test_select_available_predicate_sees_target_model() {
+        // The availability check receives the target model, so a provider whose
+        // pool serves other models but not this one is skipped.
+        let raw = r#"{
+            "m": [
+                {"provider": "bedrock", "model": "openai.gpt-5.6-sol"},
+                {"provider": "bedrock", "model": "global.anthropic.claude-sonnet-5"}
+            ]
+        }"#;
+        let chains = FailoverChains::from_json(raw);
+        let picked = chains
+            .select_available("m", |_p, m| m.starts_with("global."))
+            .unwrap();
+        assert_eq!(picked.model, "global.anthropic.claude-sonnet-5");
     }
 
     #[test]
     fn test_select_available_none_when_all_unhealthy_or_no_chain() {
         let chains = FailoverChains::from_json(r#"{"m":[{"provider":"openai","model":"c"}]}"#);
         // No provider healthy → None.
-        assert!(chains.select_available("m", |_| false).is_none());
+        assert!(chains.select_available("m", |_, _| false).is_none());
         // Unknown source model → None even if the predicate is permissive.
-        assert!(chains.select_available("other", |_| true).is_none());
+        assert!(chains.select_available("other", |_, _| true).is_none());
     }
 }

@@ -31,6 +31,7 @@
 pub mod config;
 mod credential;
 mod instance;
+pub mod model_filter;
 mod pool;
 mod strategy;
 
@@ -40,5 +41,6 @@ pub use config::{
 };
 pub use credential::{ApiKeyCredential, AwsCredential, Credential, CredentialHealth};
 pub use instance::BackendInstance;
+pub use model_filter::{MatchRank, ModelFilter};
 pub use pool::{CredentialPool, PoolConfig, PoolStats};
 pub use strategy::LoadBalanceStrategy;

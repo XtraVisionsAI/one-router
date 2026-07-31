@@ -280,6 +280,7 @@ async fn init_bedrock_from_backends(
         } else {
             crate::services::AwsCredential::default_credential(&cfg.region, &cred_name)
         };
+        let aws_cred = aws_cred.with_model_filter(backend.models.as_deref(), backend.priority);
 
         service_tiers.insert(cred_name.clone(), backend.service_tier.clone());
         clients.push((cred_name, client));
@@ -358,12 +359,15 @@ async fn init_gemini_from_backends(
         match GeminiService::with_pool_config(gemini_config, internal_pool_config) {
             Ok(svc) => {
                 tracing::info!(name = %backend.name, key_count = key_count, "Created Gemini service instance");
-                instances.push(BackendInstance::new(
-                    &backend.name,
-                    svc,
-                    backend.weight as u32,
-                    backend.service_tier.clone(),
-                ));
+                instances.push(
+                    BackendInstance::new(
+                        &backend.name,
+                        svc,
+                        backend.weight as u32,
+                        backend.service_tier.clone(),
+                    )
+                    .with_model_filter(backend.models.as_deref(), backend.priority),
+                );
             }
             Err(e) => {
                 tracing::warn!(name = %backend.name, error = %e, "Failed to create Gemini service");
@@ -453,12 +457,15 @@ async fn init_passthrough_from_backends(
                             key_count = key_count,
                             "Created Anthropic passthrough service instance"
                         );
-                        instances.push(BackendInstance::new(
-                            &backend.name,
-                            svc,
-                            backend.weight as u32,
-                            backend.service_tier.clone(),
-                        ));
+                        instances.push(
+                            BackendInstance::new(
+                                &backend.name,
+                                svc,
+                                backend.weight as u32,
+                                backend.service_tier.clone(),
+                            )
+                            .with_model_filter(backend.models.as_deref(), backend.priority),
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(name = %backend.name, error = %e, "Failed to create Anthropic passthrough service");
@@ -496,12 +503,15 @@ async fn init_passthrough_from_backends(
                             key_count = key_count,
                             "Created OpenAI passthrough service instance"
                         );
-                        instances.push(BackendInstance::new(
-                            &backend.name,
-                            svc,
-                            backend.weight as u32,
-                            backend.service_tier.clone(),
-                        ));
+                        instances.push(
+                            BackendInstance::new(
+                                &backend.name,
+                                svc,
+                                backend.weight as u32,
+                                backend.service_tier.clone(),
+                            )
+                            .with_model_filter(backend.models.as_deref(), backend.priority),
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(name = %backend.name, error = %e, "Failed to create OpenAI passthrough service");

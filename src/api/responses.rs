@@ -815,9 +815,14 @@ async fn handle_web_search(
                 let pool = dynamic.gemini_pool.clone().ok_or_else(|| {
                     OpenAIApiError::internal_error("Gemini backend not configured")
                 })?;
-                let instance = pool.get_next().ok_or_else(|| {
-                    OpenAIApiError::internal_error("No healthy Gemini backend available")
-                })?;
+                let instance = pool
+                    .get_next_for_model(&resolved.target_model_id)
+                    .ok_or_else(|| {
+                        OpenAIApiError::internal_error(format!(
+                            "No gemini backend serves model '{}'; check backends' models filter",
+                            resolved.target_model_id
+                        ))
+                    })?;
                 std::sync::Arc::new(crate::services::web_tools::executor::GeminiWebToolBackend {
                     service: instance.service.clone(),
                 })

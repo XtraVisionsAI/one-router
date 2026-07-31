@@ -73,6 +73,14 @@
     },
     { title: 'Priority', key: 'priority' },
     {
+      title: 'Models',
+      key: 'models',
+      render: (row: BackendSummary) =>
+        row.models?.length
+          ? h('span', { class: 'font-mono text-xs' }, row.models.join(', '))
+          : h('span', { class: 'text-slate-500 text-xs' }, 'all models')
+    },
+    {
       title: 'Health',
       key: 'health_status',
       render: (row: BackendSummary) => {

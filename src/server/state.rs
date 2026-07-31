@@ -52,34 +52,36 @@ pub struct DynamicConfig {
 }
 
 impl DynamicConfig {
-    /// True if `provider` has at least one healthy credential (or, for bedrock,
-    /// a configured service with a healthy pool). Used as the failover trigger.
+    /// True if `provider` has at least one healthy credential **eligible for
+    /// `target_model_id`** (per-backend model filter, top-rank group only).
+    /// Used as the failover trigger — model-scoped so "the GPT-only backend is
+    /// down" fails over GPT without touching Claude traffic on the same pool.
     ///
     /// Provider strings map to backends exactly as the request handlers dispatch
     /// them: `gemini`/`anthropic`/`openai` route to their pools; **anything else
     /// (including the empty string) routes to bedrock**.
-    pub fn provider_available(&self, provider: &str) -> bool {
+    pub fn provider_available(&self, provider: &str, target_model_id: &str) -> bool {
         match provider {
             "gemini" => self
                 .gemini_pool
                 .as_ref()
-                .map(|p| p.stats().is_healthy())
+                .map(|p| p.stats_for_model(target_model_id).is_healthy())
                 .unwrap_or(false),
             "anthropic" => self
                 .anthropic_pool
                 .as_ref()
-                .map(|p| p.stats().is_healthy())
+                .map(|p| p.stats_for_model(target_model_id).is_healthy())
                 .unwrap_or(false),
             "openai" => self
                 .openai_pool
                 .as_ref()
-                .map(|p| p.stats().is_healthy())
+                .map(|p| p.stats_for_model(target_model_id).is_healthy())
                 .unwrap_or(false),
             // Empty or unknown provider dispatches to bedrock (see handlers).
             _ => self
                 .bedrock
                 .as_ref()
-                .map(|b| b.pool_stats().is_healthy())
+                .map(|b| b.pool_stats_for_model(target_model_id).is_healthy())
                 .unwrap_or(false),
         }
     }
@@ -98,7 +100,7 @@ impl DynamicConfig {
         primary_provider: &str,
         primary_model: &str,
     ) -> (String, String, bool) {
-        if self.provider_available(primary_provider) {
+        if self.provider_available(primary_provider, primary_model) {
             return (
                 primary_provider.to_string(),
                 primary_model.to_string(),
@@ -107,7 +109,7 @@ impl DynamicConfig {
         }
         if let Some(target) = self
             .failover_chains
-            .select_available(source_model, |p| self.provider_available(p))
+            .select_available(source_model, |p, m| self.provider_available(p, m))
         {
             return (target.provider.clone(), target.model.clone(), true);
         }
@@ -195,7 +197,10 @@ mod tests {
     fn test_provider_available_false_when_unconfigured() {
         let cfg = empty_dynamic(FailoverChains::default());
         for p in ["bedrock", "gemini", "anthropic", "openai", "", "weird"] {
-            assert!(!cfg.provider_available(p), "provider {p} should be down");
+            assert!(
+                !cfg.provider_available(p, "any-model"),
+                "provider {p} should be down"
+            );
         }
     }
 

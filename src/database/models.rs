@@ -106,8 +106,43 @@ pub struct BackendRecord {
     pub max_failures: i32,            // default 3
     pub retry_after_secs: i64,        // default 300
     pub service_tier: Option<String>, // None=ignore, "passthrough"=forward, "flex" etc.=override
+    /// Model filter patterns (per-backend model affinity), e.g.
+    /// `["*", "!openai.*"]`. `None` / empty ≡ `["*"]` (serves all models).
+    /// Stored as a JSON string-array column; matched against target model ids.
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
+}
+
+impl BackendRecord {
+    /// Serialize `models` for a TEXT column. `None` and an empty list both
+    /// store NULL (≡ serve all models), keeping legacy rows and "cleared"
+    /// rows indistinguishable on purpose.
+    pub fn models_to_json(models: &Option<Vec<String>>) -> Option<String> {
+        models
+            .as_ref()
+            .filter(|m| !m.is_empty())
+            .and_then(|m| serde_json::to_string(m).ok())
+    }
+
+    /// Parse a TEXT column value back into `models`. Blank or malformed JSON
+    /// yields `None` (serve all) — a bad row must never break routing.
+    pub fn models_from_json(raw: Option<String>) -> Option<Vec<String>> {
+        let raw = raw?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        match serde_json::from_str::<Vec<String>>(trimmed) {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, raw = %trimmed, "Invalid backends.models JSON; treating as serve-all");
+                None
+            }
+        }
+    }
 }
 
 // ============================================================================

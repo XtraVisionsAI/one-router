@@ -246,6 +246,12 @@ impl SqliteBackend {
             .await
             .ok();
 
+        // Migration: add models column (per-backend model filter, JSON string array)
+        sqlx::query("ALTER TABLE backends ADD COLUMN models TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+
         // --- feature_flags ---
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS feature_flags (
@@ -1198,7 +1204,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn get_backend(&self, name: &str) -> Result<Option<BackendRecord>> {
         let row = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, service_tier, \
+             strategy, max_failures, retry_after_secs, service_tier, models, \
              created_at, updated_at \
              FROM backends WHERE name = ?",
         )
@@ -1218,6 +1224,7 @@ impl BackendConfigStore for SqliteBackend {
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
                 service_tier: r.get("service_tier"),
+                models: BackendRecord::models_from_json(r.get("models")),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })),
@@ -1228,7 +1235,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn list_enabled_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, service_tier, \
+             strategy, max_failures, retry_after_secs, service_tier, models, \
              created_at, updated_at \
              FROM backends WHERE enabled = 1 ORDER BY priority DESC",
         )
@@ -1248,6 +1255,7 @@ impl BackendConfigStore for SqliteBackend {
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
                 service_tier: r.get("service_tier"),
+                models: BackendRecord::models_from_json(r.get("models")),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -1259,7 +1267,7 @@ impl BackendConfigStore for SqliteBackend {
     async fn list_all_backends(&self) -> Result<Vec<BackendRecord>> {
         let rows = sqlx::query(
             "SELECT name, backend_type, config, enabled, priority, weight, \
-             strategy, max_failures, retry_after_secs, service_tier, \
+             strategy, max_failures, retry_after_secs, service_tier, models, \
              created_at, updated_at \
              FROM backends ORDER BY priority DESC",
         )
@@ -1279,6 +1287,7 @@ impl BackendConfigStore for SqliteBackend {
                 max_failures: r.get("max_failures"),
                 retry_after_secs: r.get("retry_after_secs"),
                 service_tier: r.get("service_tier"),
+                models: BackendRecord::models_from_json(r.get("models")),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
@@ -1292,9 +1301,9 @@ impl BackendConfigStore for SqliteBackend {
         sqlx::query(
             "INSERT INTO backends \
              (name, backend_type, config, enabled, priority, weight, \
-              strategy, max_failures, retry_after_secs, service_tier, \
+              strategy, max_failures, retry_after_secs, service_tier, models, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(name) DO UPDATE SET \
              backend_type = excluded.backend_type, \
              config = excluded.config, \
@@ -1305,6 +1314,7 @@ impl BackendConfigStore for SqliteBackend {
              max_failures = excluded.max_failures, \
              retry_after_secs = excluded.retry_after_secs, \
              service_tier = excluded.service_tier, \
+             models = excluded.models, \
              updated_at = excluded.updated_at",
         )
         .bind(&record.name)
@@ -1317,6 +1327,7 @@ impl BackendConfigStore for SqliteBackend {
         .bind(record.max_failures)
         .bind(record.retry_after_secs)
         .bind(&record.service_tier)
+        .bind(BackendRecord::models_to_json(&record.models))
         .bind(record.created_at)
         .bind(now)
         .execute(&self.pool)

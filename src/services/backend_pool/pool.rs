@@ -115,22 +115,66 @@ impl<C: Credential> CredentialPool<C> {
 
     /// Get the next available credential based on the load balancing strategy
     pub fn get_next(&self) -> Option<&C> {
-        if self.credentials.is_empty() {
+        let all: Vec<usize> = (0..self.credentials.len()).collect();
+        self.select_among(&all)
+    }
+
+    /// Get the next credential eligible for `target_model_id` (per-backend
+    /// model filter).
+    ///
+    /// Two-step selection: eligibility (`serves_model`), then the top
+    /// `model_match_rank` group (exact > priority > specificity), load
+    /// balanced within that group by the pool strategy. There is **no cascade**
+    /// to lower-ranked groups — if the whole top group is unhealthy the usual
+    /// in-group recovery fallback applies, and model-level fallback is the job
+    /// of `failover_chains`.
+    ///
+    /// Returns `None` when no credential is eligible at all (the caller should
+    /// surface a "no backend serves this model" error).
+    pub fn get_next_for_model(&self, target_model_id: &str) -> Option<&C> {
+        let top = self.top_group_for_model(target_model_id);
+        self.select_among(&top)
+    }
+
+    /// Indices of the top-ranked eligible group for a model (empty when no
+    /// credential is eligible).
+    fn top_group_for_model(&self, target_model_id: &str) -> Vec<usize> {
+        let ranked: Vec<(usize, super::model_filter::MatchRank)> = self
+            .credentials
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.serves_model(target_model_id))
+            .map(|(i, c)| (i, c.model_match_rank(target_model_id)))
+            .collect();
+        let Some(best) = ranked.iter().map(|(_, r)| *r).max() else {
+            return Vec::new();
+        };
+        ranked
+            .into_iter()
+            .filter(|(_, r)| *r == best)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Select a credential among the given candidate indices using the pool
+    /// strategy, considering only healthy candidates. When none are healthy,
+    /// falls back to recovering a disabled candidate (or the first candidate),
+    /// never leaving the candidate set.
+    fn select_among(&self, candidates: &[usize]) -> Option<&C> {
+        if candidates.is_empty() {
             return None;
         }
 
         // Get list of healthy credentials
-        let healthy_indices: Vec<usize> = self
-            .credentials
+        let healthy_indices: Vec<usize> = candidates
             .iter()
-            .enumerate()
-            .filter(|(_, c)| self.is_credential_available(c))
-            .map(|(i, _)| i)
+            .copied()
+            .filter(|&i| self.is_credential_available(&self.credentials[i]))
             .collect();
 
         if healthy_indices.is_empty() {
             // Try to recover a disabled credential
-            return self.try_recover_credential();
+            return self.try_recover_among(candidates);
         }
 
         let idx = match self.config.strategy {
@@ -289,6 +333,26 @@ impl<C: Credential> CredentialPool<C> {
         }
     }
 
+    /// Pool statistics restricted to the top-ranked group eligible for
+    /// `target_model_id`. `total == 0` means no credential serves the model —
+    /// `is_healthy()` is then false, which is what triggers model-level
+    /// failover chains for that model without affecting other models.
+    pub fn stats_for_model(&self, target_model_id: &str) -> PoolStats {
+        let top = self.top_group_for_model(target_model_id);
+        PoolStats {
+            total: top.len(),
+            healthy: top
+                .iter()
+                .filter(|&&i| self.is_credential_available(&self.credentials[i]))
+                .count(),
+            disabled: top
+                .iter()
+                .filter(|&&i| !self.credentials[i].is_enabled())
+                .count(),
+            strategy: self.config.strategy,
+        }
+    }
+
     /// Check if a credential is available (enabled and not at max failures)
     fn is_credential_available(&self, cred: &C) -> bool {
         if !cred.is_enabled() {
@@ -299,10 +363,11 @@ impl<C: Credential> CredentialPool<C> {
         cred.failure_count() < self.config.max_failures
     }
 
-    /// Try to recover a disabled credential for use
-    fn try_recover_credential(&self) -> Option<&C> {
+    /// Try to recover a disabled credential among the given candidate indices.
+    fn try_recover_among(&self, candidates: &[usize]) -> Option<&C> {
         // Find a disabled credential that's ready for retry
-        for cred in &self.credentials {
+        for &i in candidates {
+            let cred = &self.credentials[i];
             if !cred.is_enabled() && cred.health().should_retry(self.config.retry_after_secs) {
                 tracing::info!(
                     credential = cred.name(),
@@ -313,8 +378,8 @@ impl<C: Credential> CredentialPool<C> {
                 return Some(cred);
             }
         }
-        // Last resort: return the first credential even if it's unhealthy
-        self.credentials.first()
+        // Last resort: return the first candidate even if it's unhealthy
+        candidates.first().map(|&i| &self.credentials[i])
     }
 }
 
@@ -348,7 +413,7 @@ impl PoolStats {
 
 #[cfg(test)]
 mod tests {
-    use super::super::credential::ApiKeyCredential;
+    use super::super::credential::{ApiKeyCredential, AwsCredential};
     use super::*;
 
     fn create_test_credentials() -> Vec<ApiKeyCredential> {
@@ -357,6 +422,150 @@ mod tests {
             ApiKeyCredential::new("key2", "secondary", 1),
             ApiKeyCredential::new("key3", "backup", 1),
         ]
+    }
+
+    /// AwsCredential with a model filter, for model-affinity tests.
+    fn aws_cred(name: &str, models: &[&str], priority: i32) -> AwsCredential {
+        let models: Vec<String> = models.iter().map(|s| s.to_string()).collect();
+        AwsCredential::default_credential("us-east-1", name)
+            .with_model_filter(Some(&models), priority)
+    }
+
+    /// The target topology from the design doc: ap serves everything except
+    /// GPT, us-east-1 serves only GPT-5.x.
+    fn affinity_pool() -> CredentialPool<AwsCredential> {
+        CredentialPool::new(
+            vec![
+                aws_cred("ap-northeast-1", &["*", "!openai.*"], 0),
+                aws_cred("us-east-1", &["openai.gpt-5*"], 0),
+            ],
+            PoolConfig::new(LoadBalanceStrategy::RoundRobin),
+        )
+    }
+
+    #[test]
+    fn test_get_next_for_model_routes_by_filter() {
+        let pool = affinity_pool();
+        // Claude traffic only ever hits ap (us has no positive match).
+        for _ in 0..4 {
+            let cred = pool
+                .get_next_for_model("global.anthropic.claude-sonnet-5")
+                .unwrap();
+            assert_eq!(cred.name(), "ap-northeast-1");
+        }
+        // GPT traffic only ever hits us-east-1 (ap excludes openai.*).
+        for _ in 0..4 {
+            let cred = pool.get_next_for_model("openai.gpt-5.6-sol").unwrap();
+            assert_eq!(cred.name(), "us-east-1");
+        }
+    }
+
+    #[test]
+    fn test_get_next_for_model_none_when_no_eligible() {
+        // us backend deleted: GPT is excluded by ap and matched by nobody.
+        let pool = CredentialPool::new(
+            vec![aws_cred("ap-northeast-1", &["*", "!openai.*"], 0)],
+            PoolConfig::default(),
+        );
+        assert!(pool.get_next_for_model("openai.gpt-5.6-sol").is_none());
+        assert!(pool
+            .get_next_for_model("global.anthropic.claude-sonnet-5")
+            .is_some());
+    }
+
+    #[test]
+    fn test_get_next_for_model_unhealthy_top_group_does_not_cascade() {
+        let pool = affinity_pool();
+        pool.disable("us-east-1");
+        // The dedicated group is down — traffic must NOT leak to the `*` group
+        // (hard shadow); the in-group recovery fallback returns the unhealthy
+        // dedicated credential instead.
+        let cred = pool.get_next_for_model("openai.gpt-5.6-sol").unwrap();
+        assert_eq!(cred.name(), "us-east-1");
+    }
+
+    #[test]
+    fn test_get_next_for_model_exact_beats_wildcard() {
+        let pool = CredentialPool::new(
+            vec![
+                aws_cred("wild", &["openai.gpt-5*"], 5),
+                aws_cred("exact", &["openai.gpt-5.6-sol"], 0),
+            ],
+            PoolConfig::new(LoadBalanceStrategy::RoundRobin),
+        );
+        // Exact match wins even against a higher-priority wildcard.
+        for _ in 0..4 {
+            let cred = pool.get_next_for_model("openai.gpt-5.6-sol").unwrap();
+            assert_eq!(cred.name(), "exact");
+        }
+        // A sibling model only matches the wildcard.
+        let cred = pool.get_next_for_model("openai.gpt-5.4").unwrap();
+        assert_eq!(cred.name(), "wild");
+    }
+
+    #[test]
+    fn test_get_next_for_model_priority_breaks_wildcard_tie() {
+        let pool = CredentialPool::new(
+            vec![
+                aws_cred("low", &["openai.*"], 0),
+                aws_cred("high", &["openai.*"], 10),
+            ],
+            PoolConfig::new(LoadBalanceStrategy::RoundRobin),
+        );
+        for _ in 0..4 {
+            let cred = pool.get_next_for_model("openai.gpt-5.6-sol").unwrap();
+            assert_eq!(cred.name(), "high");
+        }
+    }
+
+    #[test]
+    fn test_get_next_for_model_same_rank_load_balances() {
+        // Two backends with the same-specificity pattern share the traffic.
+        let pool = CredentialPool::new(
+            vec![
+                aws_cred("a", &["global.*"], 0),
+                aws_cred("b", &["global.*"], 0),
+            ],
+            PoolConfig::new(LoadBalanceStrategy::RoundRobin),
+        );
+        let names: std::collections::HashSet<&str> = (0..6)
+            .map(|_| {
+                pool.get_next_for_model("global.anthropic.claude-sonnet-5")
+                    .unwrap()
+                    .name()
+            })
+            .collect();
+        assert!(names.contains("a") && names.contains("b"));
+    }
+
+    #[test]
+    fn test_stats_for_model() {
+        let pool = affinity_pool();
+
+        let gpt = pool.stats_for_model("openai.gpt-5.6-sol");
+        assert_eq!(gpt.total, 1);
+        assert_eq!(gpt.healthy, 1);
+        assert!(gpt.is_healthy());
+
+        // Disabling the dedicated credential makes GPT unhealthy without
+        // affecting Claude — the failover-chain trigger is model-scoped.
+        pool.disable("us-east-1");
+        let gpt = pool.stats_for_model("openai.gpt-5.6-sol");
+        assert_eq!(gpt.total, 1);
+        assert_eq!(gpt.healthy, 0);
+        assert!(!gpt.is_healthy());
+        let claude = pool.stats_for_model("global.anthropic.claude-sonnet-5");
+        assert_eq!(claude.total, 1);
+        assert!(claude.is_healthy());
+
+        // A model nobody serves: total 0 → unhealthy.
+        let pool2 = CredentialPool::new(
+            vec![aws_cred("ap", &["*", "!openai.*"], 0)],
+            PoolConfig::default(),
+        );
+        let stats = pool2.stats_for_model("openai.gpt-5.6-sol");
+        assert_eq!(stats.total, 0);
+        assert!(!stats.is_healthy());
     }
 
     #[test]
