@@ -1,3 +1,9 @@
+## v0.28.0 (2026-07-31)
+
+### Feat
+
+- **backends**: per-backend model affinity (wildcard + negation filter)
+
 ## v0.27.0 (2026-07-30)
 
 ### Feat
