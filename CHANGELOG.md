@@ -1,3 +1,9 @@
+## v0.28.1 (2026-08-02)
+
+### Fix
+
+- **bedrock**: resolve Mantle SigV4 keys through the SDK credential chain
+
 ## v0.28.0 (2026-07-31)
 
 ### Feat
