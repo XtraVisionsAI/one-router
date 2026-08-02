@@ -226,6 +226,10 @@ async fn init_bedrock_from_backends(
     let mut credentials: Vec<crate::services::AwsCredential> = Vec::new();
     let mut service_tiers: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
+    let mut credential_providers: std::collections::HashMap<
+        String,
+        aws_credential_types::provider::SharedCredentialsProvider,
+    > = std::collections::HashMap::new();
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in bedrock_backends.iter().enumerate() {
@@ -256,7 +260,10 @@ async fn init_bedrock_from_backends(
             "Creating Bedrock client from backends table"
         );
 
-        let client = crate::config::create_bedrock_client_from_config(&cfg).await;
+        let (client, provider) = crate::config::create_bedrock_client_from_config(&cfg).await;
+        if let Some(provider) = provider {
+            credential_providers.insert(cred_name.clone(), provider);
+        }
 
         let aws_cred = if let Some(ref p) = cfg.profile {
             crate::services::AwsCredential::with_profile(
@@ -297,6 +304,7 @@ async fn init_bedrock_from_backends(
         clients,
         pool,
         service_tiers,
+        credential_providers,
     )))
 }
 

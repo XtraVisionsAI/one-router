@@ -11,6 +11,11 @@
   其他 region 返回 404「model doesn't exist」。**生产后端(ap-northeast-1)必须
   增配 us-east-1 凭证才能用 GPT-5.6**。
 - **认证**:SigV4 直接可用(service name `bedrock`),无需 bearer token 生成器。
+  签名密钥经 SDK 凭证链解析(2026-08-02 起):`create_bedrock_client_from_config`
+  把 `SdkConfig` 的 `SharedCredentialsProvider` 一并存入 `BedrockService`,
+  `mantle_post` 通过它取密钥——显式 access key / profile(含 SSO)/ EC2 实例角色
+  均可用,临时凭证的缓存与刷新由 `aws_config` 自带的 lazy-caching 层负责。
+  (此前只读 backend 记录的显式 key 字段,profile / 实例角色签名必败。)
 - **路径必须带 `/openai` 前缀**:bedrock-runtime 的 `/v1/chat/completions`(旧代码
   所用)会返回 **HTTP 200 + coral `UnknownOperationException` 包体**——这就是此前
   `/v1/messages` 走 Mantle 报「missing field `id`」的真正根因(存量 bug,本次一并

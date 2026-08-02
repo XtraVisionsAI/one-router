@@ -38,6 +38,14 @@ pub struct BedrockService {
     pool: std::sync::Arc<CredentialPool<AwsCredential>>,
     /// Per-credential service tier config (keyed by credential name)
     service_tiers: std::collections::HashMap<String, Option<String>>,
+    /// Per-credential AWS credentials provider (keyed by credential name),
+    /// taken from the same `SdkConfig` the SDK client was built with. Used by
+    /// the Mantle path to resolve SigV4 signing keys through the full chain
+    /// (explicit keys / profile / SSO / instance role).
+    credential_providers: std::collections::HashMap<
+        String,
+        aws_credential_types::provider::SharedCredentialsProvider,
+    >,
     /// Shared HTTP client for the Mantle endpoints — reused across requests so
     /// keep-alive connections avoid a TCP+TLS handshake per call (which costs
     /// several RTTs when the Bedrock region is far from the gateway).
@@ -50,11 +58,16 @@ impl BedrockService {
         clients: Vec<(String, BedrockRuntimeClient)>,
         pool: CredentialPool<AwsCredential>,
         service_tiers: std::collections::HashMap<String, Option<String>>,
+        credential_providers: std::collections::HashMap<
+            String,
+            aws_credential_types::provider::SharedCredentialsProvider,
+        >,
     ) -> Self {
         Self {
             clients,
             pool: std::sync::Arc::new(pool),
             service_tiers,
+            credential_providers,
             http_client: reqwest::Client::new(),
         }
     }
@@ -457,6 +470,37 @@ impl BedrockService {
             .map_err(BedrockError::Unknown)
     }
 
+    /// Resolve SigV4 signing credentials for a pool credential through the
+    /// credentials provider captured from the SDK client's `SdkConfig`.
+    ///
+    /// This runs exactly the chain the SDK paths use: explicit access keys,
+    /// named profile (incl. SSO / assume-role), or the default chain (env
+    /// vars, EC2/ECS instance role). `aws_config` wraps non-static providers
+    /// in its lazy-caching layer, so temporary credentials are cached and
+    /// refreshed by the SDK — no extra caching here.
+    ///
+    /// Resolution failure records a pool failure for the credential (it is a
+    /// per-credential problem: missing profile, unreachable IMDS, expired SSO),
+    /// so cooldown/failover treat it like any other credential error.
+    async fn mantle_signing_credentials(
+        &self,
+        cred_name: &str,
+    ) -> Result<aws_credential_types::Credentials, BedrockError> {
+        use aws_credential_types::provider::ProvideCredentials;
+
+        let provider = self.credential_providers.get(cred_name).ok_or_else(|| {
+            BedrockError::Unknown(format!(
+                "Credential '{cred_name}' has no AWS credentials provider configured"
+            ))
+        })?;
+        provider.provide_credentials().await.map_err(|e| {
+            self.record_failure(cred_name);
+            BedrockError::Unknown(format!(
+                "Failed to resolve AWS credentials for '{cred_name}': {e}"
+            ))
+        })
+    }
+
     /// Sign and send a POST to the Bedrock OpenAI-compatible (Mantle) endpoint.
     /// Picks a credential eligible for `target_model_id` from the pool (per-
     /// backend model filter), SigV4-signs the body, and sends it. Records a
@@ -470,24 +514,16 @@ impl BedrockService {
         body: Vec<u8>,
         target_model_id: &str,
     ) -> Result<(String, reqwest::Response), BedrockError> {
-        use aws_credential_types::Credentials as AwsCreds;
         use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
         use aws_sigv4::sign::v4;
 
-        // Gather credential info (clone owned data before any async work)
-        let (cred_name, region, access_key_id, secret_access_key, session_token, has_access_key) = {
+        // Pick a credential eligible for the target model.
+        let (cred_name, region) = {
             let cred = self
                 .pool
                 .get_next_for_model(target_model_id)
                 .ok_or_else(|| BedrockError::no_backend_serves_model(target_model_id))?;
-            (
-                cred.name().to_string(),
-                cred.region().to_string(),
-                cred.access_key_id().map(|s| s.to_string()),
-                cred.secret_access_key().map(|s| s.to_string()),
-                cred.session_token().map(|s| s.to_string()),
-                cred.uses_access_key(),
-            )
+            (cred.name().to_string(), cred.region().to_string())
         };
 
         const BEDROCK_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024; // 4MB
@@ -498,25 +534,15 @@ impl BedrockService {
             )));
         }
 
-        // Warn when credentials lack explicit access keys (profile/default creds will fail SigV4 signing)
-        if !has_access_key {
-            tracing::warn!(
-                credential = %cred_name,
-                "Credential does not have explicit access keys; Bedrock Mantle SigV4 signing may fail. Use access key credentials for non-Claude models."
-            );
-        }
+        // Resolve signing key material through the SDK client's credential
+        // chain — supports explicit keys, profiles, SSO, and instance roles,
+        // with the SDK's own caching/refresh for temporary credentials.
+        let aws_creds = self.mantle_signing_credentials(&cred_name).await?;
 
         let host = host_kind.host(&region);
         let url = format!("https://{host}{path}");
 
         // Build AWS Identity for signing
-        let aws_creds = AwsCreds::new(
-            access_key_id.as_deref().unwrap_or(""),
-            secret_access_key.as_deref().unwrap_or(""),
-            session_token.clone(),
-            None,
-            "one-router",
-        );
         let identity: aws_smithy_runtime_api::client::identity::Identity = aws_creds.into();
 
         let signing_params = v4::SigningParams::builder()

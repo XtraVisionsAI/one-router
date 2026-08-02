@@ -78,23 +78,29 @@ pub async fn create_bedrock_client_with_profile(
     BedrockRuntimeClient::new(&sdk_config)
 }
 
-/// Create a Bedrock Runtime client from a typed backend config.
+/// Create a Bedrock Runtime client from a typed backend config, together with
+/// the resolved credentials provider from the same `SdkConfig`.
 ///
-/// Supports profile, access key, and default credential chain.
-pub async fn create_bedrock_client_from_config(cfg: &BedrockBackendConfig) -> BedrockRuntimeClient {
+/// Supports profile, access key, and default credential chain. The provider is
+/// handed to `BedrockService` so the Mantle path (manual SigV4 over reqwest)
+/// can resolve signing keys through the exact same chain the SDK client uses —
+/// including `aws_config`'s built-in caching/refresh for temporary credentials.
+pub async fn create_bedrock_client_from_config(
+    cfg: &BedrockBackendConfig,
+) -> (
+    BedrockRuntimeClient,
+    Option<aws_credential_types::provider::SharedCredentialsProvider>,
+) {
     let region = Region::new(cfg.region.clone());
 
-    if let Some(profile_name) = &cfg.profile {
+    let sdk_config = if let Some(profile_name) = &cfg.profile {
         tracing::debug!(profile = %profile_name, region = %region, "Creating Bedrock client with profile");
-        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        aws_config::defaults(BehaviorVersion::latest())
             .region(region)
             .profile_name(profile_name)
             .load()
-            .await;
-        return BedrockRuntimeClient::new(&sdk_config);
-    }
-
-    if let (Some(ak), Some(sk)) = (&cfg.access_key_id, &cfg.secret_access_key) {
+            .await
+    } else if let (Some(ak), Some(sk)) = (&cfg.access_key_id, &cfg.secret_access_key) {
         tracing::debug!(region = %region, "Creating Bedrock client with access key");
         let creds = aws_sdk_bedrockruntime::config::Credentials::new(
             ak,
@@ -103,18 +109,19 @@ pub async fn create_bedrock_client_from_config(cfg: &BedrockBackendConfig) -> Be
             None,
             "one-router-static",
         );
-        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        aws_config::defaults(BehaviorVersion::latest())
             .region(region)
             .credentials_provider(creds)
             .load()
-            .await;
-        return BedrockRuntimeClient::new(&sdk_config);
-    }
+            .await
+    } else {
+        tracing::debug!(region = %region, "Creating Bedrock client with default credentials");
+        aws_config::defaults(BehaviorVersion::latest())
+            .region(region)
+            .load()
+            .await
+    };
 
-    tracing::debug!(region = %region, "Creating Bedrock client with default credentials");
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region)
-        .load()
-        .await;
-    BedrockRuntimeClient::new(&sdk_config)
+    let provider = sdk_config.credentials_provider();
+    (BedrockRuntimeClient::new(&sdk_config), provider)
 }
