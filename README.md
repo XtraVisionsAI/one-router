@@ -29,13 +29,15 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Usage Query API** — query your token usage and cost history via `GET /v1/usage` (aggregated, grouped by hour or model) and `GET /v1/usage/records` (paginated raw records)
 - **Smart Model Mapping** — maps model names across providers (e.g. `gpt-4o` -> Claude Sonnet, `claude-*` -> Bedrock), with exact match, wildcard, and configurable priority
 - **Backend Pool & Load Balancing** — each backend record is an independent service instance; multiple instances of the same type are load-balanced with round-robin, weighted, random, or failover strategies
+- **Per-Backend Model Affinity** — each backend can declare a `models` filter (wildcards + `!` negation, e.g. `["*", "!openai.*"]`) so same-provider backends in different regions serve different models
 - **Model-Level Failover** — configurable failover chains switch a model to a backup provider/model when the primary provider has no healthy credential
-- **Automatic Pricing Sync** — optionally sync per-model pricing from the LiteLLM price table on a schedule; mappings priced manually are pinned and never overwritten
+- **Bedrock GPT-5.x (Mantle Responses)** — Responses-only GPT-5.x models on AWS Bedrock work from all three chat endpoints: native passthrough on `/v1/responses`, one-hop protocol conversion on `/v1/messages` (Claude Code) and `/v1/chat/completions`
+- **Automatic Pricing Sync** — optionally sync per-model pricing from the LiteLLM price table on a schedule; mappings priced manually are pinned and never overwritten. Browse and import new model mappings from the LiteLLM catalog in the Admin UI
 - **Pluggable Storage** — SQLite (zero-config), PostgreSQL, or DynamoDB — switch with one env var
 - **API Key Management** — issue API keys with per-key rate limits, budget caps, and service tiers; master key is admin-only (cannot call business APIs)
 - **Admin Session Auth** — admin UI uses HttpOnly cookie sessions via login endpoint; no key stored in browser
 - **Streaming Support** — full SSE streaming for both OpenAI and Anthropic protocols
-- **Extended Thinking** — per-model extended thinking support with style hints (Claude, Nova 2, Kimi)
+- **Extended Thinking** — per-model extended thinking support with style hints (Claude, Nova 2, Kimi, GPT effort-based)
 - **Tool Use & PTC** — tool calling support including Programmatic Tool Calling with sandboxed code execution
 - **Web Search & Fetch** — proxy-side web search (Tavily/Brave) and page fetch with agentic loop, streaming, citation post-processing, and Dynamic Filtering (code execution in loop for v2 tools)
 - **Per-Model Capabilities** — declare per-model capabilities (thinking, document, tool use, PTC) in model mappings; global defaults configurable via settings
@@ -172,6 +174,8 @@ curl -N http://localhost:8000/v1/responses \
 ```
 
 Multi-turn conversations are stateful: pass a prior response's `id` as `previous_response_id` to continue where it left off (stored responses are bound to the API key that created them). To point the Codex CLI at One Router, set its base URL to `http://localhost:8000/v1` and use your API key.
+
+> **Bedrock GPT-5.x:** GPT-5.x models on AWS Bedrock are Responses-only (no Converse API). When a mapping targets one (`openai.gpt-5*`), `/v1/responses` passes the raw request through to the Bedrock Mantle Responses endpoint with native SSE relay, and `/v1/messages` / `/v1/chat/completions` reach the same models via built-in one-hop protocol conversion — including thinking-signature round-trips for Claude Code. Note these models are region-restricted (e.g. sol is us-east-1/us-east-2 only), so the Bedrock backend credential's region must match — pair this with a per-backend `models` filter to route only GPT models to the matching region.
 
 ### Embeddings (OpenAI SDK)
 
@@ -325,8 +329,8 @@ One Router includes a built-in admin UI at **`/admin`**. Open it in a browser an
 |---|---|
 | **Dashboard** | Overview: backend health, API key count, uptime |
 | **API Keys** | Create keys (plaintext shown once), edit rate limits / budgets, deactivate / reactivate |
-| **Backends** | Add / edit backends (Gemini, Anthropic, OpenAI, Bedrock) — credentials entered in plaintext, encrypted before saving |
-| **Model Maps** | Manage source → target model mappings, priorities, pricing, and per-model capabilities |
+| **Backends** | Add / edit backends (Gemini, Anthropic, OpenAI, Bedrock) — credentials entered in plaintext, encrypted before saving; optional per-backend models filter |
+| **Model Maps** | Manage source → target model mappings, priorities, pricing, and per-model capabilities; import models from the LiteLLM price table |
 | **Usage** | Query usage statistics by API key, time range, and grouping |
 | **Settings** | Configure default capabilities (tool use, thinking, document, PTC), rate limiting, and prompt cache behavior. Changes take effect immediately |
 
@@ -346,6 +350,7 @@ One Router uses environment variables for infrastructure config. All runtime set
 | `LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `MASTER_API_KEY` | _(auto-generated)_ | Admin-only key — for `/admin` UI login and admin API. Cannot call `/v1/*` business endpoints. Auto-generated and saved to `.env` on first bare-metal run |
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
+| `SEED_DEFAULTS` | `empty` | When to seed default model mappings on startup: `off` (never), `empty` (only when the mappings table is empty — deletions stick), or `missing` (re-insert any missing default on every startup) |
 
 **First-run behavior:**
 - **Bare metal:** Missing `MASTER_API_KEY` or `ENCRYPTION_KEY` are auto-generated and saved to `.env`.
@@ -370,6 +375,15 @@ DATABASE=dynamodb://us-east-1
 
 Backend credentials are managed via the Admin UI at `/admin` -> Backends page. Credentials are encrypted at rest with AES-256-GCM.
 
+Bedrock backends accept explicit access keys, a named AWS profile (including SSO), or the default credential chain (env vars, EC2/ECS instance role) — all forms work on every request path, including the Mantle endpoints for GPT models.
+
+Each backend can optionally declare a **models filter** — a list of wildcard patterns matched against the target model ID, with `!` for exclusion. This lets same-provider backends in different regions split traffic by model, e.g.:
+
+- `bedrock-ap-northeast-1`: `["*", "!openai.*"]` — serves everything except GPT models
+- `bedrock-us-east-1`: `["openai.gpt-5*"]` — dedicated to GPT-5.x (which only exist in US regions)
+
+An empty filter means the backend serves all models. Exclusions always win; among eligible backends the most specific match is preferred, then load-balanced.
+
 ## Architecture
 
 ```
@@ -393,7 +407,7 @@ Backend credentials are managed via the Admin UI at `/admin` -> Backends page. C
   OpenAI SDK ──────►  /v1/embeddings                     │──► AWS Bedrock
   Cohere SDK ──────►  /v1/rerank                         │──► AWS Bedrock
   OpenAI SDK ──────►  /v1/images/generations             │──► OpenAI / Bedrock / Gemini
-  Codex CLI ───────►  /v1/responses                      │──► (translated to chat backends)
+  Codex CLI ───────►  /v1/responses                      │──► (translated to chat backends, or Mantle passthrough)
                     │                                      │
                ─────►  GET /v1/usage                     │  (aggregated usage stats)
                ─────►  GET /v1/usage/records             │  (paginated raw records)
@@ -473,7 +487,7 @@ Each mapping declares what features the target model supports. This controls wha
 | Field | Default | Description |
 |---|---|---|
 | `thinking.enabled` | false | Whether extended thinking / reasoning is forwarded |
-| `thinking.style` | `claude` | How thinking is expressed: `claude` (native), `nova2`, or `kimi` |
+| `thinking.style` | `claude` | How thinking is expressed: `claude` (native), `nova2`, `kimi`, or `effort` (GPT-OSS / o-series reasoning effort) |
 | `document.enabled` | false | Whether document content blocks are forwarded |
 | `tool_use.enabled` | false | Whether tool definitions are forwarded |
 | `ptc.enabled` | false | Whether Programmatic Tool Calling is enabled |
@@ -502,7 +516,7 @@ src/
 │   ├── backend_pool/    # Backend instance pool & load balancing
 │   ├── ptc/             # Programmatic Tool Calling (sandboxed execution)
 │   ├── web_tools/       # Web search, fetch, and Dynamic Filtering (agentic loop)
-│   ├── bedrock.rs       # AWS Bedrock service (InvokeModel for Claude; Converse for non-Claude /v1/chat/completions; Bedrock Mantle for non-Claude /v1/messages)
+│   ├── bedrock.rs       # AWS Bedrock service (InvokeModel for Claude; Converse for non-Claude; Mantle Responses for GPT-5.x)
 │   ├── gemini.rs        # Google Gemini service
 │   ├── passthrough.rs   # Anthropic & OpenAI passthrough service
 │   ├── failover.rs      # Model-level credential-exhaustion failover

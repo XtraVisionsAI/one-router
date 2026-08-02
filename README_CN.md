@@ -29,13 +29,15 @@ One Router 是一个用 Rust 编写的高性能 API 网关，让你通过**一�
 - **用量查询 API** — 通过 `GET /v1/usage`（按小时或模型聚合统计）和 `GET /v1/usage/records`（分页原始记录）查询自己的 token 用量和费用历史
 - **智能模型映射** — 跨提供商映射模型名称（如 `gpt-4o` → Claude Sonnet、`claude-*` → Bedrock），支持精确匹配、通配符和优先级配置
 - **后端池与负载均衡** — 每个后端记录是独立的服务实例，同类型多实例通过轮询、加权、随机或故障转移策略做负载均衡
+- **后端模型亲和** — 每个后端可声明 `models` 过滤器（通配符 + `!` 排除，如 `["*", "!openai.*"]`），让同类型不同区域的后端各自服务不同模型
 - **模型级故障转移** — 可配置的 failover 链，当主 provider 无健康凭证时自动切换到备用 provider/模型
-- **价格自动同步** — 可选地按计划从 LiteLLM 价表同步各模型价格；手动定价的映射会被固定，不会被覆盖
+- **Bedrock GPT-5.x（Mantle Responses）** — Bedrock 上仅支持 Responses 协议的 GPT-5.x 模型，三个对话端点全部可用：`/v1/responses` 原生透传，`/v1/messages`（Claude Code）与 `/v1/chat/completions` 一跳协议转换
+- **价格自动同步** — 可选地按计划从 LiteLLM 价表同步各模型价格；手动定价的映射会被固定，不会被覆盖。Admin 界面支持从 LiteLLM 目录浏览并导入新模型映射
 - **可插拔存储** — SQLite（零配置）、PostgreSQL 或 DynamoDB — 一个环境变量切换
 - **API Key 管理** — 发放 API Key，支持独立的速率限制、预算上限和服务等级；Master key 仅限管理用途（不能调用业务 API）
 - **Admin 会话认证** — 管理界面使用 HttpOnly cookie 会话登录，浏览器不存储任何密钥
 - **流式响应** — 完整支持 OpenAI 和 Anthropic 协议的 SSE 流式传输
-- **扩展思维** — 每模型扩展思维支持，含推理风格配置（Claude、Nova 2、Kimi）
+- **扩展思维** — 每模型扩展思维支持，含推理风格配置（Claude、Nova 2、Kimi、GPT effort 风格）
 - **工具调用与 PTC** — 支持工具调用，包括带沙箱代码执行的 Programmatic Tool Calling
 - **Web 搜索与抓取** — 代理侧 Web 搜索（Tavily/Brave）与页面抓取，支持 agentic loop、流式输出、引用后处理和 Dynamic Filtering（v2 工具版本支持 loop 内代码执行）
 - **模型能力配置** — 在模型映射中声明每个模型支持的能力（思维、文档、工具调用、PTC）；全局默认值可通过 Settings 配置
@@ -172,6 +174,8 @@ curl -N http://localhost:8000/v1/responses \
 ```
 
 多轮对话是有状态的：把上一次响应的 `id` 作为 `previous_response_id` 传入即可续接（已存储的响应绑定创建它的 API Key）。若要让 Codex CLI 接入 One Router，将其 base URL 设为 `http://localhost:8000/v1` 并使用你的 API Key。
+
+> **Bedrock GPT-5.x：** Bedrock 上的 GPT-5.x 模型只支持 Responses 协议（无 Converse API）。当映射目标为此类模型（`openai.gpt-5*`）时，`/v1/responses` 将原始请求透传到 Bedrock Mantle Responses 端点并原生转发 SSE，`/v1/messages` 与 `/v1/chat/completions` 则通过内置一跳协议转换调用同一模型 —— 包括 Claude Code 的思维签名往返。注意这些模型有区域限制（如 sol 仅 us-east-1/us-east-2），Bedrock 后端凭证的区域必须匹配 —— 可配合后端 `models` 过滤器让 GPT 模型只落到对应区域的后端。
 
 ### Embeddings（OpenAI SDK）
 
@@ -329,8 +333,8 @@ One Router 内置了一个 Admin 管理界面，访问地址：**`/admin`**。�
 |---|---|
 | **Dashboard** | 概览：后端健康状态、API Key 数量、运行时长 |
 | **API Keys** | 创建 Key（明文仅展示一次）、编辑速率限制和预算、停用 / 激活 |
-| **Backends** | 新增 / 编辑后端（Gemini、Anthropic、OpenAI、Bedrock）— 明文输入凭证，保存时自动加密 |
-| **Model Maps** | 管理源模型 → 目标模型映射规则、优先级、定价和每模型能力配置 |
+| **Backends** | 新增 / 编辑后端（Gemini、Anthropic、OpenAI、Bedrock）— 明文输入凭证，保存时自动加密；可选的模型过滤器 |
+| **Model Maps** | 管理源模型 → 目标模型映射规则、优先级、定价和每模型能力配置；从 LiteLLM 价表导入模型 |
 | **Usage** | 按 API Key、时间范围和分组方式查询用量统计 |
 | **Settings** | 配置默认模型能力（工具调用、思维、文档、PTC）、速率限制和缓存行为。修改即时生效 |
 
@@ -350,6 +354,7 @@ One Router 使用环境变量配置基础设施。所有运行时设置存储在
 | `LOG_LEVEL` | `info` | 日志级别：`trace`、`debug`、`info`、`warn`、`error` |
 | `MASTER_API_KEY` | _(自动生成)_ | 管理专用 API Key — 用于 `/admin` 界面登录和管理 API，不能调用 `/v1/*` 业务端点。裸机首次运行时自动生成并保存到 `.env` |
 | `ENCRYPTION_KEY` | _(自动生成)_ | AES-256 密钥，用于凭证加密和 API Key HMAC — 首次运行时自动生成 |
+| `SEED_DEFAULTS` | `empty` | 启动时何时植入默认模型映射：`off`（从不）、`empty`（仅当映射表为空 — 用户删除不会被复活）或 `missing`（每次启动补齐缺失的默认项） |
 
 **首次运行行为：**
 - **裸机部署：** 缺失的 `MASTER_API_KEY` 或 `ENCRYPTION_KEY` 会自动生成并保存到 `.env` 文件。
@@ -374,6 +379,15 @@ DATABASE=dynamodb://us-east-1
 
 后端凭证通过 Admin 管理界面（`/admin` -> Backends 页面）管理。凭证使用 AES-256-GCM 静态加密存储。
 
+Bedrock 后端支持显式 access key、命名 AWS profile（含 SSO）或默认凭证链（环境变量、EC2/ECS 实例角色）— 所有凭证形式在全部请求路径上可用，包括 GPT 模型的 Mantle 端点。
+
+每个后端可选声明一个**模型过滤器** — 与目标模型 ID 匹配的通配符模式列表，`!` 前缀表示排除。这让同类型不同区域的后端按模型分流，例如：
+
+- `bedrock-ap-northeast-1`：`["*", "!openai.*"]` — 服务除 GPT 外的所有模型
+- `bedrock-us-east-1`：`["openai.gpt-5*"]` — 专供 GPT-5.x（仅存在于美国区域）
+
+过滤器为空表示服务所有模型。排除规则始终优先；符合条件的后端中优先选择匹配最精确的一组，组内做负载均衡。
+
 ## 架构
 
 ```
@@ -397,7 +411,7 @@ DATABASE=dynamodb://us-east-1
   OpenAI SDK ──────►  /v1/embeddings                     │──► AWS Bedrock
   Cohere SDK ──────►  /v1/rerank                         │──► AWS Bedrock
   OpenAI SDK ──────►  /v1/images/generations             │──► OpenAI / Bedrock / Gemini
-  Codex CLI ───────►  /v1/responses                      │──► （翻译到 chat 后端）
+  Codex CLI ───────►  /v1/responses                      │──► （翻译到 chat 后端，或 Mantle 透传）
                     │                                      │
                ─────►  GET /v1/usage                     │  （用量聚合统计）
                ─────►  GET /v1/usage/records             │  （分页原始记录）
@@ -477,7 +491,7 @@ Bedrock 和 Gemini 仅返回 `b64_json` 格式；OpenAI 透传同时支持 `url`
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `thinking.enabled` | false | 是否转发扩展思维 / 推理请求 |
-| `thinking.style` | `claude` | 思维表达方式：`claude`（原生）、`nova2`、`kimi` |
+| `thinking.style` | `claude` | 思维表达方式：`claude`（原生）、`nova2`、`kimi` 或 `effort`（GPT-OSS / o 系列的 reasoning effort） |
 | `document.enabled` | false | 是否转发文档内容块 |
 | `tool_use.enabled` | false | 是否转发工具定义 |
 | `ptc.enabled` | false | 是否启用 Programmatic Tool Calling |
@@ -506,7 +520,7 @@ src/
 │   ├── backend_pool/    # 后端实例池与负载均衡
 │   ├── ptc/             # Programmatic Tool Calling（沙箱执行）
 │   ├── web_tools/       # Web 搜索、抓取和 Dynamic Filtering（agentic loop）
-│   ├── bedrock.rs       # AWS Bedrock 服务（Claude 用 InvokeModel；非 Claude /v1/chat/completions 用 Converse；非 Claude /v1/messages 用 Bedrock Mantle）
+│   ├── bedrock.rs       # AWS Bedrock 服务（Claude 用 InvokeModel；非 Claude 用 Converse；GPT-5.x 用 Mantle Responses）
 │   ├── gemini.rs        # Google Gemini 服务
 │   ├── passthrough.rs   # Anthropic & OpenAI 透传服务
 │   ├── failover.rs      # 模型级凭证耗尽故障转移
