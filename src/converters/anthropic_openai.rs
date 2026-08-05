@@ -783,8 +783,12 @@ impl OpenAIToAnthropicConverter {
             other => other,
         };
 
-        // Convert tool_choice
-        let tool_choice = self.convert_tool_choice(&request.tool_choice)?;
+        // Convert tool_choice — Anthropic rejects tool_choice without tools,
+        // and some clients send a default tool_choice on tool-less requests
+        let tool_choice = match &tools {
+            Some(t) if !t.is_empty() => self.convert_tool_choice(&request.tool_choice)?,
+            _ => None,
+        };
 
         Ok(MessageRequest {
             model: target_model_id.to_string(),
@@ -1459,6 +1463,71 @@ mod tests {
         };
         let result = converter.convert_request(&request, "claude-3-5-sonnet-20241022");
         assert!(result.is_err());
+    }
+
+    fn tool_choice_request(
+        tools: Option<Vec<crate::schemas::openai::Tool>>,
+    ) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: Some(MessageContent::Text("Hello".to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            temperature: None,
+            max_tokens: Some(512),
+            max_completion_tokens: None,
+            stream: false,
+            stream_options: None,
+            top_p: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools,
+            tool_choice: Some(crate::schemas::openai::ToolChoice::Mode("auto".to_string())),
+            response_format: None,
+            seed: None,
+            user: None,
+            n: None,
+            logprobs: None,
+            top_logprobs: None,
+            service_tier: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_tool_choice_dropped_without_tools() {
+        let converter = OpenAIToAnthropicConverter::new();
+        let result = converter
+            .convert_request(&tool_choice_request(None), "claude-3-5-sonnet-20241022")
+            .unwrap();
+        assert!(result.tool_choice.is_none());
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_tool_choice_serializes_as_object() {
+        let converter = OpenAIToAnthropicConverter::new();
+        let tools = vec![crate::schemas::openai::Tool {
+            tool_type: "function".to_string(),
+            function: crate::schemas::openai::FunctionDef {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: None,
+                strict: None,
+            },
+        }];
+        let result = converter
+            .convert_request(
+                &tool_choice_request(Some(tools)),
+                "claude-3-5-sonnet-20241022",
+            )
+            .unwrap();
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["tool_choice"], serde_json::json!({"type": "auto"}));
     }
 }
 

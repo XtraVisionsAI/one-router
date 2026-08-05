@@ -431,7 +431,11 @@ impl Default for CodeExecutionTool {
 }
 
 /// Tool choice configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Deserialization is lenient (a bare `"auto"`/`"any"` string is accepted),
+/// but the Anthropic API only accepts the object form on the wire, so
+/// serialization always emits `{"type": "..."}`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ToolChoice {
     Auto(String), // "auto" or "any"
@@ -441,6 +445,29 @@ pub enum ToolChoice {
         name: String,
     },
     Object(serde_json::Value), // Generic object form
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            ToolChoice::Auto(mode) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("type", mode)?;
+                map.end()
+            }
+            ToolChoice::Specific { choice_type, name } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", choice_type)?;
+                map.serialize_entry("name", name)?;
+                map.end()
+            }
+            ToolChoice::Object(value) => value.serialize(serializer),
+        }
+    }
 }
 
 // ============================================================================
@@ -1054,5 +1081,42 @@ mod tests {
         let json = r#"{"model":"claude-3-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":100}"#;
         let req: MessageRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.service_tier, None);
+    }
+
+    #[test]
+    fn test_tool_choice_auto_serializes_as_object() {
+        // The Anthropic API rejects a bare string — Auto must serialize as {"type": ...}
+        let auto = ToolChoice::Auto("auto".to_string());
+        assert_eq!(
+            serde_json::to_value(&auto).unwrap(),
+            serde_json::json!({"type": "auto"})
+        );
+
+        // Lenient deserialization: a bare string round-trips into the object form
+        let parsed: ToolChoice = serde_json::from_str(r#""any""#).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::json!({"type": "any"})
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_specific_and_object_serialization() {
+        let specific = ToolChoice::Specific {
+            choice_type: "tool".to_string(),
+            name: "get_weather".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&specific).unwrap(),
+            serde_json::json!({"type": "tool", "name": "get_weather"})
+        );
+
+        let object = ToolChoice::Object(
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+        );
+        assert_eq!(
+            serde_json::to_value(&object).unwrap(),
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
     }
 }
