@@ -1,3 +1,9 @@
+## v0.28.2 (2026-08-05)
+
+### Fix
+
+- **converters**: serialize Anthropic tool_choice as object and drop it without tools
+
 ## v0.28.1 (2026-08-02)
 
 ### Fix
