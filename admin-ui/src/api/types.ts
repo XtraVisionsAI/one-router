@@ -66,14 +66,14 @@ export interface UpdateKeyBody {
 export interface ModelCapabilities {
   thinking: { enabled: boolean; style: 'claude' | 'nova2' | 'kimi' | 'effort' }
   document: { enabled: boolean }
-  tool_use: { enabled: boolean }
+  tool_use: { enabled: boolean; required_choice: boolean }
   ptc: { enabled: boolean }
 }
 
 export const defaultCapabilities = (): ModelCapabilities => ({
   thinking: { enabled: true, style: 'claude' },
   document: { enabled: true },
-  tool_use: { enabled: true },
+  tool_use: { enabled: true, required_choice: true },
   ptc: { enabled: false }
 })
 

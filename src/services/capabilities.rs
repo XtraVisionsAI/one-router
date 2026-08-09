@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub struct ModelCapabilities {
     pub thinking: ThinkingCapability,
     pub document: SimpleCapability,
-    pub tool_use: SimpleCapability,
+    pub tool_use: ToolUseCapability,
     pub ptc: SimpleCapability,
 }
 
@@ -27,7 +27,7 @@ impl Default for ModelCapabilities {
         Self {
             thinking: ThinkingCapability::default(),
             document: SimpleCapability { enabled: false },
-            tool_use: SimpleCapability { enabled: false },
+            tool_use: ToolUseCapability::default(),
             ptc: SimpleCapability { enabled: false },
         }
     }
@@ -54,6 +54,28 @@ impl Default for ThinkingCapability {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SimpleCapability {
     pub enabled: bool,
+}
+
+/// Tool-use capability — enabled flag plus a sub-flag for `tool_choice: "required"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolUseCapability {
+    pub enabled: bool,
+    /// Whether the backend accepts OpenAI `tool_choice: "required"`.
+    /// Older vLLM/SGLang-style backends only accept "none"/"auto"/named-function
+    /// and reject "required" with a 400. When false, the gateway downgrades
+    /// "required" to "auto" before forwarding to an OpenAI backend.
+    /// Defaults to true so existing configurations keep passthrough behavior.
+    pub required_choice: bool,
+}
+
+impl Default for ToolUseCapability {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            required_choice: true,
+        }
+    }
 }
 
 /// How the model expresses extended thinking in the request body.
@@ -121,6 +143,17 @@ mod tests {
         assert_eq!(caps.thinking.style, ThinkingStyle::Nova2);
         assert!(!caps.document.enabled);
         assert!(!caps.tool_use.enabled);
+        // required_choice defaults to true when absent from stored JSON
+        assert!(caps.tool_use.required_choice);
+    }
+
+    #[test]
+    fn from_json_tool_use_required_choice_opt_out() {
+        let caps = ModelCapabilities::from_json(Some(
+            r#"{"tool_use": {"enabled": true, "required_choice": false}}"#,
+        ));
+        assert!(caps.tool_use.enabled);
+        assert!(!caps.tool_use.required_choice);
     }
 
     #[test]

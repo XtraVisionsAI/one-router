@@ -26,7 +26,9 @@ pub use backend_pool::{
 pub use bedrock::{
     BedrockError, BedrockService, BedrockStreamError, ConverseRequest, ConverseStreamResponse,
 };
-pub use capabilities::{ModelCapabilities, SimpleCapability, ThinkingCapability, ThinkingStyle};
+pub use capabilities::{
+    ModelCapabilities, SimpleCapability, ThinkingCapability, ThinkingStyle, ToolUseCapability,
+};
 pub use gemini::{GeminiConfig, GeminiService, GeminiServiceError, GeminiStream};
 pub use model_mapping::{ModelMappingService, ModelNotFoundError, ResolvedModel};
 pub use passthrough::{PassthroughConfig, PassthroughError, PassthroughService, PassthroughTarget};

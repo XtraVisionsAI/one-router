@@ -784,7 +784,7 @@ async fn load_default_capabilities(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
 ) -> crate::services::capabilities::ModelCapabilities {
     use crate::services::capabilities::{
-        ModelCapabilities, SimpleCapability, ThinkingCapability, ThinkingStyle,
+        ModelCapabilities, SimpleCapability, ThinkingCapability, ThinkingStyle, ToolUseCapability,
     };
     ModelCapabilities {
         thinking: ThinkingCapability {
@@ -794,8 +794,9 @@ async fn load_default_capabilities(
         document: SimpleCapability {
             enabled: load_bool_setting(database, "enable_document_support", true).await,
         },
-        tool_use: SimpleCapability {
+        tool_use: ToolUseCapability {
             enabled: load_bool_setting(database, "enable_tool_use", true).await,
+            ..ToolUseCapability::default()
         },
         ptc: SimpleCapability {
             enabled: load_bool_setting(database, "enable_ptc", false).await,

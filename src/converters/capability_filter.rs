@@ -6,6 +6,7 @@
 //! when the mapping has no explicit configuration.
 
 use crate::schemas::anthropic::{ContentBlock, MessageContent, MessageRequest};
+use crate::schemas::openai::{ChatCompletionRequest, ToolChoice};
 use crate::services::capabilities::ModelCapabilities;
 
 /// Apply capability constraints to a request, returning a filtered clone.
@@ -54,12 +55,26 @@ pub fn apply_capabilities(request: &MessageRequest, caps: &ModelCapabilities) ->
     req
 }
 
+/// Downgrade OpenAI `tool_choice: "required"` to `"auto"` when the target
+/// model's backend does not accept the "required" mode
+/// (`ToolUseCapability::required_choice` is false). Older vLLM/SGLang-style
+/// backends only accept "none"/"auto"/named-function and 400 on "required".
+pub fn apply_openai_tool_choice(request: &mut ChatCompletionRequest, caps: &ModelCapabilities) {
+    if caps.tool_use.required_choice {
+        return;
+    }
+    if matches!(&request.tool_choice, Some(ToolChoice::Mode(mode)) if mode == "required") {
+        tracing::debug!("Downgrading tool_choice 'required' to 'auto' (backend capability)");
+        request.tool_choice = Some(ToolChoice::Mode("auto".to_string()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schemas::anthropic::{DocumentSource, Message, MessageContent, ThinkingConfig};
     use crate::services::capabilities::{
-        ModelCapabilities, SimpleCapability, ThinkingCapability, ThinkingStyle,
+        ModelCapabilities, SimpleCapability, ThinkingCapability, ThinkingStyle, ToolUseCapability,
     };
 
     fn caps_all_enabled() -> ModelCapabilities {
@@ -69,7 +84,10 @@ mod tests {
                 style: ThinkingStyle::Claude,
             },
             document: SimpleCapability { enabled: true },
-            tool_use: SimpleCapability { enabled: true },
+            tool_use: ToolUseCapability {
+                enabled: true,
+                required_choice: true,
+            },
             ptc: SimpleCapability { enabled: false },
         }
     }
@@ -86,7 +104,10 @@ mod tests {
 
     fn caps_no_tools() -> ModelCapabilities {
         ModelCapabilities {
-            tool_use: SimpleCapability { enabled: false },
+            tool_use: ToolUseCapability {
+                enabled: false,
+                required_choice: true,
+            },
             ..caps_all_enabled()
         }
     }
@@ -181,5 +202,56 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, ContentBlock::Document { .. })));
         }
+    }
+
+    // ---- tool_choice "required" downgrade ----
+
+    fn caps_no_required_choice() -> ModelCapabilities {
+        ModelCapabilities {
+            tool_use: ToolUseCapability {
+                enabled: true,
+                required_choice: false,
+            },
+            ..caps_all_enabled()
+        }
+    }
+
+    fn chat_request_with_tool_choice(tool_choice: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "tool_choice": tool_choice,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn required_downgraded_to_auto_when_unsupported() {
+        let mut req = chat_request_with_tool_choice(serde_json::json!("required"));
+        apply_openai_tool_choice(&mut req, &caps_no_required_choice());
+        assert!(matches!(&req.tool_choice, Some(ToolChoice::Mode(m)) if m == "auto"));
+    }
+
+    #[test]
+    fn required_kept_when_supported() {
+        let mut req = chat_request_with_tool_choice(serde_json::json!("required"));
+        apply_openai_tool_choice(&mut req, &caps_all_enabled());
+        assert!(matches!(&req.tool_choice, Some(ToolChoice::Mode(m)) if m == "required"));
+    }
+
+    #[test]
+    fn auto_and_named_choice_untouched_when_unsupported() {
+        let mut req = chat_request_with_tool_choice(serde_json::json!("auto"));
+        apply_openai_tool_choice(&mut req, &caps_no_required_choice());
+        assert!(matches!(&req.tool_choice, Some(ToolChoice::Mode(m)) if m == "auto"));
+
+        let mut req = chat_request_with_tool_choice(
+            serde_json::json!({"type": "function", "function": {"name": "f"}}),
+        );
+        apply_openai_tool_choice(&mut req, &caps_no_required_choice());
+        assert!(matches!(
+            &req.tool_choice,
+            Some(ToolChoice::Function { .. })
+        ));
     }
 }

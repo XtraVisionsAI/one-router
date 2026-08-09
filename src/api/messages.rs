@@ -485,6 +485,7 @@ pub async fn create_message(
                 &state,
                 &filtered_request,
                 &resolved.target_model_id,
+                effective_caps,
                 &request_id,
                 &usage_ctx,
                 start_time,
@@ -1176,6 +1177,7 @@ async fn handle_openai_backend(
     state: &AppState,
     request: &MessageRequest,
     target_model_id: &str,
+    caps: &crate::services::ModelCapabilities,
     request_id: &str,
     usage_ctx: &UsageContext,
     start_time: Instant,
@@ -1205,6 +1207,10 @@ async fn handle_openai_backend(
     let mut openai_request = converter
         .convert_request(request, target_model_id)
         .map_err(|e| ApiError::bad_request(format!("Request conversion error: {e}")))?;
+
+    // Anthropic tool_choice "any" converts to OpenAI "required" — downgrade it
+    // when the backend doesn't accept that mode (ToolUseCapability::required_choice).
+    crate::converters::capability_filter::apply_openai_tool_choice(&mut openai_request, caps);
 
     // Resolve service_tier: backend config → map to OpenAI provider value
     openai_request.service_tier = crate::services::service_tier::resolve_for_provider(

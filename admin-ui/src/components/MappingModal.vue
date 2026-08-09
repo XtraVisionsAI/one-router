@@ -209,7 +209,12 @@
         </div>
 
         <NCheckbox v-model:checked="caps.document.enabled">Document Support</NCheckbox>
-        <NCheckbox v-model:checked="caps.tool_use.enabled">Tool Use</NCheckbox>
+        <div class="flex items-center gap-3">
+          <NCheckbox v-model:checked="caps.tool_use.enabled">Tool Use</NCheckbox>
+          <NCheckbox v-if="caps.tool_use.enabled" v-model:checked="caps.tool_use.required_choice">
+            <span class="text-xs">supports tool_choice "required"</span>
+          </NCheckbox>
+        </div>
         <NCheckbox v-model:checked="caps.ptc.enabled">PTC (Programmatic Tool Calling)</NCheckbox>
       </div>
     </div>

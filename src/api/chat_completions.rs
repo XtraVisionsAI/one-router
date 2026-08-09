@@ -411,6 +411,7 @@ pub(crate) async fn dispatch_chat(
             state,
             &request,
             &resolved.target_model_id,
+            &resolved.capabilities,
             request_id,
             headers,
             &usage_ctx,
@@ -1484,10 +1485,12 @@ async fn handle_anthropic_backend(
 // ============================================================================
 
 /// Handle request using OpenAI passthrough backend
+#[allow(clippy::too_many_arguments)]
 async fn handle_openai_passthrough(
     state: &AppState,
     request: &ChatCompletionRequest,
     target_model_id: &str,
+    caps: &Option<crate::services::ModelCapabilities>,
     request_id: &str,
     client_headers: &HeaderMap,
     usage_ctx: &UsageContext,
@@ -1511,9 +1514,16 @@ async fn handle_openai_passthrough(
     })?;
     let svc = &instance.service;
 
+    // Downgrade tool_choice "required" when the target model's backend does
+    // not accept the "required" mode (ToolUseCapability::required_choice).
+    let default_caps = state.dynamic.read().await.default_capabilities.clone();
+    let effective_caps = caps.as_ref().unwrap_or(&default_caps);
+    let mut request = request.clone();
+    crate::converters::capability_filter::apply_openai_tool_choice(&mut request, effective_caps);
+
     // Serialize the request and replace model with resolved target model id
-    let mut body_value =
-        serde_json::to_value(request).map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
+    let mut body_value = serde_json::to_value(&request)
+        .map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
     body_value["model"] = serde_json::Value::String(target_model_id.to_string());
 
     // Resolve service_tier: backend config → map to OpenAI provider value
