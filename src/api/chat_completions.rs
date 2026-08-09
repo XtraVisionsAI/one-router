@@ -591,10 +591,10 @@ async fn handle_bedrock_request(
                     for chunk_json in converter.convert_stream_chunk_to_openai(
                         &event_type, &data, &mut conv_state,
                     ) {
-                        yield Ok(Event::default().data(format!("data: {chunk_json}\n\n")));
+                        yield Ok(Event::default().data(chunk_json));
                     }
                 }
-                yield Ok(Event::default().data("data: [DONE]\n\n"));
+                yield Ok(Event::default().data("[DONE]"));
                 bedrock_clone.record_success(&cred_name);
 
                 tracing::debug!(
