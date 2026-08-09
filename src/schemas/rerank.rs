@@ -24,13 +24,20 @@ pub struct RerankRequest {
 // Response Types
 // ============================================================================
 
+/// The document payload attached to a rerank result (Cohere contract: an
+/// object with a `text` field, not a bare string).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RerankDocument {
+    pub text: String,
+}
+
 /// A single rerank result entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankResult {
     pub index: usize,
     pub relevance_score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub document: Option<String>,
+    pub document: Option<RerankDocument>,
 }
 
 /// Cohere-compatible Rerank API response.
@@ -89,7 +96,9 @@ mod tests {
                 RerankResult {
                     index: 0,
                     relevance_score: 0.95,
-                    document: Some("Paris is the capital.".to_string()),
+                    document: Some(RerankDocument {
+                        text: "Paris is the capital.".to_string(),
+                    }),
                 },
                 RerankResult {
                     index: 1,
@@ -106,7 +115,9 @@ mod tests {
         assert!((parsed.results[0].relevance_score - 0.95).abs() < f64::EPSILON);
         assert_eq!(
             parsed.results[0].document,
-            Some("Paris is the capital.".to_string())
+            Some(RerankDocument {
+                text: "Paris is the capital.".to_string()
+            })
         );
         assert_eq!(parsed.results[1].index, 1);
         assert!(parsed.results[1].document.is_none());

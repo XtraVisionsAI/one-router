@@ -7,7 +7,7 @@ use serde_json::json;
 use std::time::Instant;
 use uuid::Uuid;
 
-use crate::schemas::rerank::{RerankRequest, RerankResponse, RerankResult};
+use crate::schemas::rerank::{RerankDocument, RerankRequest, RerankResponse, RerankResult};
 use crate::server::state::AppState;
 
 use super::chat_completions::OpenAIApiError;
@@ -82,7 +82,8 @@ pub async fn create_rerank(
         .await
         .map_err(|e| OpenAIApiError::from_bedrock_error(&e))?;
 
-    // Parse Bedrock response: { "results": [{ "index": N, "relevanceScore": F }] }
+    // Parse Bedrock response. InvokeModel returns the model's native Cohere
+    // format: { "results": [{ "index": N, "relevance_score": F }] }
     let bedrock_response: serde_json::Value =
         serde_json::from_slice(&response_bytes).map_err(|e| {
             OpenAIApiError::internal_error(format!("Failed to parse rerank response: {e}"))
@@ -98,9 +99,16 @@ pub async fn create_rerank(
         .iter()
         .map(|r| {
             let index = r["index"].as_u64().unwrap_or(0) as usize;
-            let relevance_score = r["relevanceScore"].as_f64().unwrap_or(0.0);
+            let relevance_score = r["relevance_score"]
+                .as_f64()
+                // camelCase fallback for the Bedrock Agent Runtime Rerank shape
+                .or_else(|| r["relevanceScore"].as_f64())
+                .unwrap_or(0.0);
             let document = if return_documents {
-                request.documents.get(index).cloned()
+                request
+                    .documents
+                    .get(index)
+                    .map(|text| RerankDocument { text: text.clone() })
             } else {
                 None
             };
