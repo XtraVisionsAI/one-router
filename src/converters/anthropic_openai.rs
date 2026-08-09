@@ -727,31 +727,42 @@ impl OpenAIToAnthropicConverter {
         // Convert messages
         let messages = self.convert_messages(&chat_messages)?;
 
-        // Auto-inject cache_control on the last content block of the last user message
+        // Auto-inject cache_control on the last cacheable content block of the
+        // last user message. Anthropic rejects cache_control on empty text
+        // blocks, so skip those and never fabricate an empty block to carry it.
         let messages = {
             use crate::schemas::anthropic::CacheControl;
             let mut msgs = messages;
             if let Some(last_user) = msgs.iter_mut().rev().find(|m| m.role == "user") {
                 match &mut last_user.content {
                     MessageContent::Text(text) => {
-                        let text_val = text.clone();
-                        last_user.content = MessageContent::Blocks(vec![ContentBlock::Text {
-                            text: text_val,
-                            cache_control: Some(CacheControl::new()),
-                        }]);
+                        if !text.is_empty() {
+                            let text_val = text.clone();
+                            last_user.content = MessageContent::Blocks(vec![ContentBlock::Text {
+                                text: text_val,
+                                cache_control: Some(CacheControl::new()),
+                            }]);
+                        }
                     }
                     MessageContent::Blocks(blocks) => {
-                        if let Some(last_block) = blocks.last_mut() {
-                            match last_block {
-                                ContentBlock::Text { cache_control, .. } => {
+                        for block in blocks.iter_mut().rev() {
+                            match block {
+                                ContentBlock::Text {
+                                    text,
+                                    cache_control,
+                                } if !text.is_empty() => {
                                     *cache_control = Some(CacheControl::new());
+                                    break;
                                 }
-                                _ => {
-                                    blocks.push(ContentBlock::Text {
-                                        text: String::new(),
-                                        cache_control: Some(CacheControl::new()),
-                                    });
+                                ContentBlock::Image { cache_control, .. }
+                                | ContentBlock::Document { cache_control, .. }
+                                | ContentBlock::ToolResult { cache_control, .. } => {
+                                    *cache_control = Some(CacheControl::new());
+                                    break;
                                 }
+                                // Empty text blocks and block types without a
+                                // cache_control field: keep walking backwards.
+                                _ => {}
                             }
                         }
                     }
@@ -1585,6 +1596,16 @@ mod openai_to_anthropic_cache_tests {
         }
     }
 
+    fn tool_msg(tool_call_id: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: Some(OpenAIMessageContent::Text(text.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.to_string()),
+        }
+    }
+
     #[test]
     fn system_gets_cache_control_injected() {
         let req = make_request(vec![system_msg("Be helpful."), user_msg("Hi")]);
@@ -1619,6 +1640,47 @@ mod openai_to_anthropic_cache_tests {
                 }
             }
             MessageContent::Text(_) => panic!("Expected Blocks variant after cache injection"),
+        }
+    }
+
+    #[test]
+    fn tool_result_last_user_message_gets_cache_control_without_empty_text_block() {
+        // Tool results become user-role messages with a tool_result block; the
+        // cache injection must target that block instead of appending an empty
+        // text block (Anthropic rejects cache_control on empty text blocks).
+        let req = make_request(vec![user_msg("Hello"), tool_msg("call_1", "tool output")]);
+        let converter = OpenAIToAnthropicConverter::new();
+        let result = converter
+            .convert_request(&req, "claude-3-5-sonnet-20241022")
+            .unwrap();
+        let last_msg = result.messages.last().unwrap();
+        match &last_msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1, "no extra block should be appended");
+                match &blocks[0] {
+                    ContentBlock::ToolResult { cache_control, .. } => {
+                        assert!(cache_control.is_some());
+                    }
+                    _ => panic!("Expected ToolResult block"),
+                }
+            }
+            MessageContent::Text(_) => panic!("Expected Blocks variant"),
+        }
+    }
+
+    #[test]
+    fn empty_last_user_message_gets_no_cache_control() {
+        let req = make_request(vec![user_msg("")]);
+        let converter = OpenAIToAnthropicConverter::new();
+        let result = converter
+            .convert_request(&req, "claude-3-5-sonnet-20241022")
+            .unwrap();
+        let last_msg = result.messages.last().unwrap();
+        match &last_msg.content {
+            MessageContent::Text(text) => assert!(text.is_empty()),
+            MessageContent::Blocks(_) => {
+                panic!("Empty text must not be wrapped into a cache_control block")
+            }
         }
     }
 
