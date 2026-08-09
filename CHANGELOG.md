@@ -1,3 +1,9 @@
+## v0.29.0 (2026-08-09)
+
+### Feat
+
+- **capabilities**: add tool_use.required_choice for OpenAI backends lacking tool_choice "required"
+
 ## v0.28.2 (2026-08-05)
 
 ### Fix
