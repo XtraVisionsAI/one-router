@@ -1,3 +1,9 @@
+## v0.29.1 (2026-08-09)
+
+### Fix
+
+- **api**: remove double data: wrapping in Bedrock Claude OpenAI-compat streaming
+
 ## v0.29.0 (2026-08-09)
 
 ### Feat
