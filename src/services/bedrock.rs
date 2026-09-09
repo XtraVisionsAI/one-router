@@ -422,20 +422,22 @@ impl BedrockService {
     }
 
     /// Determine if a Bedrock model is only reachable through the Mantle
-    /// Responses API (`/v1/responses`). The GPT-5.x family has no Converse form
-    /// and Mantle's `/v1/chat/completions` rejects it (LiteLLM lists these under
-    /// `bedrock_mantle/` with mode `responses`). `openai.gpt-oss-*` supports
-    /// Converse and intentionally does not match.
+    /// Responses API (`/v1/responses`). The GPT-5.x and later families (gpt-6,
+    /// …) have no Converse form and Mantle's `/v1/chat/completions` rejects
+    /// them (LiteLLM lists these under `bedrock_mantle/` with mode
+    /// `responses`). `openai.gpt-oss-*` supports Converse and intentionally
+    /// does not match.
     ///
-    /// Hardcoded prefix list (same precedent as the `beta_headers` blocklist).
+    /// Cross-region inference-profile ids (`global.openai.gpt-6-astra`,
+    /// `us.openai.gpt-5.6-sol`) match too — the region prefix is stripped
+    /// before classification, while the invocation still uses the original id.
+    ///
     /// Keyed on the resolved target model id so the answer stays correct for
     /// failover targets, which bypass per-model capabilities.
     pub fn is_mantle_responses_model(target_model_id: &str) -> bool {
-        const RESPONSES_ONLY_PREFIXES: [&str; 1] = ["openai.gpt-5"];
         let lower = target_model_id.to_lowercase();
-        RESPONSES_ONLY_PREFIXES
-            .iter()
-            .any(|prefix| lower.starts_with(prefix))
+        let base = crate::services::pricing_sync::strip_region_prefix(&lower);
+        base.starts_with("openai.gpt-") && !base.starts_with("openai.gpt-oss")
     }
 
     /// Resolve an application inference profile ARN to its underlying model ARN
@@ -1834,9 +1836,23 @@ mod tests {
         ));
         assert!(BedrockService::is_mantle_responses_model("openai.gpt-5.4"));
         assert!(BedrockService::is_mantle_responses_model("OpenAI.GPT-5.5"));
+        // Later generations (gpt-6, …) are Responses-only too, including
+        // cross-region inference-profile ids.
+        assert!(BedrockService::is_mantle_responses_model(
+            "openai.gpt-6-astra"
+        ));
+        assert!(BedrockService::is_mantle_responses_model(
+            "global.openai.gpt-6-astra"
+        ));
+        assert!(BedrockService::is_mantle_responses_model(
+            "us.openai.gpt-5.6-sol"
+        ));
         // gpt-oss supports Converse; Claude and Nova are unaffected
         assert!(!BedrockService::is_mantle_responses_model(
             "openai.gpt-oss-120b-1:0"
+        ));
+        assert!(!BedrockService::is_mantle_responses_model(
+            "us.openai.gpt-oss-120b-1:0"
         ));
         assert!(!BedrockService::is_mantle_responses_model(
             "global.anthropic.claude-sonnet-5"
