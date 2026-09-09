@@ -1,3 +1,15 @@
+## v0.30.0 (2026-09-09)
+
+### Feat
+
+- **services**: route Responses API calls to runtime or Mantle host by model id form
+
+### Fix
+
+- **services**: detect gpt-6 and region-prefixed ids as Mantle Responses-only
+- **api**: return Cohere-shaped rerank documents and read correct score field
+- **converters**: never inject cache_control onto empty text blocks
+
 ## v0.29.1 (2026-08-09)
 
 ### Fix
