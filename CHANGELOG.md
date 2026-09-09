@@ -1,3 +1,9 @@
+## v0.30.1 (2026-09-09)
+
+### Fix
+
+- **services**: strip the whole refusal-fallback surface before Bedrock InvokeModel
+
 ## v0.30.0 (2026-09-09)
 
 ### Feat
