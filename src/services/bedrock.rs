@@ -711,7 +711,7 @@ impl BedrockService {
 
         let (cred_name, response) = self
             .mantle_post(
-                MantleHost::Mantle,
+                MantleHost::for_responses(&target_model_id),
                 "/openai/v1/responses",
                 body,
                 &target_model_id,
@@ -729,7 +729,7 @@ impl BedrockService {
 
         if !response.status().is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(mantle_http_error(status, text));
+            return Err(mantle_http_error(status, text, &target_model_id));
         }
 
         response
@@ -739,8 +739,11 @@ impl BedrockService {
     }
 
     /// Call the Bedrock Mantle Responses API (`/v1/responses`) streaming.
-    /// Returns the raw SSE byte stream — already Responses-protocol SSE with
-    /// `event:` lines and `sequence_number`s; the caller relays frames.
+    /// Returns the raw SSE byte stream — Responses-protocol SSE frames whose
+    /// payloads carry `type` + `sequence_number` (the Mantle host also sends
+    /// `event:` lines; the runtime host sends `data:`-only frames plus a
+    /// trailing `data: [DONE]`) — the caller's frame parser handles both and
+    /// re-emits normalized events.
     pub async fn mantle_responses_stream(
         &self,
         responses_request: &serde_json::Value,
@@ -757,7 +760,7 @@ impl BedrockService {
 
         let (cred_name, response) = self
             .mantle_post(
-                MantleHost::Mantle,
+                MantleHost::for_responses(&target_model_id),
                 "/openai/v1/responses",
                 body,
                 &target_model_id,
@@ -772,7 +775,7 @@ impl BedrockService {
                 self.record_failure(&cred_name);
             }
             let text = response.text().await.unwrap_or_default();
-            return Err(mantle_http_error(status, text));
+            return Err(mantle_http_error(status, text, &target_model_id));
         }
         self.record_success(&cred_name);
 
@@ -781,11 +784,15 @@ impl BedrockService {
 }
 
 /// Which Bedrock OpenAI-compatible host to call. The classic runtime host
-/// serves `/openai/v1/chat/completions`; the dedicated Mantle host serves the
-/// Responses API (the GPT-5.x family lives only there). Both accept SigV4
-/// with service name "bedrock" (verified 2026-07-30). The paths REQUIRE the
-/// `/openai` prefix — without it bedrock-runtime answers HTTP 200 with a coral
-/// `UnknownOperationException` body that then fails response parsing.
+/// serves `/openai/v1/chat/completions` plus the Responses API for models
+/// invoked through a cross-region inference profile id (`global.`/`us.`/…);
+/// the dedicated Mantle host serves the Responses API for bare model ids
+/// (gpt-5.4/5.5 live only there — verified 2026-09-09, they have no profile
+/// form, while gpt-6+ exists only behind a profile id on the runtime host).
+/// Both accept SigV4 with service name "bedrock" (verified 2026-07-30 /
+/// 2026-09-09). The paths REQUIRE the `/openai` prefix — without it
+/// bedrock-runtime answers HTTP 200 with a coral `UnknownOperationException`
+/// body that then fails response parsing.
 enum MantleHost {
     Runtime,
     Mantle,
@@ -798,13 +805,31 @@ impl MantleHost {
             MantleHost::Mantle => format!("bedrock-mantle.{region}.api.aws"),
         }
     }
+
+    /// Select the host for a Responses API call from the target model id's
+    /// form: a Bedrock region/inference-profile prefix (`global.`, `us.`, …)
+    /// means the runtime host (which only accepts profile ids), a bare id
+    /// means the Mantle host (which only accepts bare ids). The id itself is
+    /// sent as-is either way.
+    fn for_responses(target_model_id: &str) -> Self {
+        use crate::services::pricing_sync::strip_region_prefix;
+        if strip_region_prefix(target_model_id).len() != target_model_id.len() {
+            MantleHost::Runtime
+        } else {
+            MantleHost::Mantle
+        }
+    }
 }
 
 /// Map a Mantle HTTP error to a typed BedrockError, extracting the OpenAI-style
 /// `error.message` when the body is a JSON error object so the client sees the
 /// upstream message instead of a wrapped blob.
-fn mantle_http_error(status: u16, body: String) -> BedrockError {
-    let message = serde_json::from_str::<serde_json::Value>(&body)
+///
+/// A 404 for a bare `openai.gpt-*` id gets a routing hint appended: newer GPT
+/// models exist only behind a cross-region inference profile on the runtime
+/// host, so the fix is a `global.`-prefixed target model id, not a retry.
+fn mantle_http_error(status: u16, body: String, target_model_id: &str) -> BedrockError {
+    let mut message = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| {
             v.get("error")?
@@ -813,6 +838,18 @@ fn mantle_http_error(status: u16, body: String) -> BedrockError {
                 .map(|s| s.to_string())
         })
         .unwrap_or(body);
+    let is_bare_gpt_id = {
+        use crate::services::pricing_sync::strip_region_prefix;
+        strip_region_prefix(target_model_id).len() == target_model_id.len()
+            && target_model_id.to_lowercase().starts_with("openai.gpt-")
+    };
+    if status == 404 && is_bare_gpt_id {
+        message.push_str(&format!(
+            " (hint: this model may only be served through a cross-region \
+             inference profile — set the mapping's target model id to \
+             'global.{target_model_id}')"
+        ));
+    }
     match status {
         429 => BedrockError::Throttled(message),
         400..=499 => BedrockError::ValidationError(message),
@@ -1691,7 +1728,7 @@ impl BedrockError {
 
 #[cfg(test)]
 mod tests {
-    use super::{mantle_http_error, BedrockError, BedrockService};
+    use super::{mantle_http_error, BedrockError, BedrockService, MantleHost};
 
     #[test]
     fn test_ensure_anthropic_beta() {
@@ -1869,6 +1906,7 @@ mod tests {
         let err = mantle_http_error(
             400,
             r#"{"error":{"message":"The provided model identifier is invalid.","type":"invalid_request_error"}}"#.to_string(),
+            "global.openai.gpt-5.5",
         );
         match err {
             BedrockError::ValidationError(msg) => {
@@ -1879,14 +1917,63 @@ mod tests {
 
         // 429 → Throttled
         assert!(matches!(
-            mantle_http_error(429, r#"{"error":{"message":"slow down"}}"#.to_string()),
+            mantle_http_error(
+                429,
+                r#"{"error":{"message":"slow down"}}"#.to_string(),
+                "openai.gpt-5.5"
+            ),
             BedrockError::Throttled(_)
         ));
 
         // 5xx / non-JSON body → Unknown, body carried verbatim
         assert!(matches!(
-            mantle_http_error(500, "gateway exploded".to_string()),
+            mantle_http_error(500, "gateway exploded".to_string(), "openai.gpt-5.5"),
             BedrockError::Unknown(_)
+        ));
+
+        // Mantle 404 on a bare gpt id → hint to use an inference profile id
+        let err = mantle_http_error(
+            404,
+            r#"{"error":{"message":"The model 'openai.gpt-6-astra' does not exist","code":"not_found_error"}}"#.to_string(),
+            "openai.gpt-6-astra",
+        );
+        match err {
+            BedrockError::ValidationError(msg) => {
+                assert!(msg.contains("global.openai.gpt-6-astra"), "msg: {msg}")
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+
+        // No hint for prefixed ids or non-GPT models
+        match mantle_http_error(404, "{}".to_string(), "global.openai.gpt-6-astra") {
+            BedrockError::ValidationError(msg) => assert!(!msg.contains("hint")),
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+        match mantle_http_error(404, "{}".to_string(), "qwen.qwen3-coder") {
+            BedrockError::ValidationError(msg) => assert!(!msg.contains("hint")),
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mantle_host_for_responses() {
+        // Bare ids → dedicated Mantle host (only place gpt-5.4/5.5 exist)
+        assert!(matches!(
+            MantleHost::for_responses("openai.gpt-5.5"),
+            MantleHost::Mantle
+        ));
+        assert!(matches!(
+            MantleHost::for_responses("openai.gpt-5.6-sol"),
+            MantleHost::Mantle
+        ));
+        // Inference-profile ids → runtime host (only place gpt-6 exists)
+        assert!(matches!(
+            MantleHost::for_responses("global.openai.gpt-6-astra"),
+            MantleHost::Runtime
+        ));
+        assert!(matches!(
+            MantleHost::for_responses("us.openai.gpt-5.6-sol"),
+            MantleHost::Runtime
         ));
     }
 }
