@@ -24,8 +24,14 @@ const BEDROCK_BETA_BLOCKLIST: &[&str] = &[
     "redact-thinking-2026-02-12",
     "advisor-tool-2026-03-01",
     "thinking-token-count-2026-05-13",
-    // Server-side fallbacks are unavailable on Bedrock.
+    // Server-side fallbacks are unavailable on Bedrock. (Bedrock InvokeModel
+    // tolerated this header value on 2026-09-09 but does not implement the
+    // feature, so it is still dropped for clarity.)
     "server-side-fallback-2026-06-01",
+    // Refusal-fallback credit: Bedrock rejects the header value outright
+    // ("Unexpected value(s) `fallback-credit-2026-06-09` for the
+    // `anthropic-beta` header", verified 2026-09-09).
+    "fallback-credit-2026-06-09",
 ];
 
 /// Aggregate betas Bedrock rejects, mapped to the granular native betas they
@@ -97,6 +103,12 @@ mod tests {
         // Mixed: blocklisted dropped, other passed through.
         let out = resolve_bedrock_betas(
             Some("server-side-fallback-2026-06-01, some-other-beta"),
+            "claude-sonnet",
+        );
+        assert_eq!(out, vec!["some-other-beta"]);
+        // Refusal-fallback credit beta is rejected by Bedrock → dropped.
+        let out = resolve_bedrock_betas(
+            Some("fallback-credit-2026-06-09,some-other-beta"),
             "claude-sonnet",
         );
         assert_eq!(out, vec!["some-other-beta"]);

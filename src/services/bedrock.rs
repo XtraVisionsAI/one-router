@@ -1044,18 +1044,35 @@ fn build_invoke_model_body(
         obj.remove("stream");
         obj.remove("container");
 
-        // Strip `fallback` audit-marker blocks from message content. They are
-        // client-side bookkeeping (refusal-fallback SDK middleware) that Bedrock
-        // does not understand and rejects. The `fallback_credit_token` field on
-        // the request body is kept — Bedrock reprices the retry against it.
+        // Strip the refusal-fallback beta surface (fallback-credit-2026-06-09),
+        // which Bedrock InvokeModel does not implement (verified 2026-09-09):
+        // - `fallback` audit-marker blocks in message content are rejected with
+        //   "Input tag 'fallback' found using 'type' does not match any of the
+        //   expected tags";
+        // - the top-level `fallback_credit_token` is rejected with
+        //   "fallback_credit_token: Extra inputs are not permitted".
+        // Both are client-side bookkeeping (refusal-fallback SDK middleware) and
+        // carry no conversational content, so dropping them is lossless.
+        obj.remove("fallback_credit_token");
+        //
+        // A message that consisted *only* of fallback markers (Claude Code emits
+        // these as standalone `role: "system"` entries in `messages[]`) would be
+        // left with `content: []`, which Bedrock rejects with
+        // "messages.N: system content must contain at least one block". Drop such
+        // messages entirely — they carry no conversational content. Messages that
+        // were already empty before stripping are left untouched.
         if let Some(serde_json::Value::Array(messages)) = obj.get_mut("messages") {
-            for message in messages.iter_mut() {
-                if let Some(serde_json::Value::Array(blocks)) =
+            messages.retain_mut(|message| {
+                let Some(serde_json::Value::Array(blocks)) =
                     message.as_object_mut().and_then(|m| m.get_mut("content"))
-                {
-                    blocks.retain(|b| b.get("type").and_then(|t| t.as_str()) != Some("fallback"));
-                }
-            }
+                else {
+                    return true;
+                };
+                let before = blocks.len();
+                blocks.retain(|b| b.get("type").and_then(|t| t.as_str()) != Some("fallback"));
+                // Keep unless stripping emptied a previously non-empty message.
+                !(before > 0 && blocks.is_empty())
+            });
         }
 
         // Set or remove service_tier based on backend config
@@ -1800,11 +1817,11 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_block_stripped_token_kept() {
+    fn test_fallback_block_and_credit_token_stripped() {
         use crate::schemas::anthropic::{ContentBlock, Message, MessageContent, MessageRequest};
         // A message carrying a `fallback` audit marker alongside real text: the
         // marker is stripped before Bedrock, the text stays, and the request-level
-        // fallback_credit_token is forwarded verbatim.
+        // fallback_credit_token is dropped (Bedrock: "Extra inputs are not permitted").
         let mut req = MessageRequest::new("claude", vec![], 100);
         req.fallback_credit_token = Some("tok_credit".to_string());
         req.messages = vec![Message {
@@ -1821,10 +1838,54 @@ mod tests {
         let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(v["fallback_credit_token"], "tok_credit");
+        assert!(
+            v.get("fallback_credit_token").is_none(),
+            "fallback_credit_token must not reach Bedrock"
+        );
         let blocks = v["messages"][0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 1, "fallback block should be stripped");
         assert_eq!(blocks[0]["type"], "text");
+    }
+
+    #[test]
+    fn test_fallback_only_message_dropped() {
+        use crate::schemas::anthropic::{ContentBlock, Message, MessageContent, MessageRequest};
+        // Claude Code records a refusal fallback as a standalone `role: "system"`
+        // message whose only block is the `fallback` marker. Stripping the marker
+        // must remove the whole message rather than leave `content: []` behind
+        // (Bedrock: "messages.1: system content must contain at least one block").
+        let mut req = MessageRequest::new("claude", vec![], 100);
+        req.messages = vec![
+            Message::user("hi"),
+            Message {
+                role: "system".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::Fallback {
+                    from_model: Some(serde_json::json!({"model": "a"})),
+                    to: Some(serde_json::json!({"model": "b"})),
+                }]),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::text("hello")]),
+            },
+            // A genuinely empty trailing assistant message (allowed by the API)
+            // must not be touched by the fallback cleanup.
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![]),
+            },
+        ];
+
+        let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let messages = v["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "fallback-only message should be dropped");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["text"], "hello");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2]["content"].as_array().unwrap().is_empty());
     }
 
     #[test]
