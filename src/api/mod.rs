@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod chat_completions;
 pub mod embeddings;
+pub mod extractors;
 pub mod health;
 pub mod images;
 pub mod messages;

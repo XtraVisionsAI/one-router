@@ -28,10 +28,14 @@ const BEDROCK_BETA_BLOCKLIST: &[&str] = &[
     // tolerated this header value on 2026-09-09 but does not implement the
     // feature, so it is still dropped for clarity.)
     "server-side-fallback-2026-06-01",
-    // Refusal-fallback credit: Bedrock rejects the header value outright
-    // ("Unexpected value(s) `fallback-credit-2026-06-09` for the
-    // `anthropic-beta` header", verified 2026-09-09).
+    // Refusal-fallback credit. Bedrock rejects the `-06-09` value outright
+    // ("Unexpected value(s) … for the `anthropic-beta` header", 2026-09-09) and
+    // tolerates the `-06-01` value Claude Code 2.1.x actually sends
+    // (2026-09-10) — but the feature is not implemented there and the rest of
+    // its surface (fallback blocks, credit token) is stripped anyway, so both
+    // names are dropped for consistency.
     "fallback-credit-2026-06-09",
+    "fallback-credit-2026-06-01",
 ];
 
 /// Aggregate betas Bedrock rejects, mapped to the granular native betas they
@@ -106,9 +110,9 @@ mod tests {
             "claude-sonnet",
         );
         assert_eq!(out, vec!["some-other-beta"]);
-        // Refusal-fallback credit beta is rejected by Bedrock → dropped.
+        // Refusal-fallback credit betas (both dated names) are dropped.
         let out = resolve_bedrock_betas(
-            Some("fallback-credit-2026-06-09,some-other-beta"),
+            Some("fallback-credit-2026-06-09,fallback-credit-2026-06-01,some-other-beta"),
             "claude-sonnet",
         );
         assert_eq!(out, vec!["some-other-beta"]);

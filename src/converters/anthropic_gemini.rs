@@ -264,6 +264,9 @@ mod request {
                             | ContentBlock::ServerToolResult { .. } => {}
                             // Fallback audit markers carry no model-visible content.
                             ContentBlock::Fallback { .. } => {}
+                            // Unmodeled block types (e.g. `tool_addition`) have no
+                            // Gemini representation; drop them.
+                            ContentBlock::Unknown(_) => {}
                         }
                     }
 

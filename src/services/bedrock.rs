@@ -1989,6 +1989,30 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_block_forwarded_verbatim() {
+        use crate::schemas::anthropic::{ContentBlock, Message, MessageContent, MessageRequest};
+        // Unmodeled blocks (tool_addition) reach Bedrock unchanged so that the
+        // upstream decides — and its error wording, if any, reaches the client.
+        let ta = serde_json::json!({"type":"tool_addition","tool":{"type":"tool_reference","name":"get_time"}});
+        let mut req = MessageRequest::new("claude", vec![], 100);
+        req.messages = vec![
+            Message::user("hi"),
+            Message {
+                role: "system".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::Unknown(ta.clone())]),
+                extra: Default::default(),
+            },
+            Message::assistant("hello"),
+            Message::user("Reply with OK"),
+        ];
+        let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["messages"].as_array().unwrap().len(), 4);
+        assert_eq!(v["messages"][1]["role"], "system");
+        assert_eq!(v["messages"][1]["content"][0], ta);
+    }
+
+    #[test]
     fn test_toplevel_output_config_forwarded() {
         use crate::schemas::anthropic::{Message, MessageRequest};
         let mut req = MessageRequest::new("claude", vec![Message::user("hi")], 100);

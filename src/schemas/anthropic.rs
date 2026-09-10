@@ -209,8 +209,13 @@ pub enum ToolResultValue {
 }
 
 /// Union of all content block types.
+///
+/// Serde derives are attached via `remote = "Self"` so the hand-written
+/// `Serialize`/`Deserialize` impls below can wrap them: a block whose `type` is
+/// one of [`ContentBlock::KNOWN_TYPES`] goes through the derived, strictly
+/// validated path; any other `type` is captured as [`ContentBlock::Unknown`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
+#[serde(tag = "type", remote = "Self")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text {
@@ -276,6 +281,59 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<serde_json::Value>,
     },
+    /// Any block type this schema does not model (e.g. `tool_addition` from the
+    /// `mid-conversation-tool-changes-2026-07-01` beta). Captured verbatim —
+    /// including its `type` — so an unknown block never fails request
+    /// deserialization and reaches backends that understand it unchanged.
+    /// Converters that cannot represent it drop it; Bedrock/Anthropic get it as-is
+    /// and report their own error if the model does not support it (Claude Code
+    /// keys its self-healing off that upstream wording).
+    ///
+    /// Only reached when `type` is not a known tag — a malformed *known* block is
+    /// still a hard deserialization error.
+    #[serde(skip)]
+    Unknown(serde_json::Value),
+}
+
+impl ContentBlock {
+    /// `type` tags handled by the typed variants above. Keep in sync with the
+    /// `#[serde(rename)]` attributes.
+    pub const KNOWN_TYPES: &'static [&'static str] = &[
+        "text",
+        "image",
+        "document",
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "tool_result",
+        "server_tool_use",
+        "server_tool_result",
+        "fallback",
+    ];
+}
+
+impl Serialize for ContentBlock {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ContentBlock::Unknown(value) => value.serialize(serializer),
+            known => ContentBlock::serialize(known, serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let known = value
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| ContentBlock::KNOWN_TYPES.contains(&t));
+        if known {
+            ContentBlock::deserialize(value).map_err(serde::de::Error::custom)
+        } else {
+            Ok(ContentBlock::Unknown(value))
+        }
+    }
 }
 
 impl ContentBlock {
@@ -297,6 +355,14 @@ impl ContentBlock {
         matches!(self, ContentBlock::ToolUse { .. })
     }
 
+    /// The `type` tag of an unmodeled block, if this is one.
+    pub fn unknown_type(&self) -> Option<&str> {
+        match self {
+            ContentBlock::Unknown(v) => v.get("type").and_then(|t| t.as_str()),
+            _ => None,
+        }
+    }
+
     /// Get text content if this is a text block.
     pub fn as_text(&self) -> Option<&str> {
         match self {
@@ -311,11 +377,51 @@ impl ContentBlock {
 // ============================================================================
 
 /// Message content - can be string or list of content blocks.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// `Deserialize` is hand-written instead of `#[serde(untagged)]`: the untagged
+/// derive swallows the real error of a malformed block behind "data did not
+/// match any variant of untagged enum MessageContent". Dispatching on the JSON
+/// shape ourselves keeps the block index and the inner serde message
+/// (e.g. `block[0]: missing field 'text'`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
     Blocks(Vec<ContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(text) => Ok(MessageContent::Text(text)),
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    serde_json::from_value::<ContentBlock>(item)
+                        .map_err(|e| D::Error::custom(format!("block[{i}]: {e}")))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(MessageContent::Blocks),
+            other => Err(D::Error::custom(format!(
+                "expected a string or an array of content blocks, got {}",
+                json_kind(&other)
+            ))),
+        }
+    }
+}
+
+/// Short JSON type name for error messages.
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 impl MessageContent {
@@ -968,6 +1074,59 @@ mod tests {
             plain.as_object().unwrap().keys().collect::<Vec<_>>(),
             vec!["content", "role"]
         );
+    }
+
+    #[test]
+    fn test_message_content_errors_keep_block_index_and_cause() {
+        // String form.
+        let c: MessageContent = serde_json::from_str(r#""hi""#).unwrap();
+        assert_eq!(c, MessageContent::Text("hi".into()));
+        // Block form.
+        let c: MessageContent = serde_json::from_str(r#"[{"type":"text","text":"hi"}]"#).unwrap();
+        assert!(matches!(c, MessageContent::Blocks(ref b) if b.len() == 1));
+        // A malformed known block reports which block and what is wrong.
+        let err = serde_json::from_str::<MessageContent>(
+            r#"[{"type":"text","text":"ok"},{"type":"text"}]"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("block[1]"), "{err}");
+        assert!(err.contains("missing field `text`"), "{err}");
+        assert!(!err.contains("untagged"), "{err}");
+        // Wrong JSON shape is named explicitly.
+        let err = serde_json::from_str::<MessageContent>("42")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("expected a string or an array of content blocks, got a number"),
+            "{err}"
+        );
+        // Inside a full message the outer path is still prefixed by the caller
+        // (serde_path_to_error in axum), so the inner message stays relative.
+        let err =
+            serde_json::from_str::<Message>(r#"{"role":"user","content":[{"type":"image"}]}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("block[0]") && err.contains("source"), "{err}");
+    }
+
+    #[test]
+    fn test_unknown_block_roundtrips_verbatim() {
+        // tool_addition (mid-conversation-tool-changes-2026-07-01) is not modeled;
+        // it must deserialize into Unknown and serialize back byte-for-byte.
+        let json = r#"{"type":"tool_addition","tool":{"type":"tool_reference","name":"get_time"}}"#;
+        let block: ContentBlock = serde_json::from_str(json).unwrap();
+        assert_eq!(block.unknown_type(), Some("tool_addition"));
+        let out: serde_json::Value = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            out,
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+        // Known tags still hit their typed variants, not the catch-all.
+        let text: ContentBlock = serde_json::from_str(r#"{"type":"text","text":"hi"}"#).unwrap();
+        assert!(matches!(text, ContentBlock::Text { .. }));
+        // A known tag with an invalid payload is still a hard error (not swallowed).
+        assert!(serde_json::from_str::<ContentBlock>(r#"{"type":"text"}"#).is_err());
     }
 
     #[test]

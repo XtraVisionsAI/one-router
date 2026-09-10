@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
+use crate::api::extractors::AnthropicJson;
 use crate::converters::{
     AnthropicToGeminiConverter, AnthropicToOpenAIConverter, GeminiToAnthropicConverter,
 };
@@ -150,7 +151,7 @@ pub async fn create_message(
     State(state): State<AppState>,
     Extension(key_info): Extension<ApiKeyInfo>,
     headers: HeaderMap,
-    Json(mut request): Json<MessageRequest>,
+    AnthropicJson(mut request): AnthropicJson<MessageRequest>,
 ) -> Result<MessageApiResponse, ApiError> {
     let start_time = Instant::now();
     let request_id = Uuid::new_v4().to_string();
@@ -1686,7 +1687,7 @@ pub struct CountTokensResponse {
 /// Note: Bedrock doesn't provide a direct token counting API, so this returns an estimate.
 pub async fn count_tokens(
     State(_state): State<AppState>,
-    Json(request): Json<CountTokensRequest>,
+    AnthropicJson(request): AnthropicJson<CountTokensRequest>,
 ) -> Result<Json<CountTokensResponse>, ApiError> {
     tracing::debug!(
         model = %request.model,
