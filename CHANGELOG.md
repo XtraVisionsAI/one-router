@@ -1,3 +1,13 @@
+## v0.31.0 (2026-09-10)
+
+### Feat
+
+- **schemas**: pass unknown content blocks through and render JSON rejections in Anthropic format
+
+### Fix
+
+- **schemas**: preserve per-message output_config and lift mid-conversation system directives for Bedrock
+
 ## v0.30.1 (2026-09-09)
 
 ### Fix
