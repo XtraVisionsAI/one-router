@@ -1044,8 +1044,8 @@ fn build_invoke_model_body(
         obj.remove("stream");
         obj.remove("container");
 
-        // Strip the refusal-fallback beta surface (fallback-credit-2026-06-09),
-        // which Bedrock InvokeModel does not implement (verified 2026-09-09):
+        // Strip the refusal-fallback beta surface (fallback-credit-*), which
+        // Bedrock InvokeModel does not implement (verified 2026-09-09):
         // - `fallback` audit-marker blocks in message content are rejected with
         //   "Input tag 'fallback' found using 'type' does not match any of the
         //   expected tags";
@@ -1054,25 +1054,55 @@ fn build_invoke_model_body(
         // Both are client-side bookkeeping (refusal-fallback SDK middleware) and
         // carry no conversational content, so dropping them is lossless.
         obj.remove("fallback_credit_token");
+
+        // Mid-conversation `role: "system"` directives (Claude Code's
+        // per-turn-control / mid-conversation-system betas). Bedrock accepts a
+        // system turn with content, but rejects any per-message field beyond
+        // role/content ("messages.N.output_config: Extra inputs are not
+        // permitted") and an empty system turn ("messages.N: system content must
+        // contain at least one block"). Verified 2026-09-09/10 on Haiku 4.5 and
+        // Opus 5 (global profile), with and without the corresponding betas.
         //
-        // A message that consisted *only* of fallback markers (Claude Code emits
-        // these as standalone `role: "system"` entries in `messages[]`) would be
-        // left with `content: []`, which Bedrock rejects with
-        // "messages.N: system content must contain at least one block". Drop such
-        // messages entirely — they carry no conversational content. Messages that
-        // were already empty before stripping are left untouched.
+        // Claude Code's per-turn effort statement is exactly
+        // `{role:"system", content:[], output_config:{effort}}`, so:
+        // - lift every message-level `output_config` into the top-level
+        //   `output_config` (message-level keys win — the directive is the
+        //   client's latest intent for this turn; Bedrock honours the top-level
+        //   form on effort-capable models);
+        // - strip all other per-message extras;
+        // - drop a system turn whose content ends up empty. Non-system messages
+        //   that were already empty (e.g. a trailing empty assistant turn the
+        //   API allows) are left untouched.
+        let mut lifted_output_config = serde_json::Map::new();
         if let Some(serde_json::Value::Array(messages)) = obj.get_mut("messages") {
             messages.retain_mut(|message| {
-                let Some(serde_json::Value::Array(blocks)) =
-                    message.as_object_mut().and_then(|m| m.get_mut("content"))
-                else {
+                let Some(m) = message.as_object_mut() else {
+                    return true;
+                };
+                if let Some(serde_json::Value::Object(cfg)) = m.remove("output_config") {
+                    lifted_output_config.extend(cfg);
+                }
+                m.retain(|k, _| k == "role" || k == "content");
+
+                let is_system = m.get("role").and_then(|r| r.as_str()) == Some("system");
+                let Some(serde_json::Value::Array(blocks)) = m.get_mut("content") else {
                     return true;
                 };
                 let before = blocks.len();
                 blocks.retain(|b| b.get("type").and_then(|t| t.as_str()) != Some("fallback"));
-                // Keep unless stripping emptied a previously non-empty message.
-                !(before > 0 && blocks.is_empty())
+                let emptied_by_strip = before > 0 && blocks.is_empty();
+                // Keep unless: a system turn is empty, or stripping emptied any turn.
+                !((is_system && blocks.is_empty()) || emptied_by_strip)
             });
+        }
+        if !lifted_output_config.is_empty() {
+            let top = obj
+                .entry("output_config")
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+            match top {
+                serde_json::Value::Object(top) => top.extend(lifted_output_config),
+                other => *other = serde_json::Value::Object(lifted_output_config),
+            }
         }
 
         // Set or remove service_tier based on backend config
@@ -1825,6 +1855,7 @@ mod tests {
         let mut req = MessageRequest::new("claude", vec![], 100);
         req.fallback_credit_token = Some("tok_credit".to_string());
         req.messages = vec![Message {
+            extra: Default::default(),
             role: "assistant".into(),
             content: MessageContent::Blocks(vec![
                 ContentBlock::Fallback {
@@ -1858,6 +1889,7 @@ mod tests {
         req.messages = vec![
             Message::user("hi"),
             Message {
+                extra: Default::default(),
                 role: "system".into(),
                 content: MessageContent::Blocks(vec![ContentBlock::Fallback {
                     from_model: Some(serde_json::json!({"model": "a"})),
@@ -1865,12 +1897,14 @@ mod tests {
                 }]),
             },
             Message {
+                extra: Default::default(),
                 role: "assistant".into(),
                 content: MessageContent::Blocks(vec![ContentBlock::text("hello")]),
             },
             // A genuinely empty trailing assistant message (allowed by the API)
             // must not be touched by the fallback cleanup.
             Message {
+                extra: Default::default(),
                 role: "assistant".into(),
                 content: MessageContent::Blocks(vec![]),
             },
@@ -1886,6 +1920,82 @@ mod tests {
         assert_eq!(messages[1]["content"][0]["text"], "hello");
         assert_eq!(messages[2]["role"], "assistant");
         assert!(messages[2]["content"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_per_turn_system_directive_lifted_to_output_config() {
+        use crate::schemas::anthropic::{Message, MessageContent, MessageRequest};
+        // Claude Code's per-turn effort statement:
+        //   {role:"system", content:[], output_config:{effort:"low"}}
+        // Bedrock rejects both the message-level output_config and an empty
+        // system turn, so the directive is lifted to the top-level output_config
+        // and the (now empty) system turn is dropped.
+        let mut directive = Message {
+            role: "system".into(),
+            content: MessageContent::Blocks(vec![]),
+            extra: Default::default(),
+        };
+        directive
+            .extra
+            .insert("output_config".into(), serde_json::json!({"effort": "low"}));
+        let mut req = MessageRequest::new("claude", vec![], 100);
+        req.messages = vec![
+            Message::user("hi"),
+            directive,
+            Message::assistant("hello"),
+            Message::user("Reply with OK"),
+        ];
+
+        let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let messages = v["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "empty system directive must be dropped");
+        assert!(messages.iter().all(|m| m["role"] != "system"));
+        assert_eq!(v["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn test_mid_conv_system_text_kept_and_extras_stripped() {
+        use crate::schemas::anthropic::{ContentBlock, Message, MessageContent, MessageRequest};
+        // A system turn with real content survives (Bedrock accepts mid_conv_system
+        // text), but per-message extras are stripped and output_config is lifted.
+        let mut sys = Message {
+            role: "system".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::text("Be terse.")]),
+            extra: Default::default(),
+        };
+        sys.extra.insert(
+            "output_config".into(),
+            serde_json::json!({"effort": "medium"}),
+        );
+        sys.extra
+            .insert("clear_at".into(), serde_json::json!("some-marker"));
+        let mut req = MessageRequest::new("claude", vec![], 100);
+        req.output_config = Some(serde_json::json!({"effort": "high", "format": {"type": "text"}}));
+        req.messages = vec![Message::user("hi"), sys, Message::user("Reply with OK")];
+
+        let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let messages = v["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        let sys = messages[1].as_object().unwrap();
+        assert_eq!(sys["role"], "system");
+        assert_eq!(sys.keys().collect::<Vec<_>>(), vec!["content", "role"]);
+        // Message-level effort overrides the top-level one; other top-level keys stay.
+        assert_eq!(v["output_config"]["effort"], "medium");
+        assert_eq!(v["output_config"]["format"]["type"], "text");
+    }
+
+    #[test]
+    fn test_toplevel_output_config_forwarded() {
+        use crate::schemas::anthropic::{Message, MessageRequest};
+        let mut req = MessageRequest::new("claude", vec![Message::user("hi")], 100);
+        req.output_config = Some(serde_json::json!({"effort": "high"}));
+        let body = super::build_invoke_model_body(&req, "model", false, None, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["output_config"]["effort"], "high");
     }
 
     #[test]

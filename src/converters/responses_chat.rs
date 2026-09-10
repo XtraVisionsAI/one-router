@@ -422,6 +422,7 @@ fn input_to_anthropic_messages(
     let mut messages: Vec<AnthMessage> = prev
         .iter()
         .map(|(role, text)| AnthMessage {
+            extra: Default::default(),
             role: if role == "assistant" {
                 "assistant".to_string()
             } else {
@@ -433,6 +434,7 @@ fn input_to_anthropic_messages(
 
     match input {
         Some(ResponsesInput::Text(text)) => messages.push(AnthMessage {
+            extra: Default::default(),
             role: "user".to_string(),
             content: AnthMessageContent::Text(text.clone()),
         }),
@@ -453,6 +455,7 @@ fn input_to_anthropic_messages(
                         };
                         if !text.is_empty() {
                             messages.push(AnthMessage {
+                                extra: Default::default(),
                                 role: if role == "assistant" {
                                     "assistant".to_string()
                                 } else {

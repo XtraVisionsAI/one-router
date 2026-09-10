@@ -802,6 +802,7 @@ impl OpenAIToAnthropicConverter {
         };
 
         Ok(MessageRequest {
+            output_config: None,
             model: target_model_id.to_string(),
             messages,
             max_tokens,
@@ -849,6 +850,7 @@ impl OpenAIToAnthropicConverter {
                         None => MessageContent::Text(String::new()),
                     };
                     result.push(Message {
+                        extra: Default::default(),
                         role: "user".to_string(),
                         content,
                     });
@@ -887,6 +889,7 @@ impl OpenAIToAnthropicConverter {
                     };
 
                     result.push(Message {
+                        extra: Default::default(),
                         role: "assistant".to_string(),
                         content,
                     });
@@ -911,6 +914,7 @@ impl OpenAIToAnthropicConverter {
                     };
 
                     result.push(Message {
+                        extra: Default::default(),
                         role: "user".to_string(),
                         content: MessageContent::Blocks(vec![block]),
                     });

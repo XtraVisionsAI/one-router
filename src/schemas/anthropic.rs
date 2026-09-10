@@ -337,10 +337,17 @@ impl MessageContent {
 }
 
 /// Message in the conversation.
+///
+/// `extra` preserves per-message fields this schema does not model (e.g. the
+/// `output_config` carried by Claude Code's mid-conversation `role: "system"`
+/// per-turn effort directive). They round-trip verbatim on passthrough; the
+/// Bedrock InvokeModel path decides what to lift or strip.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
-    pub role: String, // "user" or "assistant"
+    pub role: String, // "user" | "assistant" | "system" (mid-conversation directive)
     pub content: MessageContent,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Message {
@@ -349,6 +356,7 @@ impl Message {
         Self {
             role: "user".to_string(),
             content: MessageContent::Text(content.into()),
+            extra: Default::default(),
         }
     }
 
@@ -357,6 +365,7 @@ impl Message {
         Self {
             role: "assistant".to_string(),
             content: MessageContent::Text(content.into()),
+            extra: Default::default(),
         }
     }
 
@@ -365,6 +374,7 @@ impl Message {
         Self {
             role: role.into(),
             content: MessageContent::Blocks(blocks),
+            extra: Default::default(),
         }
     }
 }
@@ -589,6 +599,12 @@ pub struct MessageRequest {
     // backend reprices it against the refused request. Forwarded verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_credit_token: Option<String>,
+
+    /// Output configuration (`effort`, `format`, ...). Carried verbatim so the
+    /// effort level reaches backends that honour it (Bedrock InvokeModel accepts
+    /// the top-level form for effort-capable Claude models).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<serde_json::Value>,
 }
 
 fn default_max_tokens() -> i32 {
@@ -615,6 +631,7 @@ impl MessageRequest {
             container: None,
             service_tier: None,
             fallback_credit_token: None,
+            output_config: None,
         }
     }
 
@@ -934,6 +951,23 @@ mod tests {
         let msg = Message::user("Hello");
         assert_eq!(msg.role, "user");
         assert!(matches!(msg.content, MessageContent::Text(ref t) if t == "Hello"));
+    }
+
+    #[test]
+    fn test_message_extra_fields_roundtrip() {
+        // Claude Code's per-turn directive carries a per-message output_config.
+        let json = r#"{"role":"system","content":[],"output_config":{"effort":"low"}}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, "system");
+        assert_eq!(msg.extra["output_config"]["effort"], "low");
+        let out: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(out["output_config"]["effort"], "low");
+        // A plain message serializes without any extra key.
+        let plain: serde_json::Value = serde_json::to_value(Message::user("hi")).unwrap();
+        assert_eq!(
+            plain.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["content", "role"]
+        );
     }
 
     #[test]

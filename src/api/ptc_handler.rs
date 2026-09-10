@@ -292,6 +292,7 @@ fn build_ptc_request(request: &MessageRequest) -> MessageRequest {
     let messages = filter_non_direct_tool_calls(&request.messages);
 
     MessageRequest {
+        output_config: None,
         model: request.model.clone(),
         messages,
         max_tokens: request.max_tokens,
@@ -362,6 +363,7 @@ fn filter_non_direct_tool_calls(messages: &[Message]) -> Vec<Message> {
                 other => other.clone(),
             };
             Message {
+                extra: Default::default(),
                 role: msg.role.clone(),
                 content,
             }
@@ -527,12 +529,14 @@ async fn call_claude_with_code_result(
 
     // Add assistant message (Claude's response with execute_code)
     messages.push(Message {
+        extra: Default::default(),
         role: "assistant".to_string(),
         content: MessageContent::Blocks(assistant_response.content.clone()),
     });
 
     // Add tool_result
     messages.push(Message {
+        extra: Default::default(),
         role: "user".to_string(),
         content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
             tool_use_id: tool_use_id.to_string(),
@@ -574,12 +578,14 @@ async fn finalize_with_claude_from_state(
 
     // Add assistant message with the full original content (thinking + execute_code)
     messages.push(Message {
+        extra: Default::default(),
         role: "assistant".to_string(),
         content: MessageContent::Blocks(exec_state.original_assistant_content),
     });
 
     // Add tool_result for execute_code
     messages.push(Message {
+        extra: Default::default(),
         role: "user".to_string(),
         content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
             tool_use_id: exec_state.execute_code_tool_id,
@@ -593,6 +599,7 @@ async fn finalize_with_claude_from_state(
     let modified_messages = filter_non_direct_tool_calls(&messages);
 
     let continuation = MessageRequest {
+        output_config: None,
         model: exec_state.original_model,
         messages: modified_messages,
         max_tokens: exec_state.original_max_tokens,
@@ -626,6 +633,7 @@ fn build_continuation_request(
     messages: Vec<Message>,
 ) -> MessageRequest {
     MessageRequest {
+        output_config: None,
         model: original_request.model.clone(),
         messages,
         max_tokens: original_request.max_tokens,

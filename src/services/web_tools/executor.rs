@@ -335,10 +335,12 @@ impl WebToolExecutor {
             }
 
             messages.push(Message {
+                extra: Default::default(),
                 role: "assistant".into(),
                 content: MessageContent::Blocks(response.content),
             });
             messages.push(Message {
+                extra: Default::default(),
                 role: "user".into(),
                 content: MessageContent::Blocks(tool_result_blocks),
             });
@@ -508,10 +510,12 @@ impl WebToolExecutor {
                 }
 
                 messages.push(Message {
+                    extra: Default::default(),
                     role: "assistant".into(),
                     content: MessageContent::Blocks(response.content),
                 });
                 messages.push(Message {
+                    extra: Default::default(),
                     role: "user".into(),
                     content: MessageContent::Blocks(tool_result_blocks),
                 });
