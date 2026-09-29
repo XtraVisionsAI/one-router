@@ -731,7 +731,14 @@ pub fn chat_to_responses_request(
     }
 
     if let Some(effort) = &request.reasoning_effort {
-        body["reasoning"] = serde_json::json!({"effort": effort, "summary": "auto"});
+        let mut reasoning = serde_json::json!({"effort": effort});
+        // The runtime host (profile-prefixed ids) rejects `reasoning.summary`.
+        if crate::services::bedrock::BedrockService::responses_supports_reasoning_summary(
+            target_model_id,
+        ) {
+            reasoning["summary"] = serde_json::json!("auto");
+        }
+        body["reasoning"] = reasoning;
     }
 
     if request.temperature.is_some() || request.top_p.is_some() || request.stop.is_some() {
@@ -1490,7 +1497,13 @@ mod mantle_tests {
         assert_eq!(body["max_output_tokens"], 2048);
         assert_eq!(body["store"], false);
         assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
         assert!(body.get("temperature").is_none());
+
+        // Runtime-host models (profile-prefixed ids) reject `reasoning.summary`.
+        let body = chat_to_responses_request(&req, "global.openai.gpt-6-astra");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body["reasoning"].get("summary").is_none());
         assert_eq!(body["tool_choice"], "auto");
 
         let input = body["input"].as_array().unwrap();

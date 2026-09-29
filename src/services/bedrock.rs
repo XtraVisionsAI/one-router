@@ -440,6 +440,20 @@ impl BedrockService {
         base.starts_with("openai.gpt-") && !base.starts_with("openai.gpt-oss")
     }
 
+    /// Whether the Responses endpoint serving `target_model_id` accepts the
+    /// `reasoning.summary` parameter. Only the dedicated Mantle host does; the
+    /// classic runtime host (profile-prefixed ids such as
+    /// `global.openai.gpt-6-astra`) rejects it with "Unsupported parameter:
+    /// 'reasoning.summary' is not supported with the '<model>' model"
+    /// (observed 2026-09-29) — same class of Mantle-only param as
+    /// `include_reasoning`.
+    pub fn responses_supports_reasoning_summary(target_model_id: &str) -> bool {
+        matches!(
+            MantleHost::for_responses(target_model_id),
+            MantleHost::Mantle
+        )
+    }
+
     /// Resolve an application inference profile ARN to its underlying model ARN
     /// for routing/pricing decisions. Non-ARN model IDs are returned unchanged
     /// with no network call. Application-inference-profile ARNs are resolved via
@@ -2169,6 +2183,12 @@ mod tests {
         assert!(matches!(
             MantleHost::for_responses("us.openai.gpt-5.6-sol"),
             MantleHost::Runtime
+        ));
+        assert!(BedrockService::responses_supports_reasoning_summary(
+            "openai.gpt-5.5"
+        ));
+        assert!(!BedrockService::responses_supports_reasoning_summary(
+            "global.openai.gpt-6-astra"
         ));
     }
 }

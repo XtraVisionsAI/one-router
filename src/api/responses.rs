@@ -326,6 +326,11 @@ async fn handle_mantle_responses_passthrough(
     // (verified against the live endpoint), so merge them there.
     merge_additional_tools(&mut upstream);
 
+    // The runtime host (profile-prefixed ids such as global.openai.gpt-6-astra)
+    // rejects `reasoning.summary` ("Unsupported parameter"), which Codex sends
+    // by default. Drop it there; the Mantle host accepts it.
+    strip_unsupported_reasoning_params(&mut upstream, target_model_id);
+
     let bedrock = state
         .dynamic
         .read()
@@ -450,6 +455,29 @@ fn relay_mantle_responses_sse(
             }
         }
     })
+}
+
+/// Remove `reasoning.summary` when the target's Responses host does not accept
+/// it (see `BedrockService::responses_supports_reasoning_summary`). An emptied
+/// `reasoning` object is removed entirely.
+fn strip_unsupported_reasoning_params(upstream: &mut serde_json::Value, target_model_id: &str) {
+    if crate::services::BedrockService::responses_supports_reasoning_summary(target_model_id) {
+        return;
+    }
+    let Some(reasoning) = upstream.get_mut("reasoning") else {
+        return;
+    };
+    if let Some(obj) = reasoning.as_object_mut() {
+        if obj.remove("summary").is_some() {
+            tracing::debug!(
+                target_model = %target_model_id,
+                "Dropping reasoning.summary (unsupported on the Bedrock runtime Responses host)"
+            );
+        }
+        if obj.is_empty() {
+            upstream.as_object_mut().map(|o| o.remove("reasoning"));
+        }
+    }
 }
 
 /// Move the tool definitions of Codex's `additional_tools` input items into
@@ -1061,6 +1089,31 @@ mod tests {
         assert!(!names.iter().any(|t| t == "response.output_text.delta"));
         assert!(names.iter().any(|t| t == "response.content_part.added"));
         assert!(names.iter().any(|t| t == "response.content_part.done"));
+    }
+
+    #[test]
+    fn test_strip_unsupported_reasoning_params() {
+        // Runtime host: summary dropped, effort kept.
+        let mut v = serde_json::json!({"reasoning": {"effort": "high", "summary": "auto"}});
+        strip_unsupported_reasoning_params(&mut v, "global.openai.gpt-6-astra");
+        assert_eq!(v["reasoning"]["effort"], "high");
+        assert!(v["reasoning"].get("summary").is_none());
+
+        // Runtime host: summary-only reasoning object removed entirely.
+        let mut only = serde_json::json!({"reasoning": {"summary": "auto"}, "input": "hi"});
+        strip_unsupported_reasoning_params(&mut only, "us.openai.gpt-6-astra");
+        assert!(only.get("reasoning").is_none());
+        assert_eq!(only["input"], "hi");
+
+        // Mantle host: untouched.
+        let mut m = serde_json::json!({"reasoning": {"effort": "low", "summary": "auto"}});
+        strip_unsupported_reasoning_params(&mut m, "openai.gpt-5.5");
+        assert_eq!(m["reasoning"]["summary"], "auto");
+
+        // No reasoning field: no-op.
+        let mut none = serde_json::json!({"input": "x"});
+        strip_unsupported_reasoning_params(&mut none, "global.openai.gpt-6-astra");
+        assert_eq!(none, serde_json::json!({"input": "x"}));
     }
 
     #[test]

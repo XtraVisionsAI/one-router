@@ -25,6 +25,7 @@ use crate::schemas::anthropic::{
     ContentBlock, MessageContent, MessageRequest, MessageResponse, StopReason, SystemContent,
     ToolChoice, ToolResultValue, Usage,
 };
+use crate::services::bedrock::BedrockService;
 
 /// Prefix marking a thinking-block signature as a Mantle reasoning round-trip
 /// token (vs. a native Claude signature, which cannot be replayed to GPT).
@@ -223,15 +224,22 @@ pub fn anthropic_to_responses_request(
         body["tool_choice"] = tc;
     }
 
-    // thinking budget → reasoning effort; summaries requested so thinking text
-    // streams back. If thinking was capability-filtered away, the model still
-    // reasons internally at its default effort (inherent to these models).
+    // thinking budget → reasoning effort; summaries requested (where the host
+    // accepts the param — the runtime host rejects `reasoning.summary`) so
+    // thinking text streams back. If thinking was capability-filtered away,
+    // the model still reasons internally at its default effort (inherent to
+    // these models).
     if let Some(thinking) = &request.thinking {
-        let mut reasoning = serde_json::json!({"summary": "auto"});
-        if let Some(effort) = thinking_to_reasoning_effort(thinking) {
-            reasoning["effort"] = serde_json::json!(effort);
+        let mut reasoning = serde_json::Map::new();
+        if BedrockService::responses_supports_reasoning_summary(target_model_id) {
+            reasoning.insert("summary".into(), serde_json::json!("auto"));
         }
-        body["reasoning"] = reasoning;
+        if let Some(effort) = thinking_to_reasoning_effort(thinking) {
+            reasoning.insert("effort".into(), serde_json::json!(effort));
+        }
+        if !reasoning.is_empty() {
+            body["reasoning"] = serde_json::Value::Object(reasoning);
+        }
     }
 
     if request.temperature.is_some()
@@ -779,9 +787,14 @@ mod tests {
             thinking_type: "enabled".into(),
             budget_tokens: Some(20_000),
         });
-        let body = anthropic_to_responses_request(&req, "m");
+        let body = anthropic_to_responses_request(&req, "openai.gpt-5.5");
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
+
+        // Runtime-host models (profile-prefixed ids) reject `reasoning.summary`.
+        let body = anthropic_to_responses_request(&req, "global.openai.gpt-6-astra");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body["reasoning"].get("summary").is_none());
     }
 
     #[test]
