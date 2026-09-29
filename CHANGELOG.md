@@ -1,3 +1,9 @@
+## v0.31.1 (2026-09-29)
+
+### Fix
+
+- **bedrock**: drop reasoning.summary for runtime-host Responses models
+
 ## v0.31.0 (2026-09-10)
 
 ### Feat
