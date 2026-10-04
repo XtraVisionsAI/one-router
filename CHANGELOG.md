@@ -1,3 +1,9 @@
+## v0.31.2 (2026-10-04)
+
+### Fix
+
+- **litellm**: resolve import keys directly instead of via the capped browse list
+
 ## v0.31.1 (2026-09-29)
 
 ### Fix
