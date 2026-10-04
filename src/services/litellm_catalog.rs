@@ -143,7 +143,69 @@ fn infer_capabilities(spec: &serde_json::Map<String, serde_json::Value>, target:
     )
 }
 
+/// Build an import candidate from one LiteLLM table entry, or `None` when the
+/// entry does not belong to `ns` / is not an importable token-priced mode.
+fn candidate_from_entry(
+    key: &str,
+    spec: &serde_json::Value,
+    ns: ProviderNs,
+    provider: &str,
+    existing: &[ModelMappingRecord],
+) -> Option<ImportCandidate> {
+    if key == "sample_spec" {
+        return None;
+    }
+    let spec = spec.as_object()?;
+    let entry_ns = spec
+        .get("litellm_provider")
+        .and_then(|v| v.as_str())
+        .and_then(ProviderNs::from_litellm_provider)?;
+    if entry_ns != ns {
+        return None;
+    }
+    let mode = spec.get("mode").and_then(|v| v.as_str())?;
+    if !SYNCED_MODES.contains(&mode) {
+        return None;
+    }
+    let input = pricing_sync::to_price_per_million(spec.get("input_cost_per_token"))?;
+    let output = pricing_sync::to_price_per_million(spec.get("output_cost_per_token"))?;
+
+    let target = strip_table_prefix(key).to_string();
+    let suggested = friendly_source_id(ns, &target);
+    let exists = existing
+        .iter()
+        .any(|m| m.provider == provider && m.source_model_id == suggested);
+    Some(ImportCandidate {
+        key: key.to_string(),
+        capabilities: infer_capabilities(spec, &target),
+        suggested_source_id: suggested,
+        target_model_id: target,
+        mode: mode.to_string(),
+        input_price: input,
+        output_price: output,
+        cache_read_price: pricing_sync::to_price_per_million(
+            spec.get("cache_read_input_token_cost"),
+        ),
+        cache_write_price: pricing_sync::to_price_per_million(
+            spec.get("cache_creation_input_token_cost"),
+        ),
+        supports_reasoning: spec
+            .get("supports_reasoning")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        supports_function_calling: spec
+            .get("supports_function_calling")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        max_input_tokens: spec.get("max_input_tokens").and_then(|v| v.as_i64()),
+        max_output_tokens: spec.get("max_output_tokens").and_then(|v| v.as_i64()),
+        exists,
+    })
+}
+
 /// List import candidates for a provider, filtered by a substring query.
+/// Capped at [`MAX_CANDIDATES`] entries — browse only; `import_models` looks
+/// selected keys up directly so the cap never hides an importable entry.
 pub fn list_candidates(
     data: &serde_json::Value,
     provider: &str,
@@ -159,69 +221,12 @@ pub fn list_candidates(
 
     let mut out = Vec::new();
     for (key, spec) in obj {
-        if key == "sample_spec" {
-            continue;
-        }
-        let Some(spec) = spec.as_object() else {
-            continue;
-        };
-        let Some(entry_ns) = spec
-            .get("litellm_provider")
-            .and_then(|v| v.as_str())
-            .and_then(ProviderNs::from_litellm_provider)
-        else {
-            continue;
-        };
-        if entry_ns != ns {
-            continue;
-        }
-        let Some(mode) = spec.get("mode").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if !SYNCED_MODES.contains(&mode) {
-            continue;
-        }
-        let (Some(input), Some(output)) = (
-            pricing_sync::to_price_per_million(spec.get("input_cost_per_token")),
-            pricing_sync::to_price_per_million(spec.get("output_cost_per_token")),
-        ) else {
-            continue;
-        };
         if !query.is_empty() && !key.to_ascii_lowercase().contains(&query) {
             continue;
         }
-
-        let target = strip_table_prefix(key).to_string();
-        let suggested = friendly_source_id(ns, &target);
-        let exists = existing
-            .iter()
-            .any(|m| m.provider == provider && m.source_model_id == suggested);
-        out.push(ImportCandidate {
-            key: key.clone(),
-            capabilities: infer_capabilities(spec, &target),
-            suggested_source_id: suggested,
-            target_model_id: target,
-            mode: mode.to_string(),
-            input_price: input,
-            output_price: output,
-            cache_read_price: pricing_sync::to_price_per_million(
-                spec.get("cache_read_input_token_cost"),
-            ),
-            cache_write_price: pricing_sync::to_price_per_million(
-                spec.get("cache_creation_input_token_cost"),
-            ),
-            supports_reasoning: spec
-                .get("supports_reasoning")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            supports_function_calling: spec
-                .get("supports_function_calling")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            max_input_tokens: spec.get("max_input_tokens").and_then(|v| v.as_i64()),
-            max_output_tokens: spec.get("max_output_tokens").and_then(|v| v.as_i64()),
-            exists,
-        });
+        if let Some(cand) = candidate_from_entry(key, spec, ns, provider, existing) {
+            out.push(cand);
+        }
         if out.len() >= MAX_CANDIDATES {
             break;
         }
@@ -264,7 +269,11 @@ pub async fn import_models(
         .list_mappings()
         .await
         .map_err(|e| format!("failed to list model mappings: {e}"))?;
-    let candidates = list_candidates(data, provider, "", &existing)?;
+    let ns = ProviderNs::from_mapping_provider(provider)
+        .ok_or_else(|| format!("unknown provider '{provider}'"))?;
+    let obj = data
+        .as_object()
+        .ok_or_else(|| "unexpected pricing payload".to_string())?;
 
     let mut summary = ImportSummary::default();
     let mut taken: std::collections::HashSet<String> = existing
@@ -275,7 +284,13 @@ pub async fn import_models(
     let now = chrono::Utc::now().timestamp();
 
     for item in items {
-        let Some(cand) = candidates.iter().find(|c| c.key == item.key) else {
+        // Direct lookup: the browse list is capped at MAX_CANDIDATES, and the
+        // Bedrock namespace alone exceeds it, so resolving via `list_candidates`
+        // reported entries past the cap as not found.
+        let Some(cand) = obj
+            .get(&item.key)
+            .and_then(|spec| candidate_from_entry(&item.key, spec, ns, provider, &existing))
+        else {
             summary.not_found.push(item.key.clone());
             continue;
         };
@@ -466,5 +481,55 @@ mod tests {
         }];
         let gpt = list_candidates(&data, "bedrock", "gpt-5.5", &existing).unwrap();
         assert!(gpt[0].exists);
+    }
+
+    /// Regression: the Bedrock namespace in the real table exceeds
+    /// `MAX_CANDIDATES`, so an import resolved through the capped browse list
+    /// reported `global.openai.gpt-6-sol` as not found. Import must resolve
+    /// selected keys directly from the table instead.
+    #[test]
+    fn import_lookup_is_not_limited_by_browse_cap() {
+        let mut table = serde_json::Map::new();
+        for i in 0..MAX_CANDIDATES {
+            table.insert(
+                format!("anthropic.filler-{i:04}"),
+                serde_json::json!({
+                    "litellm_provider": "bedrock",
+                    "mode": "chat",
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.000002
+                }),
+            );
+        }
+        // Sorts after every filler key, i.e. past the cap.
+        let key = "global.openai.gpt-6-sol";
+        table.insert(
+            key.to_string(),
+            serde_json::json!({
+                "litellm_provider": "bedrock_converse",
+                "mode": "chat",
+                "input_cost_per_token": 0.00000175,
+                "output_cost_per_token": 0.000014,
+                "supports_function_calling": true,
+                "supports_reasoning": true
+            }),
+        );
+        let data = serde_json::Value::Object(table);
+
+        let browse = list_candidates(&data, "bedrock", "", &[]).unwrap();
+        assert_eq!(browse.len(), MAX_CANDIDATES);
+        assert!(
+            browse.iter().all(|c| c.key != key),
+            "cap should hide the entry"
+        );
+
+        let cand = candidate_from_entry(key, &data[key], ProviderNs::Bedrock, "bedrock", &[])
+            .expect("direct lookup must find the entry past the cap");
+        assert_eq!(cand.target_model_id, "global.openai.gpt-6-sol");
+        assert_eq!(cand.suggested_source_id, "gpt-6-sol");
+        let caps: serde_json::Value = serde_json::from_str(&cand.capabilities).unwrap();
+        assert_eq!(caps["tool_use"]["enabled"], true);
+        assert_eq!(caps["thinking"]["enabled"], true);
+        assert_eq!(caps["thinking"]["style"], "effort");
     }
 }
