@@ -1013,6 +1013,14 @@ impl ErrorResponse {
             },
         }
     }
+
+    /// Serialize for use as an SSE `error` event payload.
+    pub fn to_json_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            r#"{"type":"error","error":{"type":"api_error","message":"internal error"}}"#
+                .to_string()
+        })
+    }
 }
 
 // ============================================================================

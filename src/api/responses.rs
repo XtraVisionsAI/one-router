@@ -50,7 +50,9 @@ impl IntoResponse for ResponsesApiResponse {
         match self {
             ResponsesApiResponse::Json(resp) => Json(*resp).into_response(),
             ResponsesApiResponse::Raw(value) => Json(*value).into_response(),
-            ResponsesApiResponse::Stream(stream) => Sse::new(stream).into_response(),
+            ResponsesApiResponse::Stream(stream) => Sse::new(stream)
+                .keep_alive(crate::api::sse_keep_alive())
+                .into_response(),
         }
     }
 }

@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
-use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
+use aws_sdk_bedrockruntime::types::error::{ConverseStreamOutputError, ResponseStreamError};
 use aws_sdk_bedrockruntime::types::{PayloadPart, ResponseStream};
 
 use super::backend_pool::{AwsCredential, Credential, CredentialPool};
@@ -119,7 +119,7 @@ impl BedrockService {
     /// throttling: a `ThrottlingException` disables the credential immediately (like
     /// an HTTP 429) so failover can switch to a healthy pool, rather than burning
     /// `max_failures` doomed requests on a throttled credential.
-    fn record_bedrock_error(&self, name: &str, err: &BedrockError) {
+    pub fn record_bedrock_error(&self, name: &str, err: &BedrockError) {
         if matches!(err, BedrockError::Throttled(_)) {
             self.record_rate_limited(name);
         } else {
@@ -929,6 +929,11 @@ impl ConverseRequest {
 // InvokeModel Stream Response (native Anthropic SSE)
 // ============================================================================
 
+/// `(event_type, json_data)` pairs from a Bedrock InvokeModel event stream; a
+/// terminal `Err` carries a mid-stream Bedrock failure.
+pub type InvokeModelEventPairs =
+    Pin<Box<dyn Stream<Item = Result<(String, String), BedrockError>> + Send>>;
+
 /// Streaming response from Bedrock InvokeModelWithResponseStream.
 /// The inner stream yields native Anthropic SSE events.
 pub struct InvokeModelStreamResponse {
@@ -972,13 +977,22 @@ impl InvokeModelStreamResponse {
                         yield Ok(ev);
                     }
                     Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: None, .. }))) => {}
-                    Ok(Some(_)) | Ok(None) => break,
+                    // Unknown event-stream variants are skipped, not treated as EOF.
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
                     Err(e) => {
+                        // Surface the upstream failure as an Anthropic `error`
+                        // event so the client can distinguish it from a
+                        // truncated stream, instead of silently closing.
+                        let err = BedrockError::from_response_stream_error(&e);
                         tracing::warn!(
-                            error = %e,
+                            error = %err,
                             credential = %cred_name,
                             "InvokeModel stream error"
                         );
+                        yield Ok(Event::default()
+                            .event("error")
+                            .data(err.to_anthropic_error_event()));
                         break;
                     }
                 }
@@ -992,7 +1006,13 @@ impl InvokeModelStreamResponse {
     ///
     /// Each Bedrock `PayloadPart` chunk contains a complete JSON object.
     /// The `type` field is extracted as event_type; the full JSON is data.
-    pub fn into_event_pairs(self) -> Pin<Box<dyn Stream<Item = (String, String)> + Send>> {
+    ///
+    /// A mid-stream Bedrock failure (throttling, `ModelStreamErrorException`,
+    /// internal error, …) is yielded as a terminal `Err(BedrockError)` so the
+    /// caller can emit a protocol-appropriate error frame and mark the
+    /// credential as failed. Previously these were swallowed and the SSE body
+    /// simply ended, which clients report as a truncated response.
+    pub fn into_event_pairs(self) -> InvokeModelEventPairs {
         Box::pin(async_stream::stream! {
             let mut receiver = self.inner;
             let cred_name = self.credential_name;
@@ -1010,16 +1030,20 @@ impl InvokeModelStreamResponse {
                             .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
                             .unwrap_or_default();
 
-                        yield (event_type, chunk);
+                        yield Ok((event_type, chunk));
                     }
                     Ok(Some(ResponseStream::Chunk(PayloadPart { bytes: None, .. }))) => {}
-                    Ok(Some(_)) | Ok(None) => break,
+                    // Unknown event-stream variants are skipped, not treated as EOF.
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
                     Err(e) => {
+                        let err = BedrockError::from_response_stream_error(&e);
                         tracing::warn!(
-                            error = %e,
+                            error = %err,
                             credential = %cred_name,
                             "InvokeModel stream error"
                         );
+                        yield Err(err);
                         break;
                     }
                 }
@@ -1705,6 +1729,58 @@ impl BedrockError {
         }
     }
 
+    /// Map a mid-stream `InvokeModelWithResponseStream` failure (an exception
+    /// delivered inside the event stream after HTTP 200) to a `BedrockError`.
+    pub fn from_response_stream_error<R>(err: &SdkError<ResponseStreamError, R>) -> Self
+    where
+        R: std::fmt::Debug,
+    {
+        match err {
+            SdkError::ServiceError(service_err) => match service_err.err() {
+                ResponseStreamError::ThrottlingException(e) => {
+                    BedrockError::Throttled(e.message().unwrap_or("Rate limited").to_string())
+                }
+                ResponseStreamError::ValidationException(e) => BedrockError::ValidationError(
+                    e.message().unwrap_or("Validation failed").to_string(),
+                ),
+                ResponseStreamError::ModelTimeoutException(e) => BedrockError::ServiceUnavailable(
+                    e.message().unwrap_or("Model timeout").to_string(),
+                ),
+                ResponseStreamError::ServiceUnavailableException(e) => {
+                    BedrockError::ServiceUnavailable(
+                        e.message().unwrap_or("Service unavailable").to_string(),
+                    )
+                }
+                ResponseStreamError::InternalServerException(e) => BedrockError::InternalError(
+                    e.message().unwrap_or("Internal server error").to_string(),
+                ),
+                ResponseStreamError::ModelStreamErrorException(e) => BedrockError::ApiError {
+                    message: e.message().unwrap_or("Model stream error").to_string(),
+                    error_type: BedrockErrorType::Server,
+                    is_retryable: true,
+                },
+                other => BedrockError::Unknown(format!("{other:?}")),
+            },
+            other => BedrockError::Unknown(format!("Stream transport error: {other:?}")),
+        }
+    }
+
+    /// Render this error as the payload of an Anthropic SSE `error` event
+    /// (`{"type":"error","error":{"type":...,"message":...}}`), using the same
+    /// error-type vocabulary as the non-streaming `ApiError` mapping.
+    pub fn to_anthropic_error_event(&self) -> String {
+        let error_type = match self {
+            BedrockError::Throttled(_) => "rate_limit_error",
+            BedrockError::ValidationError(_) | BedrockError::ModelNotFound(_) => {
+                "invalid_request_error"
+            }
+            BedrockError::AccessDenied(_) => "authentication_error",
+            BedrockError::ServiceUnavailable(_) => "overloaded_error",
+            _ => "api_error",
+        };
+        crate::schemas::anthropic::ErrorResponse::new(error_type, self.to_string()).to_json_string()
+    }
+
     pub fn from_invoke_model_error<R>(err: SdkError<InvokeModelError, R>) -> Self
     where
         R: std::fmt::Debug,
@@ -1789,6 +1865,32 @@ impl BedrockError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mid_stream_error_renders_anthropic_error_event() {
+        use super::BedrockError;
+        let ev = BedrockError::Throttled("slow down".into()).to_anthropic_error_event();
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("slow down"));
+
+        let ev = BedrockError::ServiceUnavailable("busy".into()).to_anthropic_error_event();
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        assert_eq!(v["error"]["type"], "overloaded_error");
+
+        let ev = BedrockError::ApiError {
+            message: "model stream error".into(),
+            error_type: super::BedrockErrorType::Server,
+            is_retryable: true,
+        }
+        .to_anthropic_error_event();
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        assert_eq!(v["error"]["type"], "api_error");
+    }
+
     use super::{mantle_http_error, BedrockError, BedrockService, MantleHost};
 
     #[test]

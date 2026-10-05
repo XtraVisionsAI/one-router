@@ -139,7 +139,9 @@ impl IntoResponse for ChatCompletionApiResponse {
     fn into_response(self) -> Response {
         match self {
             ChatCompletionApiResponse::Json(json) => json.into_response(),
-            ChatCompletionApiResponse::Stream(stream) => Sse::new(stream).into_response(),
+            ChatCompletionApiResponse::Stream(stream) => Sse::new(stream)
+                .keep_alive(crate::api::sse_keep_alive())
+                .into_response(),
         }
     }
 }
@@ -562,8 +564,28 @@ async fn handle_bedrock_request(
                 let mut output_tokens: i32 = 0;
                 let mut cache_read: Option<i32> = None;
                 let mut cache_creation: Option<i32> = None;
+                let mut stream_failed = false;
 
-                while let Some((event_type, data)) = event_pairs.next().await {
+                while let Some(item) = event_pairs.next().await {
+                    let (event_type, data) = match item {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            // Mid-stream Bedrock failure: emit an OpenAI error
+                            // frame (no `[DONE]`) and mark the credential.
+                            tracing::warn!(
+                                request_id = %req_id,
+                                error = %e,
+                                "Bedrock InvokeModel stream failed mid-response (OpenAI path)"
+                            );
+                            bedrock_clone.record_bedrock_error(&cred_name, &e);
+                            stream_failed = true;
+                            let err_body = OpenAIApiError::from_bedrock_error(&e).error;
+                            if let Ok(json) = serde_json::to_string(&err_body) {
+                                yield Ok(Event::default().data(json));
+                            }
+                            break;
+                        }
+                    };
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
                         match event_type.as_str() {
                             "message_start" => {
@@ -594,8 +616,10 @@ async fn handle_bedrock_request(
                         yield Ok(Event::default().data(chunk_json));
                     }
                 }
-                yield Ok(Event::default().data("[DONE]"));
-                bedrock_clone.record_success(&cred_name);
+                if !stream_failed {
+                    yield Ok(Event::default().data("[DONE]"));
+                    bedrock_clone.record_success(&cred_name);
+                }
 
                 tracing::debug!(
                     request_id = %req_id,

@@ -132,7 +132,9 @@ impl IntoResponse for MessageApiResponse {
     fn into_response(self) -> Response {
         match self {
             MessageApiResponse::Json(json) => json.into_response(),
-            MessageApiResponse::Stream(stream) => Sse::new(stream).into_response(),
+            MessageApiResponse::Stream(stream) => Sse::new(stream)
+                .keep_alive(crate::api::sse_keep_alive())
+                .into_response(),
         }
     }
 }
@@ -761,9 +763,29 @@ async fn handle_bedrock_request(
             let mut output_tokens: i32 = 0;
             let mut cache_read: Option<i32> = None;
             let mut cache_creation: Option<i32> = None;
+            let mut stream_failed = false;
 
             futures::pin_mut!(event_pairs);
-            while let Some((event_type, data)) = event_pairs.next().await {
+            while let Some(item) = event_pairs.next().await {
+                let (event_type, data) = match item {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // Mid-stream Bedrock failure: tell the client (Anthropic
+                        // `error` event) and mark the credential, instead of
+                        // ending the body as if the model had finished.
+                        tracing::warn!(
+                            request_id = %req_id,
+                            error = %e,
+                            "Bedrock InvokeModel stream failed mid-response"
+                        );
+                        bedrock_clone.record_bedrock_error(&cred_name, &e);
+                        stream_failed = true;
+                        yield Ok(Event::default()
+                            .event("error")
+                            .data(e.to_anthropic_error_event()));
+                        break;
+                    }
+                };
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
                     match event_type.as_str() {
                         "message_start" => {
@@ -795,7 +817,9 @@ async fn handle_bedrock_request(
                 yield Ok(ev);
             }
 
-            bedrock_clone.record_success(&cred_name);
+            if !stream_failed {
+                bedrock_clone.record_success(&cred_name);
+            }
 
             tracing::debug!(
                 request_id = %req_id,
