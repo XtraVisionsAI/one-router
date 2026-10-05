@@ -1,3 +1,9 @@
+## v0.31.3 (2026-10-05)
+
+### Fix
+
+- **streaming**: SSE keep-alive + surface mid-stream Bedrock errors
+
 ## v0.31.2 (2026-10-04)
 
 ### Fix
