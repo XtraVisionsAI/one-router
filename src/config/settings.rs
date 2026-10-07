@@ -4,12 +4,16 @@
 //! - DATABASE: Storage backend (sqlite://, postgres://, dynamodb://)
 //! - PORT: HTTP listen port (default: 8000)
 //! - LOG_LEVEL: Logging level (default: info)
+//! - MAX_BODY_SIZE_MB: Maximum HTTP request body size in MB (default: 64)
 //! - MASTER_API_KEY: Admin API key (auto-generated if missing on bare metal)
 //! - ENCRYPTION_KEY: AES-256-GCM key for credential encryption (auto-generated if missing on bare metal)
 
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::io::Write;
+
+/// Default maximum HTTP request body size in megabytes.
+pub const DEFAULT_MAX_BODY_SIZE_MB: u64 = 64;
 
 /// Main application settings — loaded from a minimal set of env vars.
 #[derive(Debug, Clone)]
@@ -25,6 +29,11 @@ pub struct Settings {
 
     /// Log level filter
     pub log_level: String,
+
+    /// Maximum HTTP request body size in megabytes (applied via axum
+    /// `DefaultBodyLimit`). Long Codex / Claude Code sessions ship the whole
+    /// conversation in a single request, easily exceeding axum's 2 MB default.
+    pub max_body_size_mb: u64,
 
     /// Master API key for admin access
     pub master_api_key: Option<String>,
@@ -69,6 +78,14 @@ impl Settings {
 
         let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
 
+        let max_body_size_mb: u64 = env::var("MAX_BODY_SIZE_MB")
+            .unwrap_or_else(|_| DEFAULT_MAX_BODY_SIZE_MB.to_string())
+            .parse()
+            .context("Invalid MAX_BODY_SIZE_MB value")?;
+        if max_body_size_mb == 0 {
+            bail!("Invalid MAX_BODY_SIZE_MB value: must be at least 1");
+        }
+
         let master_api_key = env::var("MASTER_API_KEY").ok().filter(|k| !k.is_empty());
 
         let encryption_key = env::var("ENCRYPTION_KEY").ok().filter(|k| !k.is_empty());
@@ -96,6 +113,7 @@ impl Settings {
             port,
             host,
             log_level,
+            max_body_size_mb,
             master_api_key,
             encryption_key,
             web_search_provider,
@@ -185,6 +203,7 @@ impl Settings {
         port: Option<u16>,
         host: Option<String>,
         log_level: Option<String>,
+        max_body_size_mb: Option<u64>,
         master_api_key: Option<String>,
         encryption_key: Option<String>,
         seed_defaults: Option<crate::database::seed::SeedMode>,
@@ -200,6 +219,9 @@ impl Settings {
         }
         if let Some(v) = log_level {
             self.log_level = v;
+        }
+        if let Some(v) = max_body_size_mb {
+            self.max_body_size_mb = v.max(1);
         }
         if let Some(v) = master_api_key {
             self.master_api_key = Some(v);
@@ -222,6 +244,11 @@ impl Settings {
     /// Get the server address string.
     pub fn server_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// Maximum request body size in bytes (for axum `DefaultBodyLimit`).
+    pub fn max_body_size_bytes(&self) -> usize {
+        usize::try_from(self.max_body_size_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
     }
 
     /// Lightweight startup configuration health check. Returns human-readable
@@ -316,6 +343,7 @@ mod tests {
             port: 9000,
             host: "127.0.0.1".into(),
             log_level: "debug".into(),
+            max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             master_api_key: None,
             encryption_key: None,
             web_search_provider: None,
@@ -335,6 +363,7 @@ mod tests {
             port: 8000,
             host: "0.0.0.0".into(),
             log_level: "info".into(),
+            max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             master_api_key: Some("changeme".into()),
             encryption_key: Some("a".repeat(32)),
             web_search_provider: None,
@@ -355,6 +384,7 @@ mod tests {
             port: 8000,
             host: "0.0.0.0".into(),
             log_level: "info".into(),
+            max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             master_api_key: Some("sk-9f3c1a7e5b2d4f60a8c1e3d5b7f9a1c3".into()),
             encryption_key: Some("a".repeat(32)),
             web_search_provider: None,
@@ -373,12 +403,41 @@ mod tests {
     }
 
     #[test]
+    fn test_max_body_size_bytes() {
+        let mut settings = Settings {
+            database: "sqlite://./test.db".into(),
+            port: 8000,
+            host: "0.0.0.0".into(),
+            log_level: "info".into(),
+            max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
+            master_api_key: None,
+            encryption_key: None,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_max_content_kb: 512,
+            seed_defaults: crate::database::seed::SeedMode::default(),
+            app_version: "0.1.0".into(),
+            ephemeral_api_key: None,
+        };
+        assert_eq!(settings.max_body_size_bytes(), 64 * 1024 * 1024);
+
+        settings.apply_overrides(None, None, None, None, Some(8), None, None, None);
+        assert_eq!(settings.max_body_size_mb, 8);
+        assert_eq!(settings.max_body_size_bytes(), 8 * 1024 * 1024);
+
+        // Zero is clamped to the 1 MB floor rather than disabling uploads.
+        settings.apply_overrides(None, None, None, None, Some(0), None, None, None);
+        assert_eq!(settings.max_body_size_mb, 1);
+    }
+
+    #[test]
     fn test_generate_ephemeral_key() {
         let mut settings = Settings {
             database: "sqlite://./test.db".into(),
             port: 8000,
             host: "0.0.0.0".into(),
             log_level: "info".into(),
+            max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             master_api_key: None,
             encryption_key: None,
             web_search_provider: None,

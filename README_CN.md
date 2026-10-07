@@ -355,6 +355,7 @@ One Router 使用环境变量配置基础设施。所有运行时设置存储在
 | `MASTER_API_KEY` | _(自动生成)_ | 管理专用 API Key — 用于 `/admin` 界面登录和管理 API，不能调用 `/v1/*` 业务端点。裸机首次运行时自动生成并保存到 `.env` |
 | `ENCRYPTION_KEY` | _(自动生成)_ | AES-256 密钥，用于凭证加密和 API Key HMAC — 首次运行时自动生成 |
 | `SEED_DEFAULTS` | `empty` | 启动时何时植入默认模型映射：`off`（从不）、`empty`（仅当映射表为空 — 用户删除不会被复活）或 `missing`（每次启动补齐缺失的默认项） |
+| `MAX_BODY_SIZE_MB` | `64` | HTTP 请求体大小上限（MB）。长会话的 Codex / Claude Code 会把完整对话放在单个请求里。前置反向代理的限制（如 nginx `client_max_body_size`）需与此值对齐 |
 
 **首次运行行为：**
 - **裸机部署：** 缺失的 `MASTER_API_KEY` 或 `ENCRYPTION_KEY` 会自动生成并保存到 `.env` 文件。

@@ -2,6 +2,7 @@
 
 use axum::{
     body::Body,
+    extract::DefaultBodyLimit,
     http::Request,
     middleware,
     response::Response,
@@ -26,6 +27,10 @@ use crate::server::state::AppState;
 /// at startup. This is safe because the router is built once before the server
 /// starts accepting requests (no write contention).
 pub fn create_router(state: AppState) -> Router {
+    // Request body cap (axum defaults to 2 MB, far too small for long Codex /
+    // Claude Code sessions that ship the whole conversation per request).
+    let body_limit = DefaultBodyLimit::max(state.settings.max_body_size_bytes());
+
     // Health check routes (no authentication required)
     let health_routes = Router::new()
         .route("/health", get(health::health_check))
@@ -178,6 +183,7 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/admin/api", admin_api_routes) // protected admin endpoints
         .nest("/admin", admin_static_routes) // broader wildcard second
         .fallback(move |request: Request<Body>| async move { fallback_handler(request) })
+        .layer(body_limit)
         .layer(middleware::from_fn(track_http_metrics))
         .layer(create_cors_layer())
         .with_state(state)

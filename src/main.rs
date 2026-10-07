@@ -26,6 +26,11 @@ struct Cli {
     #[arg(long, short = 'l')]
     log_level: Option<String>,
 
+    /// Maximum HTTP request body size in MB (overrides MAX_BODY_SIZE_MB env var,
+    /// default 64)
+    #[arg(long, value_name = "MB")]
+    max_body_size_mb: Option<u64>,
+
     /// Master API key for admin access (overrides MASTER_API_KEY env var)
     #[arg(long)]
     master_api_key: Option<String>,
@@ -72,6 +77,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         cli.port,
         cli.host,
         cli.log_level,
+        cli.max_body_size_mb,
         cli.master_api_key,
         cli.encryption_key,
         cli.seed_defaults,
@@ -83,6 +89,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     println!("{}", "=".repeat(60));
     println!("  Database:  {}", settings.database);
     println!("  Listen:    {}:{}", settings.host, settings.port);
+    println!("  Max body:  {} MB", settings.max_body_size_mb);
 
     if cfg!(debug_assertions) {
         let ephemeral_key = settings.generate_ephemeral_key();

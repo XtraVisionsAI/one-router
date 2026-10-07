@@ -106,6 +106,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 8000,
             log_level: "debug".to_string(),
+            max_body_size_mb: crate::config::settings::DEFAULT_MAX_BODY_SIZE_MB,
             master_api_key: master.map(|s| s.to_string()),
             encryption_key: None,
             web_search_provider: None,

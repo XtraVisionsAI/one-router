@@ -351,6 +351,7 @@ One Router uses environment variables for infrastructure config. All runtime set
 | `MASTER_API_KEY` | _(auto-generated)_ | Admin-only key — for `/admin` UI login and admin API. Cannot call `/v1/*` business endpoints. Auto-generated and saved to `.env` on first bare-metal run |
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
 | `SEED_DEFAULTS` | `empty` | When to seed default model mappings on startup: `off` (never), `empty` (only when the mappings table is empty — deletions stick), or `missing` (re-insert any missing default on every startup) |
+| `MAX_BODY_SIZE_MB` | `64` | Maximum HTTP request body size in MB (long Codex / Claude Code sessions send the whole conversation per request). Align any reverse proxy's limit (e.g. nginx `client_max_body_size`) with this value |
 
 **First-run behavior:**
 - **Bare metal:** Missing `MASTER_API_KEY` or `ENCRYPTION_KEY` are auto-generated and saved to `.env`.

@@ -60,6 +60,7 @@ Options:
       --master-api-key <KEY>          Master API key for admin access
       --encryption-key <KEY>          Encryption key for credential storage
       --seed-defaults <MODE>          When to seed default model mappings: off / empty / missing
+      --max-body-size-mb <MB>         Maximum HTTP request body size in MB (default 64)
   -h, --help                          Print help
   -V, --version                       Print version
 ```
@@ -82,6 +83,7 @@ Infrastructure env vars — all other config lives in the database (`system_sett
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
 | `CONTAINER` | _(unset)_ | Set to `true` in Docker — requires MASTER_API_KEY and ENCRYPTION_KEY to be provided explicitly |
 | `SEED_DEFAULTS` | `empty` | When to seed default model mappings on startup: `off` (never) / `empty` (only when the mappings table is empty — user deletions stick) / `missing` (legacy: re-insert any missing default on every startup). System settings are always backfilled per key regardless of this mode |
+| `MAX_BODY_SIZE_MB` | `64` | Maximum HTTP request body size in MB, applied as an axum `DefaultBodyLimit` on the whole router (axum's own default is 2 MB). Infrastructure-level: read once at startup, not hot-reloadable. Keep any reverse proxy's limit (nginx `client_max_body_size`) in step |
 
 **DATABASE URI formats:**
 - `sqlite:///app/data/gateway.db`
