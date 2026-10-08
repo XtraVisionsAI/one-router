@@ -1,3 +1,13 @@
+## v0.33.0 (2026-10-08)
+
+### Feat
+
+- **messages**: per-provider token counting for /v1/messages/count_tokens
+
+### Refactor
+
+- **messages**: extract resolve_request_route + effective_capabilities
+
 ## v0.32.0 (2026-10-08)
 
 ### Feat
