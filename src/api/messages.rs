@@ -1713,61 +1713,309 @@ async fn create_gemini_streaming_response(
 // Count Tokens Endpoint
 // ============================================================================
 
-/// Count tokens request
-#[derive(Debug, Clone, Deserialize)]
-pub struct CountTokensRequest {
-    pub model: String,
-    pub messages: Vec<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<serde_json::Value>>,
-}
-
-/// Count tokens response
-#[derive(Debug, Clone, Serialize)]
+/// Count tokens response (`{"input_tokens": N}` — Anthropic wire format).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
 }
 
+/// Why a count_tokens request fell back to the local estimate. Logged (never
+/// returned to the client, never a metric label).
+#[derive(Debug)]
+enum CountTokensFallback {
+    /// The resolved provider has no token-counting API (OpenAI).
+    ProviderHasNoApi,
+    /// The target model has no counting support (Mantle Responses-only, or the
+    /// backend said so).
+    UnsupportedModel(String),
+    /// No configured/eligible credential for the target model.
+    NoCredential(String),
+    /// Conversion or upstream failure.
+    Upstream(String),
+}
+
+impl CountTokensFallback {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::ProviderHasNoApi => "provider_has_no_api",
+            Self::UnsupportedModel(_) => "unsupported_model",
+            Self::NoCredential(_) => "no_credential",
+            Self::Upstream(_) => "upstream_error",
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::ProviderHasNoApi => "",
+            Self::UnsupportedModel(s) | Self::NoCredential(s) | Self::Upstream(s) => s,
+        }
+    }
+}
+
 /// POST /v1/messages/count_tokens - Count tokens in a message
 ///
-/// This endpoint estimates the number of tokens that would be used by a request.
-/// Note: Bedrock doesn't provide a direct token counting API, so this returns an estimate.
+/// The request body is a Messages API request without `max_tokens` (the field
+/// has a serde default, so the official count_tokens shape parses as a
+/// `MessageRequest`). The source model is routed exactly like `/v1/messages`
+/// (model mapping → failover → capability filter), then:
+///
+/// - `anthropic` → forwarded to the upstream `count_tokens` endpoint
+/// - `bedrock`   → `CountTokens` API (InvokeModel body for Claude, Converse body otherwise;
+///   Mantle Responses-only models have no counting API)
+/// - `gemini`    → `models/{model}:countTokens`
+/// - `openai`    → no upstream API
+///
+/// Any failure of the exact path degrades to a local estimate with HTTP 200:
+/// this is an auxiliary endpoint (Claude Code uses it to decide when to
+/// compact), and a slightly-off number serves the client better than a 5xx.
+/// Request-shape errors (400) and unmapped models (400) still surface as-is.
 pub async fn count_tokens(
-    State(_state): State<AppState>,
-    AnthropicJson(request): AnthropicJson<CountTokensRequest>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AnthropicJson(mut request): AnthropicJson<MessageRequest>,
 ) -> Result<Json<CountTokensResponse>, ApiError> {
+    let request_id = Uuid::new_v4().to_string();
+    let beta_header = extract_beta_header(&headers);
+
+    // Same routing decision as create_message. Never a PTC request, so failover
+    // applies unconditionally.
+    let resolved = resolve_request_route(&state, &request.model, &request_id, false).await?;
+    let caps = effective_capabilities(&state, &resolved).await;
+
+    if matches!(resolved.provider.as_str(), "bedrock" | "gemini") {
+        crate::services::image_url_fetcher::resolve_anthropic_image_urls(&mut request)
+            .await
+            .map_err(ApiError::bad_request)?;
+    }
+    let filtered = crate::converters::capability_filter::apply_capabilities(&request, &caps);
+
     tracing::debug!(
+        request_id = %request_id,
         model = %request.model,
+        target_model = %resolved.target_model_id,
+        provider = %resolved.provider,
         message_count = request.messages.len(),
         "Counting tokens"
     );
 
-    // Simple estimation: ~4 characters per token (rough estimate)
-    let mut char_count = 0;
+    let counted: Result<i32, CountTokensFallback> = match resolved.provider.as_str() {
+        "anthropic" => {
+            count_tokens_anthropic(&state, &filtered, &resolved.target_model_id, &headers).await
+        }
+        "gemini" => count_tokens_gemini(&state, &filtered, &resolved.target_model_id).await,
+        "openai" => Err(CountTokensFallback::ProviderHasNoApi),
+        _ => {
+            count_tokens_bedrock(
+                &state,
+                &filtered,
+                &resolved.target_model_id,
+                &caps,
+                beta_header.as_deref(),
+            )
+            .await
+        }
+    };
 
-    for message in &request.messages {
-        if let Some(content) = message.get("content") {
-            char_count += content.to_string().len();
+    let (input_tokens, exact) = match counted {
+        Ok(n) => (n, true),
+        Err(fallback) => {
+            let estimate = crate::utils::tokens::estimate_message_request_tokens(&filtered);
+            match &fallback {
+                CountTokensFallback::ProviderHasNoApi
+                | CountTokensFallback::UnsupportedModel(_) => {
+                    tracing::debug!(
+                        request_id = %request_id,
+                        provider = %resolved.provider,
+                        target_model = %resolved.target_model_id,
+                        reason = fallback.reason(),
+                        detail = fallback.detail(),
+                        "count_tokens: using local estimate"
+                    );
+                }
+                _ => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        provider = %resolved.provider,
+                        target_model = %resolved.target_model_id,
+                        reason = fallback.reason(),
+                        detail = fallback.detail(),
+                        "count_tokens: exact count unavailable, using local estimate"
+                    );
+                }
+            }
+            (estimate, false)
+        }
+    };
+
+    crate::observability::metrics::record_count_tokens(&resolved.provider, exact);
+    tracing::info!(
+        request_id = %request_id,
+        provider = %resolved.provider,
+        target_model = %resolved.target_model_id,
+        input_tokens,
+        method = if exact { "exact" } else { "estimated" },
+        "count_tokens completed"
+    );
+
+    Ok(Json(CountTokensResponse { input_tokens }))
+}
+
+/// Anthropic passthrough: forward to the upstream count_tokens endpoint.
+async fn count_tokens_anthropic(
+    state: &AppState,
+    request: &MessageRequest,
+    target_model_id: &str,
+    client_headers: &HeaderMap,
+) -> Result<i32, CountTokensFallback> {
+    let pool = state
+        .dynamic
+        .read()
+        .await
+        .anthropic_pool
+        .clone()
+        .ok_or_else(|| {
+            CountTokensFallback::NoCredential("Anthropic backend not configured".into())
+        })?;
+    let instance = pool.get_next_for_model(target_model_id).ok_or_else(|| {
+        CountTokensFallback::NoCredential(format!(
+            "No anthropic backend serves model '{target_model_id}'"
+        ))
+    })?;
+    let svc = &instance.service;
+
+    let mut body = serde_json::to_value(request)
+        .map_err(|e| CountTokensFallback::Upstream(format!("serialize: {e}")))?;
+    body["model"] = serde_json::Value::String(target_model_id.to_string());
+    if let Some(obj) = body.as_object_mut() {
+        // Not part of the count_tokens request shape.
+        for k in ["max_tokens", "stream", "container", "service_tier"] {
+            obj.remove(k);
+        }
+    }
+    let body_bytes = serde_json::to_vec(&body)
+        .map_err(|e| CountTokensFallback::Upstream(format!("serialize: {e}")))?;
+
+    let mut extra_headers: Vec<(String, String)> = Vec::new();
+    for name in &["anthropic-version", "anthropic-beta"] {
+        if let Some(v) = client_headers.get(*name).and_then(|v| v.to_str().ok()) {
+            extra_headers.push((name.to_string(), v.to_string()));
         }
     }
 
-    if let Some(ref system) = request.system {
-        char_count += system.to_string().len();
-    }
+    let (resp, credential_name) = svc
+        .forward("/v1/messages/count_tokens", body_bytes, &extra_headers)
+        .await
+        .map_err(|e| CountTokensFallback::Upstream(e.to_string()))?;
 
-    if let Some(ref tools) = request.tools {
-        for tool in tools {
-            char_count += tool.to_string().len();
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        // 429: count_tokens has its own quota — do not cool the credential down.
+        if status >= 500 {
+            svc.record_failure(&credential_name);
         }
+        return Err(CountTokensFallback::Upstream(format!(
+            "HTTP {status}: {text}"
+        )));
     }
 
-    let estimated_tokens = (char_count / 4).max(1) as i32;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| CountTokensFallback::Upstream(format!("read body: {e}")))?;
+    svc.record_success(&credential_name);
+    let parsed: CountTokensResponse = serde_json::from_str(&text)
+        .map_err(|e| CountTokensFallback::Upstream(format!("parse: {e}")))?;
+    Ok(parsed.input_tokens)
+}
 
-    Ok(Json(CountTokensResponse {
-        input_tokens: estimated_tokens,
-    }))
+/// Gemini: `models/{model}:countTokens` on the converted request.
+async fn count_tokens_gemini(
+    state: &AppState,
+    request: &MessageRequest,
+    target_model_id: &str,
+) -> Result<i32, CountTokensFallback> {
+    let pool = state
+        .dynamic
+        .read()
+        .await
+        .gemini_pool
+        .clone()
+        .ok_or_else(|| CountTokensFallback::NoCredential("Gemini backend not configured".into()))?;
+    let instance = pool.get_next_for_model(target_model_id).ok_or_else(|| {
+        CountTokensFallback::NoCredential(format!(
+            "No gemini backend serves model '{target_model_id}'"
+        ))
+    })?;
+
+    let (_, gemini_request) = AnthropicToGeminiConverter::new()
+        .convert_request(request)
+        .map_err(|e| CountTokensFallback::Upstream(format!("conversion: {e}")))?;
+
+    let total = instance
+        .service
+        .count_tokens(target_model_id, &gemini_request)
+        .await
+        .map_err(|e| match e {
+            crate::services::gemini::GeminiServiceError::ApiError { code, message }
+                if code == 404 || code == 400 =>
+            {
+                CountTokensFallback::UnsupportedModel(format!("{code}: {message}"))
+            }
+            other => CountTokensFallback::Upstream(other.to_string()),
+        })?;
+    Ok(total.clamp(0, i32::MAX as i64) as i32)
+}
+
+/// Bedrock: `CountTokens` with an InvokeModel body (Claude) or a Converse body
+/// (other Converse-capable models). Mantle Responses-only models have no
+/// counting API.
+async fn count_tokens_bedrock(
+    state: &AppState,
+    request: &MessageRequest,
+    target_model_id: &str,
+    caps: &crate::services::capabilities::ModelCapabilities,
+    beta_header: Option<&str>,
+) -> Result<i32, CountTokensFallback> {
+    let bedrock = state.dynamic.read().await.bedrock.clone().ok_or_else(|| {
+        CountTokensFallback::NoCredential("Bedrock backend not configured".into())
+    })?;
+
+    let routing_model_id = bedrock
+        .resolve_routing_model_id(target_model_id)
+        .await
+        .map_err(|e| CountTokensFallback::Upstream(e.to_string()))?;
+
+    if crate::services::BedrockService::is_mantle_responses_model(&routing_model_id) {
+        return Err(CountTokensFallback::UnsupportedModel(format!(
+            "'{target_model_id}' is a Responses-only model (no CountTokens API)"
+        )));
+    }
+
+    let result = if crate::services::BedrockService::is_claude_model(&routing_model_id) {
+        bedrock
+            .count_tokens_invoke_model(request, target_model_id, beta_header)
+            .await
+    } else {
+        let chat_req = AnthropicToOpenAIConverter::new()
+            .convert_request(request, target_model_id)
+            .map_err(|e| CountTokensFallback::Upstream(format!("conversion: {e}")))?;
+        let converse =
+            crate::converters::openai_bedrock::convert_request(&chat_req, target_model_id, caps)
+                .map_err(|e| CountTokensFallback::Upstream(format!("conversion: {e}")))?;
+        bedrock.count_tokens_converse(converse).await
+    };
+
+    result.map_err(|e| match &e {
+        BedrockError::ValidationError(m) if m.to_ascii_lowercase().contains("not support") => {
+            CountTokensFallback::UnsupportedModel(m.clone())
+        }
+        BedrockError::ModelNotFound(m) => CountTokensFallback::UnsupportedModel(m.clone()),
+        BedrockError::ServiceUnavailable(m) if m.starts_with("No bedrock backend serves") => {
+            CountTokensFallback::NoCredential(m.clone())
+        }
+        _ => CountTokensFallback::Upstream(e.to_string()),
+    })
 }
 
 // ============================================================================
@@ -2034,10 +2282,38 @@ mod tests {
     }
 
     #[test]
-    fn test_count_tokens_estimation() {
-        let char_count = 400;
-        let estimated_tokens = (char_count / 4).max(1);
-        assert_eq!(estimated_tokens, 100);
+    fn count_tokens_request_parses_without_max_tokens() {
+        // The official count_tokens body is a Messages request minus max_tokens.
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "system": "be brief",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}]
+        });
+        let req: MessageRequest = serde_json::from_value(body).expect("parses");
+        assert_eq!(req.messages.len(), 1);
+        assert!(req.tools.is_some());
+        assert!(req.max_tokens > 0, "serde default must fill max_tokens");
+    }
+
+    #[test]
+    fn count_tokens_fallback_reasons_are_bounded_labels() {
+        let cases = [
+            CountTokensFallback::ProviderHasNoApi,
+            CountTokensFallback::UnsupportedModel("x".into()),
+            CountTokensFallback::NoCredential("x".into()),
+            CountTokensFallback::Upstream("x".into()),
+        ];
+        let reasons: Vec<&str> = cases.iter().map(|c| c.reason()).collect();
+        assert_eq!(
+            reasons,
+            [
+                "provider_has_no_api",
+                "unsupported_model",
+                "no_credential",
+                "upstream_error"
+            ]
+        );
     }
 
     #[test]

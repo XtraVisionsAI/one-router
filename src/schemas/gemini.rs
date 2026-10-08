@@ -37,6 +37,13 @@ pub struct GeminiRequest {
     pub tool_config: Option<ToolConfig>,
 }
 
+/// Response body of `models/{model}:countTokens`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiCountTokensResponse {
+    pub total_tokens: i64,
+}
+
 /// Content block containing role and parts
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiContent {

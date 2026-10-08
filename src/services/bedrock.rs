@@ -6,12 +6,13 @@
 use aws_sdk_bedrockruntime::{
     operation::converse::{ConverseError, ConverseOutput},
     operation::converse_stream::ConverseStreamError,
+    operation::count_tokens::CountTokensError,
     operation::invoke_model::InvokeModelError,
     operation::invoke_model_with_response_stream::InvokeModelWithResponseStreamError,
     primitives::Blob,
     types::{
-        ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage,
-        SystemContentBlock, ToolConfiguration,
+        ConverseStreamOutput, ConverseTokensRequest, CountTokensInput, InferenceConfiguration,
+        InvokeModelTokensRequest, Message as BedrockMessage, SystemContentBlock, ToolConfiguration,
     },
     Client as BedrockRuntimeClient,
 };
@@ -190,6 +191,111 @@ impl BedrockService {
 
         self.record_success(&cred_name);
         Ok(result)
+    }
+
+    /// Count prompt tokens for a Claude model via `CountTokens` with an
+    /// InvokeModel-shaped body.
+    ///
+    /// The body is built by `build_invoke_model_body` — the same function the
+    /// real InvokeModel call uses — so every Bedrock-specific rewrite (beta
+    /// headers, `output_config` lifting, fallback stripping, …) is applied and
+    /// the count matches what the inference request will be billed. The body
+    /// keeps `max_tokens`: CountTokens accepts a full InvokeModel request body.
+    pub async fn count_tokens_invoke_model(
+        &self,
+        request: &crate::schemas::anthropic::MessageRequest,
+        model_id: &str,
+        beta_header: Option<&str>,
+    ) -> Result<i32, BedrockError> {
+        let (cred_name, client) = self.get_client_for(model_id)?;
+        let cred_name = cred_name.to_string();
+
+        let body = build_invoke_model_body(request, model_id, false, None, beta_header)?;
+        let input = InvokeModelTokensRequest::builder()
+            .body(Blob::new(body))
+            .build()
+            .map_err(|e| BedrockError::Serialization(e.to_string()))?;
+
+        tracing::debug!(
+            model_id = %model_id,
+            credential = %cred_name,
+            "Calling Bedrock CountTokens (InvokeModel body)"
+        );
+
+        let result = client
+            .count_tokens()
+            .model_id(model_id)
+            .input(CountTokensInput::InvokeModel(input))
+            .send()
+            .await;
+
+        self.finish_count_tokens(&cred_name, result)
+    }
+
+    /// Count prompt tokens for a Converse-capable (non-Claude) model via
+    /// `CountTokens` with a Converse-shaped body. `inference_config` is not part
+    /// of the count input and is dropped.
+    pub async fn count_tokens_converse(
+        &self,
+        request: ConverseRequest,
+    ) -> Result<i32, BedrockError> {
+        let (cred_name, client) = self.get_client_for(&request.model_id)?;
+        let cred_name = cred_name.to_string();
+
+        let input = ConverseTokensRequest::builder()
+            .set_messages(Some(request.messages))
+            .set_system(request.system)
+            .set_tool_config(request.tool_config)
+            .set_additional_model_request_fields(request.additional_model_request_fields)
+            .build();
+
+        tracing::debug!(
+            model_id = %request.model_id,
+            credential = %cred_name,
+            "Calling Bedrock CountTokens (Converse body)"
+        );
+
+        let result = client
+            .count_tokens()
+            .model_id(&request.model_id)
+            .input(CountTokensInput::Converse(input))
+            .send()
+            .await;
+
+        self.finish_count_tokens(&cred_name, result)
+    }
+
+    /// Shared tail of the CountTokens calls: map the SDK result and update the
+    /// credential's health.
+    ///
+    /// CountTokens has its own throttling quota, independent of inference, so a
+    /// `ThrottlingException` here must NOT cool the credential down (that would
+    /// take a perfectly usable inference credential out of rotation). Server
+    /// errors still count as failures; success still re-enables the credential.
+    fn finish_count_tokens<R: std::fmt::Debug>(
+        &self,
+        cred_name: &str,
+        result: Result<
+            aws_sdk_bedrockruntime::operation::count_tokens::CountTokensOutput,
+            SdkError<CountTokensError, R>,
+        >,
+    ) -> Result<i32, BedrockError> {
+        match result {
+            Ok(output) => {
+                self.record_success(cred_name);
+                Ok(output.input_tokens())
+            }
+            Err(e) => {
+                let err = BedrockError::from_count_tokens_error(e);
+                if matches!(
+                    err,
+                    BedrockError::ServiceUnavailable(_) | BedrockError::InternalError(_)
+                ) {
+                    self.record_failure(cred_name);
+                }
+                Err(err)
+            }
+        }
     }
 
     pub async fn converse_stream(
@@ -1779,6 +1885,41 @@ impl BedrockError {
             _ => "api_error",
         };
         crate::schemas::anthropic::ErrorResponse::new(error_type, self.to_string()).to_json_string()
+    }
+
+    pub fn from_count_tokens_error<R>(err: SdkError<CountTokensError, R>) -> Self
+    where
+        R: std::fmt::Debug,
+    {
+        match &err {
+            SdkError::ServiceError(service_err) => {
+                let error = service_err.err();
+                match error {
+                    CountTokensError::ThrottlingException(e) => {
+                        BedrockError::Throttled(e.message().unwrap_or("Rate limited").to_string())
+                    }
+                    CountTokensError::ValidationException(e) => BedrockError::ValidationError(
+                        e.message().unwrap_or("Validation failed").to_string(),
+                    ),
+                    CountTokensError::InternalServerException(e) => BedrockError::InternalError(
+                        e.message().unwrap_or("Internal server error").to_string(),
+                    ),
+                    CountTokensError::AccessDeniedException(e) => BedrockError::AccessDenied(
+                        e.message().unwrap_or("Access denied").to_string(),
+                    ),
+                    CountTokensError::ResourceNotFoundException(e) => BedrockError::ModelNotFound(
+                        e.message().unwrap_or("Resource not found").to_string(),
+                    ),
+                    CountTokensError::ServiceUnavailableException(e) => {
+                        BedrockError::ServiceUnavailable(
+                            e.message().unwrap_or("Service unavailable").to_string(),
+                        )
+                    }
+                    _ => BedrockError::Unknown(format!("{error:?}")),
+                }
+            }
+            _ => BedrockError::Unknown(format!("{err:?}")),
+        }
     }
 
     pub fn from_invoke_model_error<R>(err: SdkError<InvokeModelError, R>) -> Self

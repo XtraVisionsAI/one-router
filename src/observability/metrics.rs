@@ -39,6 +39,9 @@ struct Metrics {
     inflight_requests: IntGauge,
     /// Authentication failures, labeled by reason.
     auth_failures_total: IntCounterVec,
+    /// `/v1/messages/count_tokens` calls, labeled by provider and whether the
+    /// count came from the backend (`exact`) or a local estimate (`estimated`).
+    count_tokens_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -108,6 +111,15 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let count_tokens_total = IntCounterVec::new(
+            Opts::new(
+                "onerouter_count_tokens_total",
+                "count_tokens requests, by provider and method (exact/estimated)",
+            ),
+            &["provider", "method"],
+        )
+        .expect("valid metric");
+
         let build_info = IntGaugeVec::new(
             Opts::new(
                 "onerouter_build_info",
@@ -142,6 +154,9 @@ impl Metrics {
         registry
             .register(Box::new(auth_failures_total.clone()))
             .expect("register auth_failures_total");
+        registry
+            .register(Box::new(count_tokens_total.clone()))
+            .expect("register count_tokens_total");
         // build_info is register-and-forget: the registry holds the clone, the
         // value never changes, and nothing reads it back.
         registry
@@ -157,6 +172,7 @@ impl Metrics {
             http_request_duration,
             inflight_requests,
             auth_failures_total,
+            count_tokens_total,
         }
     }
 }
@@ -213,6 +229,16 @@ pub fn record_failover(from_provider: &str, to_provider: &str) {
     metrics()
         .failover_total
         .with_label_values(&[from_provider, to_provider])
+        .inc();
+}
+
+/// Record one `/v1/messages/count_tokens` call. `exact` is true when the count
+/// came from the backend's token-counting API, false for the local estimate.
+pub fn record_count_tokens(provider: &str, exact: bool) {
+    let method = if exact { "exact" } else { "estimated" };
+    metrics()
+        .count_tokens_total
+        .with_label_values(&[provider, method])
         .inc();
 }
 

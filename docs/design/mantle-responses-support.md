@@ -111,7 +111,7 @@ target model id,failover 到 GPT 模型时判断依然正确。
    thinking capability 门控),reasoning summary → `reasoning_content`,
    `stream_options.include_usage` 支持。chat 协议无 reasoning 回传(与 OpenAI
    原生行为一致)。
-4. `/v1/messages/count_tokens` 维持本地估算,不受影响。
+4. `/v1/messages/count_tokens` 对 Responses-only 模型回落到本地估算（无 CountTokens 接口）；其他 Bedrock 模型走 `CountTokens`，见 `docs/design/count-tokens-dispatch.md`。
 
 接线:两个 handler 的 Bedrock 分支在 `resolve_routing_model_id` 后、Claude
 判定前拦截 `is_mantle_responses_model` → `handle_mantle_responses_request`

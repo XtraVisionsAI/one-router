@@ -1,6 +1,6 @@
 # `/v1/messages/count_tokens` 按 provider 分发实现方案
 
-**状态**: 设计稿（2026-10-08）
+**状态**: 已实现（2026-10-08，分支 `worktree-count-tokens-design`）。本文已按实际落地内容修订；与原设计稿的差异见 §12。
 **范围**: 仅 Anthropic 协议端点 `POST /v1/messages/count_tokens`。OpenAI 协议不新增端点（上游 OpenAI 也没有 token 计数 API，客户端靠 tiktoken 本地算）。
 
 ---
@@ -58,7 +58,7 @@
 ### 4.2 Handler 骨架
 
 ```text
-count_tokens(State, Extension<ApiKeyInfo>, HeaderMap, AnthropicJson<MessageRequest>)
+count_tokens(State, HeaderMap, AnthropicJson<MessageRequest>)
   │
   ├── resolve_request_route(&state, &request, beta_header)   ← 从 create_message 抽出的共享步骤
   │     ├── model_mapping.resolve
@@ -80,9 +80,9 @@ count_tokens(State, Extension<ApiKeyInfo>, HeaderMap, AnthropicJson<MessageReque
   └── Ok(Json(CountTokensResponse { input_tokens }))
 ```
 
-**抽取共享步骤**: `create_message` 里「resolve → failover → capability filter」目前内联。本方案抽成
-`async fn resolve_request_route(state, request, beta_header, is_ptc) -> Result<RoutedRequest, ApiError>`，
-`RoutedRequest { resolved: ResolvedModel, filtered_request: MessageRequest, effective_caps: ModelCapabilities }`，两处共用。`create_message` 行为不变，这是纯重构。
+**抽取共享步骤**: `create_message` 里「resolve → failover」与「capability 三层回退」原本内联。已抽成两个函数共用：
+`resolve_request_route(state, source_model, request_id, skip_failover) -> Result<ResolvedModel, ApiError>`
+与 `effective_capabilities(state, &resolved) -> ModelCapabilities`。拆成两个而不是一个 `RoutedRequest`，是因为 `create_message` 的 PTC 分支位于两步之间且使用未过滤的请求；拆开后 `create_message` 行为完全不变（已单独 commit）。
 
 **降级原则**: 任一上游计数失败（网络、权限、模型不支持 `CountTokens`、配额），**不对客户端报错**，记一条 `warn` 后回落到估算并返回 200。理由：计数端点是辅助端点，Claude Code 若收到 5xx 会直接把 compaction 判断置空；一个略偏的估算比报错对客户端更友好。例外：请求体解析失败（400）与 model 未映射（400）仍如实返回，与 `/v1/messages` 一致。
 
@@ -133,15 +133,14 @@ pub async fn count_tokens_converse(
 **InvokeModel 分支**（Claude）:
 
 - body 复用 `build_invoke_model_body(request, model_id, false, None, beta_header)`。它已经做了：`anthropic_version` 注入、`model`/`stream` 移除、`fallback` 块与 `fallback_credit_token` 剥离、message 级 `output_config` 上提、空 system 轮次丢弃、beta 头解析进 `anthropic_beta`。这是精度与正式请求一致的关键，也避免 Bedrock 对多余字段再报 "Extra inputs"。
-- `max_tokens` 的接受度待实测（§10 项 2）。若 `CountTokens` 拒绝，给 `build_invoke_model_body` 加 `for_count_tokens: bool` 参数，为 true 时顺带移除 `max_tokens`；若容忍则不动。实测结果与日期写进代码注释。
+- `max_tokens` 保留在 body 中：Bedrock 文档定义 InvokeModel 形态的计数输入就是「一份完整的 InvokeModel 请求体」。仍列入 §10 实测项 2 做确认；若实测被拒，再给 `build_invoke_model_body` 加 `for_count_tokens` 参数剥离。
 - `service_tier` 固定传 `None`。
 - `input(CountTokensInput::InvokeModel(InvokeModelTokensRequest::builder().body(Blob::new(body)).build()))`。
 - 读 `output.input_tokens()`。
 
 **Converse 分支**（Nova / Kimi / GPT-OSS）:
 
-- 先用 `AnthropicToOpenAIConverter::convert_request` 得到 `ChatCompletionRequest`，再 `openai_bedrock::convert_request(&chat_req, model_id, effective_caps)` 得到 `ConverseRequest`，取其 `messages` / `system` 装入 `ConverseTokensRequest`（SDK 类型，字段为 `messages` + `system`，不含 inferenceConfig / toolConfig）。
-- 工具定义不在 `ConverseTokensRequest` 里，Bedrock 侧对 Converse 的 tool 计数无法精确；文档中注明这一限制，不做补偿估算。
+- 先用 `AnthropicToOpenAIConverter::convert_request` 得到 `ChatCompletionRequest`，再 `openai_bedrock::convert_request(&chat_req, model_id, effective_caps)` 得到 `ConverseRequest`，取其 `messages` / `system` / `tool_config` / `additional_model_request_fields` 装入 `ConverseTokensRequest`（SDK 1.120.0 的该类型**包含** `tool_config`，工具定义会被计入；只有 `inference_config` 不在计数输入里，被丢弃）。
 
 **Mantle Responses-only**（`is_mantle_responses_model`）: 直接估算。
 
@@ -166,9 +165,10 @@ pub async fn count_tokens(&self, model: &str, request: &GeminiRequest) -> Result
 
 | 内容 | 规则 |
 |---|---|
-| 文本 / system / tool 名与描述 / tool `input_schema` 序列化 | `len / 4`，但对 CJK 字符按 1 字符 ≈ 1 token（按 Unicode block 粗分） |
-| `image` 块 | Anthropic 公式 `(w*h)/750`；无尺寸信息时固定 1600 |
-| `document`（PDF）块 | 每页约 1500–3000，无页数时按 base64 大小 / 3 粗估 |
+| 文本 / system / tool 名与描述 / tool `input_schema` 序列化 | 非 CJK 按 4 字节 ≈ 1 token，CJK 字符按 1 字符 ≈ 1 token（按 Unicode block 粗分） |
+| `image` 块 | 固定 1600（不解码图片，取 Anthropic 公式 `(w*h)/750` 在不缩放上限 1092×1092 时的值） |
+| 每条 message | 额外 +3 框架开销 |
+| `document`（PDF）块 | base64 解码后字节数 / 20，下限 1500（约一页） |
 | `thinking` 块 | 文本规则 |
 | `tool_use` / `tool_result` | 序列化后文本规则 |
 
@@ -218,10 +218,10 @@ labels bounded，不含 api_key。`estimated` 分支的原因（`unsupported_mod
 | 文件 | 改动 |
 |---|---|
 | `src/api/messages.rs` | 删 `CountTokensRequest`；`count_tokens` 改签名为 `(State, Extension<ApiKeyInfo>, HeaderMap, AnthropicJson<MessageRequest>)`；抽 `resolve_request_route` 供 `create_message` / `count_tokens` 共用；新增 `count_anthropic_passthrough` / `count_bedrock` / `count_gemini` / `estimate_fallback` |
-| `src/services/bedrock.rs` | `count_tokens_invoke_model` / `count_tokens_converse`；`BedrockError::from_count_tokens_error`；视实测给 `build_invoke_model_body` 加 `for_count_tokens` 参数 |
+| `src/services/bedrock.rs` | `count_tokens_invoke_model` / `count_tokens_converse` / `finish_count_tokens`（健康记账）；`BedrockError::from_count_tokens_error` |
 | `src/services/gemini.rs` | `count_tokens` |
 | `src/schemas/gemini.rs` | `GeminiCountTokensResponse` |
-| `src/utils/tokens.rs` | `estimate_message_request_tokens` |
+| `src/utils/tokens.rs` | `estimate_text_tokens`（CJK 感知）/ `estimate_message_request_tokens` |
 | `src/observability/metrics.rs` | `onerouter_count_tokens_total` |
 | `src/server/routes.rs` | 无变化（路由已存在，中间件已覆盖） |
 | `CLAUDE.md` | Conventions 加一条 count_tokens 分发规则 |
@@ -260,3 +260,28 @@ labels bounded，不含 api_key。`estimated` 分支的原因（`unsupported_mod
 | CJK 估算规则仍是粗估 | 仅作为兜底，精确路径覆盖主流 provider 后影响面很小 |
 | `record_success` 自动 re-enable credential 可能被计数请求触发 | 可接受：计数 2xx 说明凭据与网络确实可用 |
 | 抽取 `resolve_request_route` 触碰 `create_message` 热路径 | 单独 commit + 既有测试覆盖；行为无改变 |
+
+---
+
+## 12. 落地记录（2026-10-08）
+
+**Commit 结构**
+
+1. `refactor(messages): extract resolve_request_route + effective_capabilities` — 纯重构，`create_message` 行为不变。
+2. `feat(messages): per-provider token counting for /v1/messages/count_tokens` — 本文 §4–§7 全部内容。
+
+**与原设计稿的差异**
+
+- Handler 签名不取 `Extension<ApiKeyInfo>`：计数不记 usage，不需要 key 信息（auth 中间件仍然生效）。
+- `ConverseTokensRequest` 含 `tool_config`，Converse 模型的工具定义可以精确计数，原稿「无法精确」的限制不成立。
+- 估算规则：PDF 改为「解码字节 / 20，下限 1500」；image 固定 1600；每条 message +3。
+- Gemini 分支用 `resolved.target_model_id` 调 countTokens。注意现有 `handle_gemini_request` 用的是转换器按**源**模型名得到的 id（`AnthropicToGeminiConverter::get_gemini_model`，内部映射表为空时等于源名），与 CLAUDE.md「模型 id 一律经 ModelMappingService」的约定不一致，属既有问题，本次未改。
+
+**已验证**
+
+- `cargo clippy --all-targets -D warnings` / `cargo fmt --check` 通过；`cargo test --lib` 413 通过（新增 6 个：估算 4 个、请求形态 1 个、fallback 标签 1 个）。
+- 本地起服（无任何 backend）HTTP 冒烟：已映射模型 → 200 + 估算；CJK 文本估算高于 bytes/4；未映射模型 → 400 Anthropic 错误封装；畸形 content block → 400 带 serde 路径；缺 key → 401；`/metrics` 出现 `onerouter_count_tokens_total{method="estimated",provider="bedrock"}`。
+
+**未验证（需真实凭据，见 §10 集成项）**
+
+- Bedrock `CountTokens`（InvokeModel / Converse 两种输入）、Gemini `countTokens`、Anthropic 透传三条精确路径均未对真实上游跑过；SDK 类型与 HTTP 形态按文档实现。

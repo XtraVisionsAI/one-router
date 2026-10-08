@@ -294,6 +294,73 @@ impl GeminiService {
         }
     }
 
+    /// Count prompt tokens via `models/{model}:countTokens`.
+    ///
+    /// The body is the same shape as `generateContent` (`generationConfig` is
+    /// ignored upstream). Credential health: a 429 does NOT cool the credential
+    /// down (countTokens has its own quota, independent of inference); 5xx and
+    /// transport errors record a failure; 2xx records a success.
+    pub async fn count_tokens(
+        &self,
+        model: &str,
+        request: &GeminiRequest,
+    ) -> Result<i64, GeminiServiceError> {
+        let credential = self.get_credential()?;
+        let credential_name = credential.name().to_string();
+        let api_key = credential.api_key().to_string();
+
+        let url = format!("{}/models/{}:countTokens", self.base_url(), model);
+
+        tracing::debug!(
+            model = %model,
+            url = %url,
+            credential = %credential_name,
+            "Calling Gemini countTokens API"
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", &api_key)
+            .header("Content-Type", "application/json")
+            .json(request)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let error_text = resp.text().await.unwrap_or_default();
+                    if status.as_u16() >= 500 {
+                        self.record_failure(&credential_name);
+                    }
+                    if let Ok(gemini_error) = serde_json::from_str::<GeminiError>(&error_text) {
+                        return Err(GeminiServiceError::ApiError {
+                            code: gemini_error.error.code,
+                            message: gemini_error.error.message,
+                        });
+                    }
+                    return Err(GeminiServiceError::ApiError {
+                        code: status.as_u16() as i32,
+                        message: error_text,
+                    });
+                }
+
+                self.record_success(&credential_name);
+                let text = resp.text().await?;
+                let parsed: crate::schemas::gemini::GeminiCountTokensResponse =
+                    serde_json::from_str(&text)
+                        .map_err(|e| GeminiServiceError::ParseError(format!("countTokens: {e}")))?;
+                Ok(parsed.total_tokens)
+            }
+            Err(e) => {
+                self.record_failure(&credential_name);
+                Err(GeminiServiceError::HttpError(e))
+            }
+        }
+    }
+
     /// Generate content with a raw JSON body (non-streaming).
     ///
     /// Unlike `generate_content()`, this method accepts and returns raw
