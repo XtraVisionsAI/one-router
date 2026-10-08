@@ -158,22 +158,8 @@ pub async fn create_message(
     let start_time = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
-    // Resolve model via data-driven routing
-    let mut resolved = match state.model_mapping.resolve(&request.model).await {
-        Ok(r) => r,
-        Err(_) => {
-            return Err(ApiError::bad_request(format!(
-                "Model '{}' is not supported. Check model_mappings configuration.",
-                request.model
-            )))
-        }
-    };
-
     // Extract beta headers for feature flags.
-    let beta_header = headers
-        .get("anthropic-beta")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let beta_header = extract_beta_header(&headers);
 
     // PTC requests are Bedrock/Docker-specific and must NOT be failed over to a
     // different provider; detect PTC up front so failover can skip it.
@@ -183,38 +169,8 @@ pub async fn create_message(
         .map(|svc| svc.is_ptc_request(&request, beta_header.as_deref()))
         .unwrap_or(false);
 
-    // Credential-exhaustion failover: if the resolved provider has no healthy
-    // credential and a failover chain is configured for this source model,
-    // switch to the first available backup provider/model. Must happen before
-    // the provider-dependent branches below (image inlining, web tools, dispatch).
-    // Skipped for PTC (see above).
-    if !is_ptc {
-        let dynamic = state.dynamic.read().await;
-        if !dynamic.failover_chains.is_empty() {
-            let (provider, model, switched) = dynamic.apply_failover(
-                &request.model,
-                &resolved.provider,
-                &resolved.target_model_id,
-            );
-            if switched {
-                tracing::warn!(
-                    request_id = %request_id,
-                    source_model = %request.model,
-                    from_provider = %resolved.provider,
-                    to_provider = %provider,
-                    to_model = %model,
-                    "Failover: primary provider unavailable, switched to backup"
-                );
-                crate::observability::metrics::record_failover(&resolved.provider, &provider);
-                resolved.provider = provider;
-                resolved.target_model_id = model;
-                // The failover target names a backend model directly (not routed
-                // through model_mapping), so per-model capabilities do not apply;
-                // fall back to the gateway default capabilities.
-                resolved.capabilities = None;
-            }
-        }
-    }
+    // Resolve model via data-driven routing + credential-exhaustion failover.
+    let resolved = resolve_request_route(&state, &request.model, &request_id, is_ptc).await?;
 
     // Bedrock/Gemini image blocks require inline base64; the Anthropic/OpenAI
     // passthroughs accept url image sources natively. Download and inline any
@@ -303,11 +259,8 @@ pub async fn create_message(
         return Ok(MessageApiResponse::Json(Json(response)));
     }
     // Route to appropriate backend based on resolved provider
-    let default_capabilities = state.dynamic.read().await.default_capabilities.clone();
-    let effective_caps = resolved
-        .capabilities
-        .as_ref()
-        .unwrap_or(&default_capabilities);
+    let effective_caps = effective_capabilities(&state, &resolved).await;
+    let effective_caps = &effective_caps;
     let filtered_request =
         crate::converters::capability_filter::apply_capabilities(&request, effective_caps);
 
@@ -558,6 +511,78 @@ pub async fn create_message(
             crate::observability::metrics::record_request(&resolved.provider, "anthropic", false);
             result
         }
+    }
+}
+
+/// Read the inbound `anthropic-beta` header as an owned string, if present.
+fn extract_beta_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Resolve the source model to a backend provider/model and apply
+/// credential-exhaustion failover.
+///
+/// Shared by `create_message` and `count_tokens` so both endpoints route the
+/// same source model to the same backend. Failover is skipped for PTC requests
+/// (Bedrock/Docker-specific); on a switch the per-model capabilities are
+/// cleared because the failover target names a backend model directly (not
+/// routed through model_mapping), so the gateway defaults apply instead.
+async fn resolve_request_route(
+    state: &AppState,
+    source_model: &str,
+    request_id: &str,
+    skip_failover: bool,
+) -> Result<crate::services::ResolvedModel, ApiError> {
+    let mut resolved = match state.model_mapping.resolve(source_model).await {
+        Ok(r) => r,
+        Err(_) => {
+            return Err(ApiError::bad_request(format!(
+                "Model '{source_model}' is not supported. Check model_mappings configuration."
+            )))
+        }
+    };
+
+    // Credential-exhaustion failover: if the resolved provider has no healthy
+    // credential and a failover chain is configured for this source model,
+    // switch to the first available backup provider/model. Must happen before
+    // any provider-dependent step (image inlining, web tools, dispatch).
+    if !skip_failover {
+        let dynamic = state.dynamic.read().await;
+        if !dynamic.failover_chains.is_empty() {
+            let (provider, model, switched) =
+                dynamic.apply_failover(source_model, &resolved.provider, &resolved.target_model_id);
+            if switched {
+                tracing::warn!(
+                    request_id = %request_id,
+                    source_model = %source_model,
+                    from_provider = %resolved.provider,
+                    to_provider = %provider,
+                    to_model = %model,
+                    "Failover: primary provider unavailable, switched to backup"
+                );
+                crate::observability::metrics::record_failover(&resolved.provider, &provider);
+                resolved.provider = provider;
+                resolved.target_model_id = model;
+                resolved.capabilities = None;
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Effective capabilities for a resolved model: per-model override when the
+/// mapping declares one, otherwise the gateway-wide defaults.
+async fn effective_capabilities(
+    state: &AppState,
+    resolved: &crate::services::ResolvedModel,
+) -> crate::services::capabilities::ModelCapabilities {
+    match &resolved.capabilities {
+        Some(caps) => caps.clone(),
+        None => state.dynamic.read().await.default_capabilities.clone(),
     }
 }
 
