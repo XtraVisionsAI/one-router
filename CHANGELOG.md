@@ -1,3 +1,9 @@
+## v0.33.1 (2026-10-08)
+
+### Fix
+
+- **converters**: sum Anthropic cache tokens into OpenAI prompt_tokens
+
 ## v0.33.0 (2026-10-08)
 
 ### Feat
