@@ -13,8 +13,8 @@ use crate::schemas::anthropic::{
 use crate::schemas::openai::{
     AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
     ChatMessage, ChatRole, Choice, ChunkChoice, ChunkDelta, CompletionUsage, FunctionCall,
-    FunctionCallDelta, MessageContent as OpenAIMessageContent, Tool, ToolCall, ToolCallDelta,
-    ToolChoice,
+    FunctionCallDelta, MessageContent as OpenAIMessageContent, PromptTokensDetails, Tool, ToolCall,
+    ToolCallDelta, ToolChoice,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -371,11 +371,14 @@ impl AnthropicToOpenAIConverter {
 
         let content = self.convert_choice_to_content(choice)?;
         let stop_reason = self.convert_finish_reason_to_anthropic(choice.finish_reason.as_deref());
+        // OpenAI's `prompt_tokens` includes cached tokens; Anthropic's
+        // `input_tokens` excludes them, so split the cached portion out.
+        let cached = response.usage.cached_tokens();
         let usage = Usage {
-            input_tokens: response.usage.prompt_tokens,
+            input_tokens: response.usage.uncached_prompt_tokens(),
             output_tokens: response.usage.completion_tokens,
             cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_read_input_tokens: (cached > 0).then_some(cached),
         };
 
         Ok(MessageResponse {
@@ -1031,13 +1034,12 @@ impl OpenAIToAnthropicConverter {
             StopReason::ModelContextWindowExceeded => "length".to_string(),
         });
 
-        let usage = CompletionUsage {
-            prompt_tokens: response.usage.input_tokens,
-            completion_tokens: response.usage.output_tokens,
-            total_tokens: response.usage.input_tokens + response.usage.output_tokens,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-        };
+        let usage = anthropic_usage_to_openai(
+            response.usage.input_tokens,
+            response.usage.cache_creation_input_tokens.unwrap_or(0),
+            response.usage.cache_read_input_tokens.unwrap_or(0),
+            response.usage.output_tokens,
+        );
 
         Ok(ChatCompletionResponse {
             id: format!("chatcmpl-{}", Uuid::new_v4().to_string().replace("-", "")),
@@ -1083,8 +1085,15 @@ impl OpenAIToAnthropicConverter {
             "message_start" => {
                 // Capture input_tokens from message_start
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(tokens) = val["message"]["usage"]["input_tokens"].as_i64() {
+                    let usage = &val["message"]["usage"];
+                    if let Some(tokens) = usage["input_tokens"].as_i64() {
                         state.input_tokens = tokens as i32;
+                    }
+                    if let Some(tokens) = usage["cache_creation_input_tokens"].as_i64() {
+                        state.cache_creation_input_tokens = tokens as i32;
+                    }
+                    if let Some(tokens) = usage["cache_read_input_tokens"].as_i64() {
+                        state.cache_read_input_tokens = tokens as i32;
                     }
                     // Emit first chunk with role if not yet sent
                     if !state.role_sent {
@@ -1280,7 +1289,6 @@ impl OpenAIToAnthropicConverter {
                     };
 
                     let output_tokens = val["usage"]["output_tokens"].as_i64().unwrap_or(0) as i32;
-                    let input_tokens = state.input_tokens;
 
                     let chunk = ChatCompletionChunk {
                         id: format!("chatcmpl-{}", Uuid::new_v4().to_string().replace("-", "")),
@@ -1295,13 +1303,12 @@ impl OpenAIToAnthropicConverter {
                         }],
                         system_fingerprint: None,
                         usage: if state.include_usage {
-                            Some(CompletionUsage {
-                                prompt_tokens: input_tokens,
-                                completion_tokens: output_tokens,
-                                total_tokens: input_tokens + output_tokens,
-                                prompt_tokens_details: None,
-                                completion_tokens_details: None,
-                            })
+                            Some(anthropic_usage_to_openai(
+                                state.input_tokens,
+                                state.cache_creation_input_tokens,
+                                state.cache_read_input_tokens,
+                                output_tokens,
+                            ))
                         } else {
                             None
                         },
@@ -1328,7 +1335,35 @@ pub struct AnthropicToOpenAIStreamState {
     pub tool_call_count: i32,
     pub block_to_tool_index: std::collections::HashMap<i32, i32>,
     pub input_tokens: i32,
+    pub cache_creation_input_tokens: i32,
+    pub cache_read_input_tokens: i32,
     pub include_usage: bool,
+}
+
+/// Map Anthropic usage onto OpenAI `CompletionUsage`.
+///
+/// Anthropic's `input_tokens` counts only the uncached prompt, with
+/// `cache_creation_input_tokens` / `cache_read_input_tokens` reported
+/// separately. OpenAI's `prompt_tokens` is the whole prompt, with the cached
+/// subset echoed in `prompt_tokens_details.cached_tokens`. So the three
+/// Anthropic input figures are summed, and cache reads become `cached_tokens`
+/// (OpenAI has no cache-write counterpart, so creation only joins the total).
+pub fn anthropic_usage_to_openai(
+    input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+    output_tokens: i32,
+) -> CompletionUsage {
+    let prompt_tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens;
+    CompletionUsage {
+        prompt_tokens,
+        completion_tokens: output_tokens,
+        total_tokens: prompt_tokens + output_tokens,
+        prompt_tokens_details: (cache_read_input_tokens > 0).then_some(PromptTokensDetails {
+            cached_tokens: Some(cache_read_input_tokens),
+        }),
+        completion_tokens_details: None,
+    }
 }
 
 // ============================================================================
@@ -1340,6 +1375,186 @@ mod tests {
     use super::*;
     use crate::schemas::anthropic::{Message, MessageRequest};
     use crate::schemas::openai::{ChatCompletionRequest, ChatMessage, ChatRole, MessageContent};
+
+    // ---- usage mapping: Anthropic input excludes cache, OpenAI prompt includes it ----
+
+    #[test]
+    fn test_usage_mapping_no_cache() {
+        let u = anthropic_usage_to_openai(100, 0, 0, 20);
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 20);
+        assert_eq!(u.total_tokens, 120);
+        assert!(u.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn test_usage_mapping_cache_read() {
+        let u = anthropic_usage_to_openai(100, 0, 400, 20);
+        assert_eq!(u.prompt_tokens, 500);
+        assert_eq!(u.total_tokens, 520);
+        assert_eq!(u.cached_tokens(), 400);
+        assert_eq!(u.uncached_prompt_tokens(), 100);
+    }
+
+    #[test]
+    fn test_usage_mapping_cache_creation() {
+        // Cache writes have no OpenAI counterpart: they join the total but are
+        // not reported as cached_tokens.
+        let u = anthropic_usage_to_openai(100, 300, 0, 20);
+        assert_eq!(u.prompt_tokens, 400);
+        assert_eq!(u.total_tokens, 420);
+        assert!(u.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn test_usage_mapping_cache_read_and_creation() {
+        let u = anthropic_usage_to_openai(10, 300, 400, 5);
+        assert_eq!(u.prompt_tokens, 710);
+        assert_eq!(u.total_tokens, 715);
+        assert_eq!(u.cached_tokens(), 400);
+    }
+
+    #[test]
+    fn test_convert_response_anthropic_to_openai_sums_cache_tokens() {
+        let converter = OpenAIToAnthropicConverter::new();
+        let mut usage = Usage::new(100, 20);
+        usage.cache_creation_input_tokens = Some(300);
+        usage.cache_read_input_tokens = Some(400);
+        let resp = MessageResponse::new("msg_1", "claude-x", vec![ContentBlock::text("hi")], usage);
+        let out = converter.convert_response(&resp, "claude-x").unwrap();
+        assert_eq!(out.usage.prompt_tokens, 800);
+        assert_eq!(out.usage.completion_tokens, 20);
+        assert_eq!(out.usage.total_tokens, 820);
+        assert_eq!(out.usage.cached_tokens(), 400);
+    }
+
+    #[test]
+    fn test_convert_response_openai_to_anthropic_splits_cached_tokens() {
+        let converter = AnthropicToOpenAIConverter::new();
+        let resp: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 30,
+                "total_tokens": 1030,
+                "prompt_tokens_details": {"cached_tokens": 800}
+            }
+        }))
+        .unwrap();
+        let out = converter.convert_response(&resp, "claude-x").unwrap();
+        assert_eq!(out.usage.input_tokens, 200);
+        assert_eq!(out.usage.cache_read_input_tokens, Some(800));
+        assert_eq!(out.usage.cache_creation_input_tokens, None);
+        assert_eq!(out.usage.output_tokens, 30);
+    }
+
+    #[test]
+    fn test_convert_response_openai_to_anthropic_no_cache_details() {
+        let converter = AnthropicToOpenAIConverter::new();
+        let resp: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 500, "completion_tokens": 30, "total_tokens": 530}
+        }))
+        .unwrap();
+        let out = converter.convert_response(&resp, "claude-x").unwrap();
+        assert_eq!(out.usage.input_tokens, 500);
+        assert_eq!(out.usage.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_stream_usage_chunk_sums_cache_tokens() {
+        let converter = OpenAIToAnthropicConverter::new();
+        let mut state = AnthropicToOpenAIStreamState {
+            model: "claude-x".into(),
+            include_usage: true,
+            ..Default::default()
+        };
+        let start = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-x",
+                "content": [], "stop_reason": null,
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 300,
+                    "cache_read_input_tokens": 400,
+                    "output_tokens": 1
+                }
+            }
+        })
+        .to_string();
+        converter.convert_stream_chunk_to_openai("message_start", &start, &mut state);
+        assert_eq!(state.input_tokens, 100);
+        assert_eq!(state.cache_creation_input_tokens, 300);
+        assert_eq!(state.cache_read_input_tokens, 400);
+
+        let delta = serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": 20}
+        })
+        .to_string();
+        let chunks = converter.convert_stream_chunk_to_openai("message_delta", &delta, &mut state);
+        let usage_chunk = chunks
+            .iter()
+            .filter_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .find(|v| !v["usage"].is_null())
+            .expect("usage chunk emitted");
+        assert_eq!(usage_chunk["usage"]["prompt_tokens"], 800);
+        assert_eq!(usage_chunk["usage"]["completion_tokens"], 20);
+        assert_eq!(usage_chunk["usage"]["total_tokens"], 820);
+        assert_eq!(
+            usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"],
+            400
+        );
+    }
+
+    #[test]
+    fn test_stream_usage_chunk_without_cache_has_no_details() {
+        let converter = OpenAIToAnthropicConverter::new();
+        let mut state = AnthropicToOpenAIStreamState {
+            model: "claude-x".into(),
+            include_usage: true,
+            ..Default::default()
+        };
+        let start = serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 50, "output_tokens": 1}}
+        })
+        .to_string();
+        converter.convert_stream_chunk_to_openai("message_start", &start, &mut state);
+        let delta = serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 7}
+        })
+        .to_string();
+        let chunks = converter.convert_stream_chunk_to_openai("message_delta", &delta, &mut state);
+        let usage_chunk = chunks
+            .iter()
+            .filter_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .find(|v| !v["usage"].is_null())
+            .unwrap();
+        assert_eq!(usage_chunk["usage"]["prompt_tokens"], 50);
+        assert_eq!(usage_chunk["usage"]["total_tokens"], 57);
+        assert!(usage_chunk["usage"]["prompt_tokens_details"].is_null());
+    }
 
     #[test]
     fn test_anthropic_to_openai_simple_request() {
