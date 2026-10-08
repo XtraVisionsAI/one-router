@@ -1,3 +1,9 @@
+## v0.32.0 (2026-10-08)
+
+### Feat
+
+- **server**: configurable request body limit (MAX_BODY_SIZE_MB, default 64)
+
 ## v0.31.3 (2026-10-05)
 
 ### Fix
