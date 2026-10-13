@@ -1,3 +1,9 @@
+## v0.33.2 (2026-10-13)
+
+### Fix
+
+- **responses**: fold Codex configuration_update items into top-level reasoning
+
 ## v0.33.1 (2026-10-08)
 
 ### Fix
