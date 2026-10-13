@@ -26,7 +26,13 @@
 - **Codex 兼容**:Codex 发的 `additional_tools` input item 是 Codex 扩展,Mantle
   拒收(`Invalid 'input': value did not match any expected variant`)。透传前把其
   中的工具定义合并进顶层 `tools` 数组(实测等价可用);`client_metadata` 顶层字段
-  Mantle 容忍。
+  Mantle 容忍。Codex 0.155+ 还会在 `input[]` 里发
+  `{"type":"configuration_update","reasoning":{"effort":"high"}}`(GPT-6 Astra 的
+  "中途改 effort、不破坏缓存前缀"特性),Bedrock 两个 host 都拒收(`The
+  'configuration_update' item type is not supported with this model`,2026-10-13
+  实测 `global.openai.gpt-6-astra`)。透传前把它折叠进顶层 `reasoning`(多项时最后
+  一项胜出,逐 key 覆盖请求级值)并从 `input` 删除;翻译路径
+  (`responses_to_chat_request`)同样让其覆盖 `reasoning_effort`。
 - **SSE 帧序**:Mantle 的帧是 `data:` 行在前、`event:` 行在后,自带
   `sequence_number`;转发器按行前缀解析,不依赖行序。
 

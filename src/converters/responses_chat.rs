@@ -273,14 +273,36 @@ pub fn responses_to_chat_request(
         logprobs: None,
         top_logprobs: None,
         service_tier: req.service_tier.clone(),
-        // Responses `reasoning: {"effort": "..."}` → Chat Completions reasoning_effort
-        reasoning_effort: req
-            .reasoning
-            .as_ref()
-            .and_then(|r| r.get("effort"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        // Responses `reasoning: {"effort": "..."}` → Chat Completions
+        // reasoning_effort; a Codex `configuration_update` input item (last
+        // one wins) overrides the request-level value.
+        reasoning_effort: configuration_update_effort(req).or_else(|| {
+            req.reasoning
+                .as_ref()
+                .and_then(|r| r.get("effort"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        }),
     }
+}
+
+/// The `reasoning.effort` carried by the last `configuration_update` input
+/// item, if any. Codex emits these to change effort mid-conversation; the
+/// items themselves carry no role and are skipped by `convert_input_item`.
+fn configuration_update_effort(req: &ResponsesRequest) -> Option<String> {
+    let Some(ResponsesInput::Items(items)) = &req.input else {
+        return None;
+    };
+    items
+        .iter()
+        .rev()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("configuration_update"))
+        .find_map(|item| {
+            item.get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
 }
 
 /// Build the assistant `message` output item for a Responses response.
@@ -1176,6 +1198,27 @@ mod tests {
                 .to_string_content(),
             "hello"
         );
+    }
+
+    #[test]
+    fn test_configuration_update_overrides_reasoning_effort() {
+        let mut req = req_with_input(ResponsesInput::Items(vec![
+            serde_json::json!({"type": "message", "role": "user", "content": "hi"}),
+            serde_json::json!({"type": "configuration_update", "reasoning": {"effort": "low"}}),
+            serde_json::json!({"type": "configuration_update", "reasoning": {"effort": "high"}}),
+        ]));
+        req.reasoning = Some(serde_json::json!({"effort": "medium"}));
+        let chat = responses_to_chat_request(&req, &[]);
+        // Last update wins over the request-level effort; the items produce no messages.
+        assert_eq!(chat.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, ChatRole::User);
+
+        // Without an update the request-level effort is used.
+        let mut plain = req_with_input(ResponsesInput::Text("hi".into()));
+        plain.reasoning = Some(serde_json::json!({"effort": "medium"}));
+        let chat = responses_to_chat_request(&plain, &[]);
+        assert_eq!(chat.reasoning_effort.as_deref(), Some("medium"));
     }
 
     #[test]

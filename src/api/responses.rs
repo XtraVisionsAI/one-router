@@ -328,6 +328,12 @@ async fn handle_mantle_responses_passthrough(
     // (verified against the live endpoint), so merge them there.
     merge_additional_tools(&mut upstream);
 
+    // Codex compatibility: `configuration_update` input items (GPT-6 Astra
+    // mid-conversation reasoning-effort changes) are rejected by Bedrock's
+    // Responses hosts ("The 'configuration_update' item type is not supported
+    // with this model"). Fold them into the top-level `reasoning` object.
+    apply_configuration_updates(&mut upstream);
+
     // The runtime host (profile-prefixed ids such as global.openai.gpt-6-astra)
     // rejects `reasoning.summary` ("Unsupported parameter"), which Codex sends
     // by default. Drop it there; the Mantle host accepts it.
@@ -506,6 +512,43 @@ fn merge_additional_tools(upstream: &mut serde_json::Value) {
     match upstream.get_mut("tools").and_then(|t| t.as_array_mut()) {
         Some(tools) => tools.extend(extracted),
         None => upstream["tools"] = serde_json::Value::Array(extracted),
+    }
+}
+
+/// Fold Codex's `configuration_update` input items into the top-level
+/// `reasoning` object and drop them from `input`. Codex 0.155+ emits
+/// `{"type":"configuration_update","reasoning":{"effort":"high"}}` to change
+/// effort mid-conversation without disturbing the cached prefix (an OpenAI
+/// GPT-6 Astra feature); Bedrock's Responses hosts reject the item type. The
+/// update applies until a later one overrides it, so the last item wins per
+/// key, and item keys override request-level `reasoning` keys. Requests
+/// without such items are untouched.
+fn apply_configuration_updates(upstream: &mut serde_json::Value) {
+    let Some(input) = upstream.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let mut merged = serde_json::Map::new();
+    input.retain(|item| {
+        if item.get("type").and_then(|t| t.as_str()) == Some("configuration_update") {
+            if let Some(reasoning) = item.get("reasoning").and_then(|r| r.as_object()) {
+                for (k, v) in reasoning {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if merged.is_empty() {
+        return;
+    }
+    match upstream
+        .get_mut("reasoning")
+        .and_then(|r| r.as_object_mut())
+    {
+        Some(existing) => existing.extend(merged),
+        None => upstream["reasoning"] = serde_json::Value::Object(merged),
     }
 }
 
@@ -1153,6 +1196,40 @@ mod tests {
         let mut plain = serde_json::json!({"input": "hello"});
         merge_additional_tools(&mut plain);
         assert_eq!(plain["input"].as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn test_apply_configuration_updates() {
+        let mut upstream = serde_json::json!({
+            "model": "m",
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "configuration_update", "reasoning": {"effort": "low"}},
+                {"type": "message", "role": "user", "content": "harder"},
+                {"type": "configuration_update", "reasoning": {"effort": "high"}},
+            ],
+        });
+        apply_configuration_updates(&mut upstream);
+        let input = upstream["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert!(input.iter().all(|i| i["type"].as_str() == Some("message")));
+        // Last update wins; unrelated reasoning keys survive.
+        assert_eq!(upstream["reasoning"]["effort"].as_str(), Some("high"));
+        assert_eq!(upstream["reasoning"]["summary"].as_str(), Some("auto"));
+
+        // No reasoning field yet → created.
+        let mut bare = serde_json::json!({
+            "input": [{"type": "configuration_update", "reasoning": {"effort": "xhigh"}}],
+        });
+        apply_configuration_updates(&mut bare);
+        assert_eq!(bare["input"].as_array().unwrap().len(), 0);
+        assert_eq!(bare["reasoning"], serde_json::json!({"effort": "xhigh"}));
+
+        // No such items / string input → untouched.
+        let mut plain = serde_json::json!({"input": "hello"});
+        apply_configuration_updates(&mut plain);
+        assert_eq!(plain, serde_json::json!({"input": "hello"}));
     }
 
     #[test]
