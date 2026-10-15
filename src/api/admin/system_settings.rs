@@ -68,6 +68,10 @@ fn validate_setting(key: &str, value: &str) -> Result<(), &'static str> {
             Ok(n) if n > 0 => Ok(()),
             _ => Err("web_fetch_max_content_kb must be a positive integer"),
         },
+        "bedrock_max_request_mb" => match value.parse::<u64>() {
+            Ok(n) if (1..=64).contains(&n) => Ok(()),
+            _ => Err("bedrock_max_request_mb must be an integer between 1 and 64 (MB)"),
+        },
         _ => Ok(()), // unknown keys are accepted as-is
     }
 }
@@ -202,5 +206,18 @@ mod tests {
     #[test]
     fn validate_unknown_key_passes() {
         assert!(validate_setting("some_future_key", "any_value").is_ok());
+    }
+
+    #[test]
+    fn validate_bedrock_max_request_mb() {
+        for v in ["1", "15", "19", "64"] {
+            assert!(validate_setting("bedrock_max_request_mb", v).is_ok(), "{v}");
+        }
+        for v in ["0", "65", "-1", "15.5", "abc", ""] {
+            assert!(
+                validate_setting("bedrock_max_request_mb", v).is_err(),
+                "{v}"
+            );
+        }
     }
 }

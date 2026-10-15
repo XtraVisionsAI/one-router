@@ -210,6 +210,7 @@ impl App {
 async fn init_bedrock_from_backends(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
     encryptor: &Encryptor,
+    max_request_mb: u64,
 ) -> Result<Option<BedrockService>> {
     let backends = database.backends().list_enabled_backends().await?;
 
@@ -300,12 +301,10 @@ async fn init_bedrock_from_backends(
         strategy = %pool.strategy(),
         "Bedrock service initialized with credential pool"
     );
-    Ok(Some(BedrockService::with_pool(
-        clients,
-        pool,
-        service_tiers,
-        credential_providers,
-    )))
+    Ok(Some(
+        BedrockService::with_pool(clients, pool, service_tiers, credential_providers)
+            .with_max_request_mb(max_request_mb),
+    ))
 }
 
 /// Initialize Gemini pool from the backends table.
@@ -549,17 +548,23 @@ async fn build_dynamic_config(
     settings: &Settings,
     ptc_service: Option<&Arc<PtcService>>,
 ) -> DynamicConfig {
-    let bedrock = match init_bedrock_from_backends(database, encryptor).await {
-        Ok(Some(service)) => {
-            tracing::info!("Bedrock service initialized");
-            Some(Arc::new(service))
-        }
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!("Failed to initialize Bedrock: {e}");
-            None
-        }
-    };
+    let bedrock_max_request_mb = load_string_setting(database, "bedrock_max_request_mb")
+        .await
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(crate::services::bedrock::DEFAULT_MAX_REQUEST_MB);
+    let bedrock =
+        match init_bedrock_from_backends(database, encryptor, bedrock_max_request_mb).await {
+            Ok(Some(service)) => {
+                tracing::info!("Bedrock service initialized");
+                Some(Arc::new(service))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("Failed to initialize Bedrock: {e}");
+                None
+            }
+        };
 
     let gemini_pool = match init_gemini_from_backends(database, encryptor).await {
         Ok(Some(pool)) => {

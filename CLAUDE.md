@@ -116,6 +116,7 @@ Managed via Admin UI or `PUT /admin/api/settings/:key`. Changes take effect **im
 | `pricing_sync_enabled` | `false` | Auto-sync model pricing from the LiteLLM price table. When on, a background job periodically overwrites the prices of mappings whose `pricing_source` is `litellm`; rows marked `manual` are never touched |
 | `pricing_sync_url` | _(BerriAI raw JSON)_ | Source URL for the LiteLLM `model_prices_and_context_window.json`. Must be https |
 | `pricing_sync_interval_hours` | `24` | Background pricing-sync interval (hours, min 1) |
+| `bedrock_max_request_mb` | `15` | Gateway pre-check ceiling (MB, 1–64) for bodies sent to Bedrock's OpenAI-compatible endpoints (Mantle + runtime chat/responses). Measured 2026-10-15: bedrock-runtime caps at ~20,000,000 bytes and answers larger bodies with a misleading "JSON malformed" 400; Mantle accepted 20 MB. Replaces the old hardcoded 4 MB guard |
 
 ---
 

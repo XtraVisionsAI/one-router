@@ -51,6 +51,32 @@ pub struct BedrockService {
     /// keep-alive connections avoid a TCP+TLS handshake per call (which costs
     /// several RTTs when the Bedrock region is far from the gateway).
     http_client: reqwest::Client,
+    /// Pre-check ceiling for Mantle/Runtime OpenAI-compatible request bodies,
+    /// in bytes (from the `bedrock_max_request_mb` system setting).
+    max_request_bytes: usize,
+}
+
+/// Default for the `bedrock_max_request_mb` system setting.
+///
+/// Measured 2026-10-15 against us-east-1 with `openai.gpt-5.6-luna`: the
+/// runtime host (`bedrock-runtime`) accepts bodies up to ~20,000,000 bytes and
+/// answers anything larger with a misleading HTTP 400 "The JSON object in the
+/// request body is malformed" (truncated body); the Mantle host accepted
+/// 20 MB. 15 MB leaves headroom under both while still allowing long Codex
+/// sessions (encrypted reasoning items accumulate several MB before compaction).
+pub const DEFAULT_MAX_REQUEST_MB: u64 = 15;
+
+/// Return the pre-check error for a Mantle/Runtime request body of `body_len`
+/// bytes under a `max_mb` ceiling, or `None` when it fits.
+fn request_size_error(body_len: usize, max_mb: u64) -> Option<BedrockError> {
+    let max_bytes = (max_mb as usize).saturating_mul(1024 * 1024);
+    (body_len > max_bytes).then(|| {
+        BedrockError::ValidationError(format!(
+            "Request body {body_len} bytes exceeds the gateway's bedrock_max_request_mb \
+             limit ({max_mb} MB); raise the system setting if the upstream accepts \
+             larger bodies (bedrock-runtime caps at ~20 MB)"
+        ))
+    })
 }
 
 impl BedrockService {
@@ -70,7 +96,25 @@ impl BedrockService {
             service_tiers,
             credential_providers,
             http_client: reqwest::Client::new(),
+            max_request_bytes: (DEFAULT_MAX_REQUEST_MB as usize) * 1024 * 1024,
         }
+    }
+
+    /// Set the Mantle/Runtime request-body pre-check ceiling in MB
+    /// (`bedrock_max_request_mb`). A value of 0 falls back to the default.
+    pub fn with_max_request_mb(mut self, max_mb: u64) -> Self {
+        let mb = if max_mb == 0 {
+            DEFAULT_MAX_REQUEST_MB
+        } else {
+            max_mb
+        };
+        self.max_request_bytes = (mb as usize).saturating_mul(1024 * 1024);
+        self
+    }
+
+    /// Configured Mantle/Runtime request-body ceiling in MB.
+    pub fn max_request_mb(&self) -> u64 {
+        (self.max_request_bytes / (1024 * 1024)) as u64
     }
 
     /// Get the service tier config for a credential.
@@ -648,12 +692,19 @@ impl BedrockService {
             (cred.name().to_string(), cred.region().to_string())
         };
 
-        const BEDROCK_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024; // 4MB
-        if body.len() > BEDROCK_MAX_REQUEST_BYTES {
-            return Err(BedrockError::Serialization(format!(
-                "Request body {} bytes exceeds Bedrock 4MB limit",
-                body.len()
-            )));
+        // Gateway-side size pre-check (see `DEFAULT_MAX_REQUEST_MB`): the
+        // runtime host answers oversized bodies with a misleading "JSON
+        // malformed" 400, so fail early with an actionable message instead.
+        if let Some(err) = request_size_error(body.len(), self.max_request_mb()) {
+            tracing::warn!(
+                credential = %cred_name,
+                region = %region,
+                target_model = %target_model_id,
+                body_bytes = body.len(),
+                max_mb = self.max_request_mb(),
+                "Bedrock OpenAI-compat request body exceeds bedrock_max_request_mb"
+            );
+            return Err(err);
         }
 
         // Resolve signing key material through the SDK client's credential
@@ -2006,6 +2057,26 @@ impl BedrockError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_request_size_error_threshold() {
+        use super::{request_size_error, BedrockError, DEFAULT_MAX_REQUEST_MB};
+        let mb = 15 * 1024 * 1024;
+        assert!(request_size_error(mb, 15).is_none());
+        assert!(request_size_error(mb - 1, 15).is_none());
+        let err = request_size_error(mb + 1, 15).expect("over the ceiling");
+        match err {
+            BedrockError::ValidationError(msg) => {
+                assert!(msg.contains("bedrock_max_request_mb"), "{msg}");
+                assert!(msg.contains("15 MB"), "{msg}");
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+        // The 2026-10-14 production case (4,456,124 bytes) must pass at the
+        // default and still be rejected under the old 4 MB ceiling.
+        assert!(request_size_error(4_456_124, DEFAULT_MAX_REQUEST_MB).is_none());
+        assert!(request_size_error(4_456_124, 4).is_some());
+    }
+
     #[test]
     fn mid_stream_error_renders_anthropic_error_event() {
         use super::BedrockError;

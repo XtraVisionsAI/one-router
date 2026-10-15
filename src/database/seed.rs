@@ -1124,6 +1124,19 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             ),
             updated_at: None,
         },
+        SystemSettingRecord {
+            key: "bedrock_max_request_mb".into(),
+            value: "15".into(),
+            description: "Gateway pre-check ceiling (MB) for request bodies sent to Bedrock's \
+                          OpenAI-compatible endpoints (Mantle / runtime chat + responses). \
+                          bedrock-runtime rejects bodies above ~20 MB with a misleading \
+                          'JSON malformed' 400; keep this below that and below MAX_BODY_SIZE_MB."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"number","label":"Bedrock Max Request Body (MB)","group":"General","sort_order":40,"placeholder":"15"}"#.into(),
+            ),
+            updated_at: None,
+        },
     ]
 }
 
