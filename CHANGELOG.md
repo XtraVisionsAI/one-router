@@ -1,3 +1,9 @@
+## v0.34.0 (2026-10-15)
+
+### Feat
+
+- **bedrock**: make the Mantle request-body guard configurable (bedrock_max_request_mb, default 15)
+
 ## v0.33.2 (2026-10-13)
 
 ### Fix
