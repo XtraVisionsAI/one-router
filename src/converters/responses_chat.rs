@@ -435,8 +435,90 @@ use crate::schemas::anthropic::{
     MessageRequest, MessageResponse, SystemContent,
 };
 
-/// Extract plain text from a Responses `input` value (string or items) for the
-/// Anthropic web_search path.
+/// Convert one Responses message item's `content` (string or parts array) into
+/// Anthropic message content for the web_search path. Text-only content stays
+/// `MessageContent::Text` (parts joined with a newline); `input_image` parts
+/// turn the message into `Blocks` with text and `image` blocks in order.
+/// Returns `None` when nothing usable remains.
+fn responses_content_to_anthropic(content: &serde_json::Value) -> Option<AnthMessageContent> {
+    match content {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(AnthMessageContent::Text(s.clone()))
+            }
+        }
+        serde_json::Value::Array(parts) => {
+            let mut blocks: Vec<AnthContentBlock> = Vec::new();
+            let mut has_image = false;
+            for p in parts {
+                let ptype = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if ptype == "input_image" || ptype == "image_url" {
+                    // `image_url` may be a bare string or `{url, detail}`.
+                    let url = p.get("image_url").and_then(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .or_else(|| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
+                    });
+                    let Some(url) = url else { continue };
+                    let source = if url.starts_with("data:") {
+                        match crate::utils::image::parse_image_data_url(&url) {
+                            Ok(parsed) => crate::schemas::anthropic::ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: Some(parsed.media_type),
+                                data: Some(parsed.base64_data),
+                                url: None,
+                            },
+                            Err(e) => {
+                                tracing::warn!(error = %e, "web_search path: dropping undecodable input_image");
+                                continue;
+                            }
+                        }
+                    } else {
+                        crate::schemas::anthropic::ImageSource {
+                            source_type: "url".to_string(),
+                            media_type: None,
+                            data: None,
+                            url: Some(url),
+                        }
+                    };
+                    has_image = true;
+                    blocks.push(AnthContentBlock::Image {
+                        source,
+                        cache_control: None,
+                    });
+                } else if let Some(text) = p.get("text").and_then(|t| t.as_str()) {
+                    blocks.push(AnthContentBlock::Text {
+                        text: text.to_string(),
+                        cache_control: None,
+                    });
+                }
+            }
+            if blocks.is_empty() {
+                return None;
+            }
+            if !has_image {
+                let text = blocks
+                    .iter()
+                    .filter_map(|b| b.as_text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return if text.is_empty() {
+                    None
+                } else {
+                    Some(AnthMessageContent::Text(text))
+                };
+            }
+            Some(AnthMessageContent::Blocks(blocks))
+        }
+        _ => None,
+    }
+}
+
+/// Extract conversational turns from a Responses `input` value (string or
+/// items) for the Anthropic web_search path. Text and `input_image` parts are
+/// preserved; function items are not meaningful to the agentic loop.
 fn input_to_anthropic_messages(
     input: &Option<ResponsesInput>,
     prev: &[(String, String)],
@@ -465,27 +547,18 @@ fn input_to_anthropic_messages(
                 // Only message items carry conversational text; function items are
                 // not meaningful to the web_search agentic loop.
                 if let Some(role) = item.get("role").and_then(|r| r.as_str()) {
-                    if let Some(content) = item.get("content") {
-                        let text = match content {
-                            serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Array(parts) => parts
-                                .iter()
-                                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                            _ => String::new(),
-                        };
-                        if !text.is_empty() {
-                            messages.push(AnthMessage {
-                                extra: Default::default(),
-                                role: if role == "assistant" {
-                                    "assistant".to_string()
-                                } else {
-                                    "user".to_string()
-                                },
-                                content: AnthMessageContent::Text(text),
-                            });
-                        }
+                    if let Some(content) =
+                        item.get("content").and_then(responses_content_to_anthropic)
+                    {
+                        messages.push(AnthMessage {
+                            extra: Default::default(),
+                            role: if role == "assistant" {
+                                "assistant".to_string()
+                            } else {
+                                "user".to_string()
+                            },
+                            content,
+                        });
                     }
                 }
             }
@@ -1391,6 +1464,46 @@ mod tests {
         assert_eq!(out.output[0]["name"], "f");
         assert_eq!(out.output[0]["call_id"], "call_9");
         assert_eq!(out.output[1]["type"], "message");
+    }
+
+    #[test]
+    fn test_web_search_path_keeps_input_image() {
+        use crate::schemas::anthropic::{ContentBlock, MessageContent};
+        let png = crate::utils::image::test_fixtures::PNG_1X1_B64;
+        let mut req = req_with_input(ResponsesInput::Items(vec![serde_json::json!({
+            "type": "message", "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is in this picture?"},
+                {"type": "input_image", "image_url": format!("data:image/jpeg;base64,{png}")},
+            ]
+        })]));
+        req.tools = Some(vec![serde_json::json!({"type": "web_search"})]);
+        let out = responses_to_message_request(&req, &[]);
+        assert_eq!(out.messages.len(), 1);
+        let MessageContent::Blocks(blocks) = &out.messages[0].content else {
+            panic!("expected Blocks, got {:?}", out.messages[0].content);
+        };
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text, .. } if text == "what is in this picture?")
+        );
+        let ContentBlock::Image { source, .. } = &blocks[1] else {
+            panic!("expected image block");
+        };
+        // Declared jpeg, sniffed png.
+        assert_eq!(source.media_type.as_deref(), Some("image/png"));
+        assert_eq!(source.data.as_deref(), Some(png));
+    }
+
+    #[test]
+    fn test_web_search_path_text_only_parts_stay_text() {
+        use crate::schemas::anthropic::MessageContent;
+        let req = req_with_input(ResponsesInput::Items(vec![serde_json::json!({
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]
+        })]));
+        let out = responses_to_message_request(&req, &[]);
+        assert!(matches!(&out.messages[0].content, MessageContent::Text(t) if t == "a\nb"));
     }
 
     #[test]

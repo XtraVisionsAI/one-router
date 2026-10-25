@@ -14,7 +14,6 @@ use crate::schemas::openai::{
     ChatMessage, ChatRole, Choice, ChunkChoice, ChunkDelta, CompletionUsage, ContentPart,
     FunctionCall, FunctionCallDelta, MessageContent, Tool, ToolCall, ToolCallDelta, ToolChoice,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
@@ -254,29 +253,13 @@ impl OpenAIToGeminiConverter {
         ))
     }
 
+    /// Decode a `data:` URL into `(media_type, base64)`. The media type is
+    /// sniffed from the bytes (shared helper) so a mislabeled payload reaches
+    /// Gemini with the correct `mimeType`.
     fn convert_data_url(&self, url: &str) -> Result<(String, String), OpenAIGeminiError> {
-        let parts: Vec<&str> = url.splitn(2, ',').collect();
-        if parts.len() != 2 {
-            return Err(OpenAIGeminiError::InvalidImageUrl(
-                "Invalid data URL format".to_string(),
-            ));
-        }
-
-        let metadata = parts[0];
-        let data = parts[1];
-
-        let media_type = metadata
-            .strip_prefix("data:")
-            .and_then(|s| s.split(';').next())
-            .ok_or_else(|| {
-                OpenAIGeminiError::InvalidImageUrl("Could not parse media type".to_string())
-            })?;
-
-        BASE64
-            .decode(data)
-            .map_err(|e| OpenAIGeminiError::Base64DecodeError(e.to_string()))?;
-
-        Ok((media_type.to_string(), data.to_string()))
+        let parsed = crate::utils::image::parse_image_data_url(url)
+            .map_err(OpenAIGeminiError::InvalidImageUrl)?;
+        Ok((parsed.media_type, parsed.base64_data))
     }
 
     fn convert_tool_result_message(
@@ -726,5 +709,20 @@ mod tests {
         assert_eq!(config.temperature, Some(0.7));
         assert_eq!(config.top_p, Some(0.9));
         assert_eq!(config.max_output_tokens, Some(1024));
+    }
+
+    #[test]
+    fn test_data_url_mime_type_follows_bytes() {
+        let converter = OpenAIToGeminiConverter::new();
+        let url = format!(
+            "data:image/jpeg;base64,{}",
+            crate::utils::image::test_fixtures::PNG_1X1_B64
+        );
+        let (media_type, data) = converter.convert_data_url(&url).unwrap();
+        assert_eq!(media_type, "image/png");
+        assert_eq!(data, crate::utils::image::test_fixtures::PNG_1X1_B64);
+        assert!(converter
+            .convert_data_url("data:image/png;base64,%%%")
+            .is_err());
     }
 }

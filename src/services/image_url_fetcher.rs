@@ -34,28 +34,9 @@ impl FetchedImage {
 }
 
 /// Detect a supported image media type from the leading magic bytes.
-/// Returns `None` for unrecognized/unsupported formats.
+/// Shared with the converters via `utils::image`.
 fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() < 12 {
-        return None;
-    }
-    // JPEG: FF D8 FF
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return Some("image/jpeg");
-    }
-    // PNG: 89 50 4E 47 0D 0A 1A 0A
-    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
-        return Some("image/png");
-    }
-    // GIF: "GIF87a" / "GIF89a"
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return Some("image/gif");
-    }
-    // WEBP: "RIFF"...."WEBP"
-    if bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-    None
+    crate::utils::image::sniff_image_media_type(bytes)
 }
 
 /// Strip query/fragment/userinfo from a URL for safe inclusion in error
@@ -104,28 +85,14 @@ pub async fn fetch_image(url: &str) -> Result<FetchedImage, String> {
 }
 
 /// Decode the portion of a `data:` URL after the `data:` prefix.
+///
+/// The media type is resolved from the bytes (sniffed type wins over the
+/// declared one) via `utils::image::parse_image_data_url`.
 fn decode_data_url(rest: &str) -> Result<FetchedImage, String> {
-    let (meta, data) = rest
-        .split_once(',')
-        .ok_or_else(|| "Invalid data URL: missing comma".to_string())?;
-    let media_type = meta.split(';').next().unwrap_or("").to_string();
-    if !meta.contains("base64") {
-        return Err("Only base64 data URLs are supported".to_string());
-    }
-    // Validate the payload decodes and is a supported image.
-    let bytes = BASE64
-        .decode(data)
-        .map_err(|e| format!("Invalid base64 in data URL: {e}"))?;
-    let sniffed = sniff_media_type(&bytes)
-        .ok_or_else(|| "Unsupported or unrecognized image format in data URL".to_string())?;
+    let parsed = crate::utils::image::parse_image_data_url(&format!("data:{rest}"))?;
     Ok(FetchedImage {
-        // Prefer the sniffed type over a possibly-wrong declared type.
-        media_type: if media_type.starts_with("image/") {
-            media_type
-        } else {
-            sniffed.to_string()
-        },
-        base64_data: data.to_string(),
+        media_type: parsed.media_type,
+        base64_data: parsed.base64_data,
     })
 }
 

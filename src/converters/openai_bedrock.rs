@@ -307,37 +307,31 @@ fn convert_openai_content_to_sdk(
 }
 
 /// Parse a data URL and convert to SDK ImageBlock.
+///
+/// The image format is taken from the sniffed bytes (via
+/// `utils::image::parse_image_data_url`), not the declared media type —
+/// Bedrock validates the format against the payload.
 fn parse_data_url_to_image(url: &str) -> Result<SdkContentBlock, OpenAIConversionError> {
     use aws_sdk_bedrockruntime::types::{ImageBlock, ImageFormat, ImageSource};
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-    let parts: Vec<&str> = url.splitn(2, ',').collect();
-    if parts.len() != 2 {
-        return Err(OpenAIConversionError::InvalidImageUrl(
-            "Invalid data URL format".to_string(),
-        ));
-    }
+    let parsed = crate::utils::image::parse_image_data_url(url)
+        .map_err(OpenAIConversionError::InvalidImageUrl)?;
 
-    let metadata = parts[0];
-    let data = parts[1];
-
-    let media_type = metadata
-        .strip_prefix("data:")
-        .and_then(|s| s.split(';').next())
-        .ok_or_else(|| {
-            OpenAIConversionError::InvalidImageUrl("Could not parse media type".to_string())
-        })?;
-
-    let format = match media_type {
+    let format = match parsed.media_type.as_str() {
         "image/png" => ImageFormat::Png,
         "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
         "image/gif" => ImageFormat::Gif,
         "image/webp" => ImageFormat::Webp,
-        _ => ImageFormat::Png,
+        other => {
+            return Err(OpenAIConversionError::InvalidImageUrl(format!(
+                "Unsupported image format '{other}' (Bedrock Converse accepts png/jpeg/gif/webp)"
+            )))
+        }
     };
 
     let bytes = BASE64
-        .decode(data)
+        .decode(parsed.base64_data.as_str())
         .map_err(|e| OpenAIConversionError::Base64DecodeError(e.to_string()))?;
 
     let image = ImageBlock::builder()
@@ -688,5 +682,67 @@ mod tests {
         )
         .unwrap();
         assert!(result.additional_model_request_fields.is_none());
+    }
+
+    #[test]
+    fn user_image_format_follows_bytes_not_declared_mime() {
+        use crate::schemas::openai::{ContentPart, ImageUrl};
+        use aws_sdk_bedrockruntime::types::ImageFormat;
+        let msg = ChatMessage {
+            role: ChatRole::User,
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "colour?".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        // Declared JPEG, actual PNG bytes.
+                        url: format!(
+                            "data:image/jpeg;base64,{}",
+                            crate::utils::image::test_fixtures::PNG_1X1_B64
+                        ),
+                        detail: None,
+                    },
+                },
+            ])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let result = convert_request(
+            &make_request(vec![msg]),
+            "amazon.nova-pro-v1:0",
+            &ModelCapabilities::default(),
+        )
+        .unwrap();
+        let content = result.messages[0].content();
+        let image = content
+            .iter()
+            .find_map(|b| b.as_image().ok())
+            .expect("image block must be present");
+        assert_eq!(image.format(), &ImageFormat::Png);
+    }
+
+    #[test]
+    fn user_image_undecodable_data_url_is_rejected() {
+        use crate::schemas::openai::{ContentPart, ImageUrl};
+        let msg = ChatMessage {
+            role: ChatRole::User,
+            content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,%%%".to_string(),
+                    detail: None,
+                },
+            }])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        assert!(convert_request(
+            &make_request(vec![msg]),
+            "amazon.nova-pro-v1:0",
+            &ModelCapabilities::default(),
+        )
+        .is_err());
     }
 }

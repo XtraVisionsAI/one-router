@@ -2,6 +2,7 @@
 
 pub mod api_key;
 pub mod glob;
+pub mod image;
 pub mod retry;
 pub mod string;
 pub mod timeout;

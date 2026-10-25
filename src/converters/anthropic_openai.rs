@@ -7,8 +7,8 @@
 //! - Anthropic Messages API response → OpenAI Chat Completions API response
 
 use crate::schemas::anthropic::{
-    ContentBlock, Message, MessageContent, MessageRequest, MessageResponse, StopReason,
-    SystemContent, ThinkingConfig, Usage,
+    ContentBlock, ImageSource, Message, MessageContent, MessageRequest, MessageResponse,
+    StopReason, SystemContent, ThinkingConfig, Usage,
 };
 use crate::schemas::openai::{
     AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
@@ -46,6 +46,44 @@ pub enum AnthropicOpenAIError {
 
     #[error("Serialization error: {0}")]
     SerializationError(String),
+}
+
+/// Map an OpenAI `image_url.url` onto an Anthropic image source.
+///
+/// `data:` URLs are decoded and their media type sniffed from the bytes
+/// (Anthropic rejects a `media_type` that disagrees with the payload). Any
+/// other URL is carried as a `url` source rather than dropped.
+fn openai_image_url_to_source(url: &str) -> Result<ImageSource, AnthropicOpenAIError> {
+    if url.starts_with("data:") {
+        let parsed = crate::utils::image::parse_image_data_url(url)
+            .map_err(|e| AnthropicOpenAIError::InvalidContent(format!("image_url: {e}")))?;
+        return Ok(ImageSource {
+            source_type: "base64".to_string(),
+            media_type: Some(parsed.media_type),
+            data: Some(parsed.base64_data),
+            url: None,
+        });
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Ok(ImageSource {
+            source_type: "url".to_string(),
+            media_type: None,
+            data: None,
+            url: Some(url.to_string()),
+        });
+    }
+    Err(AnthropicOpenAIError::InvalidContent(
+        "image_url must be a data: URL or an http(s) URL".to_string(),
+    ))
+}
+
+/// Map an Anthropic image source onto an OpenAI `image_url.url`
+/// (`data:` URL for base64 sources, the URL itself for url sources).
+fn anthropic_image_source_to_url(source: &ImageSource) -> Option<String> {
+    match (&source.media_type, &source.data) {
+        (Some(mt), Some(data)) => Some(format!("data:{mt};base64,{data}")),
+        _ => source.url.clone(),
+    }
 }
 
 // ============================================================================
@@ -183,7 +221,12 @@ impl AnthropicToOpenAIConverter {
         role: ChatRole,
         blocks: &[ContentBlock],
     ) -> Result<ChatMessage, AnthropicOpenAIError> {
+        use crate::schemas::openai::{ContentPart, ImageUrl};
+
         let mut text_parts: Vec<String> = Vec::new();
+        // Multimodal parts in block order; only materialized when an image is present.
+        let mut parts: Vec<ContentPart> = Vec::new();
+        let mut has_image = false;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut tool_result_parts: Vec<(String, String)> = Vec::new(); // (tool_call_id, content)
 
@@ -191,6 +234,18 @@ impl AnthropicToOpenAIConverter {
             match block {
                 ContentBlock::Text { text, .. } => {
                     text_parts.push(text.clone());
+                    parts.push(ContentPart::Text { text: text.clone() });
+                }
+                ContentBlock::Image { source, .. } => {
+                    let Some(url) = anthropic_image_source_to_url(source) else {
+                        return Err(AnthropicOpenAIError::InvalidContent(
+                            "image block has neither base64 data nor a url".to_string(),
+                        ));
+                    };
+                    has_image = true;
+                    parts.push(ContentPart::ImageUrl {
+                        image_url: ImageUrl { url, detail: None },
+                    });
                 }
                 ContentBlock::ToolUse {
                     id, name, input, ..
@@ -213,15 +268,35 @@ impl AnthropicToOpenAIConverter {
                 } => {
                     let text = match content {
                         crate::schemas::anthropic::ToolResultValue::Text(t) => t.clone(),
-                        crate::schemas::anthropic::ToolResultValue::Blocks(bs) => bs
-                            .iter()
-                            .filter_map(|b| b.as_text().map(|s| s.to_string()))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
+                        crate::schemas::anthropic::ToolResultValue::Blocks(bs) => {
+                            // OpenAI `tool` messages carry text only — image
+                            // blocks inside a tool_result cannot be represented.
+                            let dropped = bs
+                                .iter()
+                                .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                                .count();
+                            if dropped > 0 {
+                                tracing::warn!(
+                                    tool_use_id = %tool_use_id,
+                                    dropped_images = dropped,
+                                    "tool_result image blocks dropped: OpenAI tool messages are text-only"
+                                );
+                            }
+                            bs.iter()
+                                .filter_map(|b| b.as_text().map(|s| s.to_string()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
                     };
                     tool_result_parts.push((tool_use_id.clone(), text));
                 }
-                // Ignore thinking, redacted_thinking, server_tool_use, server_tool_result, image, document
+                ContentBlock::Document { .. } => {
+                    // OpenAI chat has no document part; never drop silently.
+                    tracing::warn!(
+                        "document block dropped: OpenAI chat messages cannot carry documents"
+                    );
+                }
+                // Ignore thinking, redacted_thinking, server_tool_use, server_tool_result
                 _ => {}
             }
         }
@@ -241,7 +316,11 @@ impl AnthropicToOpenAIConverter {
             });
         }
 
-        let content = if text_parts.is_empty() {
+        // Text-only content keeps the plain-string shape; images force the
+        // multimodal `parts` array (text + image_url in block order).
+        let content = if has_image {
+            Some(OpenAIMessageContent::Parts(parts))
+        } else if text_parts.is_empty() {
             None
         } else {
             Some(OpenAIMessageContent::Text(text_parts.join("")))
@@ -825,6 +904,55 @@ impl OpenAIToAnthropicConverter {
         })
     }
 
+    /// Convert OpenAI multimodal user parts into Anthropic message content.
+    ///
+    /// Text-only parts keep the historical shape (`MessageContent::Text`, parts
+    /// joined with a newline) so cache_control injection and request hashing
+    /// are unchanged. As soon as an `image_url` part is present the message
+    /// becomes `MessageContent::Blocks` with text and image blocks in the
+    /// original order. `data:` URLs become `base64` sources whose `media_type`
+    /// is sniffed from the bytes; any other URL becomes a `url` source (the
+    /// Anthropic API fetches those natively; the Bedrock/Gemini handlers inline
+    /// external URLs before conversion).
+    fn convert_user_parts(
+        &self,
+        parts: &[crate::schemas::openai::ContentPart],
+    ) -> Result<MessageContent, AnthropicOpenAIError> {
+        use crate::schemas::openai::ContentPart;
+
+        let has_image = parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
+        if !has_image {
+            let text = parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(MessageContent::Text(text));
+        }
+
+        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part {
+                ContentPart::Text { text } => blocks.push(ContentBlock::Text {
+                    text: text.clone(),
+                    cache_control: None,
+                }),
+                ContentPart::ImageUrl { image_url } => {
+                    blocks.push(ContentBlock::Image {
+                        source: openai_image_url_to_source(&image_url.url)?,
+                        cache_control: None,
+                    });
+                }
+            }
+        }
+        Ok(MessageContent::Blocks(blocks))
+    }
+
     fn convert_messages(
         &self,
         messages: &[&ChatMessage],
@@ -838,17 +966,7 @@ impl OpenAIToAnthropicConverter {
                     let content = match &msg.content {
                         Some(OpenAIMessageContent::Text(t)) => MessageContent::Text(t.clone()),
                         Some(OpenAIMessageContent::Parts(parts)) => {
-                            let text = parts
-                                .iter()
-                                .filter_map(|p| match p {
-                                    crate::schemas::openai::ContentPart::Text { text } => {
-                                        Some(text.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            MessageContent::Text(text)
+                            self.convert_user_parts(parts)?
                         }
                         None => MessageContent::Text(String::new()),
                     };
@@ -2108,5 +2226,282 @@ mod openai_to_anthropic_cache_tests {
             &result.content[1],
             ContentBlock::Text { text, .. } if text == "answer"
         ));
+    }
+
+    // ---- multimodal: OpenAI image_url parts must survive the trip to Anthropic ----
+
+    fn png_data_url(declared: &str) -> String {
+        format!(
+            "data:{declared};base64,{}",
+            crate::utils::image::test_fixtures::PNG_1X1_B64
+        )
+    }
+
+    fn user_parts(parts: Vec<crate::schemas::openai::ContentPart>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::User,
+            content: Some(OpenAIMessageContent::Parts(parts)),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn test_user_text_and_data_url_image_become_ordered_blocks() {
+        use crate::schemas::openai::{ContentPart, ImageUrl};
+        let req = make_request(vec![user_parts(vec![
+            ContentPart::Text {
+                text: "What colour is this?".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: png_data_url("image/png"),
+                    detail: None,
+                },
+            },
+        ])]);
+        let out = OpenAIToAnthropicConverter::new()
+            .convert_request(&req, "claude-sonnet-4-6")
+            .unwrap();
+        let MessageContent::Blocks(blocks) = &out.messages[0].content else {
+            panic!("expected Blocks, got {:?}", out.messages[0].content);
+        };
+        assert_eq!(blocks.len(), 2, "text and image must both be kept");
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text, .. } if text == "What colour is this?")
+        );
+        let ContentBlock::Image { source, .. } = &blocks[1] else {
+            panic!("second block must be an image, got {:?}", blocks[1]);
+        };
+        assert_eq!(source.source_type, "base64");
+        assert_eq!(source.media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            source.data.as_deref(),
+            Some(crate::utils::image::test_fixtures::PNG_1X1_B64)
+        );
+        assert!(source.url.is_none());
+    }
+
+    #[test]
+    fn test_user_image_media_type_follows_bytes_not_declaration() {
+        use crate::schemas::openai::{ContentPart, ImageUrl};
+        // agstack `client.vision` labels every image image/jpeg; the bytes are a PNG.
+        let req = make_request(vec![user_parts(vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: png_data_url("image/jpeg"),
+                detail: None,
+            },
+        }])]);
+        let out = OpenAIToAnthropicConverter::new()
+            .convert_request(&req, "claude-sonnet-4-6")
+            .unwrap();
+        let MessageContent::Blocks(blocks) = &out.messages[0].content else {
+            panic!("expected Blocks");
+        };
+        let ContentBlock::Image { source, .. } = &blocks[0] else {
+            panic!("expected image block");
+        };
+        assert_eq!(source.media_type.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn test_user_text_only_parts_keep_plain_text_shape() {
+        use crate::schemas::openai::ContentPart;
+        let converter = OpenAIToAnthropicConverter::new();
+        let content = converter
+            .convert_user_parts(&[
+                ContentPart::Text {
+                    text: "a".to_string(),
+                },
+                ContentPart::Text {
+                    text: "b".to_string(),
+                },
+            ])
+            .unwrap();
+        assert!(matches!(content, MessageContent::Text(ref t) if t == "a\nb"));
+    }
+
+    #[test]
+    fn test_user_external_image_url_becomes_url_source() {
+        use crate::schemas::openai::{ContentPart, ImageUrl};
+        let converter = OpenAIToAnthropicConverter::new();
+        let content = converter
+            .convert_user_parts(&[ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/a.png".to_string(),
+                    detail: None,
+                },
+            }])
+            .unwrap();
+        let MessageContent::Blocks(blocks) = content else {
+            panic!("expected Blocks");
+        };
+        let ContentBlock::Image { source, .. } = &blocks[0] else {
+            panic!("expected image block");
+        };
+        assert_eq!(source.source_type, "url");
+        assert_eq!(source.url.as_deref(), Some("https://example.com/a.png"));
+        assert!(source.data.is_none());
+    }
+
+    #[test]
+    fn test_user_unsupported_image_url_is_rejected_not_dropped() {
+        use crate::schemas::openai::{ContentPart, ImageUrl};
+        let converter = OpenAIToAnthropicConverter::new();
+        let err = converter
+            .convert_user_parts(&[ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "ftp://example.com/a.png".to_string(),
+                    detail: None,
+                },
+            }])
+            .unwrap_err();
+        assert!(err.to_string().contains("image_url"), "{err}");
+
+        let err = converter
+            .convert_user_parts(&[ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,%%%not-base64%%%".to_string(),
+                    detail: None,
+                },
+            }])
+            .unwrap_err();
+        assert!(err.to_string().contains("base64"), "{err}");
+    }
+
+    // ---- reverse direction: Anthropic image blocks → OpenAI image_url parts ----
+
+    fn anthropic_req(messages: Vec<crate::schemas::anthropic::Message>) -> MessageRequest {
+        MessageRequest::new("claude-sonnet-4-6", messages, 256)
+    }
+
+    fn png_source() -> crate::schemas::anthropic::ImageSource {
+        crate::schemas::anthropic::ImageSource {
+            source_type: "base64".to_string(),
+            media_type: Some("image/png".to_string()),
+            data: Some(crate::utils::image::test_fixtures::PNG_1X1_B64.to_string()),
+            url: None,
+        }
+    }
+
+    #[test]
+    fn test_anthropic_user_image_block_becomes_openai_image_url_part() {
+        use crate::schemas::openai::ContentPart;
+        let req = anthropic_req(vec![crate::schemas::anthropic::Message {
+            extra: Default::default(),
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "describe".to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::Image {
+                    source: png_source(),
+                    cache_control: None,
+                },
+            ]),
+        }]);
+        let out = AnthropicToOpenAIConverter::new()
+            .convert_request(&req, "gpt-5")
+            .unwrap();
+        let Some(OpenAIMessageContent::Parts(parts)) = &out.messages[0].content else {
+            panic!("expected Parts, got {:?}", out.messages[0].content);
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], ContentPart::Text { text } if text == "describe"));
+        let ContentPart::ImageUrl { image_url } = &parts[1] else {
+            panic!("expected image_url part");
+        };
+        assert_eq!(
+            image_url.url,
+            format!(
+                "data:image/png;base64,{}",
+                crate::utils::image::test_fixtures::PNG_1X1_B64
+            )
+        );
+    }
+
+    #[test]
+    fn test_anthropic_url_image_source_passes_through_as_url() {
+        use crate::schemas::openai::ContentPart;
+        let req = anthropic_req(vec![crate::schemas::anthropic::Message {
+            extra: Default::default(),
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![ContentBlock::Image {
+                source: crate::schemas::anthropic::ImageSource {
+                    source_type: "url".to_string(),
+                    media_type: None,
+                    data: None,
+                    url: Some("https://example.com/a.png".to_string()),
+                },
+                cache_control: None,
+            }]),
+        }]);
+        let out = AnthropicToOpenAIConverter::new()
+            .convert_request(&req, "gpt-5")
+            .unwrap();
+        let Some(OpenAIMessageContent::Parts(parts)) = &out.messages[0].content else {
+            panic!("expected Parts");
+        };
+        assert!(
+            matches!(&parts[0], ContentPart::ImageUrl { image_url } if image_url.url == "https://example.com/a.png")
+        );
+    }
+
+    #[test]
+    fn test_anthropic_text_only_blocks_keep_string_content() {
+        let req = anthropic_req(vec![crate::schemas::anthropic::Message {
+            extra: Default::default(),
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "a".to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::Text {
+                    text: "b".to_string(),
+                    cache_control: None,
+                },
+            ]),
+        }]);
+        let out = AnthropicToOpenAIConverter::new()
+            .convert_request(&req, "gpt-5")
+            .unwrap();
+        assert!(
+            matches!(&out.messages[0].content, Some(OpenAIMessageContent::Text(t)) if t == "ab")
+        );
+    }
+
+    #[test]
+    fn test_anthropic_tool_result_images_are_dropped_with_text_kept() {
+        // OpenAI `tool` messages are text-only; the image is logged and dropped,
+        // the text survives (documented, intentional).
+        let req = anthropic_req(vec![crate::schemas::anthropic::Message {
+            extra: Default::default(),
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: crate::schemas::anthropic::ToolResultValue::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "screenshot taken".to_string(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Image {
+                        source: png_source(),
+                        cache_control: None,
+                    },
+                ]),
+                is_error: None,
+                cache_control: None,
+            }]),
+        }]);
+        let out = AnthropicToOpenAIConverter::new()
+            .convert_request(&req, "gpt-5")
+            .unwrap();
+        assert_eq!(out.messages[0].role, ChatRole::Tool);
+        assert!(
+            matches!(&out.messages[0].content, Some(OpenAIMessageContent::Text(t)) if t == "screenshot taken")
+        );
     }
 }
