@@ -115,24 +115,28 @@ const INTERNAL_KEY_IDS: &[&str] = &["__master__", "__ephemeral__"];
 async fn resolve_api_key_filter(
     state: &AppState,
     name: Option<&str>,
-) -> Result<String, axum::response::Response> {
+) -> Result<String, Box<axum::response::Response>> {
     match name.filter(|s| !s.is_empty()) {
         Some(name) if INTERNAL_KEY_IDS.contains(&name) => Ok(name.to_string()),
         Some(name) => match state.database.api_keys().get_api_key_by_name(name).await {
             Ok(Some(record)) => Ok(record.api_key),
-            Ok(None) => Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new(
-                    "not_found_error",
-                    format!("API key '{name}' not found"),
-                )),
-            )
-                .into_response()),
-            Err(e) => Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new("api_error", e.to_string())),
-            )
-                .into_response()),
+            Ok(None) => Err(Box::new(
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse::new(
+                        "not_found_error",
+                        format!("API key '{name}' not found"),
+                    )),
+                )
+                    .into_response(),
+            )),
+            Err(e) => Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("api_error", e.to_string())),
+                )
+                    .into_response(),
+            )),
         },
         None => Ok(String::new()), // empty = all keys
     }
@@ -199,7 +203,7 @@ pub async fn get_usage_summary(
     // Resolve api_key param as a key name, then look up the hash for DB filtering.
     let api_key_filter = match resolve_api_key_filter(&state, params.api_key.as_deref()).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let rows = match state
@@ -290,7 +294,7 @@ pub async fn get_usage_records(
     // Resolve api_key param as a key name, then look up the hash for DB filtering.
     let api_key_filter = match resolve_api_key_filter(&state, params.api_key.as_deref()).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // Fetch limit+1 rows so we can detect has_more without an extra query.

@@ -970,7 +970,7 @@ impl ModelMappingStore for DynamoDbBackend {
             result.items().iter().map(model_mapping_from_item).collect();
 
         // Sort by priority DESC
-        records.sort_by(|a, b| b.priority.cmp(&a.priority));
+        records.sort_by_key(|r| std::cmp::Reverse(r.priority));
         Ok(records)
     }
 
@@ -1071,7 +1071,7 @@ impl ModelMappingStore for DynamoDbBackend {
         let mut records: Vec<ModelMappingRecord> =
             result.items().iter().map(model_mapping_from_item).collect();
 
-        records.sort_by(|a, b| b.priority.cmp(&a.priority));
+        records.sort_by_key(|r| std::cmp::Reverse(r.priority));
         Ok(records)
     }
 }
@@ -1107,7 +1107,7 @@ impl BackendConfigStore for DynamoDbBackend {
         let mut records: Vec<BackendRecord> =
             result.items().iter().map(backend_from_item).collect();
 
-        records.sort_by(|a, b| b.priority.cmp(&a.priority));
+        records.sort_by_key(|r| std::cmp::Reverse(r.priority));
         Ok(records)
     }
 
@@ -1122,7 +1122,7 @@ impl BackendConfigStore for DynamoDbBackend {
         let mut records: Vec<BackendRecord> =
             result.items().iter().map(backend_from_item).collect();
 
-        records.sort_by(|a, b| b.priority.cmp(&a.priority));
+        records.sort_by_key(|r| std::cmp::Reverse(r.priority));
         Ok(records)
     }
 

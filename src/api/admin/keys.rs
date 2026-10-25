@@ -149,27 +149,31 @@ fn is_name_unique_error(e: &anyhow::Error) -> bool {
 async fn resolve_key_by_name(
     state: &AppState,
     name: &str,
-) -> Result<ApiKeyRecord, axum::response::Response> {
+) -> Result<ApiKeyRecord, Box<axum::response::Response>> {
     match state.database.api_keys().get_api_key_by_name(name).await {
         Ok(Some(record)) => Ok(record),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new(
-                "not_found_error",
-                format!("API key '{name}' not found"),
-            )),
-        )
-            .into_response()),
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to find API key by name");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(None) => Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
                 Json(ErrorResponse::new(
-                    "api_error",
-                    "Failed to retrieve API key",
+                    "not_found_error",
+                    format!("API key '{name}' not found"),
                 )),
             )
-                .into_response())
+                .into_response(),
+        )),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to find API key by name");
+            Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        "Failed to retrieve API key",
+                    )),
+                )
+                    .into_response(),
+            ))
         }
     }
 }
@@ -274,7 +278,7 @@ pub async fn update_key(
 ) -> impl IntoResponse {
     let mut record = match resolve_key_by_name(&state, &name).await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // Apply partial updates
@@ -330,7 +334,7 @@ pub async fn delete_key(
 
     let record = match resolve_key_by_name(&state, &name).await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let reason = match action {
@@ -363,7 +367,7 @@ pub async fn activate_key(
 ) -> impl IntoResponse {
     let mut record = match resolve_key_by_name(&state, &name).await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     record.is_active = true;
