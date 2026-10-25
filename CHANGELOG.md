@@ -1,12 +1,8 @@
-## Unreleased
+## v0.34.1 (2026-10-25)
 
 ### Fix
 
-- **converters**: carry OpenAI `image_url` parts through to Anthropic/Bedrock Claude as `image` blocks (previously silently dropped on `/v1/chat/completions` for `x-provider: bedrock` Claude models and the Anthropic passthrough; the model answered "I can't see the image" with unchanged `prompt_tokens`)
-- **converters**: carry Anthropic `image` blocks through to OpenAI `image_url` parts (`/v1/messages` → OpenAI passthrough, Bedrock Mantle chat and Converse paths previously dropped them)
-- **converters**: resolve image `media_type` from the bytes (PNG/JPEG/GIF/WEBP magic numbers) instead of the client-declared MIME on every data-URL path (`anthropic_openai`, `openai_bedrock`, `openai_gemini`, `image_url_fetcher`); a mismatch is logged at warn
-- **responses**: keep `input_image` parts on the hosted `web_search` path instead of flattening to text
-- **converters**: log a warn instead of silently dropping image blocks inside `tool_result` and document blocks when converting to OpenAI chat (text-only by protocol)
+- **converters**: carry user images through OpenAI<->Anthropic conversion, sniff media type from bytes
 
 ## v0.34.0 (2026-10-15)
 
