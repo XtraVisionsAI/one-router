@@ -1,8 +1,11 @@
 //! Services module
 
+pub mod audit;
+pub mod auth_cache;
 pub mod backend_pool;
 pub mod bedrock;
 pub mod beta_headers;
+pub mod budget_alerts;
 pub mod capabilities;
 pub mod failover;
 pub mod gemini;

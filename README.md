@@ -348,6 +348,7 @@ One Router uses environment variables for infrastructure config. All runtime set
 | `PORT` | `8000` | HTTP listen port |
 | `HOST` | `127.0.0.1` (`0.0.0.0` when `CONTAINER=true`) | HTTP bind host. Loopback by default on bare metal; set `HOST=0.0.0.0` only behind a firewall / TLS reverse proxy |
 | `METRICS_PUBLIC` | `false` | Serve `/metrics` without authentication. Default requires the master key (`authorization: Bearer <MASTER_API_KEY>`) or an admin session |
+| `TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is trusted for the client address (IP allowlists, audit log) |
 | `LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `MASTER_API_KEY` | _(auto-generated)_ | Admin-only key — for `/admin` UI login and admin API. Cannot call `/v1/*` business endpoints. Auto-generated and saved to `.env` on first bare-metal run |
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |

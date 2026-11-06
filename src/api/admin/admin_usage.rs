@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
-use crate::database::models::looks_like_key_id;
+use crate::database::models::{explode_tag_rows, looks_like_key_id, storage_dimension};
+use crate::database::traits::UsageFilter;
 use crate::middleware::auth::{EPHEMERAL_KEY_ID, MASTER_KEY_ID};
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::state::AppState;
@@ -29,6 +30,8 @@ pub struct AdminUsageQueryParams {
     pub api_key: Option<String>,
     /// Filter by user: `user_id` or user name. Combines with `api_key` (AND).
     pub user: Option<String>,
+    /// Only rows carrying this usage tag.
+    pub tag: Option<String>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
     #[serde(default = "default_group_by")]
@@ -45,6 +48,7 @@ fn default_group_by() -> String {
 pub struct AdminRecordsQueryParams {
     pub api_key: Option<String>,
     pub user: Option<String>,
+    pub tag: Option<String>,
     pub start_time: Option<String>,
     pub limit: Option<i64>,
 }
@@ -100,6 +104,7 @@ pub struct UsageRecordItem {
     /// Owning user's display label (name, `deleted user · <id>`, or `unattributed`).
     pub user: String,
     pub user_id: Option<String>,
+    pub tags: Vec<String>,
     pub timestamp: String,
     pub request_id: String,
     pub model: String,
@@ -261,7 +266,7 @@ pub async fn get_usage_summary(
     Query(params): Query<AdminUsageQueryParams>,
 ) -> impl IntoResponse {
     const VALID_GROUP_BY: &[&str] = &[
-        "hour", "day", "month", "model", "provider", "api_key", "user",
+        "hour", "day", "month", "model", "provider", "api_key", "user", "tag",
     ];
     if !VALID_GROUP_BY.contains(&params.group_by.as_str()) {
         return (
@@ -301,16 +306,23 @@ pub async fn get_usage_summary(
         .database
         .usage()
         .query_usage_summary(
-            &api_key_filter,
-            user_filter.as_deref(),
+            UsageFilter {
+                api_key: &api_key_filter,
+                user_id: user_filter.as_deref(),
+                tag: params.tag.as_deref(),
+            },
             params.start_time.as_deref(),
             params.end_time.as_deref(),
-            &params.group_by,
-            params.split_by.as_deref(),
+            storage_dimension(&params.group_by),
+            params.split_by.as_deref().map(storage_dimension),
         )
         .await
     {
-        Ok(r) => r,
+        Ok(r) => explode_tag_rows(
+            r,
+            params.group_by == "tag",
+            params.split_by.as_deref() == Some("tag"),
+        ),
         Err(e) => {
             tracing::error!(error = %e, "Failed to query admin usage summary");
             return (
@@ -407,8 +419,11 @@ pub async fn get_usage_records(
         .database
         .usage()
         .get_usage_by_api_key(
-            &api_key_filter,
-            user_filter.as_deref(),
+            UsageFilter {
+                api_key: &api_key_filter,
+                user_id: user_filter.as_deref(),
+                tag: params.tag.as_deref(),
+            },
             params.start_time.as_deref(),
             Some(limit + 1),
             None,
@@ -446,6 +461,16 @@ pub async fn get_usage_records(
             key_id: r.key_id,
             user: resolve_user_name(r.user_id.as_deref(), &user_labels),
             user_id: r.user_id,
+            tags: r
+                .tags
+                .as_deref()
+                .map(|t| {
+                    t.split(',')
+                        .filter(|x| !x.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
             timestamp: r.timestamp,
             request_id: r.request_id,
             model: r.model,

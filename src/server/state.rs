@@ -162,6 +162,10 @@ pub struct AppState {
 
     /// Hot-reloadable config (backends, settings, web tools)
     pub dynamic: Arc<RwLock<DynamicConfig>>,
+
+    /// API key lookup cache (+ last_used debounce). Invalidated on key/user
+    /// admin writes; TTL from `auth_cache_ttl_secs`.
+    pub auth_cache: Arc<crate::services::auth_cache::AuthCache>,
 }
 
 impl AppState {

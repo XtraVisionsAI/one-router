@@ -388,6 +388,7 @@ mod tests {
             monthly_budget: None,
             budget_used_mtd: 0.0,
             budget_mtd_month: None,
+            budget_period: Default::default(),
         });
         info
     }

@@ -41,6 +41,11 @@ pub struct Settings {
     /// (e.g. a Prometheus sidecar).
     pub metrics_public: bool,
 
+    /// Peers whose `X-Forwarded-For` is trusted when resolving the client
+    /// address (`TRUSTED_PROXY_CIDRS`, comma-separated). Empty = use the TCP
+    /// peer address only.
+    pub trusted_proxy_cidrs: Vec<crate::utils::client_ip::Cidr>,
+
     /// Master API key for admin access
     pub master_api_key: Option<String>,
 
@@ -103,6 +108,10 @@ impl Settings {
         let metrics_public = env::var("METRICS_PUBLIC")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+        let trusted_proxy_cidrs = crate::utils::client_ip::parse_cidr_list(
+            &env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
+        )
+        .map_err(|e| anyhow::anyhow!("Invalid TRUSTED_PROXY_CIDRS: {e}"))?;
 
         let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
 
@@ -143,6 +152,7 @@ impl Settings {
             log_level,
             max_body_size_mb,
             metrics_public,
+            trusted_proxy_cidrs,
             master_api_key,
             encryption_key,
             web_search_provider,
@@ -380,6 +390,7 @@ mod tests {
             log_level: "debug".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             metrics_public: false,
+            trusted_proxy_cidrs: Vec::new(),
             master_api_key: None,
             encryption_key: None,
             web_search_provider: None,
@@ -401,6 +412,7 @@ mod tests {
             log_level: "info".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             metrics_public: false,
+            trusted_proxy_cidrs: Vec::new(),
             master_api_key: Some("changeme".into()),
             encryption_key: Some("a".repeat(32)),
             web_search_provider: None,
@@ -423,6 +435,7 @@ mod tests {
             log_level: "info".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             metrics_public: false,
+            trusted_proxy_cidrs: Vec::new(),
             master_api_key: Some("sk-9f3c1a7e5b2d4f60a8c1e3d5b7f9a1c3".into()),
             encryption_key: Some("a".repeat(32)),
             web_search_provider: None,
@@ -449,6 +462,7 @@ mod tests {
             log_level: "info".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             metrics_public: false,
+            trusted_proxy_cidrs: Vec::new(),
             master_api_key: None,
             encryption_key: None,
             web_search_provider: None,
@@ -478,6 +492,7 @@ mod tests {
             log_level: "info".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
             metrics_public: false,
+            trusted_proxy_cidrs: Vec::new(),
             master_api_key: None,
             encryption_key: None,
             web_search_provider: None,

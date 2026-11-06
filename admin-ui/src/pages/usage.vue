@@ -1,7 +1,7 @@
 <script setup lang="ts">
   import type { ApiKey, User, UsageSummaryResponse, UsageSummaryRow } from '@/api/types'
   import type { GroupByDimension, UsageSummaryParams } from '@/api/usage'
-  import { NButton, NCard, NDataTable, NDatePicker, NSelect, NStatistic, useMessage } from 'naive-ui'
+  import { NButton, NCard, NDataTable, NDatePicker, NInput, NSelect, NStatistic, useMessage } from 'naive-ui'
   import { h } from 'vue'
   import VChart from 'vue-echarts'
   import { use } from 'echarts/core'
@@ -26,6 +26,7 @@
   const users = ref<User[]>([])
   const selectedKey = ref<string | null>(null)
   const selectedUser = ref<string | null>(null)
+  const tagFilter = ref('')
   const groupBy = ref<GroupByDimension>('hour')
   const splitBy = ref<GroupByDimension | null>(null)
   const dateRange = ref<[number, number] | null>(null)
@@ -53,6 +54,7 @@
     { label: 'By Model', value: 'model' },
     { label: 'By Provider', value: 'provider' },
     { label: 'By User', value: 'user' },
+    { label: 'By Tag', value: 'tag' },
     { label: 'By API Key', value: 'api_key' }
   ]
 
@@ -63,7 +65,7 @@
 
   const groupByLabel: Record<string, string> = {
     hour: 'Hour', day: 'Day', month: 'Month',
-    model: 'Model', provider: 'Provider', api_key: 'API Key', user: 'User',
+    model: 'Model', provider: 'Provider', api_key: 'API Key', user: 'User', tag: 'Tag',
   }
 
   const isTimeDimension = computed(() => ['hour', 'day', 'month'].includes(groupBy.value))
@@ -111,6 +113,7 @@
       if (splitBy.value) params.split_by = splitBy.value
       if (selectedKey.value) params.api_key = selectedKey.value
       if (selectedUser.value) params.user = selectedUser.value
+      if (tagFilter.value.trim()) params.tag = tagFilter.value.trim()
       if (dateRange.value) {
         params.start_time = new Date(dateRange.value[0]).toISOString()
         params.end_time = new Date(dateRange.value[1] + 86400000 - 1).toISOString()
@@ -207,6 +210,10 @@
       <div>
         <div class="text-xs text-slate-400 mb-1">User</div>
         <NSelect v-model:value="selectedUser" :options="userOptions" placeholder="All users" clearable filterable style="width: 180px" />
+      </div>
+      <div>
+        <div class="text-xs text-slate-400 mb-1">Tag</div>
+        <NInput v-model:value="tagFilter" placeholder="any" clearable style="width: 140px" />
       </div>
       <div>
         <div class="text-xs text-slate-400 mb-1">API Key</div>

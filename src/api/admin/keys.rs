@@ -18,6 +18,12 @@
 //!                                               default; use POST …/deactivate)
 //! POST   /admin/api/keys/:key_id/deactivate → deactivate (reversible)
 //! POST   /admin/api/keys/:key_id/activate   → re-activate
+//! POST   /admin/api/keys/:key_id/rotate     → issue a replacement, expire the old
+//!                                               key after a grace period
+//!
+//! Every write invalidates this instance's auth cache and attaches an
+//! `AuditDetail` (before/after snapshots of `AdminKeyItem`, which never holds
+//! the secret or its hash).
 
 use axum::{
     extract::{Path, Query, State},
@@ -31,10 +37,12 @@ use std::collections::HashMap;
 
 use super::common::*;
 use super::users::resolve_user;
+use crate::database::models::BudgetPeriod;
 use crate::database::models::{looks_like_key_id, new_key_id, ApiKeyRecord, UserRecord};
 use crate::middleware::auth::ApiKeyInfo;
 use crate::server::state::AppState;
-use crate::utils::api_key::{hash_key, mask_key};
+use crate::services::audit::AuditDetail;
+use crate::utils::api_key::{generate_key, hash_key, mask_key};
 
 // ============================================================================
 // Response types
@@ -62,6 +70,12 @@ pub struct AdminKeyItem {
     pub cache_ttl: Option<String>,
     pub expires_at: Option<i64>,
     pub allowed_models: Option<Vec<String>>,
+    pub allowed_cidrs: Option<Vec<String>>,
+    pub budget_period: BudgetPeriod,
+    pub default_tags: Option<Vec<String>>,
+    pub last_used_at: Option<i64>,
+    /// `key_id` of the replacement if this key was rotated.
+    pub rotated_to: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
@@ -69,7 +83,7 @@ pub struct AdminKeyItem {
 
 impl AdminKeyItem {
     pub(super) fn from_record(r: &ApiKeyRecord, user_name: Option<String>) -> Self {
-        let current_month = Utc::now().format("%Y-%m").to_string();
+        let current_period = r.budget_period.key_at(Utc::now());
         Self {
             key_id: r.key_id.clone(),
             api_key: if r.key_display.is_empty() {
@@ -88,12 +102,17 @@ impl AdminKeyItem {
             budget_used_mtd: crate::database::models::period_spend(
                 r.budget_used_mtd,
                 r.budget_mtd_month.as_deref(),
-                &current_month,
+                &current_period,
             ),
             budget_used: r.budget_used,
             cache_ttl: r.cache_ttl.clone(),
             expires_at: r.expires_at,
             allowed_models: r.allowed_models.clone(),
+            allowed_cidrs: r.allowed_cidrs.clone(),
+            budget_period: r.budget_period,
+            default_tags: r.default_tags.clone(),
+            last_used_at: r.last_used_at,
+            rotated_to: r.rotated_to.clone(),
             metadata: decode_metadata(r.metadata.as_deref()),
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -145,6 +164,10 @@ pub struct CreateKeyRequest {
     /// Unix seconds; `None` = never expires.
     pub expires_at: Option<i64>,
     pub allowed_models: Option<Vec<String>>,
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// `monthly` (default) / `weekly` / `daily` — period of the key sub-budget.
+    pub budget_period: Option<String>,
+    pub default_tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +190,28 @@ pub struct UpdateKeyRequest {
     pub expires_at: Option<Option<i64>>,
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub allowed_models: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub allowed_cidrs: Option<Option<Vec<String>>>,
+    pub budget_period: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub default_tags: Option<Option<Vec<String>>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RotateKeyRequest {
+    /// How long the old key keeps working (seconds, default 86400, 0 = now).
+    pub grace_period_secs: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateKeyResponse {
+    pub key_id: String,
+    pub api_key: String, // full plaintext of the replacement — show once
+    pub name: String,
+    pub old_key_id: String,
+    /// Unix seconds when the old key stops working.
+    pub old_expires_at: i64,
+    pub message: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +300,23 @@ async fn user_name_of(state: &AppState, user_id: &str) -> Option<String> {
 
 async fn item(state: &AppState, record: &ApiKeyRecord) -> AdminKeyItem {
     AdminKeyItem::from_record(record, user_name_of(state, &record.user_id).await)
+}
+
+/// Audit detail for a key write, with before/after snapshots.
+fn audit(
+    action: &str,
+    key_id: &str,
+    before: Option<&AdminKeyItem>,
+    after: Option<&AdminKeyItem>,
+) -> AuditDetail {
+    let mut d = AuditDetail::new(action, "api_key", key_id);
+    if let Some(b) = before {
+        d = d.before(b);
+    }
+    if let Some(a) = after {
+        d = d.after(a);
+    }
+    d
 }
 
 fn validate_key_limits(
@@ -353,6 +415,9 @@ async fn create_key_inner(
     validate_non_negative("cost_rate", body.cost_rate)?;
     let metadata = body.metadata.as_ref().map(encode_metadata).transpose()?;
     let allowed_models = validate_allowed_models(body.allowed_models)?;
+    let allowed_cidrs = validate_cidrs(body.allowed_cidrs)?;
+    let default_tags = validate_tags(body.default_tags)?;
+    let budget_period = parse_budget_period(body.budget_period.as_deref())?.unwrap_or_default();
     let now = Utc::now().timestamp();
 
     // Owner: explicit user, or (legacy) a new user carrying the limit fields.
@@ -397,8 +462,7 @@ async fn create_key_inner(
         }
     };
 
-    // Generate key: sk-<32 hex chars>
-    let raw_key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let raw_key = generate_key();
     let (rate_limit, tpm_limit, monthly_budget, cache_ttl) = key_limits;
     let record = ApiKeyRecord {
         api_key: hash_key(&raw_key, state.settings.encryption_key.as_deref()),
@@ -420,6 +484,12 @@ async fn create_key_inner(
         metadata,
         expires_at: body.expires_at,
         allowed_models,
+        allowed_cidrs,
+        budget_period,
+        budget_alerts_sent: None,
+        default_tags,
+        last_used_at: None,
+        rotated_to: None,
         created_at: now,
         updated_at: None,
     };
@@ -437,10 +507,12 @@ async fn create_key_inner(
         });
     }
 
+    state.auth_cache.invalidate_all();
+    let snapshot = AdminKeyItem::from_record(&record, Some(user.name.clone()));
     let resp = (
         StatusCode::CREATED,
         Json(CreateKeyResponse {
-            key_id: record.key_id,
+            key_id: record.key_id.clone(),
             user_id: record.user_id,
             api_key: raw_key,
             name: record.name,
@@ -448,6 +520,7 @@ async fn create_key_inner(
         }),
     )
         .into_response();
+    let resp = audit("api_key.create", &record.key_id, None, Some(&snapshot)).attach(resp);
     Ok(if legacy { deprecated(resp) } else { resp })
 }
 
@@ -461,8 +534,19 @@ pub async fn update_key(
         Ok(k) => k,
         Err(resp) => return *resp,
     };
+    let before = item(&state, &resolved.record).await;
     match update_key_inner(&state, &resolved, body).await {
-        Ok(record) => resolved.finish(Json(item(&state, &record).await).into_response()),
+        Ok(record) => {
+            state.auth_cache.invalidate_all();
+            let after = item(&state, &record).await;
+            let detail = audit(
+                "api_key.update",
+                &record.key_id,
+                Some(&before),
+                Some(&after),
+            );
+            resolved.finish(detail.attach(Json(after).into_response()))
+        }
         Err(resp) => *resp,
     }
 }
@@ -510,6 +594,15 @@ async fn update_key_inner(
     if let Some(models) = body.allowed_models {
         record.allowed_models = validate_allowed_models(models)?;
     }
+    if let Some(cidrs) = body.allowed_cidrs {
+        record.allowed_cidrs = validate_cidrs(cidrs)?;
+    }
+    if let Some(p) = parse_budget_period(body.budget_period.as_deref())? {
+        record.budget_period = p;
+    }
+    if let Some(tags) = body.default_tags {
+        record.default_tags = validate_tags(tags)?;
+    }
 
     match state.database.api_keys().update_api_key(&record).await {
         Ok(()) => Ok(record),
@@ -535,10 +628,21 @@ pub async fn delete_key(
     };
 
     match query.action.as_deref() {
-        Some("delete") => match hard_delete(&state, &resolved.record).await {
-            Ok(()) => resolved.finish(Json(OkResponse { ok: true }).into_response()),
-            Err(resp) => *resp,
-        },
+        Some("delete") => {
+            let before = item(&state, &resolved.record).await;
+            match hard_delete(&state, &resolved.record).await {
+                Ok(()) => resolved.finish(
+                    audit(
+                        "api_key.delete",
+                        &resolved.record.key_id,
+                        Some(&before),
+                        None,
+                    )
+                    .attach(Json(OkResponse { ok: true }).into_response()),
+                ),
+                Err(resp) => *resp,
+            }
+        }
         None | Some("deactivate") => deprecated(deactivate(&state, &resolved.record).await),
         Some(other) => *bad_request(format!(
             "Unknown action '{other}' (expected 'delete' or 'deactivate')"
@@ -557,6 +661,7 @@ pub(super) async fn hard_delete(
         .delete_api_key(&record.api_key)
         .await
         .map_err(|e| internal_error("Failed to delete API key", &e))?;
+    state.auth_cache.invalidate_all();
     tracing::info!(
         key_id = %record.key_id,
         user_id = %record.user_id,
@@ -574,7 +679,11 @@ async fn deactivate(state: &AppState, record: &ApiKeyRecord) -> Response {
         .deactivate_api_key(&record.api_key, "admin")
         .await
     {
-        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Ok(()) => {
+            state.auth_cache.invalidate_all();
+            audit("api_key.deactivate", &record.key_id, None, None)
+                .attach(Json(OkResponse { ok: true }).into_response())
+        }
         Err(e) => *internal_error("Failed to deactivate API key", &e),
     }
 }
@@ -598,9 +707,127 @@ pub async fn activate_key(State(state): State<AppState>, Path(ident): Path<Strin
     record.deactivated_reason = None;
 
     match state.database.api_keys().update_api_key(&record).await {
-        Ok(()) => resolved.finish(Json(item(&state, &record).await).into_response()),
+        Ok(()) => {
+            state.auth_cache.invalidate_all();
+            let after = item(&state, &record).await;
+            resolved.finish(
+                audit("api_key.activate", &record.key_id, None, Some(&after))
+                    .attach(Json(after).into_response()),
+            )
+        }
         Err(e) => *internal_error("Failed to activate API key", &e),
     }
+}
+
+/// POST /admin/api/keys/:key_id/rotate — issue a replacement with the same
+/// owner, name, limits and allowlists; the old key is renamed
+/// `<name>~rotated-<timestamp>-<key_id8>`, linked via `rotated_to`, and expires after the
+/// grace period (an earlier existing expiry is kept).
+pub async fn rotate_key(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    body: Option<Json<RotateKeyRequest>>,
+) -> Response {
+    let resolved = match resolve_key(&state, &ident).await {
+        Ok(k) => k,
+        Err(resp) => return *resp,
+    };
+    let grace = body.and_then(|b| b.0.grace_period_secs).unwrap_or(86_400);
+    match rotate_inner(&state, &resolved.record, grace).await {
+        Ok(resp) => resolved.finish(resp),
+        Err(resp) => *resp,
+    }
+}
+
+async fn rotate_inner(
+    state: &AppState,
+    old: &ApiKeyRecord,
+    grace: i64,
+) -> Result<Response, HandlerError> {
+    if grace < 0 {
+        return Err(bad_request("grace_period_secs must be >= 0"));
+    }
+    if old.rotated_to.is_some() {
+        return Err(conflict(
+            "This key was already rotated; rotate its replacement instead",
+        ));
+    }
+    let now = Utc::now();
+    let before = item(state, old).await;
+
+    // 1. Free the name, set the expiry, link forward (key_id assigned up front).
+    let new_key_id = new_key_id();
+    let mut retired = old.clone();
+    // Key-id prefix keeps two rotations within the same second distinct.
+    retired.name = format!(
+        "{}~rotated-{}-{}",
+        old.name,
+        now.format("%Y%m%d%H%M%S"),
+        old.key_id.chars().take(8).collect::<String>()
+    );
+    let old_expires_at = old
+        .expires_at
+        .map_or(now.timestamp() + grace, |e| e.min(now.timestamp() + grace));
+    retired.expires_at = Some(old_expires_at);
+    retired.rotated_to = Some(new_key_id.clone());
+    state
+        .database
+        .api_keys()
+        .update_api_key(&retired)
+        .await
+        .map_err(|e| internal_error("Failed to update the rotated key", &e))?;
+
+    // 2. The replacement inherits everything but identity and counters.
+    let raw_key = generate_key();
+    let replacement = ApiKeyRecord {
+        api_key: hash_key(&raw_key, state.settings.encryption_key.as_deref()),
+        key_id: new_key_id,
+        key_display: mask_key(&raw_key),
+        name: old.name.clone(),
+        is_active: true,
+        deactivated_reason: None,
+        budget_used: 0.0,
+        budget_used_mtd: 0.0,
+        budget_mtd_month: None,
+        budget_history: None,
+        budget_alerts_sent: None,
+        last_used_at: None,
+        rotated_to: None,
+        // Expiry is not inherited: rotating a key that expires soon should
+        // produce one that does not.
+        expires_at: None,
+        created_at: now.timestamp(),
+        updated_at: None,
+        ..old.clone()
+    };
+    if let Err(e) = state.database.api_keys().create_api_key(&replacement).await {
+        // Roll the old key back so the admin can retry.
+        let _ = state.database.api_keys().update_api_key(old).await;
+        return Err(internal_error("Failed to create the replacement key", &e));
+    }
+    state.auth_cache.invalidate_all();
+
+    let after = item(state, &replacement).await;
+    let detail = AuditDetail::new("api_key.rotate", "api_key", &old.key_id)
+        .before(&before)
+        .after(&serde_json::json!({
+            "replacement": after,
+            "old_expires_at": old_expires_at,
+        }));
+    Ok(detail.attach(
+        (
+            StatusCode::CREATED,
+            Json(RotateKeyResponse {
+                key_id: replacement.key_id,
+                api_key: raw_key,
+                name: replacement.name,
+                old_key_id: old.key_id.clone(),
+                old_expires_at,
+                message: "Save this key — it will not be shown again. The old key keeps working until old_expires_at.",
+            }),
+        )
+            .into_response(),
+    ))
 }
 
 #[cfg(test)]
@@ -628,6 +855,12 @@ mod tests {
             metadata: Some(r#"{"owner":"alice"}"#.to_string()),
             expires_at: None,
             allowed_models: Some(vec!["claude-*".into()]),
+            allowed_cidrs: None,
+            budget_period: BudgetPeriod::Monthly,
+            budget_alerts_sent: None,
+            default_tags: None,
+            last_used_at: None,
+            rotated_to: None,
             created_at: 0,
             updated_at: None,
         }
@@ -635,9 +868,9 @@ mod tests {
 
     #[test]
     fn key_generation_format() {
-        let raw_key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-        assert!(raw_key.starts_with("sk-"));
-        assert_eq!(raw_key.len(), 35); // "sk-" + 32 hex chars
+        let raw_key = generate_key();
+        assert!(raw_key.starts_with("sk-or-"));
+        assert_eq!(raw_key.len(), 38); // "sk-or-" + 32 hex chars
     }
 
     #[test]

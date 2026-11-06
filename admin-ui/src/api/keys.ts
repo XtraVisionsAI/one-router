@@ -18,6 +18,14 @@ export function useKeysApi() {
 
     deactivate: (keyId: string) => request<{ ok: boolean }>('POST', `${path(keyId)}/deactivate`),
 
+    /** Issue a replacement; the old key keeps working for `graceSecs`. */
+    rotate: (keyId: string, graceSecs: number) =>
+      request<{ key_id: string; api_key: string; name: string; old_key_id: string; old_expires_at: number }>(
+        'POST',
+        `${path(keyId)}/rotate`,
+        { grace_period_secs: graceSecs }
+      ),
+
     /** Permanent delete — usage history is kept. */
     remove: (keyId: string) => request<{ ok: boolean }>('DELETE', `${path(keyId)}?action=delete`)
   }

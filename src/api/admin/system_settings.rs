@@ -39,8 +39,27 @@ pub struct UpsertSettingRequest {
 
 /// Validate the value for known keys. Returns Err with a human-readable message
 /// if validation fails, Ok(()) otherwise.
-fn validate_setting(key: &str, value: &str) -> Result<(), &'static str> {
-    match key {
+fn validate_setting(key: &str, value: &str) -> Result<(), String> {
+    use crate::services::budget_alerts::{parse_thresholds, parse_webhook_url};
+    let r: Result<(), &'static str> = match key {
+        "budget_alert_thresholds" => {
+            return parse_thresholds(value)
+                .map(|_| ())
+                .map_err(|e| format!("budget_alert_thresholds: {e}"))
+        }
+        "budget_alert_webhook_url" => {
+            return parse_webhook_url(value)
+                .map(|_| ())
+                .map_err(|e| format!("budget_alert_webhook_url: {e}"))
+        }
+        "audit_log_retention_days" => match value.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => Ok(()),
+            _ => Err("audit_log_retention_days must be an integer >= 0 (0 = keep forever)"),
+        },
+        "auth_cache_ttl_secs" => match value.trim().parse::<u64>() {
+            Ok(n) if n <= crate::services::auth_cache::MAX_TTL_SECS => Ok(()),
+            _ => Err("auth_cache_ttl_secs must be an integer between 0 and 300"),
+        },
         "prompt_cache" => {
             if matches!(value, "disable" | "passthrough" | "5m" | "1h") {
                 Ok(())
@@ -73,7 +92,8 @@ fn validate_setting(key: &str, value: &str) -> Result<(), &'static str> {
             _ => Err("bedrock_max_request_mb must be an integer between 1 and 64 (MB)"),
         },
         _ => Ok(()), // unknown keys are accepted as-is
-    }
+    };
+    r.map_err(String::from)
 }
 
 // ============================================================================
@@ -150,6 +170,28 @@ pub async fn upsert_setting(
             .into_response();
     }
 
+    // Audit snapshot: values of sensitive settings are never recorded.
+    let existing = state
+        .database
+        .system_settings()
+        .get_setting(&key)
+        .await
+        .ok()
+        .flatten();
+    let sensitive = existing
+        .as_ref()
+        .is_some_and(|e| is_sensitive(&e.ui_schema));
+    let shown = |v: &str| {
+        if sensitive {
+            serde_json::json!({"value": "<redacted>"})
+        } else {
+            serde_json::json!({"value": v})
+        }
+    };
+    let detail = crate::services::audit::AuditDetail::new("setting.update", "setting", &key)
+        .before(&existing.as_ref().map(|e| shown(&e.value)))
+        .after(&shown(&body.value));
+
     let record = SystemSettingRecord {
         key: key.clone(),
         value: body.value,
@@ -167,10 +209,11 @@ pub async fn upsert_setting(
         Ok(()) => {
             reload_dynamic_config(&state).await;
             // Return the freshly saved record
-            match state.database.system_settings().get_setting(&key).await {
+            let resp = match state.database.system_settings().get_setting(&key).await {
                 Ok(Some(saved)) => (StatusCode::OK, Json(saved)).into_response(),
                 _ => StatusCode::OK.into_response(),
-            }
+            };
+            detail.attach(resp)
         }
         Err(e) => {
             tracing::error!(error = %e, key = %key, "Failed to upsert system setting");

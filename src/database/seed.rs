@@ -1137,6 +1137,52 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             ),
             updated_at: None,
         },
+        SystemSettingRecord {
+            key: "budget_alert_thresholds".into(),
+            value: "0.8,1.0".into(),
+            description: "Budget alert thresholds as fractions of a user's / key's budget \
+                          (comma-separated, e.g. 0.8,1.0). Each fires once per budget period. \
+                          Empty = no alerts."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"text","label":"Budget Alert Thresholds","group":"Budgets","sort_order":10,"placeholder":"0.8,1.0"}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "budget_alert_webhook_url".into(),
+            value: String::new(),
+            description: "HTTPS webhook for budget alerts (Slack-compatible JSON: {\"text\": ...} \
+                          plus a structured \"alert\" object). Empty = log + metric only."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"password","label":"Budget Alert Webhook URL","group":"Budgets","sort_order":20,"sensitive":true,"placeholder":"https://hooks.slack.com/services/..."}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "audit_log_retention_days".into(),
+            value: "365".into(),
+            description: "Delete audit log entries older than this many days (0 = keep forever). \
+                          Purged daily."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"number","label":"Audit Log Retention (days)","group":"Security","sort_order":10,"placeholder":"365"}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "auth_cache_ttl_secs".into(),
+            value: "30".into(),
+            description: "Seconds an API key lookup is cached per instance (0 = no cache, max 300). \
+                          Key/user changes apply immediately on the instance that made them and \
+                          within this TTL on other instances."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"number","label":"Auth Cache TTL (seconds)","group":"Security","sort_order":20,"placeholder":"30"}"#.into(),
+            ),
+            updated_at: None,
+        },
     ]
 }
 

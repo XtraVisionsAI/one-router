@@ -352,6 +352,7 @@ One Router 使用环境变量配置基础设施。所有运行时设置存储在
 | `PORT` | `8000` | HTTP 监听端口 |
 | `HOST` | `127.0.0.1`(`CONTAINER=true` 时为 `0.0.0.0`) | HTTP 绑定地址。裸机默认只监听本机;仅在防火墙 / TLS 反向代理之后才设置 `HOST=0.0.0.0` |
 | `METRICS_PUBLIC` | `false` | `/metrics` 免鉴权。默认需要 master key(`authorization: Bearer <MASTER_API_KEY>`)或管理会话 |
+| `TRUSTED_PROXY_CIDRS` | _(空)_ | 受信反向代理的 CIDR(逗号分隔),仅来自这些地址的 `X-Forwarded-For` 用于确定客户端 IP(IP 白名单、审计日志) |
 | `LOG_LEVEL` | `info` | 日志级别：`trace`、`debug`、`info`、`warn`、`error` |
 | `MASTER_API_KEY` | _(自动生成)_ | 管理专用 API Key — 用于 `/admin` 界面登录和管理 API，不能调用 `/v1/*` 业务端点。裸机首次运行时自动生成并保存到 `.env` |
 | `ENCRYPTION_KEY` | _(自动生成)_ | AES-256 密钥，用于凭证加密和 API Key HMAC — 首次运行时自动生成 |

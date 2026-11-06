@@ -9,7 +9,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::database::models::period_spend;
+use crate::database::models::{explode_tag_rows, period_spend, storage_dimension};
+use crate::database::traits::UsageFilter;
 use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::state::AppState;
@@ -30,6 +31,8 @@ pub struct UsageQueryParams {
     pub split_by: Option<String>,
     /// "key" (default) = this key only; "user" = all keys of this key's user.
     pub scope: Option<String>,
+    /// Only rows carrying this usage tag.
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,7 +149,7 @@ pub async fn get_usage_summary(
     let group_by = params.group_by.as_deref().unwrap_or("hour");
 
     // Validate group_by parameter (api_key dimension is admin-only)
-    const VALID_GROUP_BY: &[&str] = &["hour", "day", "month", "model", "provider"];
+    const VALID_GROUP_BY: &[&str] = &["hour", "day", "month", "model", "provider", "tag"];
     if !VALID_GROUP_BY.contains(&group_by) {
         return (
             StatusCode::BAD_REQUEST,
@@ -180,16 +183,23 @@ pub async fn get_usage_summary(
         .database
         .usage()
         .query_usage_summary(
-            key_filter,
-            user_filter,
+            UsageFilter {
+                api_key: key_filter,
+                user_id: user_filter,
+                tag: params.tag.as_deref(),
+            },
             params.start_time.as_deref(),
             params.end_time.as_deref(),
-            group_by,
-            params.split_by.as_deref(),
+            storage_dimension(group_by),
+            params.split_by.as_deref().map(storage_dimension),
         )
         .await
     {
-        Ok(r) => r,
+        Ok(r) => explode_tag_rows(
+            r,
+            group_by == "tag",
+            params.split_by.as_deref() == Some("tag"),
+        ),
         Err(e) => {
             tracing::error!(error = %e, "Failed to query usage summary");
             return (
@@ -205,14 +215,14 @@ pub async fn get_usage_summary(
 
     // key_info already contains budget info (loaded from DB by auth middleware into Extension).
     // Budget of the scope's principal; a counter from an earlier month counts as 0.
-    let current_month = chrono::Utc::now().format("%Y-%m").to_string();
+    let now = chrono::Utc::now();
     let (monthly_budget, budget_used_mtd) = match (user_filter, key_info.user.as_ref()) {
         (Some(_), Some(u)) => (
             u.monthly_budget,
             period_spend(
                 u.budget_used_mtd,
                 u.budget_mtd_month.as_deref(),
-                &current_month,
+                &u.budget_period.key_at(now),
             ),
         ),
         _ => (
@@ -220,7 +230,7 @@ pub async fn get_usage_summary(
             period_spend(
                 key_info.budget_used_mtd,
                 key_info.budget_mtd_month.as_deref(),
-                &current_month,
+                &key_info.budget_period.key_at(now),
             ),
         ),
     };
@@ -297,8 +307,11 @@ pub async fn get_usage_records(
         .database
         .usage()
         .get_usage_by_api_key(
-            key_filter,
-            user_filter,
+            UsageFilter {
+                api_key: key_filter,
+                user_id: user_filter,
+                tag: None,
+            },
             params.start_time.as_deref(),
             Some(limit + 1),
             params.before_id,
@@ -364,6 +377,7 @@ mod tests {
     fn test_parse_group_by_defaults_to_hour() {
         let params = UsageQueryParams {
             scope: None,
+            tag: None,
             start_time: None,
             end_time: None,
             group_by: None,
@@ -376,6 +390,7 @@ mod tests {
     fn test_parse_group_by_model() {
         let params = UsageQueryParams {
             scope: None,
+            tag: None,
             start_time: None,
             end_time: None,
             group_by: Some("model".to_string()),

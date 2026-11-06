@@ -74,6 +74,9 @@ impl DynamoDbBackend {
                 if expr.contains("#n") {
                     scan = scan.expression_attribute_names("#n", "name");
                 }
+                if expr.contains("#ts") {
+                    scan = scan.expression_attribute_names("#ts", "timestamp");
+                }
             }
             let page = scan.send().await?;
             out.extend(page.items().iter().cloned());
@@ -313,6 +316,63 @@ impl DynamoDbBackend {
         Ok(updated)
     }
 
+    /// Compare-and-set on `budget_alerts_sent` (see `ApiKeyStore::claim_budget_alert`).
+    async fn claim_alert(
+        &self,
+        table: &str,
+        id_col: &str,
+        id: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool> {
+        for _ in 0..5 {
+            let item = self
+                .client
+                .get_item()
+                .table_name(Self::table_name(table))
+                .key(id_col, av_s(id))
+                .consistent_read(true)
+                .send()
+                .await?;
+            let Some(item) = item.item() else {
+                return Ok(false);
+            };
+            let current = get_opt_s(item, "budget_alerts_sent");
+            let Some(next) = next_alert_state(current.as_deref(), period, threshold) else {
+                return Ok(false);
+            };
+            let mut update = self
+                .client
+                .update_item()
+                .table_name(Self::table_name(table))
+                .key(id_col, av_s(id))
+                .update_expression("SET budget_alerts_sent = :next")
+                .expression_attribute_values(":next", av_s(&next));
+            update = match &current {
+                Some(cur) => update
+                    .condition_expression("budget_alerts_sent = :cur")
+                    .expression_attribute_values(":cur", av_s(cur)),
+                None => update
+                    .condition_expression(
+                        "attribute_exists(#id) AND (attribute_not_exists(budget_alerts_sent) \
+                         OR attribute_type(budget_alerts_sent, :null_t))",
+                    )
+                    .expression_attribute_names("#id", id_col)
+                    .expression_attribute_values(":null_t", av_s("NULL")),
+            };
+            match update.send().await {
+                Ok(_) => return Ok(true),
+                Err(e) => {
+                    let svc = e.into_service_error();
+                    if !svc.is_conditional_check_failed_exception() {
+                        return Err(anyhow::anyhow!("claim_alert: {svc}"));
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Fallback: filtered scan for name uniqueness check.
     async fn name_exists_scan(&self, name: &str, exclude_api_key: Option<&str>) -> Result<bool> {
         let mut scan = self
@@ -480,8 +540,47 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
         metadata: get_opt_s(item, "metadata"),
         expires_at: get_opt_i64(item, "expires_at"),
         allowed_models: patterns_from_json(get_opt_s(item, "allowed_models")),
+        allowed_cidrs: patterns_from_json(get_opt_s(item, "allowed_cidrs")),
+        budget_period: BudgetPeriod::parse(get_opt_s(item, "budget_period").as_deref()),
+        budget_alerts_sent: get_opt_s(item, "budget_alerts_sent"),
+        default_tags: patterns_from_json(get_opt_s(item, "default_tags")),
+        last_used_at: get_opt_i64(item, "last_used_at"),
+        rotated_to: get_opt_s(item, "rotated_to"),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
+    }
+}
+
+fn spend_after(attrs: Option<&HashMap<String, AttributeValue>>) -> SpendAfter {
+    SpendAfter {
+        used: attrs.map(|a| get_f64(a, "budget_used_mtd")).unwrap_or(0.0),
+        budget: attrs.and_then(|a| get_opt_f64(a, "monthly_budget")),
+    }
+}
+
+fn tag_matches(r: &UsageRecord, tag: Option<&str>) -> bool {
+    tag.is_none_or(|t| {
+        r.tags
+            .as_deref()
+            .is_some_and(|tags| tags.split(',').any(|x| x == t))
+    })
+}
+
+fn audit_from_item(item: &HashMap<String, AttributeValue>) -> AuditLogRecord {
+    AuditLogRecord {
+        id: get_s(item, "id"),
+        timestamp: get_s(item, "timestamp"),
+        actor: get_s(item, "actor"),
+        source_ip: get_opt_s(item, "source_ip"),
+        user_agent: get_opt_s(item, "user_agent"),
+        action: get_s(item, "action"),
+        target_type: get_opt_s(item, "target_type"),
+        target_id: get_opt_s(item, "target_id"),
+        before: get_opt_s(item, "before"),
+        after: get_opt_s(item, "after"),
+        status: get_i64(item, "status") as u16,
+        method: get_s(item, "method"),
+        path: get_s(item, "path"),
     }
 }
 
@@ -502,6 +601,10 @@ fn user_from_item(item: &HashMap<String, AttributeValue>) -> UserRecord {
         allowed_models: patterns_from_json(get_opt_s(item, "allowed_models")),
         cache_ttl: get_opt_s(item, "cache_ttl"),
         metadata: get_opt_s(item, "metadata"),
+        allowed_cidrs: patterns_from_json(get_opt_s(item, "allowed_cidrs")),
+        budget_period: BudgetPeriod::parse(get_opt_s(item, "budget_period").as_deref()),
+        budget_alerts_sent: get_opt_s(item, "budget_alerts_sent"),
+        default_tags: patterns_from_json(get_opt_s(item, "default_tags")),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
     }
@@ -527,6 +630,16 @@ fn user_to_item(u: &UserRecord) -> HashMap<String, AttributeValue> {
     );
     item.insert("cache_ttl".into(), av_opt_s(&u.cache_ttl));
     item.insert("metadata".into(), av_opt_s(&u.metadata));
+    item.insert(
+        "allowed_cidrs".into(),
+        av_opt_s(&patterns_to_json(&u.allowed_cidrs)),
+    );
+    item.insert("budget_period".into(), av_s(u.budget_period.as_str()));
+    item.insert("budget_alerts_sent".into(), av_opt_s(&u.budget_alerts_sent));
+    item.insert(
+        "default_tags".into(),
+        av_opt_s(&patterns_to_json(&u.default_tags)),
+    );
     item.insert("created_at".into(), av_n(u.created_at));
     item.insert("updated_at".into(), av_opt_n_i64(u.updated_at));
     item
@@ -568,6 +681,21 @@ fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
         "allowed_models".into(),
         av_opt_s(&patterns_to_json(&record.allowed_models)),
     );
+    item.insert(
+        "allowed_cidrs".into(),
+        av_opt_s(&patterns_to_json(&record.allowed_cidrs)),
+    );
+    item.insert("budget_period".into(), av_s(record.budget_period.as_str()));
+    item.insert(
+        "budget_alerts_sent".into(),
+        av_opt_s(&record.budget_alerts_sent),
+    );
+    item.insert(
+        "default_tags".into(),
+        av_opt_s(&patterns_to_json(&record.default_tags)),
+    );
+    item.insert("last_used_at".into(), av_opt_n_i64(record.last_used_at));
+    item.insert("rotated_to".into(), av_opt_s(&record.rotated_to));
     item.insert("created_at".into(), av_n(record.created_at));
     item.insert("updated_at".into(), av_opt_n_i64(record.updated_at));
     item
@@ -579,6 +707,7 @@ fn usage_from_item(item: &HashMap<String, AttributeValue>) -> UsageRecord {
         api_key: get_s(item, "api_key"),
         key_id: get_opt_s(item, "key_id"),
         user_id: get_opt_s(item, "user_id"),
+        tags: get_opt_s(item, "tags"),
         timestamp: get_s(item, "timestamp"),
         request_id: get_s(item, "request_id"),
         model: get_s(item, "model"),
@@ -649,6 +778,9 @@ impl DatabaseService for DynamoDbBackend {
         self
     }
     fn users(&self) -> &dyn UserStore {
+        self
+    }
+    fn audit(&self) -> &dyn AuditStore {
         self
     }
     fn usage(&self) -> &dyn UsageStore {
@@ -779,7 +911,7 @@ impl ApiKeyStore for DynamoDbBackend {
         Ok(())
     }
 
-    async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<bool> {
+    async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<SpendAfter> {
         let now = unix_now();
         let result = self
             .client
@@ -797,17 +929,7 @@ impl ApiKeyStore for DynamoDbBackend {
             .send()
             .await?;
 
-        if let Some(attrs) = result.attributes() {
-            let budget = get_opt_f64(attrs, "monthly_budget");
-            let used = get_f64(attrs, "budget_used_mtd");
-            if let Some(limit) = budget {
-                if used >= limit {
-                    return Ok(true);
-                }
-            }
-        }
-
-        Ok(false)
+        Ok(spend_after(result.attributes()))
     }
 
     async fn reset_monthly_budget(
@@ -1033,6 +1155,158 @@ impl ApiKeyStore for DynamoDbBackend {
             }
         }
     }
+
+    async fn touch_last_used(&self, api_key: &str, at: i64) -> Result<()> {
+        let res = self
+            .client
+            .update_item()
+            .table_name(Self::table_name("api_keys"))
+            .key("api_key", av_s(api_key))
+            .update_expression("SET last_used_at = :t")
+            .condition_expression("attribute_exists(api_key)")
+            .expression_attribute_values(":t", av_n(at))
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_conditional_check_failed_exception() {
+                    Ok(()) // key deleted meanwhile
+                } else {
+                    Err(anyhow::anyhow!("touch_last_used: {svc}"))
+                }
+            }
+        }
+    }
+
+    async fn claim_budget_alert(
+        &self,
+        api_key: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool> {
+        self.claim_alert("api_keys", "api_key", api_key, period, threshold)
+            .await
+    }
+}
+
+// ============================================================================
+// AuditStore — PK `month` ("YYYY-MM"), SK `sort_key` ("<timestamp>#<id>")
+// ============================================================================
+
+#[async_trait]
+impl AuditStore for DynamoDbBackend {
+    async fn record_audit(&self, a: &AuditLogRecord) -> Result<()> {
+        let mut item = HashMap::new();
+        item.insert(
+            "month".into(),
+            av_s(&a.timestamp.chars().take(7).collect::<String>()),
+        );
+        item.insert(
+            "sort_key".into(),
+            av_s(&format!("{}#{}", a.timestamp, a.id)),
+        );
+        item.insert("id".into(), av_s(&a.id));
+        item.insert("timestamp".into(), av_s(&a.timestamp));
+        item.insert("actor".into(), av_s(&a.actor));
+        item.insert("source_ip".into(), av_opt_s(&a.source_ip));
+        item.insert("user_agent".into(), av_opt_s(&a.user_agent));
+        item.insert("action".into(), av_s(&a.action));
+        item.insert("target_type".into(), av_opt_s(&a.target_type));
+        item.insert("target_id".into(), av_opt_s(&a.target_id));
+        item.insert("before".into(), av_opt_s(&a.before));
+        item.insert("after".into(), av_opt_s(&a.after));
+        item.insert("status".into(), av_n(a.status as i64));
+        item.insert("method".into(), av_s(&a.method));
+        item.insert("path".into(), av_s(&a.path));
+        self.client
+            .put_item()
+            .table_name(Self::table_name("audit_logs"))
+            .set_item(Some(item))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn query_audit(&self, q: &AuditQuery) -> Result<Vec<AuditLogRecord>> {
+        // Walk month partitions newest → oldest (bounded to 36 months).
+        let upper = [q.end.as_deref(), q.before.as_deref()]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(String::from)
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let mut month =
+            chrono::NaiveDate::parse_from_str(&format!("{}-01", &upper[..7]), "%Y-%m-%d")
+                .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+        let lower_month = q
+            .start
+            .as_deref()
+            .map(|s| s.chars().take(7).collect::<String>());
+        let mut out = Vec::new();
+        for _ in 0..36 {
+            let key = month.format("%Y-%m").to_string();
+            if lower_month.as_deref().is_some_and(|l| key.as_str() < l) {
+                break;
+            }
+            let mut start_key = None;
+            loop {
+                let page = self
+                    .client
+                    .query()
+                    .table_name(Self::table_name("audit_logs"))
+                    .key_condition_expression("#m = :m")
+                    .expression_attribute_names("#m", "month")
+                    .expression_attribute_values(":m", av_s(&key))
+                    .scan_index_forward(false)
+                    .set_exclusive_start_key(start_key)
+                    .send()
+                    .await?;
+                for item in page.items() {
+                    let r = audit_from_item(item);
+                    if q.matches(&r) {
+                        out.push(r);
+                        if out.len() >= q.limit.max(1) {
+                            return Ok(out);
+                        }
+                    }
+                }
+                start_key = page.last_evaluated_key().cloned();
+                if start_key.is_none() {
+                    break;
+                }
+            }
+            month = month
+                .checked_sub_months(chrono::Months::new(1))
+                .unwrap_or(month);
+        }
+        Ok(out)
+    }
+
+    async fn purge_audit_before(&self, cutoff: &str) -> Result<u64> {
+        let old = self
+            .scan_all(
+                "audit_logs",
+                Some(("#ts < :cut", &[(":cut", av_s(cutoff))])),
+            )
+            .await?;
+        let mut n = 0;
+        for item in old {
+            self.client
+                .delete_item()
+                .table_name(Self::table_name("audit_logs"))
+                .key("month", item.get("month").cloned().unwrap_or(av_s("")))
+                .key(
+                    "sort_key",
+                    item.get("sort_key").cloned().unwrap_or(av_s("")),
+                )
+                .send()
+                .await?;
+            n += 1;
+        }
+        Ok(n)
+    }
 }
 
 // ============================================================================
@@ -1101,7 +1375,9 @@ impl UserStore for DynamoDbBackend {
             .update_expression(
                 "SET #n = :name, email = :email, is_active = :active, cost_rate = :rate, \
                  monthly_budget = :budget, rate_limit = :rpm, tpm_limit = :tpm, \
-                 allowed_models = :models, cache_ttl = :ttl, metadata = :meta, updated_at = :now",
+                 allowed_models = :models, cache_ttl = :ttl, metadata = :meta, \
+                 allowed_cidrs = :cidrs, budget_period = :period, default_tags = :tags, \
+                 updated_at = :now",
             )
             .expression_attribute_names("#n", "name")
             .expression_attribute_values(":name", av_s(&u.name))
@@ -1114,6 +1390,9 @@ impl UserStore for DynamoDbBackend {
             .expression_attribute_values(":models", av_opt_s(&patterns_to_json(&u.allowed_models)))
             .expression_attribute_values(":ttl", av_opt_s(&u.cache_ttl))
             .expression_attribute_values(":meta", av_opt_s(&u.metadata))
+            .expression_attribute_values(":cidrs", av_opt_s(&patterns_to_json(&u.allowed_cidrs)))
+            .expression_attribute_values(":period", av_s(u.budget_period.as_str()))
+            .expression_attribute_values(":tags", av_opt_s(&patterns_to_json(&u.default_tags)))
             .expression_attribute_values(":now", av_n(unix_now()))
             .send()
             .await?;
@@ -1130,7 +1409,7 @@ impl UserStore for DynamoDbBackend {
         Ok(())
     }
 
-    async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<bool> {
+    async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<SpendAfter> {
         let result = self
             .client
             .update_item()
@@ -1146,10 +1425,17 @@ impl UserStore for DynamoDbBackend {
             .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
             .send()
             .await?;
-        Ok(result.attributes().is_some_and(|a| {
-            get_opt_f64(a, "monthly_budget")
-                .is_some_and(|limit| get_f64(a, "budget_used_mtd") >= limit)
-        }))
+        Ok(spend_after(result.attributes()))
+    }
+
+    async fn claim_user_budget_alert(
+        &self,
+        user_id: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool> {
+        self.claim_alert("users", "user_id", user_id, period, threshold)
+            .await
     }
 
     async fn reset_user_monthly_budget(
@@ -1204,6 +1490,9 @@ impl UsageStore for DynamoDbBackend {
         if let Some(ref user_id) = record.user_id {
             item.insert("user_id".into(), av_s(user_id));
         }
+        if let Some(ref tags) = record.tags {
+            item.insert("tags".into(), av_s(tags));
+        }
         item.insert("timestamp".into(), av_s(&record.timestamp));
         item.insert("request_id".into(), av_s(&record.request_id));
         item.insert("model".into(), av_s(&record.model));
@@ -1234,12 +1523,16 @@ impl UsageStore for DynamoDbBackend {
 
     async fn get_usage_by_api_key(
         &self,
-        api_key: &str,
-        user_id: Option<&str>,
+        filter: UsageFilter<'_>,
         since: Option<&str>,
         limit: Option<i64>,
         _before_id: Option<i64>,
     ) -> Result<Vec<UsageRecord>> {
+        let UsageFilter {
+            api_key,
+            user_id,
+            tag,
+        } = filter;
         // Empty api_key means "all keys" — use Scan instead of Query
         let records = if api_key.is_empty() {
             let mut scan = self.client.scan().table_name(Self::table_name("usage"));
@@ -1259,6 +1552,7 @@ impl UsageStore for DynamoDbBackend {
             if let Some(u) = user_id {
                 records.retain(|r| r.user_id.as_deref() == Some(u));
             }
+            records.retain(|r| tag_matches(r, tag));
             records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             records
         } else {
@@ -1286,6 +1580,7 @@ impl UsageStore for DynamoDbBackend {
                 .iter()
                 .map(usage_from_item)
                 .filter(|r| user_id.is_none() || r.user_id.as_deref() == user_id)
+                .filter(|r| tag_matches(r, tag))
                 .collect()
         };
 
@@ -1294,8 +1589,7 @@ impl UsageStore for DynamoDbBackend {
 
     async fn query_usage_summary(
         &self,
-        api_key: &str,
-        user_id: Option<&str>,
+        filter: UsageFilter<'_>,
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
@@ -1305,6 +1599,11 @@ impl UsageStore for DynamoDbBackend {
 
         const MAX_ITEMS: i32 = 10_000;
 
+        let UsageFilter {
+            api_key,
+            user_id,
+            tag,
+        } = filter;
         let filter_by_key = !api_key.is_empty();
 
         // Build timestamp filter expression for server-side filtering
@@ -1322,6 +1621,11 @@ impl UsageStore for DynamoDbBackend {
         if let Some(u) = user_id {
             filter_parts.push("user_id = :uid".to_string());
             expr_values.push((":uid".to_string(), av_s(u)));
+        }
+        if let Some(t) = tag {
+            // Substring pre-filter; exact per-tag match applied after fetch.
+            filter_parts.push("contains(tags, :tag)".to_string());
+            expr_values.push((":tag".to_string(), av_s(t)));
         }
 
         let filter_expr = if filter_parts.is_empty() {
@@ -1389,6 +1693,11 @@ impl UsageStore for DynamoDbBackend {
             items.iter().map(usage_from_item).collect()
         };
 
+        let records: Vec<UsageRecord> = records
+            .into_iter()
+            .filter(|r| tag_matches(r, tag))
+            .collect();
+
         // Aggregate in memory
         fn dim_value(r: &UsageRecord, dim: &str) -> String {
             match dim {
@@ -1398,6 +1707,7 @@ impl UsageStore for DynamoDbBackend {
                 "provider" => r.provider.as_deref().unwrap_or("unknown").to_string(),
                 "api_key" => r.key_id.clone().unwrap_or_else(|| r.api_key.clone()),
                 "user" => r.user_id.clone().unwrap_or_default(),
+                "tags" => r.tags.clone().unwrap_or_default(),
                 _ => r.timestamp.chars().take(13).collect(),
             }
         }

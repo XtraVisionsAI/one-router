@@ -23,8 +23,9 @@ use std::collections::HashMap;
 
 use super::common::*;
 use super::keys::{hard_delete, AdminKeyItem};
-use crate::database::models::{period_spend, UserRecord};
+use crate::database::models::{period_spend, BudgetPeriod, UserRecord};
 use crate::server::state::AppState;
+use crate::services::audit::AuditDetail;
 
 // ============================================================================
 // Types
@@ -47,6 +48,9 @@ pub struct AdminUserItem {
     pub tpm_limit: Option<i32>,
     pub allowed_models: Option<Vec<String>>,
     pub cache_ttl: Option<String>,
+    pub allowed_cidrs: Option<Vec<String>>,
+    pub budget_period: BudgetPeriod,
+    pub default_tags: Option<Vec<String>>,
     pub metadata: Option<serde_json::Value>,
     pub key_count: usize,
     pub created_at: i64,
@@ -55,7 +59,7 @@ pub struct AdminUserItem {
 
 impl AdminUserItem {
     fn from_record(u: &UserRecord, key_count: usize) -> Self {
-        let month = Utc::now().format("%Y-%m").to_string();
+        let month = u.budget_period.key_at(Utc::now());
         Self {
             user_id: u.user_id.clone(),
             name: u.name.clone(),
@@ -70,6 +74,9 @@ impl AdminUserItem {
             tpm_limit: u.tpm_limit,
             allowed_models: u.allowed_models.clone(),
             cache_ttl: u.cache_ttl.clone(),
+            allowed_cidrs: u.allowed_cidrs.clone(),
+            budget_period: u.budget_period,
+            default_tags: u.default_tags.clone(),
             metadata: decode_metadata(u.metadata.as_deref()),
             key_count,
             created_at: u.created_at,
@@ -102,6 +109,10 @@ pub struct CreateUserRequest {
     pub allowed_models: Option<Vec<String>>,
     pub cache_ttl: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// `monthly` (default) / `weekly` / `daily`.
+    pub budget_period: Option<String>,
+    pub default_tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +133,11 @@ pub struct UpdateUserRequest {
     pub cache_ttl: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub metadata: Option<Option<serde_json::Value>>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub allowed_cidrs: Option<Option<Vec<String>>>,
+    pub budget_period: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub default_tags: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +207,14 @@ fn respond<T: Serialize>(r: Result<T, HandlerError>) -> Response {
     }
 }
 
+/// Like [`respond`], attaching an audit detail on success.
+fn respond_audited<T: Serialize>(r: Result<(T, AuditDetail), HandlerError>) -> Response {
+    match r {
+        Ok((v, d)) => d.attach(Json(v).into_response()),
+        Err(resp) => *resp,
+    }
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -240,6 +264,10 @@ pub async fn create_user(
         user.allowed_models = validate_allowed_models(body.allowed_models)?;
         user.cache_ttl = body.cache_ttl;
         user.metadata = body.metadata.as_ref().map(encode_metadata).transpose()?;
+        user.allowed_cidrs = validate_cidrs(body.allowed_cidrs)?;
+        user.default_tags = validate_tags(body.default_tags)?;
+        user.budget_period =
+            parse_budget_period(body.budget_period.as_deref())?.unwrap_or_default();
         match state.database.users().create_user(&user).await {
             Ok(()) => Ok(AdminUserItem::from_record(&user, 0)),
             Err(e) if is_unique_error(&e, "name") => Err(name_conflict(&user.name)),
@@ -248,7 +276,9 @@ pub async fn create_user(
     }
     .await;
     match result {
-        Ok(item) => (StatusCode::CREATED, Json(item)).into_response(),
+        Ok(item) => AuditDetail::new("user.create", "user", &item.user_id)
+            .after(&item)
+            .attach((StatusCode::CREATED, Json(item)).into_response()),
         Err(resp) => *resp,
     }
 }
@@ -282,9 +312,10 @@ pub async fn update_user(
     Path(ident): Path<String>,
     Json(body): Json<UpdateUserRequest>,
 ) -> Response {
-    respond(
+    respond_audited(
         async {
             let mut user = resolve_user(&state, &ident).await?;
+            let before = AdminUserItem::from_record(&user, 0);
             validate_user_limits(
                 body.cost_rate,
                 body.monthly_budget.flatten(),
@@ -319,11 +350,27 @@ pub async fn update_user(
             if let Some(meta) = body.metadata {
                 user.metadata = meta.as_ref().map(encode_metadata).transpose()?;
             }
+            if let Some(cidrs) = body.allowed_cidrs {
+                user.allowed_cidrs = validate_cidrs(cidrs)?;
+            }
+            if let Some(p) = parse_budget_period(body.budget_period.as_deref())? {
+                user.budget_period = p;
+            }
+            if let Some(tags) = body.default_tags {
+                user.default_tags = validate_tags(tags)?;
+            }
             match state.database.users().update_user(&user).await {
-                Ok(()) => Ok(AdminUserItem::from_record(
-                    &user,
-                    key_count(&state, &user.user_id).await,
-                )),
+                Ok(()) => {
+                    state.auth_cache.invalidate_all();
+                    let mut before = before;
+                    let after =
+                        AdminUserItem::from_record(&user, key_count(&state, &user.user_id).await);
+                    before.key_count = after.key_count;
+                    let detail = AuditDetail::new("user.update", "user", &user.user_id)
+                        .before(&before)
+                        .after(&after);
+                    Ok((after, detail))
+                }
                 Err(e) if is_unique_error(&e, "name") => Err(name_conflict(&user.name)),
                 Err(e) => Err(internal_error("Failed to update user", &e)),
             }
@@ -338,7 +385,7 @@ pub async fn delete_user(
     Path(ident): Path<String>,
     Query(query): Query<DeleteUserQuery>,
 ) -> Response {
-    respond(
+    respond_audited(
         async {
             let user = resolve_user(&state, &ident).await?;
             let keys = state
@@ -347,6 +394,7 @@ pub async fn delete_user(
                 .list_api_keys_by_user(&user.user_id)
                 .await
                 .map_err(|e| internal_error("Failed to retrieve API keys", &e))?;
+            let before = AdminUserItem::from_record(&user, keys.len());
             if !keys.is_empty() && !query.cascade {
                 return Err(conflict(format!(
                     "User '{}' still owns {} API key(s); delete them first or pass cascade=true",
@@ -363,11 +411,20 @@ pub async fn delete_user(
                 .delete_user(&user.user_id)
                 .await
                 .map_err(|e| internal_error("Failed to delete user", &e))?;
+            state.auth_cache.invalidate_all();
             tracing::info!(user_id = %user.user_id, name = %user.name, deleted_keys = keys.len(), "User deleted");
-            Ok(DeleteUserResponse {
-                ok: true,
-                deleted_keys: keys.len(),
-            })
+            let detail = AuditDetail::new("user.delete", "user", &user.user_id)
+                .before(&before)
+                .after(&serde_json::json!({
+                    "deleted_key_ids": keys.iter().map(|k| k.key_id.clone()).collect::<Vec<_>>(),
+                }));
+            Ok((
+                DeleteUserResponse {
+                    ok: true,
+                    deleted_keys: keys.len(),
+                },
+                detail,
+            ))
         }
         .await,
     )
@@ -377,7 +434,7 @@ async fn set_active(
     state: &AppState,
     ident: &str,
     active: bool,
-) -> Result<AdminUserItem, HandlerError> {
+) -> Result<(AdminUserItem, AuditDetail), HandlerError> {
     let mut user = resolve_user(state, ident).await?;
     user.is_active = active;
     state
@@ -386,20 +443,25 @@ async fn set_active(
         .update_user(&user)
         .await
         .map_err(|e| internal_error("Failed to update user", &e))?;
-    Ok(AdminUserItem::from_record(
-        &user,
-        key_count(state, &user.user_id).await,
-    ))
+    state.auth_cache.invalidate_all();
+    let item = AdminUserItem::from_record(&user, key_count(state, &user.user_id).await);
+    let action = if active {
+        "user.activate"
+    } else {
+        "user.deactivate"
+    };
+    let detail = AuditDetail::new(action, "user", &user.user_id);
+    Ok((item, detail))
 }
 
 /// POST /admin/api/users/:user/deactivate
 pub async fn deactivate_user(State(state): State<AppState>, Path(ident): Path<String>) -> Response {
-    respond(set_active(&state, &ident, false).await)
+    respond_audited(set_active(&state, &ident, false).await)
 }
 
 /// POST /admin/api/users/:user/activate
 pub async fn activate_user(State(state): State<AppState>, Path(ident): Path<String>) -> Response {
-    respond(set_active(&state, &ident, true).await)
+    respond_audited(set_active(&state, &ident, true).await)
 }
 
 #[cfg(test)]

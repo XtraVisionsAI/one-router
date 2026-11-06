@@ -49,8 +49,79 @@ pub struct ApiKeyRecord {
     /// backend `models`). Intersected with the user's. `None` = unrestricted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    /// Client-address allowlist (CIDRs). Intersected with the user's. `None` = any.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Budget reset period for the key-level sub-budget.
+    #[serde(default)]
+    pub budget_period: BudgetPeriod,
+    /// Alert dedupe state: `{"period": "<period key>", "thresholds": [0.8]}`.
+    #[serde(default)]
+    pub budget_alerts_sent: Option<String>,
+    /// Tags added to every usage row of this key.
+    #[serde(default)]
+    pub default_tags: Option<Vec<String>>,
+    /// Unix seconds of the last authenticated request (debounced, ~5 min).
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+    /// Set on a key that was rotated: the replacement's `key_id`.
+    #[serde(default)]
+    pub rotated_to: Option<String>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
+}
+
+/// Budget reset period. The stored "period key" (`budget_mtd_month` column,
+/// kept for compatibility) is `2026-11` / `2026-W45` / `2026-11-06`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetPeriod {
+    #[default]
+    Monthly,
+    Weekly,
+    Daily,
+}
+
+impl BudgetPeriod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetPeriod::Monthly => "monthly",
+            BudgetPeriod::Weekly => "weekly",
+            BudgetPeriod::Daily => "daily",
+        }
+    }
+
+    /// Parse a stored value; unknown / empty → monthly (the legacy behavior).
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(str::trim) {
+            Some("weekly") => BudgetPeriod::Weekly,
+            Some("daily") => BudgetPeriod::Daily,
+            _ => BudgetPeriod::Monthly,
+        }
+    }
+
+    /// Period key containing `now` (UTC): `%Y-%m`, ISO week `%G-W%V`, `%Y-%m-%d`.
+    pub fn key_at(self, now: chrono::DateTime<chrono::Utc>) -> String {
+        match self {
+            BudgetPeriod::Monthly => now.format("%Y-%m").to_string(),
+            BudgetPeriod::Weekly => now.format("%G-W%V").to_string(),
+            BudgetPeriod::Daily => now.format("%Y-%m-%d").to_string(),
+        }
+    }
+}
+
+/// Spend counters after an atomic increment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpendAfter {
+    /// Spend in the current period after the increment.
+    pub used: f64,
+    pub budget: Option<f64>,
+}
+
+impl SpendAfter {
+    pub fn exceeded(&self) -> bool {
+        self.budget.is_some_and(|b| self.used >= b)
+    }
 }
 
 /// Serialize a glob-pattern list for a TEXT column (`None`/empty → NULL).
@@ -78,9 +149,10 @@ pub fn patterns_from_json(raw: Option<String>) -> Option<Vec<String>> {
     }
 }
 
-/// Month-to-date spend that counts for `current_month` ("YYYY-MM"): the stored
-/// counter belongs to `stored_month`, and a stale month means nothing has been
-/// spent yet this month (the reset happens lazily on the next usage write).
+/// Spend that counts for the current period key (`current_month` — any
+/// [`BudgetPeriod`] key, the name predates periods): the stored counter belongs
+/// to `stored_month`, and a stale key means nothing has been spent yet this
+/// period (the reset happens lazily on the next usage write).
 pub fn period_spend(used_mtd: f64, stored_month: Option<&str>, current_month: &str) -> f64 {
     if stored_month == Some(current_month) {
         used_mtd
@@ -116,6 +188,14 @@ pub struct UserRecord {
     pub allowed_models: Option<Vec<String>>,
     pub cache_ttl: Option<String>,
     pub metadata: Option<String>,
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
+    #[serde(default)]
+    pub budget_period: BudgetPeriod,
+    #[serde(default)]
+    pub budget_alerts_sent: Option<String>,
+    #[serde(default)]
+    pub default_tags: Option<Vec<String>>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
 }
@@ -139,9 +219,74 @@ impl UserRecord {
             allowed_models: None,
             cache_ttl: None,
             metadata: None,
+            allowed_cidrs: None,
+            budget_period: BudgetPeriod::Monthly,
+            budget_alerts_sent: None,
+            default_tags: None,
             created_at: now,
             updated_at: None,
         }
+    }
+}
+
+// ============================================================================
+// audit_logs
+// ============================================================================
+
+/// One admin write operation (or login attempt).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogRecord {
+    /// UUIDv7 (time-ordered).
+    pub id: String,
+    /// RFC3339 UTC.
+    pub timestamp: String,
+    /// `master` / `ephemeral` / `session:<8 chars>` / `anonymous` (failed login).
+    pub actor: String,
+    pub source_ip: Option<String>,
+    pub user_agent: Option<String>,
+    /// e.g. `key.create`, `user.update`, `backend.delete`, `auth.login_failed`.
+    pub action: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
+    /// JSON snapshots, secrets redacted.
+    pub before: Option<String>,
+    pub after: Option<String>,
+    /// HTTP status of the operation.
+    pub status: u16,
+    pub method: String,
+    pub path: String,
+}
+
+/// Audit log query (all filters optional, newest first).
+#[derive(Debug, Clone, Default)]
+pub struct AuditQuery {
+    pub action: Option<String>,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
+    /// RFC3339 bounds (inclusive).
+    pub start: Option<String>,
+    pub end: Option<String>,
+    /// Return entries strictly older than this timestamp (pagination cursor).
+    pub before: Option<String>,
+    pub limit: usize,
+}
+
+impl AuditQuery {
+    pub fn matches(&self, r: &AuditLogRecord) -> bool {
+        self.action
+            .as_ref()
+            .is_none_or(|a| r.action.starts_with(a.as_str()))
+            && self
+                .target_type
+                .as_ref()
+                .is_none_or(|t| r.target_type.as_deref() == Some(t.as_str()))
+            && self
+                .target_id
+                .as_ref()
+                .is_none_or(|t| r.target_id.as_deref() == Some(t.as_str()))
+            && self.start.as_ref().is_none_or(|s| r.timestamp >= *s)
+            && self.end.as_ref().is_none_or(|e| r.timestamp <= *e)
+            && self.before.as_ref().is_none_or(|b| r.timestamp < *b)
     }
 }
 
@@ -182,6 +327,9 @@ pub struct UsageRecord {
     /// users that could not be attributed (key already deleted).
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Comma-joined usage tags (request `x-onerouter-tags` + key/user defaults).
+    #[serde(default)]
+    pub tags: Option<String>,
     pub timestamp: String,
     pub request_id: String,
     pub model: String,
@@ -308,4 +456,79 @@ pub struct UsageSummaryRow {
     pub total_cost: f64,
     pub total_requests: i64,
     pub error_requests: i64,
+}
+
+/// Storage dimension for an API `group_by` / `split_by` value: the API's
+/// `tag` dimension groups by the raw tag list (`tags`) and is exploded with
+/// [`explode_tag_rows`].
+pub fn storage_dimension(dim: &str) -> &str {
+    if dim == "tag" {
+        "tags"
+    } else {
+        dim
+    }
+}
+
+/// Turn rows grouped by the raw comma-joined tag list into one row per tag (a
+/// request with tags `a,b` counts toward both; untagged rows go to `(none)`).
+/// Totals across tag rows can therefore exceed the overall total.
+pub fn explode_tag_rows(
+    rows: Vec<UsageSummaryRow>,
+    group_is_tag: bool,
+    split_is_tag: bool,
+) -> Vec<UsageSummaryRow> {
+    if !group_is_tag && !split_is_tag {
+        return rows;
+    }
+    fn split(raw: &str) -> Vec<String> {
+        let tags: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+        if tags.is_empty() {
+            vec!["(none)".to_string()]
+        } else {
+            tags
+        }
+    }
+    let mut acc: std::collections::BTreeMap<(String, Option<String>), UsageSummaryRow> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        let groups = if group_is_tag {
+            split(&r.group_key)
+        } else {
+            vec![r.group_key.clone()]
+        };
+        let splits: Vec<Option<String>> = match (&r.split_key, split_is_tag) {
+            (Some(sk), true) => split(sk).into_iter().map(Some).collect(),
+            (sk, _) => vec![sk.clone()],
+        };
+        for g in &groups {
+            for sk in &splits {
+                let e = acc
+                    .entry((g.clone(), sk.clone()))
+                    .or_insert_with(|| UsageSummaryRow {
+                        group_key: g.clone(),
+                        split_key: sk.clone(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cached_tokens: 0,
+                        cache_write_tokens: 0,
+                        total_cost: 0.0,
+                        total_requests: 0,
+                        error_requests: 0,
+                    });
+                e.input_tokens += r.input_tokens;
+                e.output_tokens += r.output_tokens;
+                e.cached_tokens += r.cached_tokens;
+                e.cache_write_tokens += r.cache_write_tokens;
+                e.total_cost += r.total_cost;
+                e.total_requests += r.total_requests;
+                e.error_requests += r.error_requests;
+            }
+        }
+    }
+    acc.into_values().collect()
 }

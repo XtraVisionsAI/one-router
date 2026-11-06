@@ -53,7 +53,11 @@ pub fn create_router(state: AppState) -> Router {
     };
 
     // Create middleware state
-    let auth_state = AuthState::new(state.settings.clone(), state.database.clone());
+    let auth_state = AuthState::new(
+        state.settings.clone(),
+        state.database.clone(),
+        state.auth_cache.clone(),
+    );
     let auth_state_clone = auth_state.clone();
 
     // Rate limit state — reads the global `rate_limit` setting from
@@ -156,6 +160,8 @@ pub fn create_router(state: AppState) -> Router {
                 .put(admin::users::update_user)
                 .delete(admin::users::delete_user),
         )
+        .route("/keys/:key_id/rotate", post(admin::keys::rotate_key))
+        .route("/audit", get(admin::audit::list_audit))
         .route("/users/:user/activate", post(admin::users::activate_user))
         .route(
             "/users/:user/deactivate",
@@ -204,6 +210,14 @@ pub fn create_router(state: AppState) -> Router {
         // LiteLLM model catalog import
         .route("/pricing/models", get(admin::pricing::list_models))
         .route("/pricing/import", post(admin::pricing::import_models))
+        // Inner layer: runs after admin auth (needs AdminActor), audits writes.
+        .layer(middleware::from_fn_with_state(
+            crate::services::audit::AuditState {
+                database: state.database.clone(),
+                settings: state.settings.clone(),
+            },
+            crate::services::audit::audit_admin_writes,
+        ))
         .layer(middleware::from_fn_with_state(
             admin_auth_state,
             require_admin_key,

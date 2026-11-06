@@ -44,6 +44,10 @@ struct Metrics {
     count_tokens_total: IntCounterVec,
     /// Requests rejected by a rate limiter, labeled by kind (rpm/tpm) and scope (key).
     rate_limited_total: IntCounterVec,
+    /// Budget alerts emitted, labeled by scope (user/key) and result (sent/failed/logged).
+    budget_alerts_total: IntCounterVec,
+    /// Audit log writes that failed (the admin operation itself succeeded).
+    audit_write_failures_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -131,6 +135,24 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let budget_alerts_total = IntCounterVec::new(
+            Opts::new(
+                "onerouter_budget_alerts_total",
+                "Budget threshold alerts, by scope and result (sent/failed/logged)",
+            ),
+            &["scope", "result"],
+        )
+        .expect("valid metric");
+
+        let audit_write_failures_total = IntCounterVec::new(
+            Opts::new(
+                "onerouter_audit_write_failures_total",
+                "Audit log entries that could not be written",
+            ),
+            &["action"],
+        )
+        .expect("valid metric");
+
         let build_info = IntGaugeVec::new(
             Opts::new(
                 "onerouter_build_info",
@@ -171,6 +193,12 @@ impl Metrics {
         registry
             .register(Box::new(rate_limited_total.clone()))
             .expect("register rate_limited_total");
+        registry
+            .register(Box::new(budget_alerts_total.clone()))
+            .expect("register budget_alerts_total");
+        registry
+            .register(Box::new(audit_write_failures_total.clone()))
+            .expect("register audit_write_failures_total");
         // build_info is register-and-forget: the registry holds the clone, the
         // value never changes, and nothing reads it back.
         registry
@@ -188,6 +216,8 @@ impl Metrics {
             auth_failures_total,
             count_tokens_total,
             rate_limited_total,
+            budget_alerts_total,
+            audit_write_failures_total,
         }
     }
 }
@@ -295,6 +325,23 @@ pub fn record_rate_limited(kind: &str, scope: &str) {
     metrics()
         .rate_limited_total
         .with_label_values(&[kind, scope])
+        .inc();
+}
+
+/// Record one budget alert outcome.
+pub fn record_budget_alert(scope: &str, result: &str) {
+    metrics()
+        .budget_alerts_total
+        .with_label_values(&[scope, result])
+        .inc();
+}
+
+/// Record a failed audit log write. `action` is the bounded action name
+/// (e.g. `key.create`), never an id.
+pub fn record_audit_write_failure(action: &str) {
+    metrics()
+        .audit_write_failures_total
+        .with_label_values(&[action])
         .inc();
 }
 

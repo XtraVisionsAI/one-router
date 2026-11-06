@@ -1,5 +1,5 @@
 <script setup lang="ts">
-  import type { ApiKey, CreateKeyBody, UpdateKeyBody, User } from '@/api/types'
+  import type { ApiKey, BudgetPeriod, CreateKeyBody, UpdateKeyBody, User } from '@/api/types'
   import { useMessage } from 'naive-ui'
   import { useKeysApi } from '@/api/keys'
 
@@ -22,6 +22,12 @@
   const isEdit = computed(() => !!props.existing)
   const title = computed(() => (isEdit.value ? 'Edit API Key' : 'Create API Key'))
 
+  const periodOptions = [
+    { label: 'Monthly', value: 'monthly' },
+    { label: 'Weekly (ISO, Mon)', value: 'weekly' },
+    { label: 'Daily (UTC)', value: 'daily' }
+  ]
+
   const cacheTtlOptions = [
     { label: 'Inherit from user', value: null },
     { label: '5 minutes', value: '5m' },
@@ -38,6 +44,9 @@
     cache_ttl: null as string | null,
     expires_at: null as number | null, // ms for the date picker
     allowed_models: [] as string[],
+    allowed_cidrs: [] as string[],
+    default_tags: [] as string[],
+    budget_period: 'monthly' as BudgetPeriod,
     metadata: ''
   })
   const form = ref(blank())
@@ -58,6 +67,9 @@
             cache_ttl: k.cache_ttl,
             expires_at: k.expires_at ? k.expires_at * 1000 : null,
             allowed_models: [...(k.allowed_models ?? [])],
+            allowed_cidrs: [...(k.allowed_cidrs ?? [])],
+            default_tags: [...(k.default_tags ?? [])],
+            budget_period: k.budget_period ?? 'monthly',
             metadata: k.metadata ? JSON.stringify(k.metadata, null, 2) : ''
           }
         : { ...blank(), user_id: props.defaultUserId ?? null }
@@ -97,6 +109,9 @@
       cache_ttl: form.value.cache_ttl,
       expires_at: form.value.expires_at ? Math.floor(form.value.expires_at / 1000) : null,
       allowed_models: form.value.allowed_models.length ? form.value.allowed_models : null,
+      allowed_cidrs: form.value.allowed_cidrs.length ? form.value.allowed_cidrs : null,
+      default_tags: form.value.default_tags.length ? form.value.default_tags : null,
+      budget_period: form.value.budget_period,
       metadata
     }
 
@@ -153,9 +168,14 @@
       </div>
 
       <div class="flex gap-4">
-        <NFormItem label="Monthly Budget ($)" class="flex-1">
+        <NFormItem label="Budget ($ per period)" class="flex-1">
           <NInputNumber v-model:value="form.monthly_budget" :min="0" :precision="2" placeholder="user budget" class="w-full" />
         </NFormItem>
+        <NFormItem label="Budget Period" class="flex-1">
+          <NSelect v-model:value="form.budget_period" :options="periodOptions" />
+        </NFormItem>
+      </div>
+      <div class="flex gap-4">
         <NFormItem label="Expires At" class="flex-1">
           <NDatePicker v-model:value="form.expires_at" type="datetime" clearable placeholder="never" class="w-full" />
         </NFormItem>
@@ -163,6 +183,14 @@
 
       <NFormItem label="Allowed Models (glob, !exclude — empty = user's)">
         <NDynamicTags v-model:value="form.allowed_models" />
+      </NFormItem>
+
+      <NFormItem label="Allowed Client CIDRs (empty = any)">
+        <NDynamicTags v-model:value="form.allowed_cidrs" />
+      </NFormItem>
+
+      <NFormItem label="Default Usage Tags">
+        <NDynamicTags v-model:value="form.default_tags" :max="5" />
       </NFormItem>
 
       <NFormItem label="Cache TTL">

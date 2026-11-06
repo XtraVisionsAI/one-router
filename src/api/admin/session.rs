@@ -4,7 +4,7 @@
 //! POST /admin/api/logout — invalidate session, clear cookie
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -21,9 +21,16 @@ pub struct LoginRequest {
 
 pub async fn login(
     State(state): State<AppState>,
+    connect: Option<ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
     let key = body.key.trim();
+    let audit_state = crate::services::audit::AuditState {
+        database: state.database.clone(),
+        settings: state.settings.clone(),
+    };
+    let meta = crate::services::audit::meta(connect.map(|c| c.0), &headers, &state.settings);
 
     // Verify against master key
     let is_master = state
@@ -42,6 +49,7 @@ pub async fn login(
         .unwrap_or(false);
 
     if !is_master && !is_ephemeral {
+        crate::services::audit::record_login(&audit_state, meta, "anonymous", false, 401);
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -54,6 +62,8 @@ pub async fn login(
     // Generate session token and store it
     let token = Uuid::new_v4().to_string();
     state.sessions.write().await.insert(token.clone());
+    let actor = if is_master { "master" } else { "ephemeral" };
+    crate::services::audit::record_login(&audit_state, meta, actor, true, 200);
 
     // Build Set-Cookie header
     let cookie = format!("admin_session={token}; HttpOnly; SameSite=Strict; Path=/admin");

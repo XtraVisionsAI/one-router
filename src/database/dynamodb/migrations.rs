@@ -88,6 +88,21 @@ pub async fn create_tables(backend: &DynamoDbBackend) -> Result<()> {
     )
     .await?;
 
+    // --- audit_logs (PK: month, SK: timestamp#id) ---
+    create_table_if_not_exists(
+        backend,
+        "audit_logs",
+        vec![
+            attr_def("month", ScalarAttributeType::S),
+            attr_def("sort_key", ScalarAttributeType::S),
+        ],
+        vec![
+            key_schema("month", KeyType::Hash),
+            key_schema("sort_key", KeyType::Range),
+        ],
+    )
+    .await?;
+
     // --- GSI: api_keys name-index (for unique name lookups) ---
     ensure_name_gsi(backend).await?;
 

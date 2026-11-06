@@ -35,14 +35,27 @@ impl AdminAuthState {
     }
 }
 
+/// Audit actor for a session: a hash prefix, never the token itself.
+pub fn session_actor(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("session:{hex}")
+}
+
 pub async fn require_admin_key(
     State(state): State<AdminAuthState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, AdminAuthError> {
+    use crate::services::audit::AdminActor;
+
     // Path 1: Check session cookie
     if let Some(token) = extract_session_cookie(request.headers()) {
         if state.sessions.read().await.contains(&token) {
+            request
+                .extensions_mut()
+                .insert(AdminActor(session_actor(&token)));
             return Ok(next.run(request).await);
         }
     }
@@ -56,6 +69,7 @@ pub async fn require_admin_key(
     // Check master key
     if let Some(ref master_key) = state.settings.master_api_key {
         if crate::utils::api_key::secret_eq(&raw_key, master_key) {
+            request.extensions_mut().insert(AdminActor("master".into()));
             return Ok(next.run(request).await);
         }
     }
@@ -63,6 +77,9 @@ pub async fn require_admin_key(
     // Check ephemeral key
     if let Some(ref ephemeral_key) = state.settings.ephemeral_api_key {
         if crate::utils::api_key::secret_eq(&raw_key, ephemeral_key) {
+            request
+                .extensions_mut()
+                .insert(AdminActor("ephemeral".into()));
             return Ok(next.run(request).await);
         }
     }
@@ -106,6 +123,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 8000,
             metrics_public: false,
+            trusted_proxy_cidrs: Vec::new(),
             log_level: "debug".to_string(),
             max_body_size_mb: crate::config::settings::DEFAULT_MAX_BODY_SIZE_MB,
             master_api_key: master.map(|s| s.to_string()),

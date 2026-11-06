@@ -22,7 +22,8 @@ scripts/migrations/
 │   ├── 004_pricing_source.sql                  # pricing_source column
 │   ├── 005_backend_models.sql                  # backend models filter
 │   ├── 006_api_key_id.sql                      # api_keys/usage key_id
-│   └── 007_users.sql                           # users table, per-user key names
+│   ├── 007_users.sql                           # users table, per-user key names
+│   └── 008_p2_audit_periods_tags.sql           # audit log, budget periods, tags, CIDRs
 ├── postgres/
 │   ├── 001_model_mapping_pattern_index.sql     # text_pattern_ops index
 │   ├── 002_api_key_display.sql                 # key_display column
@@ -30,12 +31,14 @@ scripts/migrations/
 │   ├── 004_pricing_source.sql                  # pricing_source column
 │   ├── 005_backend_models.sql                  # backend models filter
 │   ├── 006_api_key_id.sql                      # api_keys/usage key_id
-│   └── 007_users.sql                           # users table, per-user key names
+│   ├── 007_users.sql                           # users table, per-user key names
+│   └── 008_p2_audit_periods_tags.sql           # audit log, budget periods, tags, CIDRs
 └── dynamodb/
     ├── 001_apikeys_name_gsi.sh                 # name-index GSI
     ├── 002_model_pricing.sh                    # model pricing backfill
     ├── 003_api_key_ids.sh                      # api_keys key_id backfill
-    └── 004_users_table.sh                      # users table
+    ├── 004_users_table.sh                      # users table
+    └── 005_audit_logs_table.sh                 # audit_logs table
 ```
 
 Migrations are numbered `NNN_description` and execute in lexicographic order.
@@ -152,6 +155,14 @@ starting at once cannot migrate a key twice.
 
 **Rolling back** to a pre-users release after this migration leaves keys with
 no budget (it moved to the user) — back up the database first.
+
+### SQLite/PostgreSQL 008 & DynamoDB 005: Audit log, budget periods, tags
+
+`audit_logs` table; on `api_keys` and `users`: `allowed_cidrs`,
+`budget_period`, `budget_alerts_sent`, `default_tags` (keys also
+`last_used_at`, `rotated_to`); `usage.tags`. All additive — no data migration.
+DynamoDB attributes need no schema change; only the `audit_logs` table
+(PK `month`, SK `sort_key`) is created.
 
 ## Adding new migrations
 

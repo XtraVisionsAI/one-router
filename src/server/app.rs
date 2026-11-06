@@ -100,7 +100,9 @@ impl App {
             ),
             sessions: Arc::new(RwLock::new(HashSet::new())),
             dynamic,
+            auth_cache: Arc::new(crate::services::auth_cache::AuthCache::default()),
         };
+        apply_auth_and_alert_settings(&state).await;
 
         tracing::info!("Application state initialized successfully");
 
@@ -182,15 +184,30 @@ impl App {
                 }
             }
         });
+        // Daily audit-log retention purge (`audit_log_retention_days`).
+        let audit_db = self.state.database.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            loop {
+                crate::services::audit::purge_expired(&audit_db).await;
+                tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+            }
+        });
+
         tracing::info!("Starting server on {}", addr);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
         let ptc_service = self.state.ptc_service.clone();
 
-        axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        // ConnectInfo: the TCP peer address feeds client-IP resolution
+        // (IP allowlists, audit log).
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
         // Clean up PTC containers on shutdown
         if let Some(ptc) = ptc_service {
@@ -706,9 +723,55 @@ pub async fn reload_dynamic_config(state: &AppState) {
         state.ptc_service.as_ref(),
     )
     .await;
-    let mut dynamic = state.dynamic.write().await;
-    *dynamic = new_config;
+    {
+        let mut dynamic = state.dynamic.write().await;
+        *dynamic = new_config;
+    }
+    apply_auth_and_alert_settings(state).await;
     tracing::info!("Dynamic config reloaded");
+}
+
+/// Push `auth_cache_ttl_secs` and the budget-alert settings into the services
+/// that hold them (startup + every reload).
+async fn apply_auth_and_alert_settings(state: &AppState) {
+    let ttl = load_string_setting(&state.database, "auth_cache_ttl_secs")
+        .await
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(30);
+    state.auth_cache.set_ttl(ttl);
+
+    use crate::services::budget_alerts::{parse_thresholds, parse_webhook_url, BudgetAlertConfig};
+    let mut cfg = BudgetAlertConfig::default();
+    if let Some(raw) = load_raw_setting(&state.database, "budget_alert_thresholds").await {
+        match parse_thresholds(&raw) {
+            Ok(t) => cfg.thresholds = t,
+            Err(e) => tracing::warn!(error = %e, "Invalid budget_alert_thresholds; using default"),
+        }
+    }
+    if let Some(raw) = load_string_setting(&state.database, "budget_alert_webhook_url").await {
+        match parse_webhook_url(&raw) {
+            Ok(u) => cfg.webhook_url = u,
+            Err(e) => {
+                tracing::warn!(error = %e, "Invalid budget_alert_webhook_url; webhook disabled")
+            }
+        }
+    }
+    state.usage_tracker.set_alert_config(cfg);
+}
+
+/// Load a setting's raw value, including an explicit empty string
+/// (`Some("")` = set to empty, `None` = missing).
+async fn load_raw_setting(
+    database: &Arc<dyn crate::database::traits::DatabaseService>,
+    key: &str,
+) -> Option<String> {
+    database
+        .system_settings()
+        .get_setting(key)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.value)
 }
 
 // ============================================================================

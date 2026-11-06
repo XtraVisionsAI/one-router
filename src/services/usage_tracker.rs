@@ -2,11 +2,13 @@
 //!
 //! Modified to use the `UsageStore` trait instead of DynamoDB directly.
 
+use crate::database::models::SpendAfter;
 use crate::database::models::UsageRecord;
 use crate::database::traits::DatabaseService;
 use crate::middleware::auth::ApiKeyInfo;
 use crate::middleware::rate_limit::{user_bucket, TokenRateLimiter};
 use crate::schemas::anthropic::Usage;
+use crate::services::budget_alerts::{self, BudgetAlert, BudgetAlertConfig};
 use crate::services::model_mapping::ModelMappingService;
 use chrono::Utc;
 use std::sync::Arc;
@@ -48,6 +50,9 @@ pub struct UsageTracker {
     model_mapping: Arc<ModelMappingService>,
     /// TPM meter shared with the rate-limit middleware.
     token_limiter: Arc<TokenRateLimiter>,
+    /// Budget alert thresholds / webhook (hot-reloaded via `set_alert_config`).
+    alerts: Arc<std::sync::RwLock<BudgetAlertConfig>>,
+    http: Arc<reqwest::Client>,
 }
 
 impl UsageTracker {
@@ -56,6 +61,70 @@ impl UsageTracker {
             storage,
             model_mapping,
             token_limiter: Arc::new(TokenRateLimiter::new()),
+            alerts: Arc::new(std::sync::RwLock::new(BudgetAlertConfig::default())),
+            http: Arc::new(reqwest::Client::new()),
+        }
+    }
+
+    pub fn set_alert_config(&self, cfg: BudgetAlertConfig) {
+        *self.alerts.write().unwrap_or_else(|e| e.into_inner()) = cfg;
+    }
+
+    fn alert_config(&self) -> BudgetAlertConfig {
+        self.alerts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Claim and emit alerts for thresholds this spend crossed. `store_id` is
+    /// the storage key (key hash / user_id); `public_id` goes into the alert
+    /// (key_id / user_id — never the hash).
+    #[allow(clippy::too_many_arguments)]
+    async fn check_alerts(
+        &self,
+        scope: &'static str,
+        store_id: &str,
+        public_id: &str,
+        name: &str,
+        period: &str,
+        spend: SpendAfter,
+        delta: f64,
+    ) {
+        let Some(budget) = spend.budget else { return };
+        let cfg = self.alert_config();
+        for threshold in budget_alerts::crossed(&cfg.thresholds, budget, spend.used, delta) {
+            let claimed = match scope {
+                "user" => {
+                    self.storage
+                        .users()
+                        .claim_user_budget_alert(store_id, period, threshold)
+                        .await
+                }
+                _ => {
+                    self.storage
+                        .api_keys()
+                        .claim_budget_alert(store_id, period, threshold)
+                        .await
+                }
+            };
+            match claimed {
+                Ok(true) => budget_alerts::emit(
+                    BudgetAlert {
+                        scope,
+                        id: public_id.to_string(),
+                        name: name.to_string(),
+                        budget,
+                        used: spend.used,
+                        threshold,
+                        period: period.to_string(),
+                    },
+                    cfg.webhook_url.clone(),
+                    self.http.clone(),
+                ),
+                Ok(false) => {} // another request / instance already sent it
+                Err(e) => tracing::warn!(error = %e, scope, "Failed to claim budget alert"),
+            }
         }
     }
 
@@ -84,29 +153,34 @@ impl UsageTracker {
 
         // Internal keys (master/ephemeral) have no DB entry — skip budget management
         let is_internal_key = key_info.raw_api_key.is_empty();
-        let current_month = timestamp.format("%Y-%m").to_string();
+        // Period key per layer (each layer has its own budget period).
+        let key_period = key_info.budget_period.key_at(timestamp);
+        let user_period = key_info
+            .user
+            .as_ref()
+            .map(|u| u.budget_period.key_at(timestamp));
 
         if !is_internal_key {
-            // Lazy month rollover, per layer.
-            if is_new_month(key_info.budget_mtd_month.as_deref(), &current_month) {
+            // Lazy period rollover, per layer.
+            if is_new_month(key_info.budget_mtd_month.as_deref(), &key_period) {
                 self.storage
                     .api_keys()
                     .reset_monthly_budget(
                         &key_info.raw_api_key,
-                        &current_month,
+                        &key_period,
                         key_info.budget_mtd_month.as_deref().unwrap_or(""),
                         key_info.budget_used_mtd,
                     )
                     .await
                     .map_err(|e| UsageError::Database(e.to_string()))?;
             }
-            if let Some(user) = &key_info.user {
-                if is_new_month(user.budget_mtd_month.as_deref(), &current_month) {
+            if let (Some(user), Some(period)) = (&key_info.user, &user_period) {
+                if is_new_month(user.budget_mtd_month.as_deref(), period) {
                     self.storage
                         .users()
                         .reset_user_monthly_budget(
                             &user.user_id,
-                            &current_month,
+                            period,
                             user.budget_mtd_month.as_deref().unwrap_or(""),
                             user.budget_used_mtd,
                         )
@@ -142,6 +216,7 @@ impl UsageTracker {
             api_key: record_api_key.to_string(),
             key_id: Some(key_info.key_id.clone()),
             user_id: key_info.user_id().map(String::from),
+            tags: (!key_info.tags.is_empty()).then(|| key_info.tags.join(",")),
             timestamp: timestamp.to_rfc3339(),
             request_id: request_id.to_string(),
             model: model.to_string(),
@@ -187,28 +262,48 @@ impl UsageTracker {
         if !is_internal_key && cost > 0.0 {
             // Two independent atomic increments (key sub-budget, user budget).
             // A failure on one is reported but does not undo the other.
-            let key_exceeded = self
+            let key_spend = self
                 .storage
                 .api_keys()
                 .increment_budget_used(&key_info.raw_api_key, cost)
                 .await
                 .map_err(|e| UsageError::Database(e.to_string()))?;
-            let user_exceeded = match &key_info.user {
-                Some(user) => self
+            self.check_alerts(
+                "key",
+                &key_info.raw_api_key,
+                &key_info.key_id,
+                &key_info.key_name,
+                &key_period,
+                key_spend,
+                cost,
+            )
+            .await;
+            let mut exceeded = key_spend.exceeded();
+            if let (Some(user), Some(period)) = (&key_info.user, &user_period) {
+                let user_spend = self
                     .storage
                     .users()
                     .increment_user_budget_used(&user.user_id, cost)
                     .await
-                    .map_err(|e| UsageError::Database(e.to_string()))?,
-                None => false,
-            };
-            let exceeded = key_exceeded || user_exceeded;
+                    .map_err(|e| UsageError::Database(e.to_string()))?;
+                self.check_alerts(
+                    "user",
+                    &user.user_id,
+                    &user.user_id,
+                    &user.name,
+                    period,
+                    user_spend,
+                    cost,
+                )
+                .await;
+                exceeded |= user_spend.exceeded();
+            }
             if exceeded {
                 tracing::warn!(
                     api_key = %key_info.api_key,
                     user = key_info.user.as_ref().map(|u| u.name.as_str()).unwrap_or("-"),
                     cost = cost,
-                    "Monthly budget reached; further requests will be rejected"
+                    "Budget reached; further requests will be rejected"
                 );
             }
             return Ok(exceeded);

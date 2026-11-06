@@ -1,6 +1,6 @@
 # API Key 管理重构:用户维度计费 + Key 生命周期 + 审计
 
-日期:2026-11-06 · 状态:P0、P1 已实施(2026-11-06,单测 + 本地烟囱测试验证,含用 P0 二进制建库后升级);P2–P3 设计中
+日期:2026-11-06 · 状态:P0、P1、P2 已实施(2026-11-06,单测 + 本地烟囱测试验证,含用 P0 二进制建库后升级);P3 设计中
 
 ## 背景与目标
 
@@ -341,6 +341,24 @@ POST   /admin/api/keys/:key_id/deactivate|activate
 
 ## P2:运维能力
 
+### 实施记录:与下文初稿的差异
+
+| 主题 | 初稿 | 实现 |
+|---|---|---|
+| 审计写入点 | 各 handler 显式调用 | **中间件统一记录**所有 admin 写操作(位于 admin 鉴权层之内,读取鉴权写入的 `AdminActor`),动作/目标由路径推导(`PUT /keys/<id>` → `api_key.update`,动作集合有界);keys / users / settings 的 handler 通过响应扩展 `AuditDetail` 补充 before/after 快照。**失败的请求(4xx/5xx)同样记录**。登录成功/失败由登录 handler 显式记录 |
+| 脱敏 | `audit::redact` 按类型脱敏 | **构造即安全**:快照只来自 Admin API 自己的响应类型(`AdminKeyItem` / `AdminUserItem`,不含明文和哈希);敏感设置(`ui_schema.sensitive`)只记 `<redacted>`;backend 凭证从不快照 |
+| actor | `master` + session 前 8 位 | `master` / `ephemeral` / `session:<token 的 SHA-256 前 8 位 hex>`(不记录 token 本身的任何部分) |
+| DynamoDB 审计保留 | 表 TTL | 与 SQL 一致的每日清理任务(Scan + 删除;admin 写入量小) |
+| 信任代理 | `TRUSTED_PROXY_CIDRS` | 已实现;`X-Forwarded-For` 从右向左跳过受信代理取第一个非受信地址;未配置时完全忽略该头。IP 白名单在客户端地址未知时**拒绝**(fail closed) |
+| 预算周期 | 新列 `budget_period_start`、重命名 `budget_used_period` | **不改列名**:沿用 `budget_mtd_month` 存"周期键"(`2026-11` / `2026-W45` / `2026-11-06`),`budget_used_mtd` 存本周期用量,新增 `budget_period` 列。修改周期后旧周期键与新格式不一致,按"已进入新周期"处理(计数从 0 起) |
+| 告警去重 | 条件更新 | 对 `budget_alerts_sent` 做比较并交换(SQLite `IS ?`、Postgres `IS NOT DISTINCT FROM`、DynamoDB 条件表达式),最多重试 5 次;每个阈值每周期只发一次。告警 payload 中 Key 用 `key_id`,从不出现哈希 |
+| 轮换 | 新旧 Key 同名 | 名称在用户内唯一,所以旧 Key 改名为 `<name>~rotated-<时间戳>-<key_id 前 8 位>`,新 Key 继承原名;新 Key **不继承**过期时间;已轮换过的 Key 再轮换返回 409。创建新 Key 失败时回滚旧 Key |
+| 鉴权缓存 | 30s TTL + 本实例失效 | 已实现;任何 Key / 用户写操作对本实例 `invalidate_all`;不存在的 Key 负缓存 5s;TTL 上限 300s;设置为 0 关闭缓存 |
+| 标签 | 维度 `group_by=tag` | 存储层按原始标签串分组,应用层拆分到每个标签(`a,b` 同时计入 a 和 b,无标签计入 `(none)`,因此各标签合计可能大于总量);`tag=` 过滤为精确匹配。Admin 与 `/v1/usage` 都支持 |
+| Key 前缀 | `sk-or-` | 已实现,旧 `sk-` Key 继续有效 |
+
+顺带修复:**鉴权在 P2 之前每个请求都读两次数据库**(Key + 用户),现在由缓存承担。
+
 ### P2-1 审计日志
 
 **范围**:所有 admin 写操作(`POST/PUT/DELETE /admin/api/*`),包括 keys、users、
@@ -571,7 +589,7 @@ key / user / team 层 `max_concurrency`。进程内信号量在请求开始时�
 |---|---|---|
 | P0 ✅ | key_id + 回填、硬删除、`/keys/:key_id`(兼容 name)、TPM、限流缓存键、全局 RPM 热更新、metadata、`/v1/usage` 修复 | 完全向后兼容(无参 `DELETE` 仍为停用) |
 | P1 ✅ | users 表 + 自动迁移、多 Key、用户级计费、过期、模型白名单、UI 用户页 | 行为不变;**不可无损回退** |
-| P2 | 审计日志、预算周期、告警、轮换、last_used、鉴权缓存、IP 白名单、标签、Key 前缀 | 向后兼容;移除 name 路径兼容 |
+| P2 ✅ | 审计日志、预算周期、告警、轮换、last_used、鉴权缓存、IP 白名单、标签、Key 前缀 | 向后兼容(name 路径兼容与无参 `DELETE` 的停用语义暂未移除,留待下个 minor 版本) |
 | P3 | 团队、并发上限、共享限流、预扣 | 新能力默认关闭 |
 
 建议 P0 与 P1 分两个 minor 版本发布:P0 完全向后兼容、可随时回退;P1 的用户

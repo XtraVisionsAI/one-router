@@ -29,6 +29,8 @@ export interface UpsertBackendBody {
 }
 
 // ── Users ─────────────────────────────────────────────────────
+export type BudgetPeriod = 'monthly' | 'weekly' | 'daily'
+
 export interface User {
   user_id: string
   name: string
@@ -43,6 +45,9 @@ export interface User {
   tpm_limit: number | null
   allowed_models: string[] | null
   cache_ttl: string | null
+  allowed_cidrs: string[] | null
+  budget_period: BudgetPeriod
+  default_tags: string[] | null
   metadata: Record<string, unknown> | null
   key_count: number
   created_at: number
@@ -63,6 +68,9 @@ export interface UserBody {
   allowed_models?: string[] | null
   cache_ttl?: string | null
   metadata?: Record<string, unknown> | null
+  allowed_cidrs?: string[] | null
+  budget_period?: BudgetPeriod
+  default_tags?: string[] | null
 }
 
 // ── API Keys ──────────────────────────────────────────────────
@@ -81,6 +89,11 @@ export interface ApiKey {
   cache_ttl: string | null
   expires_at: number | null // unix seconds
   allowed_models: string[] | null
+  allowed_cidrs: string[] | null
+  budget_period: BudgetPeriod
+  default_tags: string[] | null
+  last_used_at: number | null
+  rotated_to: string | null
   is_active: boolean
   metadata: Record<string, unknown> | null
   created_at: number
@@ -96,6 +109,9 @@ export interface CreateKeyBody {
   cache_ttl?: string | null
   expires_at?: number | null
   allowed_models?: string[] | null
+  allowed_cidrs?: string[] | null
+  budget_period?: BudgetPeriod
+  default_tags?: string[] | null
   metadata?: Record<string, unknown> | null
 }
 
@@ -107,6 +123,9 @@ export interface UpdateKeyBody {
   cache_ttl?: string | null
   expires_at?: number | null
   allowed_models?: string[] | null
+  allowed_cidrs?: string[] | null
+  budget_period?: BudgetPeriod
+  default_tags?: string[] | null
   metadata?: Record<string, unknown> | null
 }
 
@@ -215,4 +234,27 @@ export interface StatusResponse {
 export interface ListResponse<T> {
   object: string
   data: T[]
+}
+
+// ── Audit log ─────────────────────────────────────────────────
+export interface AuditEntry {
+  id: string
+  timestamp: string
+  actor: string
+  source_ip: string | null
+  user_agent: string | null
+  action: string
+  target_type: string | null
+  target_id: string | null
+  status: number
+  method: string
+  path: string
+  before_json: unknown
+  after_json: unknown
+}
+
+export interface AuditListResponse {
+  object: 'list'
+  data: AuditEntry[]
+  has_more: boolean
 }

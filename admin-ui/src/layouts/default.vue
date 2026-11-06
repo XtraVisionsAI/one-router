@@ -19,6 +19,7 @@
     { key: '/backends', label: 'Backends', icon: () => h('span', { class: 'i-carbon-server-dns text-base' }) },
     { key: '/mappings', label: 'Model Maps', icon: () => h('span', { class: 'i-carbon-arrows-horizontal text-base' }) },
     { key: '/usage', label: 'Usage', icon: () => h('span', { class: 'i-carbon-chart-bar text-base' }) },
+    { key: '/audit', label: 'Audit Log', icon: () => h('span', { class: 'i-carbon-catalog text-base' }) },
     { key: '/settings', label: 'Settings', icon: () => h('span', { class: 'i-carbon-settings text-base' }) }
   ]
 

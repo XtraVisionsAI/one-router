@@ -137,6 +137,53 @@ pub fn validate_non_negative(field: &str, value: Option<f64>) -> Result<(), Hand
     Ok(())
 }
 
+/// Validate a CIDR allowlist (`10.0.0.0/8`, `192.168.1.5`); empty → `None`.
+pub fn validate_cidrs(list: Option<Vec<String>>) -> Result<Option<Vec<String>>, HandlerError> {
+    let Some(list) = list.filter(|l| !l.is_empty()) else {
+        return Ok(None);
+    };
+    let trimmed: Vec<String> = list.iter().map(|c| c.trim().to_string()).collect();
+    crate::utils::client_ip::parse_cidrs(&trimmed)
+        .map_err(|e| bad_request(format!("invalid allowed_cidrs: {e}")))?;
+    Ok(Some(trimmed))
+}
+
+/// Validate default usage tags (same rules as `x-onerouter-tags`, ≤ 5).
+pub fn validate_tags(list: Option<Vec<String>>) -> Result<Option<Vec<String>>, HandlerError> {
+    let Some(list) = list.filter(|l| !l.is_empty()) else {
+        return Ok(None);
+    };
+    let tags: Vec<String> = list.iter().map(|t| t.trim().to_string()).collect();
+    if let Some(bad) = tags.iter().find(|t| !crate::middleware::auth::valid_tag(t)) {
+        return Err(bad_request(format!(
+            "invalid tag '{bad}': 1-64 chars of letters, digits, '_', '.', ':', '-'"
+        )));
+    }
+    if tags.len() > crate::middleware::auth::MAX_REQUEST_TAGS {
+        return Err(bad_request(format!(
+            "at most {} default tags",
+            crate::middleware::auth::MAX_REQUEST_TAGS
+        )));
+    }
+    Ok(Some(tags))
+}
+
+/// Parse `budget_period` (`monthly` / `weekly` / `daily`).
+pub fn parse_budget_period(
+    raw: Option<&str>,
+) -> Result<Option<crate::database::models::BudgetPeriod>, HandlerError> {
+    use crate::database::models::BudgetPeriod;
+    match raw.map(str::trim) {
+        None => Ok(None),
+        Some("monthly") => Ok(Some(BudgetPeriod::Monthly)),
+        Some("weekly") => Ok(Some(BudgetPeriod::Weekly)),
+        Some("daily") => Ok(Some(BudgetPeriod::Daily)),
+        Some(other) => Err(bad_request(format!(
+            "budget_period must be monthly, weekly or daily (got '{other}')"
+        ))),
+    }
+}
+
 pub fn validate_name(name: &str) -> Result<(), HandlerError> {
     if name.trim().is_empty() {
         return Err(bad_request("name must not be empty"));
@@ -167,6 +214,21 @@ mod tests {
         );
         assert!(validate_allowed_models(Some(vec!["!".into()])).is_err());
         assert!(validate_allowed_models(Some(vec!["a".into(), "!a".into()])).is_err());
+    }
+
+    #[test]
+    fn cidr_tag_period_validation() {
+        assert_eq!(validate_cidrs(Some(vec![])).unwrap(), None);
+        assert!(validate_cidrs(Some(vec![" 10.0.0.0/8".into()]))
+            .unwrap()
+            .is_some());
+        assert!(validate_cidrs(Some(vec!["10.0.0.0/40".into()])).is_err());
+        assert!(validate_tags(Some(vec!["team-a".into()])).is_ok());
+        assert!(validate_tags(Some(vec!["bad tag".into()])).is_err());
+        assert!(validate_tags(Some((0..6).map(|i| format!("t{i}")).collect())).is_err());
+        assert!(parse_budget_period(Some("weekly")).unwrap().is_some());
+        assert!(parse_budget_period(Some("yearly")).is_err());
+        assert!(parse_budget_period(None).unwrap().is_none());
     }
 
     #[test]

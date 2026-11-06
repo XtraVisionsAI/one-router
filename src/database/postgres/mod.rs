@@ -37,8 +37,9 @@ impl PostgresBackend {
              user_id = $1, name = $2, is_active = $3, rate_limit = $4, cost_rate = $5, \
              monthly_budget = $6, budget_used = $7, budget_used_mtd = $8, budget_mtd_month = $9, \
              deactivated_reason = $10, budget_history = $11, tpm_limit = $12, cache_ttl = $13, \
-             metadata = $14, expires_at = $15, allowed_models = $16, updated_at = $17 \
-             WHERE api_key = $18{extra_where}"
+             metadata = $14, expires_at = $15, allowed_models = $16, allowed_cidrs = $17, \
+             budget_period = $18, default_tags = $19, rotated_to = $20, updated_at = $21 \
+             WHERE api_key = $22{extra_where}"
         ))
         .bind(&record.user_id)
         .bind(&record.name)
@@ -56,6 +57,10 @@ impl PostgresBackend {
         .bind(&record.metadata)
         .bind(record.expires_at)
         .bind(patterns_to_json(&record.allowed_models))
+        .bind(patterns_to_json(&record.allowed_cidrs))
+        .bind(record.budget_period.as_str())
+        .bind(patterns_to_json(&record.default_tags))
+        .bind(&record.rotated_to)
         .bind(unix_now())
         .bind(&record.api_key)
         .execute(&self.pool)
@@ -107,11 +112,13 @@ impl PostgresBackend {
 const API_KEY_COLS: &str = "api_key, key_id, key_display, user_id, name, is_active, rate_limit, cost_rate, \
      monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
      deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, expires_at, allowed_models, \
+     allowed_cidrs, budget_period, budget_alerts_sent, default_tags, last_used_at, rotated_to, \
      created_at, updated_at";
 
 const USER_COLS: &str = "user_id, name, email, is_active, cost_rate, monthly_budget, budget_used, \
      budget_used_mtd, budget_mtd_month, budget_history, rate_limit, tpm_limit, allowed_models, \
-     cache_ttl, metadata, created_at, updated_at";
+     cache_ttl, metadata, allowed_cidrs, budget_period, budget_alerts_sent, default_tags, \
+     created_at, updated_at";
 
 fn row_to_user(r: &sqlx::postgres::PgRow) -> UserRecord {
     UserRecord {
@@ -130,6 +137,10 @@ fn row_to_user(r: &sqlx::postgres::PgRow) -> UserRecord {
         allowed_models: patterns_from_json(r.get("allowed_models")),
         cache_ttl: r.get("cache_ttl"),
         metadata: r.get("metadata"),
+        allowed_cidrs: patterns_from_json(r.get("allowed_cidrs")),
+        budget_period: BudgetPeriod::parse(r.get::<Option<String>, _>("budget_period").as_deref()),
+        budget_alerts_sent: r.get("budget_alerts_sent"),
+        default_tags: patterns_from_json(r.get("default_tags")),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     }
@@ -143,7 +154,7 @@ async fn increment_budget(
     id_col: &str,
     id: &str,
     amount: f64,
-) -> Result<bool> {
+) -> Result<SpendAfter> {
     let row = sqlx::query(&format!(
         "UPDATE {table} SET budget_used = budget_used + $1, \
          budget_used_mtd = budget_used_mtd + $1, updated_at = $2 WHERE {id_col} = $3 \
@@ -157,9 +168,102 @@ async fn increment_budget(
     let Some(r) = row else {
         anyhow::bail!("{table} row not found: {id}");
     };
-    let budget: Option<f64> = r.get("monthly_budget");
-    let used: f64 = r.get("budget_used_mtd");
-    Ok(budget.is_some_and(|limit| used >= limit))
+    Ok(SpendAfter {
+        used: r.get("budget_used_mtd"),
+        budget: r.get("monthly_budget"),
+    })
+}
+
+/// Compare-and-set on `budget_alerts_sent` — see `ApiKeyStore::claim_budget_alert`.
+async fn claim_alert(
+    pool: &PgPool,
+    table: &str,
+    id_col: &str,
+    id: &str,
+    period: &str,
+    threshold: f64,
+) -> Result<bool> {
+    for _ in 0..5 {
+        let row = sqlx::query(&format!(
+            "SELECT budget_alerts_sent FROM {table} WHERE {id_col} = $1"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        let Some(row) = row else { return Ok(false) };
+        let current: Option<String> = row.get("budget_alerts_sent");
+        let Some(next) = next_alert_state(current.as_deref(), period, threshold) else {
+            return Ok(false);
+        };
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET budget_alerts_sent = $1 \
+             WHERE {id_col} = $2 AND budget_alerts_sent IS NOT DISTINCT FROM $3"
+        ))
+        .bind(&next)
+        .bind(id)
+        .bind(&current)
+        .execute(pool)
+        .await?;
+        if res.rows_affected() == 1 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// WHERE clause for a [`UsageFilter`], numbering placeholders from `idx`;
+/// bind with [`bind_usage_filter`].
+fn usage_where(f: &UsageFilter<'_>, idx: &mut usize) -> String {
+    let mut w = String::from("WHERE 1=1");
+    if !f.api_key.is_empty() {
+        w.push_str(&format!(" AND api_key = ${idx}"));
+        *idx += 1;
+    }
+    if f.user_id.is_some() {
+        w.push_str(&format!(" AND user_id = ${idx}"));
+        *idx += 1;
+    }
+    if f.tag.is_some() {
+        w.push_str(&format!(
+            " AND (',' || COALESCE(tags, '') || ',') LIKE ('%,' || ${idx} || ',%')"
+        ));
+        *idx += 1;
+    }
+    w
+}
+
+fn bind_usage_filter<'q>(
+    mut q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    f: &UsageFilter<'q>,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    if !f.api_key.is_empty() {
+        q = q.bind(f.api_key);
+    }
+    if let Some(u) = f.user_id {
+        q = q.bind(u);
+    }
+    if let Some(t) = f.tag {
+        q = q.bind(t);
+    }
+    q
+}
+
+fn row_to_audit(r: &sqlx::postgres::PgRow) -> AuditLogRecord {
+    AuditLogRecord {
+        id: r.get("id"),
+        timestamp: r.get("timestamp"),
+        actor: r.get("actor"),
+        source_ip: r.get("source_ip"),
+        user_agent: r.get("user_agent"),
+        action: r.get("action"),
+        target_type: r.get("target_type"),
+        target_id: r.get("target_id"),
+        before: r.get("before"),
+        after: r.get("after"),
+        status: r.get::<i32, _>("status") as u16,
+        method: r.get("method"),
+        path: r.get("path"),
+    }
 }
 
 async fn reset_budget(
@@ -222,6 +326,12 @@ fn row_to_api_key(r: &sqlx::postgres::PgRow) -> ApiKeyRecord {
         metadata: r.get("metadata"),
         expires_at: r.get("expires_at"),
         allowed_models: patterns_from_json(r.get("allowed_models")),
+        allowed_cidrs: patterns_from_json(r.get("allowed_cidrs")),
+        budget_period: BudgetPeriod::parse(r.get::<Option<String>, _>("budget_period").as_deref()),
+        budget_alerts_sent: r.get("budget_alerts_sent"),
+        default_tags: patterns_from_json(r.get("default_tags")),
+        last_used_at: r.get("last_used_at"),
+        rotated_to: r.get("rotated_to"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     }
@@ -244,6 +354,9 @@ impl DatabaseService for PostgresBackend {
         self
     }
     fn users(&self) -> &dyn UserStore {
+        self
+    }
+    fn audit(&self) -> &dyn AuditStore {
         self
     }
     fn usage(&self) -> &dyn UsageStore {
@@ -310,9 +423,10 @@ impl ApiKeyStore for PostgresBackend {
              (api_key, key_id, key_display, user_id, name, is_active, rate_limit, cost_rate, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, \
-              expires_at, allowed_models, created_at, updated_at) \
+              expires_at, allowed_models, allowed_cidrs, budget_period, budget_alerts_sent, \
+              default_tags, last_used_at, rotated_to, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-                     $18, $19, $20, $21)",
+                     $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)",
         )
         .bind(&record.api_key)
         .bind(&record.key_id)
@@ -333,6 +447,12 @@ impl ApiKeyStore for PostgresBackend {
         .bind(&record.metadata)
         .bind(record.expires_at)
         .bind(patterns_to_json(&record.allowed_models))
+        .bind(patterns_to_json(&record.allowed_cidrs))
+        .bind(record.budget_period.as_str())
+        .bind(&record.budget_alerts_sent)
+        .bind(patterns_to_json(&record.default_tags))
+        .bind(record.last_used_at)
+        .bind(&record.rotated_to)
         .bind(record.created_at)
         .bind(record.updated_at)
         .execute(&self.pool)
@@ -360,7 +480,7 @@ impl ApiKeyStore for PostgresBackend {
         Ok(())
     }
 
-    async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<bool> {
+    async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<SpendAfter> {
         increment_budget(&self.pool, "api_keys", "api_key", api_key, amount).await
     }
 
@@ -463,6 +583,27 @@ impl ApiKeyStore for PostgresBackend {
             .await
             .map(|n| n > 0)
     }
+
+    async fn touch_last_used(&self, api_key: &str, at: i64) -> Result<()> {
+        sqlx::query("UPDATE api_keys SET last_used_at = $1 WHERE api_key = $2")
+            .bind(at)
+            .bind(api_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn claim_budget_alert(
+        &self,
+        api_key: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool> {
+        claim_alert(
+            &self.pool, "api_keys", "api_key", api_key, period, threshold,
+        )
+        .await
+    }
 }
 
 // ============================================================================
@@ -499,7 +640,8 @@ impl UserStore for PostgresBackend {
     async fn create_user(&self, u: &UserRecord) -> Result<()> {
         sqlx::query(&format!(
             "INSERT INTO users ({USER_COLS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
+              $18, $19, $20, $21)"
         ))
         .bind(&u.user_id)
         .bind(&u.name)
@@ -516,6 +658,10 @@ impl UserStore for PostgresBackend {
         .bind(patterns_to_json(&u.allowed_models))
         .bind(&u.cache_ttl)
         .bind(&u.metadata)
+        .bind(patterns_to_json(&u.allowed_cidrs))
+        .bind(u.budget_period.as_str())
+        .bind(&u.budget_alerts_sent)
+        .bind(patterns_to_json(&u.default_tags))
         .bind(u.created_at)
         .bind(u.updated_at)
         .execute(&self.pool)
@@ -528,7 +674,8 @@ impl UserStore for PostgresBackend {
         sqlx::query(
             "UPDATE users SET name = $1, email = $2, is_active = $3, cost_rate = $4, \
              monthly_budget = $5, rate_limit = $6, tpm_limit = $7, allowed_models = $8, \
-             cache_ttl = $9, metadata = $10, updated_at = $11 WHERE user_id = $12",
+             cache_ttl = $9, metadata = $10, allowed_cidrs = $11, budget_period = $12, \
+             default_tags = $13, updated_at = $14 WHERE user_id = $15",
         )
         .bind(&u.name)
         .bind(&u.email)
@@ -540,6 +687,9 @@ impl UserStore for PostgresBackend {
         .bind(patterns_to_json(&u.allowed_models))
         .bind(&u.cache_ttl)
         .bind(&u.metadata)
+        .bind(patterns_to_json(&u.allowed_cidrs))
+        .bind(u.budget_period.as_str())
+        .bind(patterns_to_json(&u.default_tags))
         .bind(unix_now())
         .bind(&u.user_id)
         .execute(&self.pool)
@@ -555,7 +705,7 @@ impl UserStore for PostgresBackend {
         Ok(())
     }
 
-    async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<bool> {
+    async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<SpendAfter> {
         increment_budget(&self.pool, "users", "user_id", user_id, amount).await
     }
 
@@ -571,6 +721,89 @@ impl UserStore for PostgresBackend {
         )
         .await
     }
+
+    async fn claim_user_budget_alert(
+        &self,
+        user_id: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool> {
+        claim_alert(&self.pool, "users", "user_id", user_id, period, threshold).await
+    }
+}
+
+// ============================================================================
+// AuditStore
+// ============================================================================
+
+#[async_trait]
+impl AuditStore for PostgresBackend {
+    async fn record_audit(&self, a: &AuditLogRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO audit_logs (id, timestamp, actor, source_ip, user_agent, action, \
+             target_type, target_id, before, after, status, method, path) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&a.id)
+        .bind(&a.timestamp)
+        .bind(&a.actor)
+        .bind(&a.source_ip)
+        .bind(&a.user_agent)
+        .bind(&a.action)
+        .bind(&a.target_type)
+        .bind(&a.target_id)
+        .bind(&a.before)
+        .bind(&a.after)
+        .bind(a.status as i32)
+        .bind(&a.method)
+        .bind(&a.path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_audit(&self, q: &AuditQuery) -> Result<Vec<AuditLogRecord>> {
+        let mut sql = String::from("SELECT * FROM audit_logs WHERE 1=1");
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx = 1usize;
+        if let Some(a) = &q.action {
+            sql.push_str(&format!(" AND action LIKE ${idx} || '%'"));
+            idx += 1;
+            binds.push(a.clone());
+        }
+        for (col, v) in [("target_type", &q.target_type), ("target_id", &q.target_id)] {
+            if let Some(v) = v {
+                sql.push_str(&format!(" AND {col} = ${idx}"));
+                idx += 1;
+                binds.push(v.clone());
+            }
+        }
+        for (op, v) in [(">=", &q.start), ("<=", &q.end), ("<", &q.before)] {
+            if let Some(v) = v {
+                sql.push_str(&format!(" AND timestamp {op} ${idx}"));
+                idx += 1;
+                binds.push(v.clone());
+            }
+        }
+        sql.push_str(&format!(" ORDER BY timestamp DESC, id DESC LIMIT ${idx}"));
+        let mut query = sqlx::query(&sql);
+        for b in &binds {
+            query = query.bind(b);
+        }
+        let rows = query
+            .bind(q.limit.max(1) as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(row_to_audit).collect())
+    }
+
+    async fn purge_audit_before(&self, cutoff: &str) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM audit_logs WHERE timestamp < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 // ============================================================================
@@ -582,14 +815,15 @@ impl UsageStore for PostgresBackend {
     async fn record_usage(&self, record: &UsageRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage \
-             (api_key, key_id, user_id, timestamp, request_id, model, input_tokens, output_tokens, \
-              cached_tokens, cache_write_tokens, cost, success, duration_ms, error_message, \
-              provider, protocol) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+             (api_key, key_id, user_id, tags, timestamp, request_id, model, input_tokens, \
+              output_tokens, cached_tokens, cache_write_tokens, cost, success, duration_ms, \
+              error_message, provider, protocol) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         )
         .bind(&record.api_key)
         .bind(&record.key_id)
         .bind(&record.user_id)
+        .bind(&record.tags)
         .bind(&record.timestamp)
         .bind(&record.request_id)
         .bind(&record.model)
@@ -611,26 +845,14 @@ impl UsageStore for PostgresBackend {
 
     async fn get_usage_by_api_key(
         &self,
-        api_key: &str,
-        user_id: Option<&str>,
+        filter: UsageFilter<'_>,
         since: Option<&str>,
         limit: Option<i64>,
         before_id: Option<i64>,
     ) -> Result<Vec<UsageRecord>> {
-        // Empty api_key means "all keys" (admin query with no key filter)
-        let filter_by_key = !api_key.is_empty();
-
         // Build dynamic SQL with numbered placeholders ($1, $2, …)
         let mut param_idx = 1usize;
-        let mut key_clause = "WHERE 1=1".to_string();
-        if filter_by_key {
-            key_clause.push_str(&format!(" AND api_key = ${param_idx}"));
-            param_idx += 1;
-        }
-        if user_id.is_some() {
-            key_clause.push_str(&format!(" AND user_id = ${param_idx}"));
-            param_idx += 1;
-        }
+        let key_clause = usage_where(&filter, &mut param_idx);
         let since_clause = if since.is_some() {
             let s = format!("AND timestamp >= ${param_idx}");
             param_idx += 1;
@@ -652,20 +874,14 @@ impl UsageStore for PostgresBackend {
         };
 
         let sql = format!(
-            "SELECT id, api_key, key_id, user_id, timestamp, request_id, model, \
+            "SELECT id, api_key, key_id, user_id, tags, timestamp, request_id, model, \
              input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
              cost, success, duration_ms, error_message, provider, protocol \
              FROM usage {key_clause} {since_clause} {before_id_clause} \
              ORDER BY timestamp DESC {limit_clause}",
         );
 
-        let mut q = sqlx::query(&sql);
-        if filter_by_key {
-            q = q.bind(api_key);
-        }
-        if let Some(u) = user_id {
-            q = q.bind(u);
-        }
+        let mut q = bind_usage_filter(sqlx::query(&sql), &filter);
         if let Some(s) = since {
             q = q.bind(s);
         }
@@ -685,6 +901,7 @@ impl UsageStore for PostgresBackend {
                 api_key: r.get("api_key"),
                 key_id: r.get("key_id"),
                 user_id: r.get("user_id"),
+                tags: r.get("tags"),
                 timestamp: r.get("timestamp"),
                 request_id: r.get("request_id"),
                 model: r.get("model"),
@@ -706,8 +923,7 @@ impl UsageStore for PostgresBackend {
 
     async fn query_usage_summary(
         &self,
-        api_key: &str,
-        user_id: Option<&str>,
+        filter: UsageFilter<'_>,
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
@@ -725,6 +941,7 @@ impl UsageStore for PostgresBackend {
                 "provider" => "COALESCE(provider, 'unknown')".to_string(),
                 "api_key" => "COALESCE(key_id, api_key)".to_string(),
                 "user" => "COALESCE(user_id, '')".to_string(),
+                "tags" => "COALESCE(tags, '')".to_string(),
                 _ => "to_char(date_trunc('hour', timestamp::timestamptz), 'YYYY-MM-DD\"T\"HH24')"
                     .to_string(),
             }
@@ -744,19 +961,10 @@ impl UsageStore for PostgresBackend {
         };
 
         // Postgres uses $1, $2... placeholders, parameter order adjusted dynamically
-        let filter_by_key = !api_key.is_empty();
 
         #[allow(unused_assignments)]
         let mut param_idx = 1usize;
-        let mut key_clause = "WHERE 1=1".to_string();
-        if filter_by_key {
-            key_clause.push_str(&format!(" AND api_key = ${param_idx}"));
-            param_idx += 1;
-        }
-        if user_id.is_some() {
-            key_clause.push_str(&format!(" AND user_id = ${param_idx}"));
-            param_idx += 1;
-        }
+        let key_clause = usage_where(&filter, &mut param_idx);
         let start_clause = if start.is_some() {
             let s = format!("AND timestamp >= ${param_idx}");
             param_idx += 1;
@@ -785,13 +993,7 @@ impl UsageStore for PostgresBackend {
              ORDER BY group_key DESC{split_order}",
         );
 
-        let mut q = sqlx::query(&sql);
-        if filter_by_key {
-            q = q.bind(api_key);
-        }
-        if let Some(u) = user_id {
-            q = q.bind(u);
-        }
+        let mut q = bind_usage_filter(sqlx::query(&sql), &filter);
         if let Some(s) = start {
             q = q.bind(s);
         }

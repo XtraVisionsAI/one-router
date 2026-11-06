@@ -1,5 +1,5 @@
 <script setup lang="ts">
-  import type { User, UserBody } from '@/api/types'
+  import type { BudgetPeriod, User, UserBody } from '@/api/types'
   import { useMessage } from 'naive-ui'
   import { useUsersApi } from '@/api/users'
 
@@ -19,6 +19,12 @@
   const isEdit = computed(() => !!props.existing)
   const title = computed(() => (isEdit.value ? 'Edit User' : 'Create User'))
 
+  const periodOptions = [
+    { label: 'Monthly', value: 'monthly' },
+    { label: 'Weekly (ISO, Mon)', value: 'weekly' },
+    { label: 'Daily (UTC)', value: 'daily' }
+  ]
+
   const cacheTtlOptions = [
     { label: 'Default (no override)', value: null },
     { label: '5 minutes', value: '5m' },
@@ -33,6 +39,9 @@
     rate_limit: null as number | null,
     tpm_limit: null as number | null,
     allowed_models: [] as string[],
+    allowed_cidrs: [] as string[],
+    default_tags: [] as string[],
+    budget_period: 'monthly' as BudgetPeriod,
     cache_ttl: null as string | null,
     metadata: ''
   })
@@ -53,6 +62,9 @@
             rate_limit: u.rate_limit,
             tpm_limit: u.tpm_limit,
             allowed_models: [...(u.allowed_models ?? [])],
+            allowed_cidrs: [...(u.allowed_cidrs ?? [])],
+            default_tags: [...(u.default_tags ?? [])],
+            budget_period: u.budget_period ?? 'monthly',
             cache_ttl: u.cache_ttl,
             metadata: u.metadata ? JSON.stringify(u.metadata, null, 2) : ''
           }
@@ -88,6 +100,9 @@
       rate_limit: form.value.rate_limit || null,
       tpm_limit: form.value.tpm_limit || null,
       allowed_models: form.value.allowed_models.length ? form.value.allowed_models : null,
+      allowed_cidrs: form.value.allowed_cidrs.length ? form.value.allowed_cidrs : null,
+      default_tags: form.value.default_tags.length ? form.value.default_tags : null,
+      budget_period: form.value.budget_period,
       cache_ttl: form.value.cache_ttl,
       metadata
     }
@@ -119,9 +134,14 @@
       </div>
 
       <div class="flex gap-4">
-        <NFormItem label="Monthly Budget ($)" class="flex-1">
+        <NFormItem label="Budget ($ per period)" class="flex-1">
           <NInputNumber v-model:value="form.monthly_budget" :min="0" :precision="2" placeholder="unlimited" class="w-full" />
         </NFormItem>
+        <NFormItem label="Budget Period" class="flex-1">
+          <NSelect v-model:value="form.budget_period" :options="periodOptions" />
+        </NFormItem>
+      </div>
+      <div class="flex gap-4">
         <NFormItem label="Cost Rate" class="flex-1">
           <NInputNumber v-model:value="form.cost_rate" :min="0" :step="0.1" :precision="2" class="w-full" />
         </NFormItem>
@@ -138,6 +158,14 @@
 
       <NFormItem label="Allowed Models (glob, !exclude — empty = all)">
         <NDynamicTags v-model:value="form.allowed_models" />
+      </NFormItem>
+
+      <NFormItem label="Allowed Client CIDRs (empty = any)">
+        <NDynamicTags v-model:value="form.allowed_cidrs" />
+      </NFormItem>
+
+      <NFormItem label="Default Usage Tags">
+        <NDynamicTags v-model:value="form.default_tags" :max="5" />
       </NFormItem>
 
       <NFormItem label="Cache TTL">

@@ -1,6 +1,7 @@
 //! Utility modules
 
 pub mod api_key;
+pub mod client_ip;
 pub mod glob;
 pub mod image;
 pub mod retry;

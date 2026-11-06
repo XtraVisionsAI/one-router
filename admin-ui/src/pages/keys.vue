@@ -66,6 +66,52 @@
     }
   }
 
+  const graceOptions = [
+    { label: 'Immediately', value: 0 },
+    { label: '1 hour', value: 3600 },
+    { label: '24 hours', value: 86400 },
+    { label: '7 days', value: 604800 }
+  ]
+  const rotateGrace = ref(86400)
+
+  function confirmRotate(key: ApiKey) {
+    rotateGrace.value = 86400
+    dialog.info({
+      title: 'Rotate API Key',
+      content: () =>
+        h('div', { class: 'space-y-3' }, [
+          h(
+            'p',
+            `Issue a new secret for "${key.name}" with the same owner, limits and allowlists. The old key keeps working for:`
+          ),
+          h(NSelect, {
+            value: rotateGrace.value,
+            options: graceOptions,
+            'onUpdate:value': (v: number) => (rotateGrace.value = v)
+          })
+        ]),
+      positiveText: 'Rotate',
+      negativeText: 'Cancel',
+      onPositiveClick: async () => {
+        try {
+          const res = await api.rotate(key.key_id, rotateGrace.value)
+          revealedKey.value = res.api_key
+          message.success('Key rotated — distribute the new key before the old one expires')
+          await load()
+        } catch (e: any) {
+          message.error(e.message)
+        }
+      }
+    })
+  }
+
+  function fmtLastUsed(row: ApiKey) {
+    if (!row.last_used_at) return h('span', { class: 'text-slate-500' }, 'never')
+    const mins = Math.floor((Date.now() / 1000 - row.last_used_at) / 60)
+    const txt = mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.floor(mins / 60)}h ago` : `${Math.floor(mins / 1440)}d ago`
+    return h('span', { title: new Date(row.last_used_at * 1000).toLocaleString() }, txt)
+  }
+
   function confirmDelete(key: ApiKey) {
     dialog.warning({
       title: 'Delete API Key',
@@ -149,6 +195,7 @@
       render: (row: ApiKey) => (row.allowed_models?.length ? row.allowed_models.join(', ') : 'user')
     },
     { title: 'Expires', key: 'expires_at', render: fmtExpiry },
+    { title: 'Last Used', key: 'last_used_at', render: fmtLastUsed },
     {
       title: 'Status',
       key: 'is_active',
@@ -168,6 +215,11 @@
               onClick: () => toggleActive(row)
             },
             { default: () => (row.is_active ? 'Deactivate' : 'Activate') }
+          ),
+          h(
+            NButton,
+            { size: 'small', disabled: !!row.rotated_to, onClick: () => confirmRotate(row) },
+            { default: () => (row.rotated_to ? 'Rotated' : 'Rotate') }
           ),
           h(NButton, { size: 'small', type: 'error', ghost: true, onClick: () => confirmDelete(row) }, { default: () => 'Delete' })
         ])

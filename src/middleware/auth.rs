@@ -16,12 +16,15 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::config::Settings;
-use crate::database::models::{period_spend, ApiKeyRecord, UserRecord};
+use crate::database::models::{period_spend, ApiKeyRecord, BudgetPeriod, UserRecord};
 use crate::database::traits::DatabaseService;
 use crate::schemas::anthropic::ErrorResponse;
+use crate::services::auth_cache::AuthCache;
 use crate::services::backend_pool::model_filter::ModelFilter;
 use crate::utils::api_key::hash_key;
+use crate::utils::client_ip::{client_ip, in_any, parse_cidrs, Cidr};
 use crate::utils::truncate_str;
+use std::net::{IpAddr, SocketAddr};
 
 // ============================================================================
 // API Key Info
@@ -44,6 +47,8 @@ pub struct UserPrincipal {
     pub monthly_budget: Option<f64>,
     pub budget_used_mtd: f64,
     pub budget_mtd_month: Option<String>,
+    #[serde(default)]
+    pub budget_period: BudgetPeriod,
 }
 
 impl UserPrincipal {
@@ -56,8 +61,43 @@ impl UserPrincipal {
             monthly_budget: u.monthly_budget,
             budget_used_mtd: u.budget_used_mtd,
             budget_mtd_month: u.budget_mtd_month.clone(),
+            budget_period: u.budget_period,
         }
     }
+}
+
+/// Max tags taken from the `x-onerouter-tags` request header.
+pub const MAX_REQUEST_TAGS: usize = 5;
+/// Max tags on a usage row (request + key/user defaults).
+pub const MAX_TOTAL_TAGS: usize = 10;
+pub const MAX_TAG_LEN: usize = 64;
+
+/// True for a well-formed tag: 1–64 chars of `[A-Za-z0-9_.:-]`.
+pub fn valid_tag(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= MAX_TAG_LEN
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+}
+
+/// Parse `x-onerouter-tags` ("projA,ci"): invalid entries are dropped with a
+/// warning, at most [`MAX_REQUEST_TAGS`] are kept.
+pub fn parse_request_tags(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for t in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if !valid_tag(t) {
+            tracing::warn!(tag = %truncate_str(t, 80), "Dropping invalid x-onerouter-tags entry");
+            continue;
+        }
+        if out.len() >= MAX_REQUEST_TAGS {
+            tracing::warn!("x-onerouter-tags has more than {MAX_REQUEST_TAGS} tags; extra dropped");
+            break;
+        }
+        if !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 fn positive(v: Option<i32>) -> Option<u32> {
@@ -92,6 +132,15 @@ pub struct ApiKeyInfo {
     /// Owning user (`None` for master/ephemeral keys).
     #[serde(default)]
     pub user: Option<UserPrincipal>,
+    /// Key name (for alerts / logs).
+    #[serde(default)]
+    pub key_name: String,
+    /// Budget period of the key-level sub-budget.
+    #[serde(default)]
+    pub budget_period: BudgetPeriod,
+    /// Usage tags for this request (request header + key/user defaults).
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Model allowlists that must ALL admit the requested model (key, user).
     /// Empty = unrestricted.
     #[serde(skip)]
@@ -113,6 +162,9 @@ impl ApiKeyInfo {
             budget_mtd_month: None,
             cache_ttl: None,
             user: None,
+            key_name: key_id.to_string(),
+            budget_period: BudgetPeriod::Monthly,
+            tags: Vec::new(),
             model_filters: Vec::new(),
         }
     }
@@ -164,6 +216,13 @@ impl ApiKeyInfo {
                 .clone()
                 .or_else(|| user.and_then(|u| u.cache_ttl.clone())),
             user: user.map(UserPrincipal::from_record),
+            key_name: record.name.clone(),
+            budget_period: record.budget_period,
+            tags: merge_tags(
+                &[],
+                record.default_tags.as_deref(),
+                user.and_then(|u| u.default_tags.as_deref()),
+            ),
             model_filters,
         }
     }
@@ -200,16 +259,17 @@ impl ApiKeyInfo {
         self.model_filters.iter().all(|f| f.matches(model))
     }
 
-    /// Which budget layer (if any) is spent for `current_month` ("YYYY-MM").
-    pub fn exhausted_budget(&self, current_month: &str) -> Option<BudgetScope> {
-        let spent = |budget: Option<f64>, used: f64, month: Option<&str>| {
-            budget.is_some_and(|limit| period_spend(used, month, current_month) >= limit)
+    /// Which budget layer (if any) is spent at `now` (each layer in its own period).
+    pub fn exhausted_budget(&self, now: chrono::DateTime<chrono::Utc>) -> Option<BudgetScope> {
+        let spent = |budget: Option<f64>, used: f64, stored: Option<&str>, p: BudgetPeriod| {
+            budget.is_some_and(|limit| period_spend(used, stored, &p.key_at(now)) >= limit)
         };
         if let Some(u) = &self.user {
             if spent(
                 u.monthly_budget,
                 u.budget_used_mtd,
                 u.budget_mtd_month.as_deref(),
+                u.budget_period,
             ) {
                 return Some(BudgetScope::User);
             }
@@ -218,11 +278,35 @@ impl ApiKeyInfo {
             self.monthly_budget,
             self.budget_used_mtd,
             self.budget_mtd_month.as_deref(),
+            self.budget_period,
         ) {
             return Some(BudgetScope::Key);
         }
         None
     }
+}
+
+/// Request tags first, then key defaults, then user defaults; de-duplicated,
+/// capped at [`MAX_TOTAL_TAGS`].
+pub fn merge_tags(
+    request: &[String],
+    key: Option<&[String]>,
+    user: Option<&[String]>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in request
+        .iter()
+        .chain(key.unwrap_or(&[]).iter())
+        .chain(user.unwrap_or(&[]).iter())
+    {
+        if out.len() >= MAX_TOTAL_TAGS {
+            break;
+        }
+        if !out.contains(t) {
+            out.push(t.clone());
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +327,7 @@ pub enum AuthError {
     ExpiredKey,
     InactiveOwner,
     BudgetExceeded(BudgetScope),
+    IpNotAllowed,
     InternalError(String),
 }
 
@@ -257,6 +342,7 @@ impl IntoResponse for AuthError {
             AuthError::ExpiredKey => "expired_key",
             AuthError::InactiveOwner => "inactive_owner",
             AuthError::BudgetExceeded(_) => "budget_exceeded",
+            AuthError::IpNotAllowed => "ip_not_allowed",
             AuthError::InternalError(_) => "internal_error",
         };
         crate::observability::metrics::record_auth_failure(reason);
@@ -295,10 +381,15 @@ impl IntoResponse for AuthError {
                 StatusCode::FORBIDDEN,
                 "permission_error",
                 match scope {
-                    BudgetScope::User => "Monthly budget exceeded for this API key's user.",
-                    BudgetScope::Key => "Monthly budget exceeded for this API key.",
+                    BudgetScope::User => "Budget exceeded for this API key's user.",
+                    BudgetScope::Key => "Budget exceeded for this API key.",
                 }
                 .into(),
+            ),
+            AuthError::IpNotAllowed => (
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Client address is not allowed for this API key.".into(),
             ),
             AuthError::InternalError(msg) => {
                 tracing::error!(error = %msg, "Auth internal error");
@@ -322,26 +413,61 @@ impl IntoResponse for AuthError {
 pub struct AuthState {
     pub settings: Arc<Settings>,
     pub storage: Arc<dyn DatabaseService>,
+    pub cache: Arc<AuthCache>,
 }
 
 impl AuthState {
-    pub fn new(settings: Arc<Settings>, storage: Arc<dyn DatabaseService>) -> Self {
-        Self { settings, storage }
+    pub fn new(
+        settings: Arc<Settings>,
+        storage: Arc<dyn DatabaseService>,
+        cache: Arc<AuthCache>,
+    ) -> Self {
+        Self {
+            settings,
+            storage,
+            cache,
+        }
     }
+}
+
+/// Per-request inputs to [`authorize`] beyond the stored records.
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    pub now: chrono::DateTime<chrono::Utc>,
+    /// Resolved client address (`None` = unknown).
+    pub client_ip: Option<IpAddr>,
+    /// Parsed `x-onerouter-tags`.
+    pub tags: Vec<String>,
+}
+
+/// Every non-empty CIDR allowlist (key, user) must contain `ip`. Unknown
+/// address + any allowlist → denied (fail closed). Malformed stored entries
+/// deny as well (they were validated on write).
+fn ip_allowed(lists: &[Option<&[String]>], ip: Option<IpAddr>) -> bool {
+    for list in lists.iter().flatten().filter(|l| !l.is_empty()) {
+        let Some(ip) = ip else { return false };
+        let cidrs: Vec<Cidr> = match parse_cidrs(list) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        if !in_any(&cidrs, ip) {
+            return false;
+        }
+    }
+    true
 }
 
 // ============================================================================
 // Middleware
 // ============================================================================
 
-/// Validate a key record (and its owner) into a principal. Pure — `now` is unix
-/// seconds, `current_month` is "YYYY-MM".
+/// Validate a key record (and its owner) into a principal. Pure.
 pub fn authorize(
     record: &ApiKeyRecord,
     user: Option<&UserRecord>,
-    now: i64,
-    current_month: &str,
+    ctx: &RequestContext,
 ) -> Result<ApiKeyInfo, AuthError> {
+    let now = ctx.now.timestamp();
     if !record.is_valid() {
         return Err(AuthError::InactiveKey {
             reason: record.deactivated_reason.clone(),
@@ -353,11 +479,59 @@ pub fn authorize(
     if user.is_some_and(|u| !u.is_active) {
         return Err(AuthError::InactiveOwner);
     }
-    let info = ApiKeyInfo::from_db_record(record, user);
-    if let Some(scope) = info.exhausted_budget(current_month) {
+    if !ip_allowed(
+        &[
+            record.allowed_cidrs.as_deref(),
+            user.and_then(|u| u.allowed_cidrs.as_deref()),
+        ],
+        ctx.client_ip,
+    ) {
+        return Err(AuthError::IpNotAllowed);
+    }
+    let mut info = ApiKeyInfo::from_db_record(record, user);
+    if let Some(scope) = info.exhausted_budget(ctx.now) {
         return Err(AuthError::BudgetExceeded(scope));
     }
+    info.tags = merge_tags(
+        &ctx.tags,
+        record.default_tags.as_deref(),
+        user.and_then(|u| u.default_tags.as_deref()),
+    );
     Ok(info)
+}
+
+/// Key + owner for a hash: auth cache first, then storage (result cached).
+async fn lookup(
+    state: &AuthState,
+    hash: &str,
+) -> Result<Option<Arc<(ApiKeyRecord, Option<UserRecord>)>>, AuthError> {
+    if let Some(hit) = state.cache.get(hash) {
+        return Ok(hit);
+    }
+    let record = state
+        .storage
+        .api_keys()
+        .get_api_key(hash)
+        .await
+        .map_err(|e| AuthError::InternalError(e.to_string()))?;
+    let Some(record) = record else {
+        state.cache.put(hash, None);
+        return Ok(None);
+    };
+    let user = if record.user_id.is_empty() {
+        None
+    } else {
+        // An owned key whose user row is gone is orphaned — rejected below.
+        state
+            .storage
+            .users()
+            .get_user(&record.user_id)
+            .await
+            .map_err(|e| AuthError::InternalError(e.to_string()))?
+    };
+    let value = (record, user);
+    state.cache.put(hash, Some(value.clone()));
+    Ok(Some(Arc::new(value)))
 }
 
 pub async fn require_api_key(
@@ -382,34 +556,45 @@ pub async fn require_api_key(
     // Hash the incoming key before looking it up in the database
     let hashed = hash_key(&api_key, auth_state.settings.encryption_key.as_deref());
 
-    let record = auth_state
-        .storage
-        .api_keys()
-        .get_api_key(&hashed)
-        .await
-        .map_err(|e| AuthError::InternalError(e.to_string()))?
-        .ok_or(AuthError::InvalidApiKey)?;
-
-    let user = if record.user_id.is_empty() {
-        None
-    } else {
-        let user = auth_state
-            .storage
-            .users()
-            .get_user(&record.user_id)
-            .await
-            .map_err(|e| AuthError::InternalError(e.to_string()))?;
-        // An owned key whose user row is gone is orphaned — reject it.
-        Some(user.ok_or(AuthError::InactiveOwner)?)
+    let Some(entry) = lookup(&auth_state, &hashed).await? else {
+        return Err(AuthError::InvalidApiKey);
     };
+    let (record, user) = (&entry.0, entry.1.as_ref());
+    if !record.user_id.is_empty() && user.is_none() {
+        return Err(AuthError::InactiveOwner);
+    }
 
-    let now = chrono::Utc::now();
-    let key_info = authorize(
-        &record,
-        user.as_ref(),
-        now.timestamp(),
-        &now.format("%Y-%m").to_string(),
-    )?;
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let ctx = RequestContext {
+        now: chrono::Utc::now(),
+        client_ip: client_ip(
+            peer,
+            request.headers(),
+            &auth_state.settings.trusted_proxy_cidrs,
+        ),
+        tags: request
+            .headers()
+            .get("x-onerouter-tags")
+            .and_then(|v| v.to_str().ok())
+            .map(parse_request_tags)
+            .unwrap_or_default(),
+    };
+    let key_info = authorize(record, user, &ctx)?;
+
+    // last_used_at, debounced per instance; never blocks the request.
+    if auth_state.cache.should_touch(&hashed) {
+        let storage = auth_state.storage.clone();
+        let at = ctx.now.timestamp();
+        tokio::spawn(async move {
+            if let Err(e) = storage.api_keys().touch_last_used(&hashed, at).await {
+                tracing::debug!(error = %e, "Failed to update last_used_at");
+            }
+        });
+    }
+
     request.extensions_mut().insert(key_info);
     Ok(next.run(request).await)
 }
@@ -456,6 +641,12 @@ mod tests {
             metadata: None,
             expires_at: None,
             allowed_models: None,
+            allowed_cidrs: None,
+            budget_period: BudgetPeriod::Monthly,
+            budget_alerts_sent: None,
+            default_tags: None,
+            last_used_at: None,
+            rotated_to: None,
             created_at: 0,
             updated_at: None,
         }
@@ -468,6 +659,23 @@ mod tests {
     }
 
     const MONTH: &str = "2026-11";
+
+    /// Context at unix `t` seconds, but in MONTH (2026-11-15) for budget periods
+    /// when `t` is small (the expiry tests use tiny timestamps).
+    fn ctx(t: i64) -> RequestContext {
+        use chrono::TimeZone;
+        let now = if t < 1_000_000 {
+            chrono::Utc.with_ymd_and_hms(2026, 11, 15, 0, 0, 0).unwrap()
+                + chrono::Duration::seconds(t)
+        } else {
+            chrono::Utc.timestamp_opt(t, 0).unwrap()
+        };
+        RequestContext {
+            now,
+            client_ip: Some("10.0.0.5".parse().unwrap()),
+            tags: vec![],
+        }
+    }
 
     #[test]
     fn test_api_key_info_master() {
@@ -503,7 +711,7 @@ mod tests {
         u.cost_rate = 0.5;
         u.cache_ttl = Some("1h".into());
         u.rate_limit = Some(30);
-        let info = authorize(&key(), Some(&u), 0, MONTH).unwrap();
+        let info = authorize(&key(), Some(&u), &ctx(0)).unwrap();
         assert_eq!(info.cost_rate, 0.5);
         assert_eq!(info.cache_ttl.as_deref(), Some("1h"));
         assert_eq!(info.user.as_ref().unwrap().rate_limit, Some(30));
@@ -512,7 +720,7 @@ mod tests {
         let mut k = key();
         k.cache_ttl = Some("5m".into()); // key overrides user
         k.rate_limit = 10;
-        let info = authorize(&k, Some(&u), 0, MONTH).unwrap();
+        let info = authorize(&k, Some(&u), &ctx(0)).unwrap();
         assert_eq!(info.cache_ttl.as_deref(), Some("5m"));
         assert_eq!(info.rate_limit, Some(10));
     }
@@ -520,22 +728,22 @@ mod tests {
     #[test]
     fn expiry_and_owner_status() {
         let mut k = key();
-        k.expires_at = Some(100);
-        assert!(authorize(&k, Some(&user()), 99, MONTH).is_ok());
+        k.expires_at = Some(ctx(100).now.timestamp());
+        assert!(authorize(&k, Some(&user()), &ctx(99)).is_ok());
         assert!(matches!(
-            authorize(&k, Some(&user()), 100, MONTH),
+            authorize(&k, Some(&user()), &ctx(100)),
             Err(AuthError::ExpiredKey)
         ));
         let mut u = user();
         u.is_active = false;
         assert!(matches!(
-            authorize(&key(), Some(&u), 0, MONTH),
+            authorize(&key(), Some(&u), &ctx(0)),
             Err(AuthError::InactiveOwner)
         ));
         let mut k = key();
         k.is_active = false;
         assert!(matches!(
-            authorize(&k, Some(&user()), 0, MONTH),
+            authorize(&k, Some(&user()), &ctx(0)),
             Err(AuthError::InactiveKey { .. })
         ));
     }
@@ -547,21 +755,76 @@ mod tests {
         u.budget_used_mtd = 10.0;
         u.budget_mtd_month = Some(MONTH.into());
         assert!(matches!(
-            authorize(&key(), Some(&u), 0, MONTH),
+            authorize(&key(), Some(&u), &ctx(0)),
             Err(AuthError::BudgetExceeded(BudgetScope::User))
         ));
         // Last month's spend does not block this month (lazy reset).
         u.budget_mtd_month = Some("2026-10".into());
-        assert!(authorize(&key(), Some(&u), 0, MONTH).is_ok());
+        assert!(authorize(&key(), Some(&u), &ctx(0)).is_ok());
 
         let mut k = key();
         k.monthly_budget = Some(1.0);
         k.budget_used_mtd = 1.5;
         k.budget_mtd_month = Some(MONTH.into());
         assert!(matches!(
-            authorize(&k, Some(&user()), 0, MONTH),
+            authorize(&k, Some(&user()), &ctx(0)),
             Err(AuthError::BudgetExceeded(BudgetScope::Key))
         ));
+    }
+
+    #[test]
+    fn ip_allowlists_intersect_and_fail_closed() {
+        let mut k = key();
+        k.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]);
+        let mut u = user();
+        u.allowed_cidrs = Some(vec!["10.0.0.0/24".into()]);
+        assert!(authorize(&k, Some(&u), &ctx(0)).is_ok()); // 10.0.0.5 in both
+        let mut c = ctx(0);
+        c.client_ip = Some("10.9.0.1".parse().unwrap()); // in key's, not user's
+        assert!(matches!(
+            authorize(&k, Some(&u), &c),
+            Err(AuthError::IpNotAllowed)
+        ));
+        c.client_ip = None; // unknown address with an allowlist → deny
+        assert!(matches!(
+            authorize(&k, Some(&u), &c),
+            Err(AuthError::IpNotAllowed)
+        ));
+        // No allowlists: unknown address is fine.
+        assert!(authorize(&key(), Some(&user()), &c).is_ok());
+    }
+
+    #[test]
+    fn weekly_user_budget_resets_with_the_week() {
+        let mut u = user();
+        u.budget_period = BudgetPeriod::Weekly;
+        u.monthly_budget = Some(5.0);
+        u.budget_used_mtd = 5.0;
+        u.budget_mtd_month = Some(BudgetPeriod::Weekly.key_at(ctx(0).now));
+        assert!(matches!(
+            authorize(&key(), Some(&u), &ctx(0)),
+            Err(AuthError::BudgetExceeded(BudgetScope::User))
+        ));
+        // Eight days later it is a new ISO week.
+        assert!(authorize(&key(), Some(&u), &ctx(8 * 86_400)).is_ok());
+    }
+
+    #[test]
+    fn tags_parse_and_merge() {
+        assert_eq!(
+            parse_request_tags(" projA, ci ,bad tag,projA"),
+            vec!["projA", "ci"]
+        );
+        assert_eq!(parse_request_tags("a,b,c,d,e,f").len(), MAX_REQUEST_TAGS);
+        assert!(!valid_tag(&"x".repeat(65)));
+        let mut k = key();
+        k.default_tags = Some(vec!["team-x".into(), "ci".into()]);
+        let mut u = user();
+        u.default_tags = Some(vec!["org".into()]);
+        let mut c = ctx(0);
+        c.tags = vec!["ci".into(), "run:42".into()];
+        let info = authorize(&k, Some(&u), &c).unwrap();
+        assert_eq!(info.tags, vec!["ci", "run:42", "team-x", "org"]);
     }
 
     #[test]
@@ -570,11 +833,11 @@ mod tests {
         k.allowed_models = Some(vec!["claude-*".into()]);
         let mut u = user();
         u.allowed_models = Some(vec!["*".into(), "!claude-opus-*".into()]);
-        let info = authorize(&k, Some(&u), 0, MONTH).unwrap();
+        let info = authorize(&k, Some(&u), &ctx(0)).unwrap();
         assert!(info.allows_model("claude-sonnet-4-5"));
         assert!(!info.allows_model("claude-opus-4-1")); // user excludes
         assert!(!info.allows_model("gpt-5")); // key excludes
-        let open = authorize(&key(), Some(&user()), 0, MONTH).unwrap();
+        let open = authorize(&key(), Some(&user()), &ctx(0)).unwrap();
         assert!(open.allows_model("gpt-5"));
     }
 }

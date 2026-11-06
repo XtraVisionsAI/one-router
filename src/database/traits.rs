@@ -19,7 +19,9 @@ pub trait ApiKeyStore: Send + Sync {
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()>;
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()>;
     async fn deactivate_api_key(&self, api_key: &str, reason: &str) -> Result<()>;
-    async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<bool>;
+    /// Atomically add `amount` to the key's spend counters; returns the
+    /// counters after the increment.
+    async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<SpendAfter>;
     /// Reset monthly budget and archive previous month's usage to budget_history.
     async fn reset_monthly_budget(
         &self,
@@ -53,6 +55,15 @@ pub trait ApiKeyStore: Send + Sync {
     /// no owner yet. Returns `false` when another writer assigned it first.
     /// Used by the one-time key → user migration (multi-instance safe).
     async fn assign_unowned_key(&self, record: &ApiKeyRecord) -> Result<bool>;
+
+    /// Set `last_used_at` (no other column changes).
+    async fn touch_last_used(&self, api_key: &str, at: i64) -> Result<()>;
+
+    /// Record that the budget alert for `threshold` in `period` was sent.
+    /// Returns `true` only for the caller that recorded it first (multi-instance
+    /// dedupe: one alert per threshold per period).
+    async fn claim_budget_alert(&self, api_key: &str, period: &str, threshold: f64)
+        -> Result<bool>;
 }
 
 #[async_trait]
@@ -67,7 +78,7 @@ pub trait UserStore: Send + Sync {
     async fn delete_user(&self, user_id: &str) -> Result<()>;
     /// Atomically add `amount` to the user's spend counters. Returns `true` when
     /// the month-to-date spend has reached the monthly budget.
-    async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<bool>;
+    async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<SpendAfter>;
     /// Reset month-to-date spend and archive `prev_mtd` under `prev_month`.
     async fn reset_user_monthly_budget(
         &self,
@@ -76,29 +87,52 @@ pub trait UserStore: Send + Sync {
         prev_month: &str,
         prev_mtd: f64,
     ) -> Result<()>;
+    /// See [`ApiKeyStore::claim_budget_alert`].
+    async fn claim_user_budget_alert(
+        &self,
+        user_id: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool>;
+}
+
+#[async_trait]
+pub trait AuditStore: Send + Sync {
+    async fn record_audit(&self, record: &AuditLogRecord) -> Result<()>;
+    /// Newest first, at most `query.limit` rows.
+    async fn query_audit(&self, query: &AuditQuery) -> Result<Vec<AuditLogRecord>>;
+    /// Delete entries older than `cutoff` (RFC3339). Returns rows removed.
+    async fn purge_audit_before(&self, cutoff: &str) -> Result<u64>;
+}
+
+/// Usage row filters; all set fields combine with AND.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UsageFilter<'a> {
+    /// Stored `usage.api_key` value (key hash / internal id). Empty = any.
+    pub api_key: &'a str,
+    pub user_id: Option<&'a str>,
+    /// Rows whose tag list contains this tag.
+    pub tag: Option<&'a str>,
 }
 
 #[async_trait]
 pub trait UsageStore: Send + Sync {
     async fn record_usage(&self, record: &UsageRecord) -> Result<()>;
-    /// Raw usage rows, newest first. `api_key` (the stored hash / internal id;
-    /// empty = any) and `user_id` filters combine with AND.
+    /// Raw usage rows, newest first.
     async fn get_usage_by_api_key(
         &self,
-        api_key: &str,
-        user_id: Option<&str>,
+        filter: UsageFilter<'_>,
         since: Option<&str>,
         limit: Option<i64>,
         before_id: Option<i64>,
     ) -> Result<Vec<UsageRecord>>;
     /// Aggregate usage query, grouped by group_by ("hour", "day", "month", "model",
-    /// "provider", "api_key", "user"). Optional split_by adds a secondary grouping
-    /// dimension. start / end are RFC3339 strings, both optional. Filters as in
-    /// [`get_usage_by_api_key`](Self::get_usage_by_api_key).
+    /// "provider", "api_key", "user", "tags" — the raw comma-joined tag list;
+    /// callers explode it per tag). Optional split_by adds a secondary grouping
+    /// dimension. start / end are RFC3339 strings, both optional.
     async fn query_usage_summary(
         &self,
-        api_key: &str,
-        user_id: Option<&str>,
+        filter: UsageFilter<'_>,
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
@@ -161,6 +195,34 @@ pub fn internal_setting(key: &str, value: &str) -> SystemSettingRecord {
     }
 }
 
+/// Next alert-dedupe state if `threshold` has not been sent in `period`
+/// (`None` = already sent). Shared by every backend's claim implementation.
+pub fn next_alert_state(current: Option<&str>, period: &str, threshold: f64) -> Option<String> {
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct State {
+        period: String,
+        thresholds: Vec<f64>,
+    }
+    let mut state: State = current
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if state.period != period {
+        state = State {
+            period: period.to_string(),
+            thresholds: Vec::new(),
+        };
+    }
+    if state
+        .thresholds
+        .iter()
+        .any(|t| (t - threshold).abs() < 1e-9)
+    {
+        return None;
+    }
+    state.thresholds.push(threshold);
+    serde_json::to_string(&state).ok()
+}
+
 /// The user a legacy (ownerless) key becomes: it takes over the key's
 /// budget, spend counters, cost rate and limits.
 fn legacy_key_user(key: &ApiKeyRecord, name: String, now: i64) -> UserRecord {
@@ -216,6 +278,7 @@ async fn unique_user_name<D: DatabaseService + ?Sized>(db: &D, base: &str) -> Re
 pub trait DatabaseService: Send + Sync {
     fn api_keys(&self) -> &dyn ApiKeyStore;
     fn users(&self) -> &dyn UserStore;
+    fn audit(&self) -> &dyn AuditStore;
     fn usage(&self) -> &dyn UsageStore;
     fn model_mapping(&self) -> &dyn ModelMappingStore;
     fn backends(&self) -> &dyn BackendConfigStore;
