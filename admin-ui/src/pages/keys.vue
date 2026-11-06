@@ -1,16 +1,28 @@
 <script setup lang="ts">
-  import type { ApiKey } from '@/api/types'
-  import { NAlert, NButton, NTag, NTooltip, useDialog, useMessage } from 'naive-ui'
+  import type { ApiKey, User } from '@/api/types'
+  import { NAlert, NButton, NSelect, NTag, NTooltip, useDialog, useMessage } from 'naive-ui'
   import { h } from 'vue'
+  import { useRoute, useRouter } from 'vue-router'
   import { useKeysApi } from '@/api/keys'
+  import { useUsersApi } from '@/api/users'
   import KeyModal from '@/components/KeyModal.vue'
   import { fmtMoney } from '@/utils/format'
 
   const message = useMessage()
   const dialog = useDialog()
   const api = useKeysApi()
+  const usersApi = useUsersApi()
+  const route = useRoute()
+  const router = useRouter()
 
   const keys = ref<ApiKey[]>([])
+  const users = ref<User[]>([])
+  const userFilter = ref<string | null>((route.query.user as string) || null)
+  const userOptions = computed(() => users.value.map((u) => ({ label: u.name, value: u.user_id })))
+  const visibleKeys = computed(() =>
+    userFilter.value ? keys.value.filter((k) => k.user_id === userFilter.value) : keys.value
+  )
+  watch(userFilter, (v) => router.replace({ query: v ? { user: v } : {} }))
   const loading = ref(true)
   const modalShow = ref(false)
   const editingKey = ref<ApiKey | undefined>()
@@ -19,8 +31,9 @@
   async function load() {
     loading.value = true
     try {
-      const res = await api.list()
-      keys.value = res.data
+      const [k, u] = await Promise.all([api.list(), usersApi.list()])
+      keys.value = k.data
+      users.value = u.data
     } catch (e: any) {
       message.error(e.message)
     } finally {
@@ -93,8 +106,20 @@
     navigator.clipboard.writeText(key).then(() => message.success('Copied!'))
   }
 
+  function fmtExpiry(row: ApiKey) {
+    if (!row.expires_at) return '—'
+    const d = new Date(row.expires_at * 1000)
+    const expired = row.expires_at * 1000 <= Date.now()
+    return h('span', { class: expired ? 'text-red-400' : '' }, `${expired ? 'expired ' : ''}${d.toLocaleDateString()}`)
+  }
+
   const columns = [
     { title: 'Name', key: 'name' },
+    {
+      title: 'User',
+      key: 'user_name',
+      render: (row: ApiKey) => row.user_name ?? h('span', { class: 'text-slate-500' }, row.user_id || '—')
+    },
     {
       title: 'Key',
       key: 'api_key',
@@ -102,19 +127,28 @@
       render: (row: ApiKey) => h('span', { class: 'font-mono text-xs text-slate-400' }, row.api_key)
     },
     {
-      title: 'Rate Limit',
+      title: 'Key Limits',
       key: 'rate_limit',
       render: (row: ApiKey) =>
         [row.rate_limit > 0 ? `${row.rate_limit} rpm` : null, row.tpm_limit ? `${row.tpm_limit} tpm` : null]
           .filter(Boolean)
-          .join(' · ') || '—'
+          .join(' · ') || 'user'
     },
     {
-      title: 'Budget MTD',
+      title: 'Spend MTD',
       key: 'budget',
       render: (row: ApiKey) =>
-        row.monthly_budget != null ? `${fmtMoney(row.budget_used_mtd)} / ${fmtMoney(row.monthly_budget)}` : '—'
+        row.monthly_budget != null
+          ? `${fmtMoney(row.budget_used_mtd)} / ${fmtMoney(row.monthly_budget)}`
+          : fmtMoney(row.budget_used_mtd)
     },
+    {
+      title: 'Models',
+      key: 'allowed_models',
+      ellipsis: { tooltip: true },
+      render: (row: ApiKey) => (row.allowed_models?.length ? row.allowed_models.join(', ') : 'user')
+    },
+    { title: 'Expires', key: 'expires_at', render: fmtExpiry },
     {
       title: 'Status',
       key: 'is_active',
@@ -147,7 +181,7 @@
   <div>
     <div class="flex items-center justify-between mb-6">
       <h1 class="text-xl font-semibold text-slate-100">API Keys</h1>
-      <n-button type="primary" @click="openCreate">
+      <n-button type="primary" :disabled="!users.length" @click="openCreate">
         <template #icon><span class="i-carbon-add" /></template>
         Create Key
       </n-button>
@@ -170,16 +204,39 @@
       </div>
     </n-alert>
 
-    <NDataTable :columns="columns" :data="keys" :loading="loading" :pagination="{ pageSize: 20 }" size="small">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="text-xs text-slate-400">User</span>
+      <NSelect
+        v-model:value="userFilter"
+        :options="userOptions"
+        filterable
+        clearable
+        placeholder="All users"
+        style="width: 220px"
+      />
+      <span v-if="!users.length && !loading" class="text-xs text-slate-400">
+        Create a user first — every key belongs to a user.
+      </span>
+    </div>
+
+    <NDataTable :columns="columns" :data="visibleKeys" :loading="loading" :pagination="{ pageSize: 20 }" size="small">
       <template #empty>
         <div class="py-12 text-center">
           <span class="i-carbon-api text-4xl text-slate-600 block mx-auto mb-3" />
           <p class="text-slate-500 text-sm">No API keys yet</p>
-          <n-button type="primary" size="small" class="mt-4" @click="openCreate">Create your first key</n-button>
+          <n-button type="primary" size="small" class="mt-4" :disabled="!users.length" @click="openCreate">
+            Create a key
+          </n-button>
         </div>
       </template>
     </NDataTable>
 
-    <key-modal v-model:show="modalShow" :existing="editingKey" @saved="onSaved" />
+    <key-modal
+      v-model:show="modalShow"
+      :existing="editingKey"
+      :users="users"
+      :default-user-id="userFilter"
+      @saved="onSaved"
+    />
   </div>
 </template>

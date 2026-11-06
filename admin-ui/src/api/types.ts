@@ -28,18 +28,59 @@ export interface UpsertBackendBody {
   config?: Record<string, unknown>
 }
 
+// ── Users ─────────────────────────────────────────────────────
+export interface User {
+  user_id: string
+  name: string
+  email: string | null
+  is_active: boolean
+  cost_rate: number
+  monthly_budget: number | null
+  budget_used_mtd: number
+  budget_used: number
+  budget_history: Record<string, number> | null
+  rate_limit: number | null // shared RPM; null = global default
+  tpm_limit: number | null
+  allowed_models: string[] | null
+  cache_ttl: string | null
+  metadata: Record<string, unknown> | null
+  key_count: number
+  created_at: number
+  updated_at: number | null
+}
+
+export interface UserDetail extends User {
+  keys: ApiKey[]
+}
+
+export interface UserBody {
+  name?: string
+  email?: string | null
+  cost_rate?: number
+  monthly_budget?: number | null
+  rate_limit?: number | null
+  tpm_limit?: number | null
+  allowed_models?: string[] | null
+  cache_ttl?: string | null
+  metadata?: Record<string, unknown> | null
+}
+
 // ── API Keys ──────────────────────────────────────────────────
 export interface ApiKey {
   key_id: string // stable identifier used in admin API paths
   api_key: string // masked display form (e.g. "sk-abcd••••5678")
   name: string
+  user_id: string
+  user_name: string | null
   deactivated_reason: string | null
-  rate_limit: number
-  monthly_budget: number | null
-  budget_used_mtd: number | null
+  rate_limit: number | null // key-level sub-limit
   tpm_limit: number | null
+  monthly_budget: number | null
+  budget_used_mtd: number
+  budget_used: number
   cache_ttl: string | null
-  cost_rate: number
+  expires_at: number | null // unix seconds
+  allowed_models: string[] | null
   is_active: boolean
   metadata: Record<string, unknown> | null
   created_at: number
@@ -48,21 +89,24 @@ export interface ApiKey {
 
 export interface CreateKeyBody {
   name: string
-  rate_limit: number
-  monthly_budget: number | null
+  user_id: string
+  rate_limit?: number | null
+  monthly_budget?: number | null
   tpm_limit?: number | null
   cache_ttl?: string | null
-  cost_rate: number
+  expires_at?: number | null
+  allowed_models?: string[] | null
   metadata?: Record<string, unknown> | null
 }
 
 export interface UpdateKeyBody {
   name?: string
-  rate_limit?: number
+  rate_limit?: number | null
   monthly_budget?: number | null
   tpm_limit?: number | null
   cache_ttl?: string | null
-  cost_rate?: number
+  expires_at?: number | null
+  allowed_models?: string[] | null
   metadata?: Record<string, unknown> | null
 }
 

@@ -57,7 +57,10 @@ impl SqliteBackend {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS api_keys (
                 api_key TEXT PRIMARY KEY,
-                name TEXT UNIQUE DEFAULT '',
+                key_id TEXT,
+                key_display TEXT DEFAULT '',
+                user_id TEXT,
+                name TEXT DEFAULT '',
                 is_active INTEGER DEFAULT 1,
                 rate_limit INTEGER DEFAULT 100,
                 service_tier TEXT DEFAULT 'default',
@@ -70,6 +73,9 @@ impl SqliteBackend {
                 tpm_limit INTEGER,
                 cache_ttl TEXT,
                 metadata TEXT,
+                cost_rate REAL DEFAULT 1.0,
+                expires_at INTEGER,
+                allowed_models TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER
             )",
@@ -103,12 +109,6 @@ impl SqliteBackend {
         .await
         .ok();
 
-        // Migration: add unique index on api_keys.name if upgrading from older schema
-        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_name ON api_keys(name)")
-            .execute(&self.pool)
-            .await
-            .ok(); // ignore error if index already exists
-
         // Migration: add key_display column for masked display form
         sqlx::query("ALTER TABLE api_keys ADD COLUMN key_display TEXT DEFAULT ''")
             .execute(&self.pool)
@@ -121,9 +121,45 @@ impl SqliteBackend {
             .await
             .ok();
         self.backfill_api_key_ids().await?;
+        // Migration: users — rebuild a legacy api_keys table (global UNIQUE name,
+        // no owner columns) into the per-user schema.
+        self.migrate_api_keys_to_user_schema().await?;
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_id ON api_keys(key_id)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_user_name ON api_keys(user_id, name)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
+            .execute(&self.pool)
+            .await?;
+
+        // --- users ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                email TEXT,
+                is_active INTEGER DEFAULT 1,
+                cost_rate REAL DEFAULT 1.0,
+                monthly_budget REAL,
+                budget_used REAL DEFAULT 0.0,
+                budget_used_mtd REAL DEFAULT 0.0,
+                budget_mtd_month TEXT,
+                budget_history TEXT,
+                rate_limit INTEGER,
+                tpm_limit INTEGER,
+                allowed_models TEXT,
+                cache_ttl TEXT,
+                metadata TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
 
         // --- usage ---
         sqlx::query(
@@ -164,6 +200,15 @@ impl SqliteBackend {
             .execute(&self.pool)
             .await
             .ok();
+
+        // Migration: usage.user_id (backfilled by migrate_keys_to_users)
+        sqlx::query("ALTER TABLE usage ADD COLUMN user_id TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_user_ts ON usage(user_id, timestamp)")
+            .execute(&self.pool)
+            .await?;
 
         // Migration: usage.key_id — on first add, attribute existing rows via
         // the key hash (only possible while the api_keys row still exists).
@@ -356,6 +401,97 @@ impl SqliteBackend {
         Ok(())
     }
 
+    /// Full-row update of an api_keys row; `extra_where` narrows the match.
+    /// Returns rows affected.
+    async fn write_api_key(&self, record: &ApiKeyRecord, extra_where: &str) -> Result<u64> {
+        let res = sqlx::query(&format!(
+            "UPDATE api_keys SET \
+             user_id = ?, name = ?, is_active = ?, rate_limit = ?, cost_rate = ?, \
+             monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
+             deactivated_reason = ?, budget_history = ?, tpm_limit = ?, cache_ttl = ?, metadata = ?, \
+             expires_at = ?, allowed_models = ?, updated_at = ? \
+             WHERE api_key = ?{extra_where}"
+        ))
+        .bind(&record.user_id)
+        .bind(&record.name)
+        .bind(record.is_active as i32)
+        .bind(record.rate_limit)
+        .bind(record.cost_rate)
+        .bind(record.monthly_budget)
+        .bind(record.budget_used)
+        .bind(record.budget_used_mtd)
+        .bind(&record.budget_mtd_month)
+        .bind(&record.deactivated_reason)
+        .bind(&record.budget_history)
+        .bind(record.tpm_limit)
+        .bind(&record.cache_ttl)
+        .bind(&record.metadata)
+        .bind(record.expires_at)
+        .bind(patterns_to_json(&record.allowed_models))
+        .bind(unix_now())
+        .bind(&record.api_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Legacy api_keys tables carry an inline global `UNIQUE(name)`, which SQLite
+    /// cannot drop in place. Rebuild into the per-user schema (owner, expiry,
+    /// allowlist columns; uniqueness becomes `(user_id, name)`). Runs once —
+    /// detected by the missing `user_id` column.
+    async fn migrate_api_keys_to_user_schema(&self) -> Result<()> {
+        let cols = sqlx::query("PRAGMA table_info(api_keys)")
+            .fetch_all(&self.pool)
+            .await?;
+        if cols.iter().any(|r| r.get::<String, _>("name") == "user_id") {
+            return Ok(());
+        }
+        tracing::info!("Rebuilding api_keys table for per-user key names");
+        let copied = "api_key, key_id, key_display, name, is_active, rate_limit, service_tier, \
+             cost_rate, monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
+             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at";
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE api_keys_new (
+                api_key TEXT PRIMARY KEY,
+                key_id TEXT,
+                key_display TEXT DEFAULT '',
+                user_id TEXT,
+                name TEXT DEFAULT '',
+                is_active INTEGER DEFAULT 1,
+                rate_limit INTEGER DEFAULT 100,
+                service_tier TEXT DEFAULT 'default',
+                monthly_budget REAL,
+                budget_used REAL DEFAULT 0.0,
+                budget_used_mtd REAL DEFAULT 0.0,
+                budget_mtd_month TEXT,
+                deactivated_reason TEXT,
+                budget_history TEXT,
+                tpm_limit INTEGER,
+                cache_ttl TEXT,
+                metadata TEXT,
+                cost_rate REAL DEFAULT 1.0,
+                expires_at INTEGER,
+                allowed_models TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            "INSERT INTO api_keys_new ({copied}) SELECT {copied} FROM api_keys"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DROP TABLE api_keys").execute(&mut *tx).await?;
+        sqlx::query("ALTER TABLE api_keys_new RENAME TO api_keys")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Assign a `key_id` to every api_keys row that lacks one.
     async fn backfill_api_key_ids(&self) -> Result<()> {
         let rows = sqlx::query("SELECT api_key FROM api_keys WHERE key_id IS NULL OR key_id = ''")
@@ -449,9 +585,120 @@ impl SqliteBackend {
 // Helper: api_keys row mapping
 // ============================================================================
 
-const API_KEY_COLS: &str = "api_key, key_id, key_display, name, is_active, rate_limit, cost_rate, \
+const API_KEY_COLS: &str = "api_key, key_id, key_display, user_id, name, is_active, rate_limit, cost_rate, \
      monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-     deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at";
+     deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, expires_at, allowed_models, \
+     created_at, updated_at";
+
+const USER_COLS: &str = "user_id, name, email, is_active, cost_rate, monthly_budget, budget_used, \
+     budget_used_mtd, budget_mtd_month, budget_history, rate_limit, tpm_limit, allowed_models, \
+     cache_ttl, metadata, created_at, updated_at";
+
+fn row_to_user(r: &sqlx::sqlite::SqliteRow) -> UserRecord {
+    UserRecord {
+        user_id: r.get("user_id"),
+        name: r.get("name"),
+        email: r.get("email"),
+        is_active: r.get::<i32, _>("is_active") != 0,
+        cost_rate: r.get::<Option<f64>, _>("cost_rate").unwrap_or(1.0),
+        monthly_budget: r.get("monthly_budget"),
+        budget_used: r.get::<Option<f64>, _>("budget_used").unwrap_or(0.0),
+        budget_used_mtd: r.get::<Option<f64>, _>("budget_used_mtd").unwrap_or(0.0),
+        budget_mtd_month: r.get("budget_mtd_month"),
+        budget_history: r.get("budget_history"),
+        rate_limit: r.get("rate_limit"),
+        tpm_limit: r.get("tpm_limit"),
+        allowed_models: patterns_from_json(r.get("allowed_models")),
+        cache_ttl: r.get("cache_ttl"),
+        metadata: r.get("metadata"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
+/// `UPDATE <table> SET budget_used += amount, budget_used_mtd += amount`, then
+/// report whether month-to-date spend reached the monthly budget.
+async fn increment_budget(
+    pool: &SqlitePool,
+    table: &str,
+    id_col: &str,
+    id: &str,
+    amount: f64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query(&format!(
+        "UPDATE {table} SET budget_used = budget_used + ?, \
+         budget_used_mtd = budget_used_mtd + ?, updated_at = ? WHERE {id_col} = ?"
+    ))
+    .bind(amount)
+    .bind(amount)
+    .bind(unix_now())
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        tx.rollback().await?;
+        anyhow::bail!("{table} row not found: {id}");
+    }
+    let row = sqlx::query(&format!(
+        "SELECT monthly_budget, budget_used_mtd FROM {table} WHERE {id_col} = ?"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row.is_some_and(|r| {
+        let budget: Option<f64> = r.get("monthly_budget");
+        let used: f64 = r.get("budget_used_mtd");
+        budget.is_some_and(|limit| used >= limit)
+    }))
+}
+
+/// Reset month-to-date spend and archive the previous month into budget_history.
+async fn reset_budget(
+    pool: &SqlitePool,
+    table: &str,
+    id_col: &str,
+    id: &str,
+    month: &str,
+    prev_month: &str,
+    prev_mtd: f64,
+) -> Result<()> {
+    let row = sqlx::query(&format!(
+        "SELECT budget_history FROM {table} WHERE {id_col} = ?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let updated_history = archive_month(
+        row.and_then(|r| r.get::<Option<String>, _>("budget_history")),
+        prev_month,
+        prev_mtd,
+    );
+    sqlx::query(&format!(
+        "UPDATE {table} SET budget_used_mtd = 0.0, budget_mtd_month = ?, \
+         budget_history = ?, updated_at = ? WHERE {id_col} = ?"
+    ))
+    .bind(month)
+    .bind(&updated_history)
+    .bind(unix_now())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Add `prev_mtd` (rounded to cents) under `prev_month` in a budget_history JSON.
+fn archive_month(existing: Option<String>, prev_month: &str, prev_mtd: f64) -> String {
+    let mut history: std::collections::HashMap<String, f64> = existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if prev_mtd > 0.0 && !prev_month.is_empty() {
+        history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
+    }
+    serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string())
+}
 
 fn row_to_api_key(r: &sqlx::sqlite::SqliteRow) -> ApiKeyRecord {
     ApiKeyRecord {
@@ -460,6 +707,7 @@ fn row_to_api_key(r: &sqlx::sqlite::SqliteRow) -> ApiKeyRecord {
         key_display: r
             .get::<Option<String>, _>("key_display")
             .unwrap_or_default(),
+        user_id: r.get::<Option<String>, _>("user_id").unwrap_or_default(),
         name: r.get("name"),
         is_active: r.get::<i32, _>("is_active") != 0,
         rate_limit: r.get("rate_limit"),
@@ -473,6 +721,8 @@ fn row_to_api_key(r: &sqlx::sqlite::SqliteRow) -> ApiKeyRecord {
         tpm_limit: r.get("tpm_limit"),
         cache_ttl: r.get("cache_ttl"),
         metadata: r.get("metadata"),
+        expires_at: r.get("expires_at"),
+        allowed_models: patterns_from_json(r.get("allowed_models")),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     }
@@ -499,6 +749,10 @@ impl DatabaseService for SqliteBackend {
         self
     }
 
+    fn users(&self) -> &dyn UserStore {
+        self
+    }
+
     fn usage(&self) -> &dyn UsageStore {
         self
     }
@@ -518,12 +772,26 @@ impl DatabaseService for SqliteBackend {
     async fn initialize(&self, encryption_key: Option<&str>, seed_mode: SeedMode) -> Result<()> {
         self.run_migrations().await?;
         self.backfill_key_hashes(encryption_key).await?;
+        self.migrate_keys_to_users().await?;
         self.seed_defaults(seed_mode).await?;
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
+    }
+
+    async fn backfill_usage_user_ids(&self) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE usage SET user_id = \
+             (SELECT user_id FROM api_keys WHERE api_keys.api_key = usage.api_key) \
+             WHERE user_id IS NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        tracing::info!(rows = res.rows_affected(), "Backfilled usage.user_id");
+        self.upsert_setting(&internal_setting(USAGE_USER_BACKFILL_SETTING, "done"))
+            .await
     }
 }
 
@@ -550,14 +818,16 @@ impl ApiKeyStore for SqliteBackend {
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO api_keys \
-             (api_key, key_id, key_display, name, is_active, rate_limit, cost_rate, \
+             (api_key, key_id, key_display, user_id, name, is_active, rate_limit, cost_rate, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, \
+              expires_at, allowed_models, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
         .bind(&record.key_id)
         .bind(&record.key_display)
+        .bind(&record.user_id)
         .bind(&record.name)
         .bind(record.is_active as i32)
         .bind(record.rate_limit)
@@ -571,6 +841,8 @@ impl ApiKeyStore for SqliteBackend {
         .bind(record.tpm_limit)
         .bind(&record.cache_ttl)
         .bind(&record.metadata)
+        .bind(record.expires_at)
+        .bind(patterns_to_json(&record.allowed_models))
         .bind(record.created_at)
         .bind(record.updated_at)
         .execute(&self.pool)
@@ -580,33 +852,7 @@ impl ApiKeyStore for SqliteBackend {
     }
 
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
-        let now = unix_now();
-        sqlx::query(
-            "UPDATE api_keys SET \
-             name = ?, is_active = ?, rate_limit = ?, cost_rate = ?, \
-             monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
-             deactivated_reason = ?, budget_history = ?, tpm_limit = ?, cache_ttl = ?, metadata = ?, updated_at = ? \
-             WHERE api_key = ?",
-        )
-        .bind(&record.name)
-        .bind(record.is_active as i32)
-        .bind(record.rate_limit)
-        .bind(record.cost_rate)
-        .bind(record.monthly_budget)
-        .bind(record.budget_used)
-        .bind(record.budget_used_mtd)
-        .bind(&record.budget_mtd_month)
-        .bind(&record.deactivated_reason)
-        .bind(&record.budget_history)
-        .bind(record.tpm_limit)
-        .bind(&record.cache_ttl)
-        .bind(&record.metadata)
-        .bind(now)
-        .bind(&record.api_key)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        self.write_api_key(record, "").await.map(|_| ())
     }
 
     async fn deactivate_api_key(&self, api_key: &str, reason: &str) -> Result<()> {
@@ -625,49 +871,7 @@ impl ApiKeyStore for SqliteBackend {
     }
 
     async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<bool> {
-        let now = unix_now();
-
-        // Use a transaction to atomically increment budget and check limit
-        let mut tx = self.pool.begin().await?;
-
-        let result = sqlx::query(
-            "UPDATE api_keys SET \
-             budget_used = budget_used + ?, \
-             budget_used_mtd = budget_used_mtd + ?, \
-             updated_at = ? \
-             WHERE api_key = ?",
-        )
-        .bind(amount)
-        .bind(amount)
-        .bind(now)
-        .bind(api_key)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            tx.rollback().await?;
-            anyhow::bail!("api_key not found: {api_key}");
-        }
-
-        let row =
-            sqlx::query("SELECT monthly_budget, budget_used_mtd FROM api_keys WHERE api_key = ?")
-                .bind(api_key)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-        tx.commit().await?;
-
-        if let Some(r) = row {
-            let budget: Option<f64> = r.get("monthly_budget");
-            let used: f64 = r.get("budget_used_mtd");
-            if let Some(limit) = budget {
-                if used >= limit {
-                    return Ok(true); // budget exceeded
-                }
-            }
-        }
-
-        Ok(false)
+        increment_budget(&self.pool, "api_keys", "api_key", api_key, amount).await
     }
 
     async fn reset_monthly_budget(
@@ -677,43 +881,10 @@ impl ApiKeyStore for SqliteBackend {
         prev_month: &str,
         prev_mtd: f64,
     ) -> Result<()> {
-        let now = unix_now();
-
-        // Read existing budget_history, append prev month's usage
-        let row = sqlx::query("SELECT budget_history FROM api_keys WHERE api_key = ?")
-            .bind(api_key)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        let updated_history = if let Some(r) = row {
-            let existing: Option<String> = r.get("budget_history");
-            let mut history: std::collections::HashMap<String, f64> = existing
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            if prev_mtd > 0.0 && !prev_month.is_empty() {
-                history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
-            }
-            serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string())
-        } else {
-            "{}".to_string()
-        };
-
-        sqlx::query(
-            "UPDATE api_keys SET \
-             budget_used_mtd = 0.0, \
-             budget_mtd_month = ?, \
-             budget_history = ?, \
-             updated_at = ? \
-             WHERE api_key = ?",
+        reset_budget(
+            &self.pool, "api_keys", "api_key", api_key, month, prev_month, prev_mtd,
         )
-        .bind(month)
-        .bind(&updated_history)
-        .bind(now)
-        .bind(api_key)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn reactivate_api_key(&self, api_key: &str) -> Result<()> {
@@ -786,6 +957,130 @@ impl ApiKeyStore for SqliteBackend {
             .await?;
         Ok(())
     }
+
+    async fn list_api_keys_by_user(&self, user_id: &str) -> Result<Vec<ApiKeyRecord>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {API_KEY_COLS} FROM api_keys WHERE user_id = ? ORDER BY created_at DESC"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_api_key).collect())
+    }
+
+    async fn assign_unowned_key(&self, record: &ApiKeyRecord) -> Result<bool> {
+        self.write_api_key(record, " AND (user_id IS NULL OR user_id = '')")
+            .await
+            .map(|n| n > 0)
+    }
+}
+
+// ============================================================================
+// UserStore
+// ============================================================================
+
+#[async_trait]
+impl UserStore for SqliteBackend {
+    async fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>> {
+        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE user_id = ?"))
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_to_user))
+    }
+
+    async fn get_user_by_name(&self, name: &str) -> Result<Option<UserRecord>> {
+        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE name = ?"))
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_to_user))
+    }
+
+    async fn list_users(&self) -> Result<Vec<UserRecord>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {USER_COLS} FROM users ORDER BY created_at DESC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_user).collect())
+    }
+
+    async fn create_user(&self, u: &UserRecord) -> Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO users ({USER_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
+        .bind(&u.user_id)
+        .bind(&u.name)
+        .bind(&u.email)
+        .bind(u.is_active as i32)
+        .bind(u.cost_rate)
+        .bind(u.monthly_budget)
+        .bind(u.budget_used)
+        .bind(u.budget_used_mtd)
+        .bind(&u.budget_mtd_month)
+        .bind(&u.budget_history)
+        .bind(u.rate_limit)
+        .bind(u.tpm_limit)
+        .bind(patterns_to_json(&u.allowed_models))
+        .bind(&u.cache_ttl)
+        .bind(&u.metadata)
+        .bind(u.created_at)
+        .bind(u.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_user(&self, u: &UserRecord) -> Result<()> {
+        // Spend counters are owned by increment/reset — never overwritten here,
+        // so an admin edit racing a request cannot lose spend.
+        sqlx::query(
+            "UPDATE users SET name = ?, email = ?, is_active = ?, cost_rate = ?, \
+             monthly_budget = ?, rate_limit = ?, tpm_limit = ?, allowed_models = ?, \
+             cache_ttl = ?, metadata = ?, updated_at = ? WHERE user_id = ?",
+        )
+        .bind(&u.name)
+        .bind(&u.email)
+        .bind(u.is_active as i32)
+        .bind(u.cost_rate)
+        .bind(u.monthly_budget)
+        .bind(u.rate_limit)
+        .bind(u.tpm_limit)
+        .bind(patterns_to_json(&u.allowed_models))
+        .bind(&u.cache_ttl)
+        .bind(&u.metadata)
+        .bind(unix_now())
+        .bind(&u.user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_user(&self, user_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM users WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<bool> {
+        increment_budget(&self.pool, "users", "user_id", user_id, amount).await
+    }
+
+    async fn reset_user_monthly_budget(
+        &self,
+        user_id: &str,
+        month: &str,
+        prev_month: &str,
+        prev_mtd: f64,
+    ) -> Result<()> {
+        reset_budget(
+            &self.pool, "users", "user_id", user_id, month, prev_month, prev_mtd,
+        )
+        .await
+    }
 }
 
 // ============================================================================
@@ -797,13 +1092,14 @@ impl UsageStore for SqliteBackend {
     async fn record_usage(&self, record: &UsageRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage \
-             (api_key, key_id, timestamp, request_id, model, input_tokens, output_tokens, \
+             (api_key, key_id, user_id, timestamp, request_id, model, input_tokens, output_tokens, \
               cached_tokens, cache_write_tokens, cost, success, duration_ms, error_message, \
               provider, protocol) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
         .bind(&record.key_id)
+        .bind(&record.user_id)
         .bind(&record.timestamp)
         .bind(&record.request_id)
         .bind(&record.model)
@@ -826,6 +1122,7 @@ impl UsageStore for SqliteBackend {
     async fn get_usage_by_api_key(
         &self,
         api_key: &str,
+        user_id: Option<&str>,
         since: Option<&str>,
         limit: Option<i64>,
         before_id: Option<i64>,
@@ -833,11 +1130,19 @@ impl UsageStore for SqliteBackend {
         // Empty api_key means "all keys" (admin query with no key filter)
         let filter_by_key = !api_key.is_empty();
 
-        let key_clause = if filter_by_key {
-            "WHERE api_key = ?"
-        } else {
-            "WHERE 1=1"
-        };
+        let key_clause = format!(
+            "WHERE 1=1{}{}",
+            if filter_by_key {
+                " AND api_key = ?"
+            } else {
+                ""
+            },
+            if user_id.is_some() {
+                " AND user_id = ?"
+            } else {
+                ""
+            },
+        );
         let since_clause = if since.is_some() {
             "AND timestamp >= ?"
         } else {
@@ -851,7 +1156,7 @@ impl UsageStore for SqliteBackend {
         let limit_clause = if limit.is_some() { "LIMIT ?" } else { "" };
 
         let sql = format!(
-            "SELECT id, api_key, key_id, timestamp, request_id, model, \
+            "SELECT id, api_key, key_id, user_id, timestamp, request_id, model, \
              input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
              cost, success, duration_ms, error_message, provider, protocol \
              FROM usage {key_clause} {since_clause} {before_id_clause} \
@@ -861,6 +1166,9 @@ impl UsageStore for SqliteBackend {
         let mut q = sqlx::query(&sql);
         if filter_by_key {
             q = q.bind(api_key);
+        }
+        if let Some(u) = user_id {
+            q = q.bind(u);
         }
         if let Some(s) = since {
             q = q.bind(s);
@@ -880,6 +1188,7 @@ impl UsageStore for SqliteBackend {
                 id: r.get("id"),
                 api_key: r.get("api_key"),
                 key_id: r.get("key_id"),
+                user_id: r.get("user_id"),
                 timestamp: r.get("timestamp"),
                 request_id: r.get("request_id"),
                 model: r.get("model"),
@@ -902,6 +1211,7 @@ impl UsageStore for SqliteBackend {
     async fn query_usage_summary(
         &self,
         api_key: &str,
+        user_id: Option<&str>,
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
@@ -914,6 +1224,7 @@ impl UsageStore for SqliteBackend {
                 "month" => "strftime('%Y-%m', timestamp)",
                 "provider" => "COALESCE(provider, 'unknown')",
                 "api_key" => "COALESCE(key_id, api_key)",
+                "user" => "COALESCE(user_id, '')",
                 _ => "strftime('%Y-%m-%dT%H', timestamp)",
             }
         }
@@ -933,11 +1244,19 @@ impl UsageStore for SqliteBackend {
         };
 
         let filter_by_key = !api_key.is_empty();
-        let key_clause = if filter_by_key {
-            "WHERE api_key = ?"
-        } else {
-            "WHERE 1=1"
-        };
+        let key_clause = format!(
+            "WHERE 1=1{}{}",
+            if filter_by_key {
+                " AND api_key = ?"
+            } else {
+                ""
+            },
+            if user_id.is_some() {
+                " AND user_id = ?"
+            } else {
+                ""
+            },
+        );
 
         let sql = format!(
             "SELECT {group_expr} AS group_key{split_select}, \
@@ -967,6 +1286,9 @@ impl UsageStore for SqliteBackend {
         let mut q = sqlx::query(&sql);
         if filter_by_key {
             q = q.bind(api_key);
+        }
+        if let Some(u) = user_id {
+            q = q.bind(u);
         }
         if let Some(s) = start {
             q = q.bind(s);
@@ -1455,6 +1777,9 @@ mod tests {
             tpm_limit: None,
             cache_ttl: None,
             metadata: None,
+            user_id: String::new(),
+            expires_at: None,
+            allowed_models: None,
             created_at: 0,
             updated_at: None,
         }
@@ -1465,6 +1790,7 @@ mod tests {
             id: None,
             api_key: hash.into(),
             key_id: key_id.map(String::from),
+            user_id: None,
             timestamp: "2026-11-06T10:00:00+00:00".into(),
             request_id: new_key_id(),
             model: "m".into(),
@@ -1506,7 +1832,7 @@ mod tests {
         // Usage survives the delete and groups under the key_id.
         let rows = db
             .usage()
-            .query_usage_summary("", None, None, "api_key", None)
+            .query_usage_summary("", None, None, None, "api_key", None)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -1593,7 +1919,7 @@ mod tests {
 
         let usage = db
             .usage()
-            .get_usage_by_api_key("", None, None, None)
+            .get_usage_by_api_key("", None, None, None, None)
             .await
             .unwrap();
         for u in &usage {
@@ -1604,6 +1930,184 @@ mod tests {
                 assert_eq!(u.key_id.as_deref(), Some(k.key_id.as_str()));
             }
         }
+    }
+
+    /// Legacy keys (global names, key-level budget/limits, one exceeded its
+    /// budget) become one user each with unchanged enforcement inputs.
+    #[tokio::test]
+    async fn legacy_keys_become_users() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // Pre-users schema: global UNIQUE(name), no owner columns.
+        sqlx::query(
+            "CREATE TABLE api_keys (api_key TEXT PRIMARY KEY, name TEXT UNIQUE DEFAULT '', \
+             is_active INTEGER DEFAULT 1, rate_limit INTEGER DEFAULT 100, \
+             service_tier TEXT DEFAULT 'default', monthly_budget REAL, budget_used REAL DEFAULT 0.0, \
+             budget_used_mtd REAL DEFAULT 0.0, budget_mtd_month TEXT, deactivated_reason TEXT, \
+             budget_history TEXT, tpm_limit INTEGER, cache_ttl TEXT, metadata TEXT, \
+             cost_rate REAL DEFAULT 1.0, key_display TEXT DEFAULT '', key_id TEXT, \
+             created_at INTEGER NOT NULL, updated_at INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE usage (id INTEGER PRIMARY KEY AUTOINCREMENT, api_key TEXT NOT NULL, \
+             key_id TEXT, timestamp TEXT NOT NULL, request_id TEXT NOT NULL, model TEXT NOT NULL, \
+             input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, \
+             cached_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0, \
+             cost REAL DEFAULT 0.0, success INTEGER DEFAULT 1, duration_ms INTEGER, \
+             error_message TEXT, provider TEXT, protocol TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let h1 = "a".repeat(64);
+        let h2 = "b".repeat(64);
+        sqlx::query(
+            "INSERT INTO api_keys (api_key, key_id, name, rate_limit, cost_rate, monthly_budget, \
+             budget_used, budget_used_mtd, budget_mtd_month, tpm_limit, cache_ttl, created_at) \
+             VALUES (?, 'k1', 'alice', 60, 0.5, 10.0, 30.0, 4.0, '2026-11', 9000, '1h', 5)",
+        )
+        .bind(&h1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (api_key, key_id, name, rate_limit, monthly_budget, \
+             budget_used_mtd, budget_mtd_month, is_active, deactivated_reason, created_at) \
+             VALUES (?, 'k2', 'bob', 0, 1.0, 2.0, '2026-10', 0, 'budget_exceeded', 6)",
+        )
+        .bind(&h2)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage (api_key, key_id, timestamp, request_id, model) \
+             VALUES (?, 'k1', 't', 'r', 'm')",
+        )
+        .bind(&h1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let db = SqliteBackend { pool };
+        db.initialize(None, SeedMode::Off).await.unwrap();
+        db.initialize(None, SeedMode::Off).await.unwrap(); // idempotent
+
+        let users = db.users().list_users().await.unwrap();
+        assert_eq!(users.len(), 2);
+        let alice = db.users().get_user_by_name("alice").await.unwrap().unwrap();
+        assert_eq!(alice.cost_rate, 0.5);
+        assert_eq!(alice.monthly_budget, Some(10.0));
+        assert_eq!(alice.budget_used, 30.0);
+        assert_eq!(alice.budget_used_mtd, 4.0);
+        assert_eq!(alice.budget_mtd_month.as_deref(), Some("2026-11"));
+        assert_eq!(alice.rate_limit, Some(60));
+        assert_eq!(alice.tpm_limit, Some(9000));
+        assert_eq!(alice.cache_ttl.as_deref(), Some("1h"));
+        let bob = db.users().get_user_by_name("bob").await.unwrap().unwrap();
+        assert_eq!(bob.rate_limit, None); // 0 meant "global default"
+
+        let k1 = db.api_keys().get_api_key(&h1).await.unwrap().unwrap();
+        assert_eq!(k1.user_id, alice.user_id);
+        assert_eq!(k1.monthly_budget, None);
+        assert_eq!(k1.rate_limit, 0);
+        assert_eq!(k1.tpm_limit, None);
+        assert_eq!(k1.cache_ttl, None);
+        assert_eq!(k1.budget_used, 30.0); // lifetime stats stay on the key
+        let k2 = db.api_keys().get_api_key(&h2).await.unwrap().unwrap();
+        assert!(k2.is_active, "budget_exceeded deactivation is lifted");
+        assert_eq!(k2.deactivated_reason, None);
+
+        // Usage attributed to the user; backfill marked done.
+        let usage = db
+            .usage()
+            .get_usage_by_api_key("", Some(&alice.user_id), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 1);
+        let flag = db
+            .get_setting(USAGE_USER_BACKFILL_SETTING)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(flag.value, "done");
+
+        // Names are now unique per user, not globally.
+        let mut dup = key_record("hash-dup", "alice");
+        dup.user_id = bob.user_id.clone();
+        db.api_keys().create_api_key(&dup).await.unwrap();
+        let mut dup2 = key_record("hash-dup2", "alice");
+        dup2.user_id = bob.user_id.clone();
+        assert!(db.api_keys().create_api_key(&dup2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn assign_unowned_key_is_first_writer_wins() {
+        let db = in_memory_db().await;
+        db.api_keys()
+            .create_api_key(&key_record("hash-x", "x"))
+            .await
+            .unwrap();
+        let mut first = db.api_keys().get_api_key("hash-x").await.unwrap().unwrap();
+        first.user_id = "u-1".into();
+        assert!(db.api_keys().assign_unowned_key(&first).await.unwrap());
+        let mut second = first.clone();
+        second.user_id = "u-2".into();
+        assert!(!db.api_keys().assign_unowned_key(&second).await.unwrap());
+        let stored = db.api_keys().get_api_key("hash-x").await.unwrap().unwrap();
+        assert_eq!(stored.user_id, "u-1");
+    }
+
+    #[tokio::test]
+    async fn user_crud_and_budget() {
+        let db = in_memory_db().await;
+        let mut u = UserRecord::new("carol", 1);
+        u.monthly_budget = Some(5.0);
+        u.allowed_models = Some(vec!["claude-*".into()]);
+        db.users().create_user(&u).await.unwrap();
+        assert!(db
+            .users()
+            .create_user(&UserRecord::new("carol", 2))
+            .await
+            .is_err());
+
+        assert!(!db
+            .users()
+            .increment_user_budget_used(&u.user_id, 2.0)
+            .await
+            .unwrap());
+        assert!(db
+            .users()
+            .increment_user_budget_used(&u.user_id, 3.0)
+            .await
+            .unwrap());
+
+        // update_user never overwrites spend counters.
+        let mut edit = db.users().get_user(&u.user_id).await.unwrap().unwrap();
+        edit.budget_used_mtd = 0.0;
+        edit.cost_rate = 2.0;
+        db.users().update_user(&edit).await.unwrap();
+        let got = db.users().get_user(&u.user_id).await.unwrap().unwrap();
+        assert_eq!(got.cost_rate, 2.0);
+        assert_eq!(got.budget_used_mtd, 5.0);
+        assert_eq!(got.allowed_models, Some(vec!["claude-*".to_string()]));
+
+        db.users()
+            .reset_user_monthly_budget(&u.user_id, "2026-12", "2026-11", 5.0)
+            .await
+            .unwrap();
+        let got = db.users().get_user(&u.user_id).await.unwrap().unwrap();
+        assert_eq!(got.budget_used_mtd, 0.0);
+        assert_eq!(got.budget_mtd_month.as_deref(), Some("2026-12"));
+        assert!(got.budget_history.unwrap().contains("2026-11"));
+
+        db.users().delete_user(&u.user_id).await.unwrap();
+        assert!(db.users().get_user(&u.user_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1646,6 +2150,9 @@ mod tests {
             tpm_limit: None,
             cache_ttl: None,
             metadata: None,
+            user_id: String::new(),
+            expires_at: None,
+            allowed_models: None,
             created_at: 0,
             updated_at: None,
         };
@@ -1691,6 +2198,9 @@ mod tests {
             tpm_limit: None,
             cache_ttl: None,
             metadata: None,
+            user_id: String::new(),
+            expires_at: None,
+            allowed_models: None,
             created_at: 0,
             updated_at: None,
         };
@@ -1729,6 +2239,9 @@ mod tests {
             tpm_limit: None,
             cache_ttl: None,
             metadata: None,
+            user_id: String::new(),
+            expires_at: None,
+            allowed_models: None,
             created_at: 0,
             updated_at: None,
         };

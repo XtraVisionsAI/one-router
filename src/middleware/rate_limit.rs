@@ -236,6 +236,44 @@ impl IntoResponse for RateLimitError {
 // Middleware
 // ============================================================================
 
+/// TPM / RPM bucket of a user (shared by all of the user's keys).
+pub fn user_bucket(user_id: &str) -> String {
+    format!("user:{user_id}")
+}
+
+/// One limiter a request must pass: (bucket id, limit, metric scope).
+type Bucket = (String, u32, &'static str);
+
+/// The TPM and RPM buckets for a caller, user scope first. The user's RPM
+/// falls back to the global default; a key-level RPM applies only when set —
+/// except for an ownerless key, which keeps the pre-users behavior (key RPM,
+/// else the global default).
+fn buckets(key_info: &ApiKeyInfo, default_rpm: u32) -> (Vec<Bucket>, Vec<Bucket>) {
+    let mut tpm = Vec::new();
+    let mut rpm = Vec::new();
+    match &key_info.user {
+        Some(user) => {
+            let bucket = user_bucket(&user.user_id);
+            if let Some(t) = user.tpm_limit {
+                tpm.push((bucket.clone(), t, "user"));
+            }
+            rpm.push((bucket, user.rate_limit.unwrap_or(default_rpm), "user"));
+            if let Some(r) = key_info.rate_limit {
+                rpm.push((key_info.key_id.clone(), r, "key"));
+            }
+        }
+        None => rpm.push((
+            key_info.key_id.clone(),
+            key_info.rate_limit.unwrap_or(default_rpm),
+            "key",
+        )),
+    }
+    if let Some(t) = key_info.tpm_limit {
+        tpm.push((key_info.key_id.clone(), t, "key"));
+    }
+    (tpm, rpm)
+}
+
 pub async fn rate_limit(
     State(rate_state): State<RateLimitState>,
     request: Request<Body>,
@@ -256,9 +294,12 @@ pub async fn rate_limit(
         return Ok(next.run(request).await);
     }
 
-    if let Some(tpm) = key_info.tpm_limit {
-        if let Err(retry_after_seconds) = rate_state.tokens.check(&key_info.key_id, tpm).await {
-            crate::observability::metrics::record_rate_limited("tpm", "key");
+    let (tpm_buckets, rpm_buckets) = buckets(&key_info, default_rpm);
+
+    // TPM checks don't consume anything — run them all first.
+    for (bucket, limit, scope) in &tpm_buckets {
+        if let Err(retry_after_seconds) = rate_state.tokens.check(bucket, *limit).await {
+            crate::observability::metrics::record_rate_limited("tpm", scope);
             return Err(RateLimitError {
                 retry_after_seconds,
                 kind: "tpm",
@@ -266,20 +307,19 @@ pub async fn rate_limit(
         }
     }
 
-    let rpm = key_info.effective_rate_limit(default_rpm);
-    let limiter = rate_state.get_limiter(&key_info.key_id, rpm).await;
-
-    match limiter.check() {
-        Ok(_) => Ok(next.run(request).await),
-        Err(not_until) => {
+    for (bucket, limit, scope) in &rpm_buckets {
+        let limiter = rate_state.get_limiter(bucket, *limit).await;
+        if let Err(not_until) = limiter.check() {
             let retry_after = not_until.wait_time_from(DefaultClock::default().now());
-            crate::observability::metrics::record_rate_limited("rpm", "key");
-            Err(RateLimitError {
+            crate::observability::metrics::record_rate_limited("rpm", scope);
+            return Err(RateLimitError {
                 retry_after_seconds: retry_after.as_secs().max(1),
                 kind: "rpm",
-            })
+            });
         }
     }
+
+    Ok(next.run(request).await)
 }
 
 #[cfg(test)]
@@ -333,6 +373,47 @@ mod tests {
         t.record("k1", 150).await;
         assert!(t.check("k1", 100).await.is_err());
         assert!(t.check("k2", 100).await.is_ok()); // keys are independent
+    }
+
+    fn principal(user_rpm: Option<u32>, key_rpm: Option<u32>) -> ApiKeyInfo {
+        let mut info = ApiKeyInfo::master("sk-x");
+        info.is_master = false;
+        info.key_id = "k1".into();
+        info.rate_limit = key_rpm;
+        info.user = Some(crate::middleware::auth::UserPrincipal {
+            user_id: "u1".into(),
+            name: "alice".into(),
+            rate_limit: user_rpm,
+            tpm_limit: Some(5000),
+            monthly_budget: None,
+            budget_used_mtd: 0.0,
+            budget_mtd_month: None,
+        });
+        info
+    }
+
+    #[test]
+    fn user_bucket_uses_default_and_key_sub_limit_is_optional() {
+        let (tpm, rpm) = buckets(&principal(None, None), 100);
+        assert_eq!(tpm, vec![("user:u1".to_string(), 5000, "user")]);
+        assert_eq!(rpm, vec![("user:u1".to_string(), 100, "user")]);
+
+        let (_, rpm) = buckets(&principal(Some(30), Some(5)), 100);
+        assert_eq!(
+            rpm,
+            vec![
+                ("user:u1".to_string(), 30, "user"),
+                ("k1".to_string(), 5, "key")
+            ]
+        );
+    }
+
+    #[test]
+    fn ownerless_key_keeps_legacy_rpm() {
+        let mut info = principal(None, None);
+        info.user = None;
+        let (_, rpm) = buckets(&info, 100);
+        assert_eq!(rpm, vec![("k1".to_string(), 100, "key")]);
     }
 
     #[test]

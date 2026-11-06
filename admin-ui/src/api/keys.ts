@@ -6,10 +6,11 @@ export function useKeysApi() {
   const path = (keyId: string) => `/keys/${encodeURIComponent(keyId)}`
 
   return {
-    list: () => request<ListResponse<ApiKey>>('GET', '/keys'),
+    list: (userId?: string) =>
+      request<ListResponse<ApiKey>>('GET', userId ? `/keys?user=${encodeURIComponent(userId)}` : '/keys'),
 
     create: (body: CreateKeyBody) =>
-      request<{ key_id: string; api_key: string; name: string }>('POST', '/keys', body),
+      request<{ key_id: string; user_id: string; api_key: string; name: string }>('POST', '/keys', body),
 
     update: (keyId: string, body: UpdateKeyBody) => request<ApiKey>('PUT', path(keyId), body),
 

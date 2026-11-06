@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::database::models::period_spend;
 use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::state::AppState;
@@ -27,6 +28,8 @@ pub struct UsageQueryParams {
     pub group_by: Option<String>,
     /// Optional secondary grouping dimension
     pub split_by: Option<String>,
+    /// "key" (default) = this key only; "user" = all keys of this key's user.
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +38,41 @@ pub struct RecordsQueryParams {
     pub limit: Option<i64>,
     /// Pagination cursor: id of the last record on the previous page (reverse order)
     pub before_id: Option<i64>,
+    /// "key" (default) or "user" — see [`UsageQueryParams::scope`].
+    pub scope: Option<String>,
+}
+
+/// Storage filters for a `scope` parameter: `(api_key, user_id)`.
+fn scope_filter<'a>(
+    key_info: &'a ApiKeyInfo,
+    scope: Option<&str>,
+) -> Result<(&'a str, Option<&'a str>), Box<axum::response::Response>> {
+    match scope.unwrap_or("key") {
+        "key" => Ok((key_info.usage_api_key(), None)),
+        "user" => match key_info.user_id() {
+            Some(u) => Ok(("", Some(u))),
+            None => Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "invalid_request_error",
+                        "scope=user requires a key that belongs to a user",
+                    )),
+                )
+                    .into_response(),
+            )),
+        },
+        other => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("scope must be 'key' or 'user', got '{other}'"),
+                )),
+            )
+                .into_response(),
+        )),
+    }
 }
 
 // ============================================================================
@@ -133,11 +171,17 @@ pub async fn get_usage_summary(
         }
     }
 
+    let (key_filter, user_filter) = match scope_filter(&key_info, params.scope.as_deref()) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
+
     let rows = match state
         .database
         .usage()
         .query_usage_summary(
-            key_info.usage_api_key(),
+            key_filter,
+            user_filter,
             params.start_time.as_deref(),
             params.end_time.as_deref(),
             group_by,
@@ -160,8 +204,26 @@ pub async fn get_usage_summary(
     };
 
     // key_info already contains budget info (loaded from DB by auth middleware into Extension).
-    let monthly_budget = key_info.monthly_budget;
-    let budget_used_mtd = key_info.budget_used_mtd;
+    // Budget of the scope's principal; a counter from an earlier month counts as 0.
+    let current_month = chrono::Utc::now().format("%Y-%m").to_string();
+    let (monthly_budget, budget_used_mtd) = match (user_filter, key_info.user.as_ref()) {
+        (Some(_), Some(u)) => (
+            u.monthly_budget,
+            period_spend(
+                u.budget_used_mtd,
+                u.budget_mtd_month.as_deref(),
+                &current_month,
+            ),
+        ),
+        _ => (
+            key_info.monthly_budget,
+            period_spend(
+                key_info.budget_used_mtd,
+                key_info.budget_mtd_month.as_deref(),
+                &current_month,
+            ),
+        ),
+    };
 
     let summary = UsageTotals {
         total_requests: rows.iter().map(|r| r.total_requests).sum(),
@@ -209,6 +271,10 @@ pub async fn get_usage_records(
     Query(params): Query<RecordsQueryParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(100).min(1000);
+    let (key_filter, user_filter) = match scope_filter(&key_info, params.scope.as_deref()) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
 
     // Safety guard: disallow unbounded queries (neither start_time nor before_id).
     // Pulling all records without limits could cause OOM; require at least one time or cursor boundary.
@@ -231,7 +297,8 @@ pub async fn get_usage_records(
         .database
         .usage()
         .get_usage_by_api_key(
-            key_info.usage_api_key(),
+            key_filter,
+            user_filter,
             params.start_time.as_deref(),
             Some(limit + 1),
             params.before_id,
@@ -296,6 +363,7 @@ mod tests {
     #[test]
     fn test_parse_group_by_defaults_to_hour() {
         let params = UsageQueryParams {
+            scope: None,
             start_time: None,
             end_time: None,
             group_by: None,
@@ -307,6 +375,7 @@ mod tests {
     #[test]
     fn test_parse_group_by_model() {
         let params = UsageQueryParams {
+            scope: None,
             start_time: None,
             end_time: None,
             group_by: Some("model".to_string()),

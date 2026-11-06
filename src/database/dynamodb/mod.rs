@@ -37,9 +37,57 @@ impl DynamoDbBackend {
         format!("{TABLE_PREFIX}{name}")
     }
 
+    /// Whether `user_id` already owns a key named `name` (other than
+    /// `exclude_api_key`). Key names are unique per user.
+    async fn user_key_name_taken(
+        &self,
+        user_id: &str,
+        name: &str,
+        exclude_api_key: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self
+            .list_api_keys_by_user(user_id)
+            .await?
+            .iter()
+            .any(|k| k.name == name && Some(k.api_key.as_str()) != exclude_api_key))
+    }
+
+    /// Paginated scan of a whole table, optionally filtered.
+    async fn scan_all(
+        &self,
+        table: &str,
+        filter: Option<(&str, &[(&str, AttributeValue)])>,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>> {
+        let mut out = Vec::new();
+        let mut start_key = None;
+        loop {
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(Self::table_name(table))
+                .set_exclusive_start_key(start_key);
+            if let Some((expr, values)) = filter {
+                scan = scan.filter_expression(expr);
+                for (k, v) in values {
+                    scan = scan.expression_attribute_values(*k, v.clone());
+                }
+                if expr.contains("#n") {
+                    scan = scan.expression_attribute_names("#n", "name");
+                }
+            }
+            let page = scan.send().await?;
+            out.extend(page.items().iter().cloned());
+            start_key = page.last_evaluated_key().cloned();
+            if start_key.is_none() {
+                return Ok(out);
+            }
+        }
+    }
+
     /// Check if a key with the given name exists, optionally excluding a specific api_key.
     /// Uses the GSI `name-index` for O(1) lookup; falls back to filtered scan if GSI is
     /// not yet available (e.g. still building after migration).
+    #[allow(dead_code)]
     async fn name_exists(&self, name: &str, exclude_api_key: Option<&str>) -> Result<bool> {
         // Try GSI Query first (O(1) — GSI partition key is `name`)
         let query_result = self
@@ -214,6 +262,57 @@ impl DynamoDbBackend {
         Ok(())
     }
 
+    async fn run_usage_user_backfill(&self, owners: &HashMap<String, String>) -> Result<u64> {
+        let mut updated = 0u64;
+        let mut start_key = None;
+        loop {
+            let page = self
+                .client
+                .scan()
+                .table_name(Self::table_name("usage"))
+                .filter_expression("attribute_not_exists(user_id)")
+                .projection_expression("api_key, sort_key")
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await?;
+            for item in page.items() {
+                let hash = get_s(item, "api_key");
+                let Some(user_id) = owners.get(&hash) else {
+                    continue; // key deleted before users existed — unattributable
+                };
+                let res = self
+                    .client
+                    .update_item()
+                    .table_name(Self::table_name("usage"))
+                    .key("api_key", av_s(&hash))
+                    .key("sort_key", av_s(&get_s(item, "sort_key")))
+                    .update_expression("SET user_id = :u")
+                    .condition_expression(
+                        "attribute_exists(api_key) AND attribute_not_exists(user_id)",
+                    )
+                    .expression_attribute_values(":u", av_s(user_id))
+                    .send()
+                    .await;
+                match res {
+                    Ok(_) => updated += 1,
+                    Err(e) => {
+                        let svc = e.into_service_error();
+                        if !svc.is_conditional_check_failed_exception() {
+                            return Err(anyhow::anyhow!("usage user_id backfill: {svc}"));
+                        }
+                    }
+                }
+            }
+            start_key = page.last_evaluated_key().cloned();
+            if start_key.is_none() {
+                break;
+            }
+        }
+        self.upsert_setting(&internal_setting(USAGE_USER_BACKFILL_SETTING, "done"))
+            .await?;
+        Ok(updated)
+    }
+
     /// Fallback: filtered scan for name uniqueness check.
     async fn name_exists_scan(&self, name: &str, exclude_api_key: Option<&str>) -> Result<bool> {
         let mut scan = self
@@ -357,6 +456,7 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
         api_key: get_s(item, "api_key"),
         key_id: get_s(item, "key_id"),
         key_display: get_s(item, "key_display"),
+        user_id: get_s(item, "user_id"),
         name: get_s(item, "name"),
         is_active: get_bool(item, "is_active"),
         rate_limit: get_i32(item, "rate_limit"),
@@ -378,9 +478,58 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
         tpm_limit: get_opt_i32(item, "tpm_limit"),
         cache_ttl: get_opt_s(item, "cache_ttl"),
         metadata: get_opt_s(item, "metadata"),
+        expires_at: get_opt_i64(item, "expires_at"),
+        allowed_models: patterns_from_json(get_opt_s(item, "allowed_models")),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
     }
+}
+
+fn user_from_item(item: &HashMap<String, AttributeValue>) -> UserRecord {
+    UserRecord {
+        user_id: get_s(item, "user_id"),
+        name: get_s(item, "name"),
+        email: get_opt_s(item, "email"),
+        is_active: get_bool(item, "is_active"),
+        cost_rate: get_opt_f64(item, "cost_rate").unwrap_or(1.0),
+        monthly_budget: get_opt_f64(item, "monthly_budget"),
+        budget_used: get_f64(item, "budget_used"),
+        budget_used_mtd: get_f64(item, "budget_used_mtd"),
+        budget_mtd_month: get_opt_s(item, "budget_mtd_month"),
+        budget_history: get_opt_s(item, "budget_history"),
+        rate_limit: get_opt_i32(item, "rate_limit"),
+        tpm_limit: get_opt_i32(item, "tpm_limit"),
+        allowed_models: patterns_from_json(get_opt_s(item, "allowed_models")),
+        cache_ttl: get_opt_s(item, "cache_ttl"),
+        metadata: get_opt_s(item, "metadata"),
+        created_at: get_i64(item, "created_at"),
+        updated_at: get_opt_i64(item, "updated_at"),
+    }
+}
+
+fn user_to_item(u: &UserRecord) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert("user_id".into(), av_s(&u.user_id));
+    item.insert("name".into(), av_s(&u.name));
+    item.insert("email".into(), av_opt_s(&u.email));
+    item.insert("is_active".into(), av_bool(u.is_active));
+    item.insert("cost_rate".into(), av_n_f64(u.cost_rate));
+    item.insert("monthly_budget".into(), av_opt_n_f64(u.monthly_budget));
+    item.insert("budget_used".into(), av_n_f64(u.budget_used));
+    item.insert("budget_used_mtd".into(), av_n_f64(u.budget_used_mtd));
+    item.insert("budget_mtd_month".into(), av_opt_s(&u.budget_mtd_month));
+    item.insert("budget_history".into(), av_opt_s(&u.budget_history));
+    item.insert("rate_limit".into(), av_opt_n_i32(u.rate_limit));
+    item.insert("tpm_limit".into(), av_opt_n_i32(u.tpm_limit));
+    item.insert(
+        "allowed_models".into(),
+        av_opt_s(&patterns_to_json(&u.allowed_models)),
+    );
+    item.insert("cache_ttl".into(), av_opt_s(&u.cache_ttl));
+    item.insert("metadata".into(), av_opt_s(&u.metadata));
+    item.insert("created_at".into(), av_n(u.created_at));
+    item.insert("updated_at".into(), av_opt_n_i64(u.updated_at));
+    item
 }
 
 fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
@@ -411,6 +560,14 @@ fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
     item.insert("tpm_limit".into(), av_opt_n_i32(record.tpm_limit));
     item.insert("cache_ttl".into(), av_opt_s(&record.cache_ttl));
     item.insert("metadata".into(), av_opt_s(&record.metadata));
+    if !record.user_id.is_empty() {
+        item.insert("user_id".into(), av_s(&record.user_id));
+    }
+    item.insert("expires_at".into(), av_opt_n_i64(record.expires_at));
+    item.insert(
+        "allowed_models".into(),
+        av_opt_s(&patterns_to_json(&record.allowed_models)),
+    );
     item.insert("created_at".into(), av_n(record.created_at));
     item.insert("updated_at".into(), av_opt_n_i64(record.updated_at));
     item
@@ -421,6 +578,7 @@ fn usage_from_item(item: &HashMap<String, AttributeValue>) -> UsageRecord {
         id: get_opt_i64(item, "id"),
         api_key: get_s(item, "api_key"),
         key_id: get_opt_s(item, "key_id"),
+        user_id: get_opt_s(item, "user_id"),
         timestamp: get_s(item, "timestamp"),
         request_id: get_s(item, "request_id"),
         model: get_s(item, "model"),
@@ -490,6 +648,9 @@ impl DatabaseService for DynamoDbBackend {
     fn api_keys(&self) -> &dyn ApiKeyStore {
         self
     }
+    fn users(&self) -> &dyn UserStore {
+        self
+    }
     fn usage(&self) -> &dyn UsageStore {
         self
     }
@@ -507,7 +668,34 @@ impl DatabaseService for DynamoDbBackend {
         migrations::create_tables(self).await?;
         self.backfill_key_hashes(encryption_key).await?;
         self.backfill_api_key_ids().await?;
+        self.migrate_keys_to_users().await?;
         self.seed_defaults(seed_mode).await?;
+        Ok(())
+    }
+
+    /// The usage table can be large, so the backfill runs in the background and
+    /// marks itself done when a full pass completes. If the process exits first,
+    /// the next startup resumes (the setting is still `"pending"`; already
+    /// attributed items are skipped by the scan filter).
+    async fn backfill_usage_user_ids(&self) -> Result<()> {
+        let owners: HashMap<String, String> = self
+            .list_api_keys()
+            .await?
+            .into_iter()
+            .filter(|k| !k.user_id.is_empty())
+            .map(|k| (k.api_key, k.user_id))
+            .collect();
+        let backend = DynamoDbBackend {
+            client: self.client.clone(),
+        };
+        tokio::spawn(async move {
+            match backend.run_usage_user_backfill(&owners).await {
+                Ok(n) => tracing::info!(rows = n, "Backfilled usage.user_id"),
+                Err(e) => {
+                    tracing::error!(error = %e, "usage.user_id backfill failed; will retry on next startup")
+                }
+            }
+        });
         Ok(())
     }
 
@@ -540,8 +728,10 @@ impl ApiKeyStore for DynamoDbBackend {
     }
 
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
-        // Check name uniqueness via filtered scan (avoids loading all keys into memory)
-        if self.name_exists(&record.name, None).await? {
+        if self
+            .user_key_name_taken(&record.user_id, &record.name, None)
+            .await?
+        {
             return Err(anyhow::anyhow!("UNIQUE constraint failed: api_keys.name"));
         }
         self.client
@@ -554,9 +744,9 @@ impl ApiKeyStore for DynamoDbBackend {
     }
 
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
-        // Check name uniqueness, excluding the current key
+        // Check per-user name uniqueness, excluding the current key
         if self
-            .name_exists(&record.name, Some(&record.api_key))
+            .user_key_name_taken(&record.user_id, &record.name, Some(&record.api_key))
             .await?
         {
             return Err(anyhow::anyhow!("UNIQUE constraint failed: api_keys.name"));
@@ -700,15 +890,13 @@ impl ApiKeyStore for DynamoDbBackend {
     }
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
-        let result = self
-            .client
-            .scan()
-            .table_name(Self::table_name("api_keys"))
-            .send()
-            .await?;
-
-        let records = result.items().iter().map(api_key_from_item).collect();
-
+        let mut records: Vec<ApiKeyRecord> = self
+            .scan_all("api_keys", None)
+            .await?
+            .iter()
+            .map(api_key_from_item)
+            .collect();
+        records.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         Ok(records)
     }
 
@@ -807,6 +995,196 @@ impl ApiKeyStore for DynamoDbBackend {
             .await?;
         Ok(())
     }
+
+    async fn list_api_keys_by_user(&self, user_id: &str) -> Result<Vec<ApiKeyRecord>> {
+        let mut records: Vec<ApiKeyRecord> = self
+            .scan_all("api_keys", Some(("user_id = :u", &[(":u", av_s(user_id))])))
+            .await?
+            .iter()
+            .map(api_key_from_item)
+            .collect();
+        records.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        Ok(records)
+    }
+
+    async fn assign_unowned_key(&self, record: &ApiKeyRecord) -> Result<bool> {
+        let mut item = api_key_to_item(record);
+        item.insert("updated_at".into(), av_n(unix_now()));
+        let res = self
+            .client
+            .put_item()
+            .table_name(Self::table_name("api_keys"))
+            .set_item(Some(item))
+            .condition_expression(
+                "attribute_exists(api_key) AND (attribute_not_exists(user_id) OR user_id = :empty)",
+            )
+            .expression_attribute_values(":empty", av_s(""))
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_conditional_check_failed_exception() {
+                    Ok(false)
+                } else {
+                    Err(anyhow::anyhow!("assign_unowned_key: {svc}"))
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// UserStore
+// ============================================================================
+
+#[async_trait]
+impl UserStore for DynamoDbBackend {
+    async fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(Self::table_name("users"))
+            .key("user_id", av_s(user_id))
+            .send()
+            .await?;
+        Ok(result.item().map(user_from_item))
+    }
+
+    async fn get_user_by_name(&self, name: &str) -> Result<Option<UserRecord>> {
+        // users is small (one row per person); a filtered scan avoids a GSI.
+        Ok(self
+            .scan_all("users", Some(("#n = :name", &[(":name", av_s(name))])))
+            .await?
+            .first()
+            .map(user_from_item))
+    }
+
+    async fn list_users(&self) -> Result<Vec<UserRecord>> {
+        let mut users: Vec<UserRecord> = self
+            .scan_all("users", None)
+            .await?
+            .iter()
+            .map(user_from_item)
+            .collect();
+        users.sort_by_key(|u| std::cmp::Reverse(u.created_at));
+        Ok(users)
+    }
+
+    async fn create_user(&self, record: &UserRecord) -> Result<()> {
+        if self.get_user_by_name(&record.name).await?.is_some() {
+            return Err(anyhow::anyhow!("UNIQUE constraint failed: users.name"));
+        }
+        self.client
+            .put_item()
+            .table_name(Self::table_name("users"))
+            .set_item(Some(user_to_item(record)))
+            .condition_expression("attribute_not_exists(user_id)")
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn update_user(&self, u: &UserRecord) -> Result<()> {
+        if let Some(other) = self.get_user_by_name(&u.name).await? {
+            if other.user_id != u.user_id {
+                return Err(anyhow::anyhow!("UNIQUE constraint failed: users.name"));
+            }
+        }
+        // Spend counters are owned by increment/reset — never overwritten here.
+        self.client
+            .update_item()
+            .table_name(Self::table_name("users"))
+            .key("user_id", av_s(&u.user_id))
+            .condition_expression("attribute_exists(user_id)")
+            .update_expression(
+                "SET #n = :name, email = :email, is_active = :active, cost_rate = :rate, \
+                 monthly_budget = :budget, rate_limit = :rpm, tpm_limit = :tpm, \
+                 allowed_models = :models, cache_ttl = :ttl, metadata = :meta, updated_at = :now",
+            )
+            .expression_attribute_names("#n", "name")
+            .expression_attribute_values(":name", av_s(&u.name))
+            .expression_attribute_values(":email", av_opt_s(&u.email))
+            .expression_attribute_values(":active", av_bool(u.is_active))
+            .expression_attribute_values(":rate", av_n_f64(u.cost_rate))
+            .expression_attribute_values(":budget", av_opt_n_f64(u.monthly_budget))
+            .expression_attribute_values(":rpm", av_opt_n_i32(u.rate_limit))
+            .expression_attribute_values(":tpm", av_opt_n_i32(u.tpm_limit))
+            .expression_attribute_values(":models", av_opt_s(&patterns_to_json(&u.allowed_models)))
+            .expression_attribute_values(":ttl", av_opt_s(&u.cache_ttl))
+            .expression_attribute_values(":meta", av_opt_s(&u.metadata))
+            .expression_attribute_values(":now", av_n(unix_now()))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_user(&self, user_id: &str) -> Result<()> {
+        self.client
+            .delete_item()
+            .table_name(Self::table_name("users"))
+            .key("user_id", av_s(user_id))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<bool> {
+        let result = self
+            .client
+            .update_item()
+            .table_name(Self::table_name("users"))
+            .key("user_id", av_s(user_id))
+            .condition_expression("attribute_exists(user_id)")
+            .update_expression(
+                "SET budget_used = budget_used + :amount, \
+                 budget_used_mtd = budget_used_mtd + :amount, updated_at = :now",
+            )
+            .expression_attribute_values(":amount", av_n_f64(amount))
+            .expression_attribute_values(":now", av_n(unix_now()))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
+            .send()
+            .await?;
+        Ok(result.attributes().is_some_and(|a| {
+            get_opt_f64(a, "monthly_budget")
+                .is_some_and(|limit| get_f64(a, "budget_used_mtd") >= limit)
+        }))
+    }
+
+    async fn reset_user_monthly_budget(
+        &self,
+        user_id: &str,
+        month: &str,
+        prev_month: &str,
+        prev_mtd: f64,
+    ) -> Result<()> {
+        let existing = self.get_user(user_id).await?.and_then(|u| u.budget_history);
+        let mut history: HashMap<String, f64> = existing
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        if prev_mtd > 0.0 && !prev_month.is_empty() {
+            history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
+        }
+        let history = serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string());
+        self.client
+            .update_item()
+            .table_name(Self::table_name("users"))
+            .key("user_id", av_s(user_id))
+            .update_expression(
+                "SET budget_used_mtd = :zero, budget_mtd_month = :month, \
+                 budget_history = :history, updated_at = :now",
+            )
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
+            .expression_attribute_values(":month", av_s(month))
+            .expression_attribute_values(":history", av_s(&history))
+            .expression_attribute_values(":now", av_n(unix_now()))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("DynamoDB reset_user_monthly_budget: {e}"))?;
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -822,6 +1200,9 @@ impl UsageStore for DynamoDbBackend {
         item.insert("sort_key".into(), av_s(&sort_key));
         if let Some(ref key_id) = record.key_id {
             item.insert("key_id".into(), av_s(key_id));
+        }
+        if let Some(ref user_id) = record.user_id {
+            item.insert("user_id".into(), av_s(user_id));
         }
         item.insert("timestamp".into(), av_s(&record.timestamp));
         item.insert("request_id".into(), av_s(&record.request_id));
@@ -854,6 +1235,7 @@ impl UsageStore for DynamoDbBackend {
     async fn get_usage_by_api_key(
         &self,
         api_key: &str,
+        user_id: Option<&str>,
         since: Option<&str>,
         limit: Option<i64>,
         _before_id: Option<i64>,
@@ -873,6 +1255,9 @@ impl UsageStore for DynamoDbBackend {
             // Filter by since in application layer (Scan has no sort key condition)
             if let Some(since_ts) = since {
                 records.retain(|r| r.timestamp.as_str() >= since_ts);
+            }
+            if let Some(u) = user_id {
+                records.retain(|r| r.user_id.as_deref() == Some(u));
             }
             records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             records
@@ -896,7 +1281,12 @@ impl UsageStore for DynamoDbBackend {
             }
 
             let result = query.send().await?;
-            result.items().iter().map(usage_from_item).collect()
+            result
+                .items()
+                .iter()
+                .map(usage_from_item)
+                .filter(|r| user_id.is_none() || r.user_id.as_deref() == user_id)
+                .collect()
         };
 
         Ok(records)
@@ -905,6 +1295,7 @@ impl UsageStore for DynamoDbBackend {
     async fn query_usage_summary(
         &self,
         api_key: &str,
+        user_id: Option<&str>,
         start: Option<&str>,
         end: Option<&str>,
         group_by: &str,
@@ -928,6 +1319,10 @@ impl UsageStore for DynamoDbBackend {
             filter_parts.push("#ts <= :end_ts".to_string());
             expr_values.push((":end_ts".to_string(), av_s(end_ts)));
         }
+        if let Some(u) = user_id {
+            filter_parts.push("user_id = :uid".to_string());
+            expr_values.push((":uid".to_string(), av_s(u)));
+        }
 
         let filter_expr = if filter_parts.is_empty() {
             None
@@ -946,9 +1341,10 @@ impl UsageStore for DynamoDbBackend {
                 .limit(MAX_ITEMS);
 
             if let Some(ref fe) = filter_expr {
-                query = query
-                    .filter_expression(fe.as_str())
-                    .expression_attribute_names("#ts", "timestamp");
+                query = query.filter_expression(fe.as_str());
+                if fe.contains("#ts") {
+                    query = query.expression_attribute_names("#ts", "timestamp");
+                }
             }
             for (k, v) in &expr_values {
                 query = query.expression_attribute_values(k, v.clone());
@@ -973,9 +1369,10 @@ impl UsageStore for DynamoDbBackend {
                 .limit(MAX_ITEMS);
 
             if let Some(ref fe) = filter_expr {
-                scan = scan
-                    .filter_expression(fe.as_str())
-                    .expression_attribute_names("#ts", "timestamp");
+                scan = scan.filter_expression(fe.as_str());
+                if fe.contains("#ts") {
+                    scan = scan.expression_attribute_names("#ts", "timestamp");
+                }
             }
             for (k, v) in &expr_values {
                 scan = scan.expression_attribute_values(k, v.clone());
@@ -1000,6 +1397,7 @@ impl UsageStore for DynamoDbBackend {
                 "month" => r.timestamp.chars().take(7).collect(),
                 "provider" => r.provider.as_deref().unwrap_or("unknown").to_string(),
                 "api_key" => r.key_id.clone().unwrap_or_else(|| r.api_key.clone()),
+                "user" => r.user_id.clone().unwrap_or_default(),
                 _ => r.timestamp.chars().take(13).collect(),
             }
         }

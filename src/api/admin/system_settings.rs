@@ -91,6 +91,11 @@ fn is_sensitive(ui_schema: &Option<String>) -> bool {
 pub async fn list_settings(State(state): State<AppState>) -> impl IntoResponse {
     match state.database.system_settings().list_settings().await {
         Ok(mut records) => {
+            // Internal migration state is not a user-facing setting.
+            records.retain(|r| {
+                !r.key
+                    .starts_with(crate::database::traits::INTERNAL_SETTING_PREFIX)
+            });
             for record in &mut records {
                 if is_sensitive(&record.ui_schema) && !record.value.is_empty() {
                     record.value =
@@ -127,6 +132,16 @@ pub async fn upsert_setting(
     Path(key): Path<String>,
     Json(body): Json<UpsertSettingRequest>,
 ) -> impl IntoResponse {
+    if key.starts_with(crate::database::traits::INTERNAL_SETTING_PREFIX) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Settings starting with '__' are internal and cannot be changed",
+            )),
+        )
+            .into_response();
+    }
     if let Err(msg) = validate_setting(&key, &body.value) {
         return (
             StatusCode::BAD_REQUEST,

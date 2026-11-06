@@ -17,15 +17,14 @@ use crate::api::{
 use crate::middleware::{
     admin_auth::{require_admin_key, AdminAuthState},
     auth::{extract_api_key, require_api_key, AuthState},
+    model_access::{enforce_model_allowlist, ModelAccessState},
     rate_limit::{rate_limit, RateLimitState},
 };
 use crate::server::state::AppState;
 
-/// Create the main application router
+/// Create the main application router.
 ///
-/// Note: reads `DynamicConfig` via `try_read()` to extract the rate-limit RPM
-/// at startup. This is safe because the router is built once before the server
-/// starts accepting requests (no write contention).
+/// Business routes run: auth → model allowlist → rate limit → handler.
 pub fn create_router(state: AppState) -> Router {
     // Request body cap (axum defaults to 2 MB, far too small for long Codex /
     // Claude Code sessions that ship the whole conversation per request).
@@ -49,6 +48,9 @@ pub fn create_router(state: AppState) -> Router {
     let rate_limit_state =
         RateLimitState::new(state.dynamic.clone(), state.usage_tracker.token_limiter());
     let rate_limit_state_clone = rate_limit_state.clone();
+    let model_access_state = ModelAccessState {
+        max_body_bytes: state.settings.max_body_size_bytes(),
+    };
 
     // Anthropic API routes (POST /v1/messages)
     let anthropic_routes = Router::new()
@@ -57,6 +59,10 @@ pub fn create_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             rate_limit_state.clone(),
             rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            model_access_state.clone(),
+            enforce_model_allowlist,
         ))
         .layer(middleware::from_fn_with_state(
             auth_state.clone(),
@@ -94,6 +100,10 @@ pub fn create_router(state: AppState) -> Router {
             rate_limit,
         ))
         .layer(middleware::from_fn_with_state(
+            model_access_state,
+            enforce_model_allowlist,
+        ))
+        .layer(middleware::from_fn_with_state(
             auth_state_clone,
             require_api_key,
         ));
@@ -122,6 +132,21 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/keys/:key_id/deactivate",
             post(admin::keys::deactivate_key),
+        )
+        .route(
+            "/users",
+            get(admin::users::list_users).post(admin::users::create_user),
+        )
+        .route(
+            "/users/:user",
+            get(admin::users::get_user)
+                .put(admin::users::update_user)
+                .delete(admin::users::delete_user),
+        )
+        .route("/users/:user/activate", post(admin::users::activate_user))
+        .route(
+            "/users/:user/deactivate",
+            post(admin::users::deactivate_user),
         )
         // Backends
         .route("/backends", get(admin::backends::list_backends))

@@ -2,6 +2,7 @@
 
 pub mod admin_auth;
 pub mod auth;
+pub mod model_access;
 pub mod rate_limit;
 
 pub use auth::{require_api_key, ApiKeyInfo, AuthError, AuthState};

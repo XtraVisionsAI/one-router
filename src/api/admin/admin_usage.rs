@@ -27,6 +27,8 @@ pub struct AdminUsageQueryParams {
     /// Filter by API key: `key_id`, key name (legacy), or `__master__`/`__ephemeral__`.
     /// Absent = all keys.
     pub api_key: Option<String>,
+    /// Filter by user: `user_id` or user name. Combines with `api_key` (AND).
+    pub user: Option<String>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
     #[serde(default = "default_group_by")]
@@ -42,6 +44,7 @@ fn default_group_by() -> String {
 #[derive(Debug, Deserialize)]
 pub struct AdminRecordsQueryParams {
     pub api_key: Option<String>,
+    pub user: Option<String>,
     pub start_time: Option<String>,
     pub limit: Option<i64>,
 }
@@ -94,6 +97,9 @@ pub struct UsageRecordItem {
     pub api_key: String,
     /// Stable key identifier; `None` on legacy rows of since-deleted keys.
     pub key_id: Option<String>,
+    /// Owning user's display label (name, `deleted user · <id>`, or `unattributed`).
+    pub user: String,
+    pub user_id: Option<String>,
     pub timestamp: String,
     pub request_id: String,
     pub model: String,
@@ -162,6 +168,64 @@ async fn resolve_api_key_filter(
     }
 }
 
+/// Resolve a `user` query parameter (`user_id` or name) to a `user_id`.
+async fn resolve_user_filter(
+    state: &AppState,
+    ident: Option<&str>,
+) -> Result<Option<String>, Box<axum::response::Response>> {
+    let Some(ident) = ident.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let users = state.database.users();
+    let found = match users.get_user(ident).await {
+        Ok(Some(u)) => Ok(Some(u)),
+        Ok(None) => users.get_user_by_name(ident).await,
+        Err(e) => Err(e),
+    };
+    match found {
+        Ok(Some(u)) => Ok(Some(u.user_id)),
+        Ok(None) => Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "not_found_error",
+                    format!("User '{ident}' not found"),
+                )),
+            )
+                .into_response(),
+        )),
+        Err(e) => Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("api_error", e.to_string())),
+            )
+                .into_response(),
+        )),
+    }
+}
+
+/// `user_id` → user name.
+async fn build_user_labels(state: &AppState) -> HashMap<String, String> {
+    state
+        .database
+        .users()
+        .list_users()
+        .await
+        .map(|users| users.into_iter().map(|u| (u.user_id, u.name)).collect())
+        .unwrap_or_default()
+}
+
+/// Display label for a usage row's `user_id` ("" / None = unattributed).
+fn resolve_user_name(raw: Option<&str>, labels: &HashMap<String, String>) -> String {
+    match raw.filter(|s| !s.is_empty()) {
+        None => "unattributed".to_string(),
+        Some(id) => labels.get(id).cloned().unwrap_or_else(|| {
+            let short: String = id.chars().take(8).collect();
+            format!("deleted user · {short}")
+        }),
+    }
+}
+
 /// Build a mapping from usage key identifiers (`key_id`, legacy hashes,
 /// internal IDs) to human-readable display names.
 async fn build_api_key_labels(state: &AppState) -> HashMap<String, String> {
@@ -196,7 +260,9 @@ pub async fn get_usage_summary(
     State(state): State<AppState>,
     Query(params): Query<AdminUsageQueryParams>,
 ) -> impl IntoResponse {
-    const VALID_GROUP_BY: &[&str] = &["hour", "day", "month", "model", "provider", "api_key"];
+    const VALID_GROUP_BY: &[&str] = &[
+        "hour", "day", "month", "model", "provider", "api_key", "user",
+    ];
     if !VALID_GROUP_BY.contains(&params.group_by.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -226,12 +292,17 @@ pub async fn get_usage_summary(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    let user_filter = match resolve_user_filter(&state, params.user.as_deref()).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
 
     let rows = match state
         .database
         .usage()
         .query_usage_summary(
             &api_key_filter,
+            user_filter.as_deref(),
             params.start_time.as_deref(),
             params.end_time.as_deref(),
             &params.group_by,
@@ -269,20 +340,28 @@ pub async fn get_usage_summary(
     } else {
         HashMap::new()
     };
+    let user_group = params.group_by == "user";
+    let user_split = params.split_by.as_deref() == Some("user");
+    let user_labels = if user_group || user_split {
+        build_user_labels(&state).await
+    } else {
+        HashMap::new()
+    };
+    let label = |raw: String, key_dim: bool, user_dim: bool| {
+        if key_dim {
+            resolve_display_name(&raw, &labels)
+        } else if user_dim {
+            resolve_user_name(Some(&raw), &user_labels)
+        } else {
+            raw
+        }
+    };
 
     let data = rows
         .into_iter()
         .map(|r| UsageBucket {
-            group_key: if resolve_group {
-                resolve_display_name(&r.group_key, &labels)
-            } else {
-                r.group_key
-            },
-            split_key: if resolve_split {
-                r.split_key.map(|sk| resolve_display_name(&sk, &labels))
-            } else {
-                r.split_key
-            },
+            group_key: label(r.group_key, resolve_group, user_group),
+            split_key: r.split_key.map(|sk| label(sk, resolve_split, user_split)),
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
             cached_tokens: r.cached_tokens,
@@ -317,6 +396,10 @@ pub async fn get_usage_records(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    let user_filter = match resolve_user_filter(&state, params.user.as_deref()).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
 
     // Fetch limit+1 rows so we can detect has_more without an extra query.
     // Passes the limit directly to the DB to avoid loading unbounded rows into RAM.
@@ -325,6 +408,7 @@ pub async fn get_usage_records(
         .usage()
         .get_usage_by_api_key(
             &api_key_filter,
+            user_filter.as_deref(),
             params.start_time.as_deref(),
             Some(limit + 1),
             None,
@@ -350,8 +434,9 @@ pub async fn get_usage_records(
         records.truncate(limit as usize);
     }
 
-    // Resolve api_key hashes to display names
+    // Resolve api_key hashes / user ids to display names
     let labels = build_api_key_labels(&state).await;
+    let user_labels = build_user_labels(&state).await;
 
     let data = records
         .into_iter()
@@ -359,6 +444,8 @@ pub async fn get_usage_records(
             id: r.id,
             api_key: resolve_display_name(r.key_id.as_deref().unwrap_or(&r.api_key), &labels),
             key_id: r.key_id,
+            user: resolve_user_name(r.user_id.as_deref(), &user_labels),
+            user_id: r.user_id,
             timestamp: r.timestamp,
             request_id: r.request_id,
             model: r.model,
@@ -405,6 +492,19 @@ mod tests {
             "deleted key · 9f8e7d6c"
         );
         assert_eq!(resolve_display_name("abc", &labels), "deleted key · abc");
+    }
+
+    #[test]
+    fn user_labels() {
+        let mut labels = HashMap::new();
+        labels.insert("u-1".to_string(), "alice".to_string());
+        assert_eq!(resolve_user_name(Some("u-1"), &labels), "alice");
+        assert_eq!(resolve_user_name(None, &labels), "unattributed");
+        assert_eq!(resolve_user_name(Some(""), &labels), "unattributed");
+        assert_eq!(
+            resolve_user_name(Some("9f8e7d6c-x"), &labels),
+            "deleted user · 9f8e7d6c"
+        );
     }
 
     #[test]

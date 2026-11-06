@@ -1,12 +1,13 @@
 //! OpenAI Models API endpoint
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
 
+use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::openai::{current_timestamp, Model, ModelsResponse, OpenAIErrorResponse};
 use crate::server::state::AppState;
 
@@ -77,7 +78,10 @@ fn get_available_models() -> Vec<Model> {
     ]
 }
 
-pub async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
+pub async fn list_models(
+    State(state): State<AppState>,
+    key_info: Option<Extension<ApiKeyInfo>>,
+) -> Json<ModelsResponse> {
     // Try to load models from database model_mappings; fall back to hardcoded list on failure
     let models = match state.database.model_mapping().list_mappings().await {
         Ok(mappings) if !mappings.is_empty() => {
@@ -105,6 +109,14 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> 
         }
         _ => get_available_models(),
     };
+    // Only what the caller's allowlists (key ∩ user) admit.
+    let models = match key_info {
+        Some(Extension(k)) => models
+            .into_iter()
+            .filter(|m| k.allows_model(&m.id))
+            .collect(),
+        None => models,
+    };
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -114,8 +126,17 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> 
 
 pub async fn get_model(
     State(_state): State<AppState>,
+    key_info: Option<Extension<ApiKeyInfo>>,
     Path(model_id): Path<String>,
 ) -> impl IntoResponse {
+    if key_info.is_some_and(|Extension(k)| !k.allows_model(&model_id)) {
+        let error = OpenAIErrorResponse::with_code(
+            "invalid_request_error",
+            &format!("The model '{model_id}' does not exist"),
+            "model_not_found",
+        );
+        return (StatusCode::NOT_FOUND, Json(error)).into_response();
+    }
     let models = get_available_models();
 
     if let Some(model) = models.into_iter().find(|m| m.id == model_id) {

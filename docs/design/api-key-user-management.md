@@ -1,6 +1,6 @@
 # API Key 管理重构:用户维度计费 + Key 生命周期 + 审计
 
-日期:2026-11-06 · 状态:P0 已实施(2026-11-06,单测 + 本地烟囱测试验证);P1–P3 设计中
+日期:2026-11-06 · 状态:P0、P1 已实施(2026-11-06,单测 + 本地烟囱测试验证,含用 P0 二进制建库后升级);P2–P3 设计中
 
 ## 背景与目标
 
@@ -180,6 +180,31 @@ token 数只有在响应结束后才知道,所以 TPM 采用**事后计量 + 事
 ---
 
 ## P1:用户维度(解决三个已知问题)
+
+### 实施记录:与下文初稿的差异
+
+以下各小节保留初稿设计;实际实现有这些调整:
+
+| 主题 | 初稿 | 实现 | 原因 |
+|---|---|---|---|
+| Key 的 `cost_rate` 列 | 移除 | 列保留但不再使用(新 Key 恒为 1.0),Admin API 不再暴露;对 Key 设置 `cost_rate` 返回 400 | 避免为删一列再重建表;倍率只看用户 |
+| Key `rate_limit` | 可空 | 仍为 INT,`<= 0` 表示"无 Key 级子限额"(API 上表现为 `null`) | 不改列类型;`0` 原义"用默认值",迁移后由用户层承接,结果等价 |
+| 迁移触发 | `users` 表为空时 + 完成标记 | 逐个处理**无主 Key**(`user_id` 为空),对 Key 的写入是**条件写**("仍无主"才写),输了的实例删除自己刚建的用户 | 天然幂等、可续跑;多实例同时启动(App Runner 滚动部署)不会重复迁移 |
+| Key 预算计数 | 清零重新累计 | 当月计数清零;**累计 `budget_used` 保留在 Key 上**作统计 | 历史已由用户承接,Key 的累计值仍有统计价值 |
+| 计费累加原子性 | SQL 事务 / `TransactWriteItems` | Key、用户两次**独立**原子累加,任一失败报错但不回滚另一个 | 软预算场景不需要跨行事务;Postgres 改为单条 `UPDATE … RETURNING` |
+| DynamoDB 索引 | `users` / `usage` 上加 GSI | 不加 GSI:`users` 小表用分页 Scan;按用户查 usage 用 Scan + 过滤(与现有无 Key 过滤时的 Scan 路径一致,上限 10k 条) | 少一类迁移风险;usage 量大时再加 GSI |
+| usage `user_id` 回填(DynamoDB) | 带游标检查点 | 后台任务整表 Scan(`attribute_not_exists(user_id)` 过滤)+ 条件更新;内部设置 `__usage_user_backfill` 从 `pending` 到 `done`,中途退出则下次启动重跑 | 已处理的行会被过滤掉,不需要游标 |
+| 内部状态 | `usage_backfill_*` 普通设置 | `__` 前缀的内部设置:Settings API 列表中隐藏、拒绝写入 | 防止管理员误改迁移状态 |
+| 模型白名单执行点 | 未定 | 业务路由上的独立中间件(auth → 白名单 → 限流):仅有白名单的调用方才缓冲 body 读取顶层 `model`;403 按入站协议格式返回;`/v1/models` 过滤、`/v1/models/:id` 对不允许的模型返回 404 | 覆盖所有端点(含 embeddings / count_tokens),无白名单者零开销 |
+| glob 语法 | — | 与 `model_mappings` / backend `models` 共用 `utils/glob.rs`:**只支持一个 `*`**(`claude-*`、`*-latest`、`a-*-b`);`*opus*` 这类多星号模式不生效 | 不改动路由共用的匹配语义 |
+| 鉴权失败指标 | — | `onerouter_auth_failures_total{reason}` 新增 `expired_key` / `inactive_owner` / `budget_exceeded` / `model_not_allowed`(预算超限原先计在 `inactive_key`) | 可区分 |
+| 用户删除 | — | 有 Key 时返回 409;`?cascade=true` 连同 Key 硬删 | |
+| 按名称寻址 Key(兼容) | 全局匹配多于一个返回 409 | 已实现 | |
+
+**顺带修复的潜在 bug**:旧的预算判断不看月份——Key 某月用完预算后,鉴权一直用
+上月的 `budget_used_mtd` 拒绝请求,而月度重置只发生在成功请求的计费路径里,
+于是该 Key 在之后的月份**永远**被拒(除非管理员手动改)。现在鉴权按
+`period_spend`(计数月份不是本月即视为 0)判断,各层独立懒重置。
 
 ### `users` 表
 
@@ -545,7 +570,7 @@ key / user / team 层 `max_concurrency`。进程内信号量在请求开始时�
 | 版本 | 内容 | 兼容性 |
 |---|---|---|
 | P0 ✅ | key_id + 回填、硬删除、`/keys/:key_id`(兼容 name)、TPM、限流缓存键、全局 RPM 热更新、metadata、`/v1/usage` 修复 | 完全向后兼容(无参 `DELETE` 仍为停用) |
-| P1 | users 表 + 自动迁移、多 Key、用户级计费、过期、模型白名单、UI 用户页 | 行为不变;**不可无损回退** |
+| P1 ✅ | users 表 + 自动迁移、多 Key、用户级计费、过期、模型白名单、UI 用户页 | 行为不变;**不可无损回退** |
 | P2 | 审计日志、预算周期、告警、轮换、last_used、鉴权缓存、IP 白名单、标签、Key 前缀 | 向后兼容;移除 name 路径兼容 |
 | P3 | 团队、并发上限、共享限流、预扣 | 新能力默认关闭 |
 

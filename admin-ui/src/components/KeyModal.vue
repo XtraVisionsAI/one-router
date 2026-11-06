@@ -1,11 +1,14 @@
 <script setup lang="ts">
-  import type { ApiKey, CreateKeyBody, UpdateKeyBody } from '@/api/types'
+  import type { ApiKey, CreateKeyBody, UpdateKeyBody, User } from '@/api/types'
   import { useMessage } from 'naive-ui'
   import { useKeysApi } from '@/api/keys'
 
   const props = defineProps<{
     show: boolean
     existing?: ApiKey
+    users: User[]
+    /** Preselected owner when creating. */
+    defaultUserId?: string | null
   }>()
 
   const emit = defineEmits<{
@@ -20,37 +23,44 @@
   const title = computed(() => (isEdit.value ? 'Edit API Key' : 'Create API Key'))
 
   const cacheTtlOptions = [
-    { label: 'Default (no override)', value: null },
+    { label: 'Inherit from user', value: null },
     { label: '5 minutes', value: '5m' },
-    { label: '1 hour', value: '1h' },
-    { label: '24 hours', value: '24h' }
+    { label: '1 hour', value: '1h' }
   ]
+  const userOptions = computed(() => props.users.map((u) => ({ label: u.name, value: u.user_id })))
 
-  const form = ref({
+  const blank = () => ({
+    user_id: null as string | null,
     name: '',
-    rate_limit: 100,
+    rate_limit: null as number | null,
     monthly_budget: null as number | null,
     tpm_limit: null as number | null,
     cache_ttl: null as string | null,
-    cost_rate: 1.0,
+    expires_at: null as number | null, // ms for the date picker
+    allowed_models: [] as string[],
     metadata: ''
   })
+  const form = ref(blank())
   const saving = ref(false)
 
   watch(
     () => props.show,
     (val) => {
-      if (val) {
-        form.value = {
-          name: props.existing?.name ?? '',
-          rate_limit: props.existing?.rate_limit ?? 100,
-          monthly_budget: props.existing?.monthly_budget ?? null,
-          tpm_limit: props.existing?.tpm_limit ?? null,
-          cache_ttl: props.existing?.cache_ttl ?? null,
-          cost_rate: props.existing?.cost_rate ?? 1.0,
-          metadata: props.existing?.metadata ? JSON.stringify(props.existing.metadata, null, 2) : ''
-        }
-      }
+      if (!val) return
+      const k = props.existing
+      form.value = k
+        ? {
+            user_id: k.user_id,
+            name: k.name,
+            rate_limit: k.rate_limit,
+            monthly_budget: k.monthly_budget,
+            tpm_limit: k.tpm_limit,
+            cache_ttl: k.cache_ttl,
+            expires_at: k.expires_at ? k.expires_at * 1000 : null,
+            allowed_models: [...(k.allowed_models ?? [])],
+            metadata: k.metadata ? JSON.stringify(k.metadata, null, 2) : ''
+          }
+        : { ...blank(), user_id: props.defaultUserId ?? null }
     }
   )
 
@@ -70,49 +80,42 @@
       message.error('Name is required')
       return
     }
+    if (!isEdit.value && !form.value.user_id) {
+      message.error('Select the user that owns this key')
+      return
+    }
     const metadata = parseMetadata()
     if (metadata === undefined) {
       message.error('Metadata must be a JSON object, e.g. {"owner": "alice"}')
       return
     }
+    const fields = {
+      name: form.value.name.trim(),
+      rate_limit: form.value.rate_limit || null,
+      monthly_budget: form.value.monthly_budget,
+      tpm_limit: form.value.tpm_limit || null,
+      cache_ttl: form.value.cache_ttl,
+      expires_at: form.value.expires_at ? Math.floor(form.value.expires_at / 1000) : null,
+      allowed_models: form.value.allowed_models.length ? form.value.allowed_models : null,
+      metadata
+    }
 
     saving.value = true
     try {
       if (isEdit.value) {
-        const body: UpdateKeyBody = {}
-        if (form.value.name !== props.existing?.name) body.name = form.value.name
-        if (form.value.rate_limit !== props.existing?.rate_limit) body.rate_limit = form.value.rate_limit
-        if (form.value.monthly_budget !== props.existing?.monthly_budget)
-          body.monthly_budget = form.value.monthly_budget
-        if (form.value.tpm_limit !== props.existing?.tpm_limit) body.tpm_limit = form.value.tpm_limit
-        if (form.value.cache_ttl !== props.existing?.cache_ttl) body.cache_ttl = form.value.cache_ttl
-        if (form.value.cost_rate !== props.existing?.cost_rate) body.cost_rate = form.value.cost_rate
-        if (JSON.stringify(metadata) !== JSON.stringify(props.existing?.metadata ?? null)) body.metadata = metadata
-        await api.update(props.existing!.key_id, body)
+        await api.update(props.existing!.key_id, fields as UpdateKeyBody)
         message.success('Key updated')
         emit('update:show', false)
         emit('saved')
       } else {
-        const body: CreateKeyBody = {
-          name: form.value.name,
-          rate_limit: form.value.rate_limit,
-          monthly_budget: form.value.monthly_budget,
-          tpm_limit: form.value.tpm_limit,
-          cache_ttl: form.value.cache_ttl,
-          cost_rate: form.value.cost_rate,
-          metadata
-        }
+        const body: CreateKeyBody = { ...fields, user_id: form.value.user_id! }
         const result = await api.create(body)
         message.success('Key created')
         emit('update:show', false)
         emit('saved', result.api_key)
       }
     } catch (e: any) {
-      if (e.status === 409) {
-        message.error('A key with this name already exists')
-      } else {
-        message.error(e.message)
-      }
+      message.error(e.status === 409 ? 'This user already has a key with this name' : e.message)
     } finally {
       saving.value = false
     }
@@ -120,52 +123,58 @@
 </script>
 
 <template>
-  <NModal :show="show" :title="title" preset="card" style="width: 480px" @update:show="emit('update:show', $event)">
+  <NModal :show="show" :title="title" preset="card" style="width: 520px" @update:show="emit('update:show', $event)">
     <div class="space-y-1">
       <NFormItem v-if="isEdit" label="Key">
         <div style="font-family: monospace; font-size: 12px; color: #94a3b8; padding: 6px 0; word-break: break-all">
-          {{ existing!.api_key }}
+          {{ existing!.api_key }} · {{ existing!.user_name ?? existing!.user_id }}
         </div>
       </NFormItem>
 
-      <NFormItem label="Name" required>
-        <NInput v-model:value="form.name" placeholder="e.g. Production App" />
-      </NFormItem>
+      <div class="flex gap-4">
+        <NFormItem v-if="!isEdit" label="User" required class="flex-1">
+          <NSelect v-model:value="form.user_id" :options="userOptions" filterable placeholder="Select owner" />
+        </NFormItem>
+        <NFormItem label="Name" required class="flex-1">
+          <NInput v-model:value="form.name" placeholder="e.g. laptop, ci" />
+        </NFormItem>
+      </div>
 
+      <div class="text-xs text-slate-400 mb-2">
+        Key-level limits are optional and can only narrow the user's limits.
+      </div>
       <div class="flex gap-4">
         <NFormItem label="Rate Limit (rpm)" class="flex-1">
-          <NInputNumber v-model:value="form.rate_limit" :min="0" class="w-full" />
+          <NInputNumber v-model:value="form.rate_limit" :min="1" placeholder="user limit" class="w-full" />
         </NFormItem>
         <NFormItem label="TPM Limit" class="flex-1">
-          <NInputNumber v-model:value="form.tpm_limit" :min="1" placeholder="unlimited" class="w-full" />
+          <NInputNumber v-model:value="form.tpm_limit" :min="1" placeholder="user limit" class="w-full" />
         </NFormItem>
       </div>
-
-      <NFormItem label="Monthly Budget ($)">
-        <NInputNumber
-          v-model:value="form.monthly_budget"
-          :min="0"
-          :precision="2"
-          placeholder="unlimited"
-          class="w-full"
-        />
-      </NFormItem>
 
       <div class="flex gap-4">
-        <NFormItem label="Cache TTL" class="flex-1">
-          <NSelect v-model:value="form.cache_ttl" :options="cacheTtlOptions" class="w-full" />
+        <NFormItem label="Monthly Budget ($)" class="flex-1">
+          <NInputNumber v-model:value="form.monthly_budget" :min="0" :precision="2" placeholder="user budget" class="w-full" />
         </NFormItem>
-        <NFormItem label="Cost Rate" class="flex-1">
-          <NInputNumber v-model:value="form.cost_rate" :min="0" :step="0.1" :precision="2" class="w-full" />
+        <NFormItem label="Expires At" class="flex-1">
+          <NDatePicker v-model:value="form.expires_at" type="datetime" clearable placeholder="never" class="w-full" />
         </NFormItem>
       </div>
+
+      <NFormItem label="Allowed Models (glob, !exclude — empty = user's)">
+        <NDynamicTags v-model:value="form.allowed_models" />
+      </NFormItem>
+
+      <NFormItem label="Cache TTL">
+        <NSelect v-model:value="form.cache_ttl" :options="cacheTtlOptions" class="w-full" />
+      </NFormItem>
 
       <NFormItem label="Metadata (JSON, optional)">
         <NInput
           v-model:value="form.metadata"
           type="textarea"
           :autosize="{ minRows: 2, maxRows: 6 }"
-          placeholder='{"owner": "alice", "ticket": "T123"}'
+          placeholder='{"ticket": "T123"}'
           style="font-family: monospace; font-size: 12px"
         />
       </NFormItem>

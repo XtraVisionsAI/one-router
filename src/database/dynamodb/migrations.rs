@@ -79,6 +79,15 @@ pub async fn create_tables(backend: &DynamoDbBackend) -> Result<()> {
     )
     .await?;
 
+    // --- users (PK: user_id) ---
+    create_table_if_not_exists(
+        backend,
+        "users",
+        vec![attr_def("user_id", ScalarAttributeType::S)],
+        vec![key_schema("user_id", KeyType::Hash)],
+    )
+    .await?;
+
     // --- GSI: api_keys name-index (for unique name lookups) ---
     ensure_name_gsi(backend).await?;
 

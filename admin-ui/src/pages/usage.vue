@@ -1,5 +1,5 @@
 <script setup lang="ts">
-  import type { ApiKey, UsageSummaryResponse, UsageSummaryRow } from '@/api/types'
+  import type { ApiKey, User, UsageSummaryResponse, UsageSummaryRow } from '@/api/types'
   import type { GroupByDimension, UsageSummaryParams } from '@/api/usage'
   import { NButton, NCard, NDataTable, NDatePicker, NSelect, NStatistic, useMessage } from 'naive-ui'
   import { h } from 'vue'
@@ -9,6 +9,7 @@
   import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
   import { CanvasRenderer } from 'echarts/renderers'
   import { useKeysApi } from '@/api/keys'
+  import { useUsersApi } from '@/api/users'
   import { useUsageApi } from '@/api/usage'
   import { useChartTheme } from '@/composables/useChartTheme'
   import { fmtMoney, fmtTokens, fmtPercent } from '@/utils/format'
@@ -18,10 +19,13 @@
   const message = useMessage()
   const api = useUsageApi()
   const keysApi = useKeysApi()
+  const usersApi = useUsersApi()
   const { baseOption, axisCommon, COLORS } = useChartTheme()
 
   const keys = ref<ApiKey[]>([])
+  const users = ref<User[]>([])
   const selectedKey = ref<string | null>(null)
+  const selectedUser = ref<string | null>(null)
   const groupBy = ref<GroupByDimension>('hour')
   const splitBy = ref<GroupByDimension | null>(null)
   const dateRange = ref<[number, number] | null>(null)
@@ -32,7 +36,14 @@
     { label: 'All keys', value: null },
     { label: 'Master Key', value: '__master__' },
     { label: 'Ephemeral Key', value: '__ephemeral__' },
-    ...keys.value.map((k) => ({ label: k.name, value: k.key_id }))
+    ...keys.value
+      .filter((k) => !selectedUser.value || k.user_id === selectedUser.value)
+      .map((k) => ({ label: k.user_name ? `${k.user_name} / ${k.name}` : k.name, value: k.key_id }))
+  ])
+
+  const userOptions = computed(() => [
+    { label: 'All users', value: null },
+    ...users.value.map((u) => ({ label: u.name, value: u.user_id }))
   ])
 
   const groupByOptions = [
@@ -41,6 +52,7 @@
     { label: 'By Month', value: 'month' },
     { label: 'By Model', value: 'model' },
     { label: 'By Provider', value: 'provider' },
+    { label: 'By User', value: 'user' },
     { label: 'By API Key', value: 'api_key' }
   ]
 
@@ -51,7 +63,7 @@
 
   const groupByLabel: Record<string, string> = {
     hour: 'Hour', day: 'Day', month: 'Month',
-    model: 'Model', provider: 'Provider', api_key: 'API Key',
+    model: 'Model', provider: 'Provider', api_key: 'API Key', user: 'User',
   }
 
   const isTimeDimension = computed(() => ['hour', 'day', 'month'].includes(groupBy.value))
@@ -70,8 +82,11 @@
   })
 
   onMounted(async () => {
-    try { keys.value = (await keysApi.list()).data }
-    catch (e: any) { message.error(`Failed to load keys: ${e.message}`) }
+    try {
+      const [k, u] = await Promise.all([keysApi.list(), usersApi.list()])
+      keys.value = k.data
+      users.value = u.data
+    } catch (e: any) { message.error(`Failed to load keys/users: ${e.message}`) }
   })
 
   function applyPreset(hours: number) {
@@ -95,6 +110,7 @@
       const params: UsageSummaryParams = { group_by: groupBy.value }
       if (splitBy.value) params.split_by = splitBy.value
       if (selectedKey.value) params.api_key = selectedKey.value
+      if (selectedUser.value) params.user = selectedUser.value
       if (dateRange.value) {
         params.start_time = new Date(dateRange.value[0]).toISOString()
         params.end_time = new Date(dateRange.value[1] + 86400000 - 1).toISOString()
@@ -188,6 +204,10 @@
 
     <!-- Filters -->
     <div class="flex gap-3 mb-3 flex-wrap items-end">
+      <div>
+        <div class="text-xs text-slate-400 mb-1">User</div>
+        <NSelect v-model:value="selectedUser" :options="userOptions" placeholder="All users" clearable filterable style="width: 180px" />
+      </div>
       <div>
         <div class="text-xs text-slate-400 mb-1">API Key</div>
         <NSelect v-model:value="selectedKey" :options="keyOptions" placeholder="All keys" clearable style="width: 200px" />

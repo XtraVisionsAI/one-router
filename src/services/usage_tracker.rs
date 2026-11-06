@@ -5,7 +5,7 @@
 use crate::database::models::UsageRecord;
 use crate::database::traits::DatabaseService;
 use crate::middleware::auth::ApiKeyInfo;
-use crate::middleware::rate_limit::TokenRateLimiter;
+use crate::middleware::rate_limit::{user_bucket, TokenRateLimiter};
 use crate::schemas::anthropic::Usage;
 use crate::services::model_mapping::ModelMappingService;
 use chrono::Utc;
@@ -84,53 +84,64 @@ impl UsageTracker {
 
         // Internal keys (master/ephemeral) have no DB entry — skip budget management
         let is_internal_key = key_info.raw_api_key.is_empty();
+        let current_month = timestamp.format("%Y-%m").to_string();
 
         if !is_internal_key {
-            let current_month = chrono::Utc::now().format("%Y-%m").to_string();
+            // Lazy month rollover, per layer.
             if is_new_month(key_info.budget_mtd_month.as_deref(), &current_month) {
-                let prev_month = key_info.budget_mtd_month.as_deref().unwrap_or("");
-                let prev_mtd = key_info.budget_used_mtd;
                 self.storage
                     .api_keys()
                     .reset_monthly_budget(
                         &key_info.raw_api_key,
                         &current_month,
-                        prev_month,
-                        prev_mtd,
+                        key_info.budget_mtd_month.as_deref().unwrap_or(""),
+                        key_info.budget_used_mtd,
                     )
                     .await
                     .map_err(|e| UsageError::Database(e.to_string()))?;
-                if key_info.is_budget_exceeded() {
+            }
+            if let Some(user) = &key_info.user {
+                if is_new_month(user.budget_mtd_month.as_deref(), &current_month) {
                     self.storage
-                        .api_keys()
-                        .reactivate_api_key(&key_info.raw_api_key)
+                        .users()
+                        .reset_user_monthly_budget(
+                            &user.user_id,
+                            &current_month,
+                            user.budget_mtd_month.as_deref().unwrap_or(""),
+                            user.budget_used_mtd,
+                        )
                         .await
                         .map_err(|e| UsageError::Database(e.to_string()))?;
-                    tracing::info!(api_key = %key_info.api_key, month = %current_month, "Budget key reactivated for new month");
                 }
             }
         }
 
         let record_api_key = key_info.usage_api_key();
 
-        // TPM metering (only keys with a limit; cache reads don't count, matching
-        // Anthropic's ITPM accounting).
+        // TPM metering (only buckets with a limit; cache reads don't count,
+        // matching Anthropic's ITPM accounting).
+        let tokens: u64 = [
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_creation_input_tokens.unwrap_or(0),
+        ]
+        .iter()
+        .map(|t| (*t).max(0) as u64)
+        .sum();
         if key_info.tpm_limit.is_some() {
-            let tokens = [
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cache_creation_input_tokens.unwrap_or(0),
-            ]
-            .iter()
-            .map(|t| (*t).max(0) as u64)
-            .sum();
             self.token_limiter.record(&key_info.key_id, tokens).await;
+        }
+        if let Some(user) = key_info.user.as_ref().filter(|u| u.tpm_limit.is_some()) {
+            self.token_limiter
+                .record(&user_bucket(&user.user_id), tokens)
+                .await;
         }
 
         let mut record = UsageRecord {
             id: None,
             api_key: record_api_key.to_string(),
             key_id: Some(key_info.key_id.clone()),
+            user_id: key_info.user_id().map(String::from),
             timestamp: timestamp.to_rfc3339(),
             request_id: request_id.to_string(),
             model: model.to_string(),
@@ -174,22 +185,33 @@ impl UsageTracker {
             .map_err(|e| UsageError::Database(e.to_string()))?;
 
         if !is_internal_key && cost > 0.0 {
-            let budget_exceeded = self
+            // Two independent atomic increments (key sub-budget, user budget).
+            // A failure on one is reported but does not undo the other.
+            let key_exceeded = self
                 .storage
                 .api_keys()
                 .increment_budget_used(&key_info.raw_api_key, cost)
                 .await
                 .map_err(|e| UsageError::Database(e.to_string()))?;
-
-            if budget_exceeded {
+            let user_exceeded = match &key_info.user {
+                Some(user) => self
+                    .storage
+                    .users()
+                    .increment_user_budget_used(&user.user_id, cost)
+                    .await
+                    .map_err(|e| UsageError::Database(e.to_string()))?,
+                None => false,
+            };
+            let exceeded = key_exceeded || user_exceeded;
+            if exceeded {
                 tracing::warn!(
                     api_key = %key_info.api_key,
+                    user = key_info.user.as_ref().map(|u| u.name.as_str()).unwrap_or("-"),
                     cost = cost,
                     "Monthly budget reached; further requests will be rejected"
                 );
             }
-
-            return Ok(budget_exceeded);
+            return Ok(exceeded);
         }
 
         Ok(false)

@@ -21,22 +21,25 @@ scripts/migrations/
 │   ├── 003_model_pricing.sql                   # model pricing backfill
 │   ├── 004_pricing_source.sql                  # pricing_source column
 │   ├── 005_backend_models.sql                  # backend models filter
-│   └── 006_api_key_id.sql                      # api_keys/usage key_id
+│   ├── 006_api_key_id.sql                      # api_keys/usage key_id
+│   └── 007_users.sql                           # users table, per-user key names
 ├── postgres/
 │   ├── 001_model_mapping_pattern_index.sql     # text_pattern_ops index
 │   ├── 002_api_key_display.sql                 # key_display column
 │   ├── 003_model_pricing.sql                   # model pricing backfill
 │   ├── 004_pricing_source.sql                  # pricing_source column
 │   ├── 005_backend_models.sql                  # backend models filter
-│   └── 006_api_key_id.sql                      # api_keys/usage key_id
+│   ├── 006_api_key_id.sql                      # api_keys/usage key_id
+│   └── 007_users.sql                           # users table, per-user key names
 └── dynamodb/
     ├── 001_apikeys_name_gsi.sh                 # name-index GSI
     ├── 002_model_pricing.sh                    # model pricing backfill
-    └── 003_api_key_ids.sh                      # api_keys key_id backfill
+    ├── 003_api_key_ids.sh                      # api_keys key_id backfill
+    └── 004_users_table.sh                      # users table
 ```
 
 Migrations are numbered `NNN_description` and execute in lexicographic order.
-All migrations are **idempotent** — safe to run multiple times.
+All migrations are **idempotent** — safe to run multiple times — except SQLite 007 (table rebuild; run once, see its header).
 
 ## Usage
 
@@ -132,6 +135,23 @@ can be hard-deleted without orphaning its usage history.
   key exists. New usage items carry `key_id`.
 
 The gateway runs the same backfill on startup.
+
+### SQLite/PostgreSQL 007 & DynamoDB 004: Users
+
+Schema for users as billing / shared-limit principals: a `users` table,
+`api_keys.user_id` / `expires_at` / `allowed_models`, key names unique per
+user instead of globally, and `usage.user_id`.
+
+These scripts only change the schema. The **data** migration runs on gateway
+startup: every key without an owner becomes one user that takes over its
+budget, spend counters, cost rate, RPM/TPM and cache TTL (so enforcement is
+unchanged), and usage rows are attributed to that user. On DynamoDB the usage
+attribution runs in the background and resumes on the next start if
+interrupted. The key → user write is conditional, so several instances
+starting at once cannot migrate a key twice.
+
+**Rolling back** to a pre-users release after this migration leaves keys with
+no budget (it moved to the user) — back up the database first.
 
 ## Adding new migrations
 

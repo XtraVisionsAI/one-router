@@ -1,6 +1,6 @@
 //! Storage data models
 //!
-//! Database-agnostic data structures for all 5 tables.
+//! Database-agnostic data structures for all tables.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +19,19 @@ pub struct ApiKeyRecord {
     pub key_id: String,
     #[serde(default)]
     pub key_display: String,
+    /// Owning user. Empty only on rows not yet migrated (startup migration
+    /// assigns every key a user).
+    #[serde(default)]
+    pub user_id: String,
+    /// Unique per user (not globally).
     pub name: String,
     pub is_active: bool,
+    /// Key-level RPM sub-limit. `<= 0` = none (only the user limit applies).
     pub rate_limit: i32,
+    /// Unused since keys gained an owning user — `cost_rate` lives on the user.
+    /// Kept so the column round-trips; always 1.0 for new keys.
     pub cost_rate: f64,
+    /// Key-level monthly budget sub-limit (USD). `None` = only the user budget applies.
     pub monthly_budget: Option<f64>,
     pub budget_used: f64,
     pub budget_used_mtd: f64,
@@ -33,8 +42,107 @@ pub struct ApiKeyRecord {
     pub tpm_limit: Option<i32>,
     pub cache_ttl: Option<String>, // "5m" | "1h" | None
     pub metadata: Option<String>,  // JSON
+    /// Unix seconds after which the key is rejected. `None` = never expires.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// Key-level model allowlist (glob patterns, `!` negation — same syntax as
+    /// backend `models`). Intersected with the user's. `None` = unrestricted.
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
+}
+
+/// Serialize a glob-pattern list for a TEXT column (`None`/empty → NULL).
+pub fn patterns_to_json(patterns: &Option<Vec<String>>) -> Option<String> {
+    patterns
+        .as_ref()
+        .filter(|m| !m.is_empty())
+        .and_then(|m| serde_json::to_string(m).ok())
+}
+
+/// Parse a TEXT column back into a pattern list. Blank or malformed → `None`.
+pub fn patterns_from_json(raw: Option<String>) -> Option<Vec<String>> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Vec<String>>(trimmed) {
+        Ok(v) if !v.is_empty() => Some(v),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, raw = %trimmed, "Invalid allowed_models JSON; treating as unrestricted");
+            None
+        }
+    }
+}
+
+/// Month-to-date spend that counts for `current_month` ("YYYY-MM"): the stored
+/// counter belongs to `stored_month`, and a stale month means nothing has been
+/// spent yet this month (the reset happens lazily on the next usage write).
+pub fn period_spend(used_mtd: f64, stored_month: Option<&str>, current_month: &str) -> f64 {
+    if stored_month == Some(current_month) {
+        used_mtd
+    } else {
+        0.0
+    }
+}
+
+// ============================================================================
+// users
+// ============================================================================
+
+/// A billing / limit principal owning one or more API keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserRecord {
+    pub user_id: String,
+    /// Globally unique display / login name.
+    pub name: String,
+    pub email: Option<String>,
+    /// `false` disables every key of the user.
+    pub is_active: bool,
+    pub cost_rate: f64,
+    pub monthly_budget: Option<f64>,
+    pub budget_used: f64,
+    pub budget_used_mtd: f64,
+    pub budget_mtd_month: Option<String>,
+    /// Monthly budget history as JSON: {"2026-02": 45.67}
+    pub budget_history: Option<String>,
+    /// RPM shared by all of the user's keys. `None` = global `rate_limit` setting.
+    pub rate_limit: Option<i32>,
+    /// TPM shared by all of the user's keys. `None` = unlimited.
+    pub tpm_limit: Option<i32>,
+    pub allowed_models: Option<Vec<String>>,
+    pub cache_ttl: Option<String>,
+    pub metadata: Option<String>,
+    pub created_at: i64,
+    pub updated_at: Option<i64>,
+}
+
+impl UserRecord {
+    /// A fresh active user with no limits.
+    pub fn new(name: impl Into<String>, now: i64) -> Self {
+        Self {
+            user_id: new_key_id(),
+            name: name.into(),
+            email: None,
+            is_active: true,
+            cost_rate: 1.0,
+            monthly_budget: None,
+            budget_used: 0.0,
+            budget_used_mtd: 0.0,
+            budget_mtd_month: None,
+            budget_history: None,
+            rate_limit: None,
+            tpm_limit: None,
+            allowed_models: None,
+            cache_ttl: None,
+            metadata: None,
+            created_at: now,
+            updated_at: None,
+        }
+    }
 }
 
 /// Generate a fresh `key_id` (UUIDv4, hyphenated).
@@ -70,6 +178,10 @@ pub struct UsageRecord {
     /// Stable key identifier. `None` on rows written before key ids existed.
     #[serde(default)]
     pub key_id: Option<String>,
+    /// Owning user at request time (denormalized). `None` on rows predating
+    /// users that could not be attributed (key already deleted).
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub timestamp: String,
     pub request_id: String,
     pub model: String,
