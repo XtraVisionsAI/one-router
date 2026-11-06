@@ -23,6 +23,11 @@ use crate::utils::truncate_str;
 // API Key Info
 // ============================================================================
 
+/// `key_id` / usage identifier of the master key.
+pub const MASTER_KEY_ID: &str = "__master__";
+/// `key_id` / usage identifier of the debug-build ephemeral key.
+pub const EPHEMERAL_KEY_ID: &str = "__ephemeral__";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyInfo {
     pub api_key: String,
@@ -30,8 +35,13 @@ pub struct ApiKeyInfo {
     /// Never serialize this into JSON responses.
     #[serde(skip_serializing)]
     pub raw_api_key: String,
+    /// Stable key identifier (`__master__` / `__ephemeral__` for internal keys).
+    /// Used for rate-limit buckets and usage attribution.
+    pub key_id: String,
     pub is_master: bool,
     pub rate_limit: Option<u32>,
+    /// Tokens-per-minute limit. `None` = unlimited.
+    pub tpm_limit: Option<u32>,
     pub cost_rate: f64,
     pub monthly_budget: Option<f64>,
     pub budget_used_mtd: f64,
@@ -44,8 +54,10 @@ impl ApiKeyInfo {
         Self {
             api_key: Self::truncate_key(api_key),
             raw_api_key: String::new(),
+            key_id: MASTER_KEY_ID.to_string(),
             is_master: true,
             rate_limit: None,
+            tpm_limit: None,
             cost_rate: 1.0,
             monthly_budget: None,
             budget_used_mtd: 0.0,
@@ -62,12 +74,20 @@ impl ApiKeyInfo {
                 record.key_display.clone()
             },
             raw_api_key: record.api_key.clone(),
+            // Rows predating key ids are backfilled at startup; fall back to the
+            // hash so limiter buckets stay per-key even if one slipped through.
+            key_id: if record.key_id.is_empty() {
+                record.api_key.clone()
+            } else {
+                record.key_id.clone()
+            },
             is_master: false,
             rate_limit: if record.rate_limit > 0 {
                 Some(record.rate_limit as u32)
             } else {
                 None
             },
+            tpm_limit: record.tpm_limit.filter(|t| *t > 0).map(|t| t as u32),
             cost_rate: record.cost_rate,
             monthly_budget: record.monthly_budget,
             budget_used_mtd: record.budget_used_mtd,
@@ -81,6 +101,16 @@ impl ApiKeyInfo {
             format!("{}...", truncate_str(key, 8))
         } else {
             key.to_string()
+        }
+    }
+
+    /// The value stored in `usage.api_key` for this caller: the key hash for
+    /// database keys, the internal identifier for master/ephemeral keys.
+    pub fn usage_api_key(&self) -> &str {
+        if self.raw_api_key.is_empty() {
+            &self.key_id
+        } else {
+            &self.raw_api_key
         }
     }
 
@@ -223,8 +253,10 @@ pub async fn require_api_key(
             request.extensions_mut().insert(ApiKeyInfo {
                 api_key: ApiKeyInfo::truncate_key(&api_key),
                 raw_api_key: String::new(),
+                key_id: EPHEMERAL_KEY_ID.to_string(),
                 is_master: false,
                 rate_limit: None,
+                tpm_limit: None,
                 cost_rate: 1.0,
                 monthly_budget: None,
                 budget_used_mtd: 0.0,
@@ -290,6 +322,16 @@ mod tests {
         let info = ApiKeyInfo::master("sk-ant-master-key-12345");
         assert!(info.is_master);
         assert!(info.bypass_rate_limit());
+    }
+
+    #[test]
+    fn usage_api_key_is_hash_or_internal_id() {
+        assert_eq!(ApiKeyInfo::master("sk-x").usage_api_key(), MASTER_KEY_ID);
+        let mut info = ApiKeyInfo::master("sk-x");
+        info.is_master = false;
+        info.raw_api_key = "deadbeef".into();
+        info.key_id = "id-1".into();
+        assert_eq!(info.usage_api_key(), "deadbeef");
     }
 
     #[test]

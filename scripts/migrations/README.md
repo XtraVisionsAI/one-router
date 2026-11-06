@@ -18,14 +18,21 @@ scripts/migrations/
 ├── sqlite/
 │   ├── 001_model_mapping_index.sql             # source_model_id index
 │   ├── 002_api_key_display.sql                 # key_display column
-│   └── 003_model_pricing.sql                   # model pricing backfill
+│   ├── 003_model_pricing.sql                   # model pricing backfill
+│   ├── 004_pricing_source.sql                  # pricing_source column
+│   ├── 005_backend_models.sql                  # backend models filter
+│   └── 006_api_key_id.sql                      # api_keys/usage key_id
 ├── postgres/
 │   ├── 001_model_mapping_pattern_index.sql     # text_pattern_ops index
 │   ├── 002_api_key_display.sql                 # key_display column
-│   └── 003_model_pricing.sql                   # model pricing backfill
+│   ├── 003_model_pricing.sql                   # model pricing backfill
+│   ├── 004_pricing_source.sql                  # pricing_source column
+│   ├── 005_backend_models.sql                  # backend models filter
+│   └── 006_api_key_id.sql                      # api_keys/usage key_id
 └── dynamodb/
     ├── 001_apikeys_name_gsi.sh                 # name-index GSI
-    └── 002_model_pricing.sh                    # model pricing backfill
+    ├── 002_model_pricing.sh                    # model pricing backfill
+    └── 003_api_key_ids.sh                      # api_keys key_id backfill
 ```
 
 Migrations are numbered `NNN_description` and execute in lexicographic order.
@@ -110,6 +117,21 @@ Populates `input_price`, `output_price`, `cache_write_price`, and `cache_read_pr
 - Gemini models: Google AI published rates (cache_write = 0; Google charges storage-per-hour instead)
 - Embedding models: input-only pricing; output/cache fields remain 0
 - Rerank models: per-query pricing ($2/1K queries), not per-token — left at 0
+
+### SQLite/PostgreSQL 006 & DynamoDB 003: Stable API key ids
+
+Adds a UUIDv4 `key_id` to every API key — the identifier used by the admin API
+(`/admin/api/keys/:key_id`), the rate limiters and usage attribution, so a key
+can be hard-deleted without orphaning its usage history.
+
+- **SQL backends:** `api_keys.key_id` (unique index) and `usage.key_id`,
+  backfilled through the key hash. Usage rows of keys that no longer exist keep
+  `key_id = NULL`. PostgreSQL needs 13+ (`gen_random_uuid()`).
+- **DynamoDB:** only `api_keys` items are backfilled; the usage table can be
+  large, so legacy usage items stay attributed through the key hash while the
+  key exists. New usage items carry `key_id`.
+
+The gateway runs the same backfill on startup.
 
 ## Adding new migrations
 

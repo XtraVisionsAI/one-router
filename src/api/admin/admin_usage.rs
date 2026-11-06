@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
+use crate::database::models::looks_like_key_id;
+use crate::middleware::auth::{EPHEMERAL_KEY_ID, MASTER_KEY_ID};
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::state::AppState;
 
@@ -22,7 +24,8 @@ use crate::server::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct AdminUsageQueryParams {
-    /// Filter by API key (required — cross-key aggregation not yet supported)
+    /// Filter by API key: `key_id`, key name (legacy), or `__master__`/`__ephemeral__`.
+    /// Absent = all keys.
     pub api_key: Option<String>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
@@ -87,7 +90,10 @@ pub struct UsageRecordsResponse {
 #[derive(Debug, Serialize)]
 pub struct UsageRecordItem {
     pub id: Option<i64>,
+    /// Display label of the key (name, or `deleted key · <id>`).
     pub api_key: String,
+    /// Stable key identifier; `None` on legacy rows of since-deleted keys.
+    pub key_id: Option<String>,
     pub timestamp: String,
     pub request_id: String,
     pub model: String,
@@ -107,67 +113,82 @@ pub struct UsageRecordItem {
 // ============================================================================
 
 /// Internal key identifiers stored in usage records (not in api_keys table).
-const INTERNAL_KEY_IDS: &[&str] = &["__master__", "__ephemeral__"];
+const INTERNAL_KEY_IDS: &[&str] = &[MASTER_KEY_ID, EPHEMERAL_KEY_ID];
 
-/// Resolve an api_key query parameter to the value stored in usage records.
-/// Internal identifiers (__master__, __ephemeral__) are passed through directly.
-/// Regular key names are resolved to their HMAC hash via the api_keys table.
+/// Resolve an api_key query parameter to the value stored in `usage.api_key`
+/// (the storage filter column). Accepts a `key_id`, a key name (legacy), or an
+/// internal identifier (`__master__`, `__ephemeral__`, passed through).
 async fn resolve_api_key_filter(
     state: &AppState,
-    name: Option<&str>,
+    ident: Option<&str>,
 ) -> Result<String, Box<axum::response::Response>> {
-    match name.filter(|s| !s.is_empty()) {
-        Some(name) if INTERNAL_KEY_IDS.contains(&name) => Ok(name.to_string()),
-        Some(name) => match state.database.api_keys().get_api_key_by_name(name).await {
-            Ok(Some(record)) => Ok(record.api_key),
-            Ok(None) => Err(Box::new(
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse::new(
-                        "not_found_error",
-                        format!("API key '{name}' not found"),
-                    )),
-                )
-                    .into_response(),
-            )),
-            Err(e) => Err(Box::new(
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new("api_error", e.to_string())),
-                )
-                    .into_response(),
-            )),
-        },
+    let store = state.database.api_keys();
+    match ident.filter(|s| !s.is_empty()) {
+        Some(id) if INTERNAL_KEY_IDS.contains(&id) => Ok(id.to_string()),
+        Some(id) => {
+            let by_id = if looks_like_key_id(id) {
+                store.get_api_key_by_id(id).await
+            } else {
+                Ok(None)
+            };
+            let found = match by_id {
+                Ok(Some(r)) => Ok(Some(r)),
+                Ok(None) => store.get_api_key_by_name(id).await,
+                Err(e) => Err(e),
+            };
+            let name = id;
+            match found {
+                Ok(Some(record)) => Ok(record.api_key),
+                Ok(None) => Err(Box::new(
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse::new(
+                            "not_found_error",
+                            format!("API key '{name}' not found"),
+                        )),
+                    )
+                        .into_response(),
+                )),
+                Err(e) => Err(Box::new(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new("api_error", e.to_string())),
+                    )
+                        .into_response(),
+                )),
+            }
+        }
         None => Ok(String::new()), // empty = all keys
     }
 }
 
-/// Build a mapping from raw api_key identifiers (hashes / internal IDs) to
-/// human-readable display names.  Used to replace hashes in usage responses.
+/// Build a mapping from usage key identifiers (`key_id`, legacy hashes,
+/// internal IDs) to human-readable display names.
 async fn build_api_key_labels(state: &AppState) -> HashMap<String, String> {
     let mut labels = HashMap::new();
-    labels.insert("__master__".to_string(), "Master Key".to_string());
-    labels.insert("__ephemeral__".to_string(), "Ephemeral Key".to_string());
+    labels.insert(MASTER_KEY_ID.to_string(), "Master Key".to_string());
+    labels.insert(EPHEMERAL_KEY_ID.to_string(), "Ephemeral Key".to_string());
 
     if let Ok(keys) = state.database.api_keys().list_api_keys().await {
         for k in keys {
+            if !k.key_id.is_empty() {
+                labels.insert(k.key_id, k.name.clone());
+            }
             labels.insert(k.api_key, k.name);
         }
     }
     labels
 }
 
-/// Resolve a raw api_key value to its display name.
-/// Falls back to `"<first 8 hex chars>… (unknown key)"` for unrecognised hashes.
+/// Resolve a usage key identifier (`key_id` or legacy hash) to its display name.
+/// Identifiers with no live api_keys row belong to deleted keys and render as
+/// `"deleted key · <first 8 chars>"` — stable, so they still group together.
 fn resolve_display_name(raw: &str, labels: &HashMap<String, String>) -> String {
     if let Some(name) = labels.get(raw) {
         return name.clone();
     }
-    if raw.len() > 8 {
-        format!("{}… (unknown key)", &raw[..8])
-    } else {
-        format!("{raw} (unknown key)")
-    }
+    let short: String = raw.chars().take(8).collect();
+    format!("deleted key · {short}")
 }
 
 /// GET /admin/api/usage/summary
@@ -336,7 +357,8 @@ pub async fn get_usage_records(
         .into_iter()
         .map(|r| UsageRecordItem {
             id: r.id,
-            api_key: resolve_display_name(&r.api_key, &labels),
+            api_key: resolve_display_name(r.key_id.as_deref().unwrap_or(&r.api_key), &labels),
+            key_id: r.key_id,
             timestamp: r.timestamp,
             request_id: r.request_id,
             model: r.model,
@@ -366,6 +388,24 @@ pub async fn get_usage_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_name_known_and_deleted() {
+        let mut labels = HashMap::new();
+        labels.insert(
+            "4b1d2c9e-7a51-4f0e-9c1e-2f6a8d3b5c70".to_string(),
+            "alice".to_string(),
+        );
+        assert_eq!(
+            resolve_display_name("4b1d2c9e-7a51-4f0e-9c1e-2f6a8d3b5c70", &labels),
+            "alice"
+        );
+        assert_eq!(
+            resolve_display_name("9f8e7d6c-0000-4000-8000-000000000000", &labels),
+            "deleted key · 9f8e7d6c"
+        );
+        assert_eq!(resolve_display_name("abc", &labels), "deleted key · abc");
+    }
 
     #[test]
     fn default_group_by_is_hour() {

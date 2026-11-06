@@ -38,6 +38,13 @@ pub trait ApiKeyStore: Send + Sync {
 
     /// Find an API key by its human-readable name.
     async fn get_api_key_by_name(&self, name: &str) -> Result<Option<ApiKeyRecord>>;
+
+    /// Find an API key by its stable `key_id`.
+    async fn get_api_key_by_id(&self, key_id: &str) -> Result<Option<ApiKeyRecord>>;
+
+    /// Permanently remove an API key row (by hash). Usage rows are kept —
+    /// they carry `key_id` for attribution.
+    async fn delete_api_key(&self, api_key: &str) -> Result<()>;
 }
 
 #[async_trait]

@@ -44,13 +44,10 @@ pub fn create_router(state: AppState) -> Router {
     let auth_state = AuthState::new(state.settings.clone(), state.database.clone());
     let auth_state_clone = auth_state.clone();
 
-    // Rate limit state from startup settings (None = globally disabled)
-    let rate_limit_rpm = state
-        .dynamic
-        .try_read()
-        .expect("DynamicConfig lock should not be contended at startup")
-        .rate_limit_rpm;
-    let rate_limit_state = RateLimitState::new(rate_limit_rpm);
+    // Rate limit state — reads the global `rate_limit` setting from
+    // DynamicConfig per request (hot-reloaded); TPM meter shared with UsageTracker.
+    let rate_limit_state =
+        RateLimitState::new(state.dynamic.clone(), state.usage_tracker.token_limiter());
     let rate_limit_state_clone = rate_limit_state.clone();
 
     // Anthropic API routes (POST /v1/messages)
@@ -115,9 +112,17 @@ pub fn create_router(state: AppState) -> Router {
         // API Keys
         .route("/keys", get(admin::keys::list_keys))
         .route("/keys", post(admin::keys::create_key))
-        .route("/keys/:name", put(admin::keys::update_key))
-        .route("/keys/:name", delete(admin::keys::delete_key))
-        .route("/keys/:name/activate", post(admin::keys::activate_key))
+        .route(
+            "/keys/:key_id",
+            get(admin::keys::get_key)
+                .put(admin::keys::update_key)
+                .delete(admin::keys::delete_key),
+        )
+        .route("/keys/:key_id/activate", post(admin::keys::activate_key))
+        .route(
+            "/keys/:key_id/deactivate",
+            post(admin::keys::deactivate_key),
+        )
         // Backends
         .route("/backends", get(admin::backends::list_backends))
         .route("/backends", post(admin::backends::create_backend))

@@ -1,6 +1,6 @@
 # API Key 管理重构:用户维度计费 + Key 生命周期 + 审计
 
-日期:2026-11-06 · 状态:设计中(未实施)
+日期:2026-11-06 · 状态:P0 已实施(2026-11-06,单测 + 本地烟囱测试验证);P1–P3 设计中
 
 ## 背景与目标
 
@@ -25,6 +25,9 @@
 | B6 | 每个请求都直接查一次数据库做鉴权,无缓存 | `middleware/auth.rs:245` |
 | B7 | Key 哈希出现在 usage 主键、管理 API 内部关联中;哈希依赖 `ENCRYPTION_KEY`,换密钥即全部失联 | `usage.api_key`、`admin_usage.rs::resolve_api_key_filter` |
 | B8 | 管理 API 以全局唯一的 `name` 作路径标识,改名即改 URL;多用户后名称冲突 | `/admin/api/keys/:name` |
+| B9 | 全局 `rate_limit` 设置只在构建路由时读取一次,改设置要重启才生效(与文档"立即生效"不符) | `server/routes.rs` |
+| B10 | `/v1/usage` 用 Key 的**脱敏显示串**过滤 usage,而 usage 存的是哈希 → 业务 Key 自查用量永远为空 | `api/usage.rs` |
+| B11 | `increment_budget_used` 拿**累计** `budget_used` 与月预算比较(应为当月 `budget_used_mtd`);只影响返回值/日志 | 三个存储后端 |
 
 **目标**:引入 `user`(以及 P3 的 `team`)作为计费/限额主体,Key 退化为
 "可多个、可过期、可轮换、可删除"的凭证;所有管理变更写审计日志;存量
@@ -98,21 +101,30 @@ handler 和中间件只消费 `effective`,不各自重新合并层级。
 | 后端 | 做法 |
 |---|---|
 | SQLite / Postgres | `UPDATE api_keys SET key_id = <uuid> WHERE key_id IS NULL`(逐行生成);`UPDATE usage SET key_id = (SELECT key_id FROM api_keys WHERE api_keys.api_key = usage.api_key) WHERE key_id IS NULL`;新增索引 `idx_usage_key_id_ts(key_id, timestamp)` |
-| DynamoDB | `api_keys` 扫描补 `key_id`;`usage` 表可能很大,改为**后台任务**分页 Scan + `UpdateItem`(幂等,`attribute_not_exists(key_id)` 条件),进度检查点存 `system_settings.usage_backfill_cursor`,完成后写 `usage_backfill_done=true`;新增 GSI `key-id-index (key_id, sort_key)` |
+| DynamoDB | 只给 `api_keys` 补 `key_id`(分页 Scan + `attribute_not_exists(key_id)` 条件更新,多实例并发安全)。**`usage` 不回填** |
 
-DynamoDB 回填完成前,usage 查询对缺少 `key_id` 的行回退到"哈希 → key_id"
-映射(api_keys 仍在,映射可得)。**回填未完成时禁止硬删 Key**(否则这些行
-永久失去归属),API 返回 409 并提示进度。
+**实施时的取舍(相对初稿)**:DynamoDB 的 `usage` 不回填、也不加 GSI、不阻止
+硬删。原因:P0 里 `usage.key_id` 的唯一用途是"Key 删除后用量仍能成组显示",
+而缺 `key_id` 的旧行按哈希分组,删除后显示为 `deleted key · <哈希前 8 位>`,
+效果与有 `key_id` 的行(`deleted key · <key_id 前 8 位>`)相同——回填一张
+可能很大的表换不来额外收益。真正需要按归属查询的是 P1 的 `user_id`,
+其回填与 GSI 在 P1 迁移中一并处理(迁移时 Key 仍在,哈希 → 用户可得)。
 
-DynamoDB `usage` 的分区键 `api_key` 无法修改,新行继续写入哈希作分区键,
-查询改走 GSI。
+DynamoDB `usage` 的分区键 `api_key` 无法修改,新行继续写入哈希作分区键并
+附带 `key_id` 属性;按 Key 过滤仍走分区键(Key 存在时哈希可得)。
+`get_api_key_by_id` 在 DynamoDB 上用带过滤的分页 Scan(api_keys 表很小),
+不新增 GSI。
+
+PostgreSQL 用内置 `gen_random_uuid()`,要求 13+。
 
 ### P0-2 Key 硬删除
 
-- `DELETE /admin/api/keys/:key_id` = **硬删除** `api_keys` 行。usage 行保留
-  (带 `key_id` / `user_id`,P1 起计费按用户聚合,不受影响)。
-- `POST /admin/api/keys/:key_id/deactivate` / `.../activate`:可逆停用
-  (原 `?action=deactivate` 行为)。
+- `DELETE /admin/api/keys/:key_id?action=delete` = **硬删除** `api_keys` 行。
+  usage 行保留(带 `key_id`,P1 起再带 `user_id`)。
+- `POST /admin/api/keys/:key_id/deactivate` / `.../activate`:可逆停用。
+- **兼容**:不带 `action`(或 `action=deactivate`)的 `DELETE` 维持旧语义
+  ——停用而非删除,响应带 `Deprecation: true`。旧脚本若按旧默认调用,不会
+  因升级而误删 Key。下一个 minor 版本把不带参数的 `DELETE` 改为硬删除。
 - 存量 `deactivated_reason = "deleted"` 的行:迁移时**不自动删除**
   (避免意外数据丢失),UI 标注"旧版已删除",提供"彻底删除"按钮。
 - 用量报表中已删除 Key 的标签显示为 `已删除 · <key_id 前 8 位>`;P2 审计
@@ -137,13 +149,28 @@ token 数只有在响应结束后才知道,所以 TPM 采用**事后计量 + 事
   cache_write` tokens。`cache_read` 不计入(与 Anthropic 官方 ITPM 口径一致)。
 - 单个请求可能让窗口"冲过"上限,这是事后计量的固有性质,在文档中说明。
 - P0 为进程内实现;P3 可切换为数据库共享计数(同一 trait)。
-- 新增 `onerouter_rate_limited_total{kind=rpm|tpm|concurrency, scope=key|user|team}`。
+- 新增 `onerouter_rate_limited_total{kind, scope}`:P0 有 `kind=rpm|tpm`、
+  `scope=key`;P1/P3 再加 `user`/`team` scope 和 `concurrency` kind。
+- `tpm_limit` 必须为正整数(`null` = 不限);`rate_limit = 0` 维持原义(用全局默认)。
+- 全局 `rate_limit = disable` 时 TPM 同样关闭,与 RPM 一致。
 
-### P0-5 限流器缓存失效(解决 B2)
+### P0-5 限流器缓存失效(解决 B2、B9)
 
-限流器缓存键从 `key` 改为 `"{scope}:{id}:{rpm}"`。配置一改,下个请求从 DB
-读到新值,自然命中新的限流器;旧限流器随 `time_to_idle` 淘汰。该方案不依赖
-跨实例失效通知,多实例下同样正确。
+限流器缓存键从 Key 的脱敏显示串改为 `"{key_id}:{rpm}"`(P1 起加上 scope 前缀)。
+配置一改,下个请求从 DB 读到新值,自然命中新的限流器;旧限流器随
+`time_to_idle` 淘汰。该方案不依赖跨实例失效通知,多实例下同样正确。
+原缓存键是脱敏串 `sk-abcd••••5678`,理论上两个 Key 可能撞键共享限流桶,
+一并修正。
+
+全局 `rate_limit` 设置改为每个请求从 `DynamicConfig` 读取(之前在构建路由
+时读一次,改设置需要重启)。
+
+### P0-7 顺带修复(B10、B11)
+
+- `ApiKeyInfo::usage_api_key()` 统一给出 usage 表里的 Key 标识(数据库 Key 为
+  哈希,master/ephemeral 为内部 ID),`/v1/usage`、`/v1/usage/records` 与
+  `UsageTracker` 都改用它。
+- `increment_budget_used` 改为比较 `budget_used_mtd`。
 
 ### P0-6 `metadata` 落地(解决 B3)
 
@@ -212,7 +239,11 @@ DynamoDB 新增 GSI `user-index (user_id)`,名称唯一性在应用层用 `(user
    时刻起重新累计(用户层已承接历史)。
 3. 现有 Key 的 `rate_limit` 值为 DB 默认 100 而非显式设置的情况无法区分 →
    **原样搬过去**,保证零行为变化。
-4. `usage` 回填 `user_id`(做法同 P0-1 的 `key_id` 回填,DynamoDB 共用后台任务)。
+4. `usage` 回填 `user_id`:SQL 后端经 `key_id`/哈希一条 `UPDATE`;DynamoDB 需要
+   **后台任务**分页 Scan + 条件 `UpdateItem`(幂等,进度检查点存
+   `system_settings.usage_backfill_cursor`,完成写 `usage_backfill_done=true`),
+   并新增 GSI `user-index (user_id, sort_key)`。回填完成前,用户维度报表对缺
+   `user_id` 的旧行回退为按哈希 → Key → 用户映射。
 5. 写入 `system_settings.user_migration_done = <version>`,防止重复执行。
 
 由于每个用户恰好一个 Key,迁移后所有约束的结果与迁移前完全一致。
@@ -488,7 +519,7 @@ key / user / team 层 `max_concurrency`。进程内信号量在请求开始时�
 ## 迁移脚本
 
 在 `scripts/migrations/{sqlite,postgres,dynamodb}/` 下按阶段新增编号脚本
-(`006_api_key_id.*`、`007_users.*`、`008_audit_logs.*`、`009_teams.*`、
+(`006_api_key_id.*` ✅ / DynamoDB `003_api_key_ids.sh` ✅、`007_users.*`、`008_audit_logs.*`、`009_teams.*`、
 `010_rate_counters.*`),内容与启动时自动迁移一致,供预部署执行。DynamoDB
 脚本负责建表、建 GSI、开启 `audit_logs` / `rate_counters` 表的 TTL。
 
@@ -513,11 +544,10 @@ key / user / team 层 `max_concurrency`。进程内信号量在请求开始时�
 
 | 版本 | 内容 | 兼容性 |
 |---|---|---|
-| P0 | key_id + 回填、硬删除、`/keys/:key_id`(兼容 name)、TPM、限流缓存键、metadata | 完全向后兼容 |
+| P0 ✅ | key_id + 回填、硬删除、`/keys/:key_id`(兼容 name)、TPM、限流缓存键、全局 RPM 热更新、metadata、`/v1/usage` 修复 | 完全向后兼容(无参 `DELETE` 仍为停用) |
 | P1 | users 表 + 自动迁移、多 Key、用户级计费、过期、模型白名单、UI 用户页 | 行为不变;**不可无损回退** |
 | P2 | 审计日志、预算周期、告警、轮换、last_used、鉴权缓存、IP 白名单、标签、Key 前缀 | 向后兼容;移除 name 路径兼容 |
 | P3 | 团队、并发上限、共享限流、预扣 | 新能力默认关闭 |
 
-P0 与 P1 可以合并为一个 minor 版本发布,但建议分开:P0 的 usage 回填在大型
-DynamoDB 部署上耗时较长,先单独上线并确认 `usage_backfill_done` 后再做 P1 迁移,
-可降低一次升级中的风险叠加。
+建议 P0 与 P1 分两个 minor 版本发布:P0 完全向后兼容、可随时回退;P1 的用户
+迁移不可无损回退,单独发布便于在出问题时定位。

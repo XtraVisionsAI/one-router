@@ -162,6 +162,58 @@ impl DynamoDbBackend {
         Ok(())
     }
 
+    /// Assign a `key_id` to every api_keys item that lacks one. Usage items are
+    /// NOT backfilled (the table can be large); legacy usage rows keep being
+    /// attributed through the key hash while the key exists.
+    async fn backfill_api_key_ids(&self) -> Result<()> {
+        let mut migrated = 0u32;
+        let mut start_key = None;
+        loop {
+            let page = self
+                .client
+                .scan()
+                .table_name(Self::table_name("api_keys"))
+                .filter_expression("attribute_not_exists(key_id)")
+                .projection_expression("api_key")
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await?;
+            for item in page.items() {
+                let hash = get_s(item, "api_key");
+                let res = self
+                    .client
+                    .update_item()
+                    .table_name(Self::table_name("api_keys"))
+                    .key("api_key", av_s(&hash))
+                    .update_expression("SET key_id = :id")
+                    .condition_expression(
+                        "attribute_exists(api_key) AND attribute_not_exists(key_id)",
+                    )
+                    .expression_attribute_values(":id", av_s(&new_key_id()))
+                    .send()
+                    .await;
+                match res {
+                    Ok(_) => migrated += 1,
+                    Err(e) => {
+                        // A failed condition means another instance won the race — fine.
+                        let svc = e.into_service_error();
+                        if !svc.is_conditional_check_failed_exception() {
+                            return Err(anyhow::anyhow!("backfill key_id: {svc}"));
+                        }
+                    }
+                }
+            }
+            start_key = page.last_evaluated_key().cloned();
+            if start_key.is_none() {
+                break;
+            }
+        }
+        if migrated > 0 {
+            tracing::info!(count = migrated, "Backfilled api_keys.key_id");
+        }
+        Ok(())
+    }
+
     /// Fallback: filtered scan for name uniqueness check.
     async fn name_exists_scan(&self, name: &str, exclude_api_key: Option<&str>) -> Result<bool> {
         let mut scan = self
@@ -303,6 +355,7 @@ fn get_bool(item: &HashMap<String, AttributeValue>, key: &str) -> bool {
 fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
     ApiKeyRecord {
         api_key: get_s(item, "api_key"),
+        key_id: get_s(item, "key_id"),
         key_display: get_s(item, "key_display"),
         name: get_s(item, "name"),
         is_active: get_bool(item, "is_active"),
@@ -333,6 +386,9 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
 fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();
     item.insert("api_key".into(), av_s(&record.api_key));
+    if !record.key_id.is_empty() {
+        item.insert("key_id".into(), av_s(&record.key_id));
+    }
     item.insert("key_display".into(), av_s(&record.key_display));
     item.insert("name".into(), av_s(&record.name));
     item.insert("is_active".into(), av_bool(record.is_active));
@@ -364,6 +420,7 @@ fn usage_from_item(item: &HashMap<String, AttributeValue>) -> UsageRecord {
     UsageRecord {
         id: get_opt_i64(item, "id"),
         api_key: get_s(item, "api_key"),
+        key_id: get_opt_s(item, "key_id"),
         timestamp: get_s(item, "timestamp"),
         request_id: get_s(item, "request_id"),
         model: get_s(item, "model"),
@@ -449,6 +506,7 @@ impl DatabaseService for DynamoDbBackend {
     async fn initialize(&self, encryption_key: Option<&str>, seed_mode: SeedMode) -> Result<()> {
         migrations::create_tables(self).await?;
         self.backfill_key_hashes(encryption_key).await?;
+        self.backfill_api_key_ids().await?;
         self.seed_defaults(seed_mode).await?;
         Ok(())
     }
@@ -551,7 +609,7 @@ impl ApiKeyStore for DynamoDbBackend {
 
         if let Some(attrs) = result.attributes() {
             let budget = get_opt_f64(attrs, "monthly_budget");
-            let used = get_f64(attrs, "budget_used");
+            let used = get_f64(attrs, "budget_used_mtd");
             if let Some(limit) = budget {
                 if used >= limit {
                     return Ok(true);
@@ -715,6 +773,40 @@ impl ApiKeyStore for DynamoDbBackend {
             }
         }
     }
+
+    async fn get_api_key_by_id(&self, key_id: &str) -> Result<Option<ApiKeyRecord>> {
+        // api_keys is small (one row per issued key); a filtered, paginated
+        // scan avoids another GSI.
+        let mut start_key = None;
+        loop {
+            let page = self
+                .client
+                .scan()
+                .table_name(Self::table_name("api_keys"))
+                .filter_expression("key_id = :id")
+                .expression_attribute_values(":id", av_s(key_id))
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await?;
+            if let Some(item) = page.items().first() {
+                return Ok(Some(api_key_from_item(item)));
+            }
+            start_key = page.last_evaluated_key().cloned();
+            if start_key.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+
+    async fn delete_api_key(&self, api_key: &str) -> Result<()> {
+        self.client
+            .delete_item()
+            .table_name(Self::table_name("api_keys"))
+            .key("api_key", av_s(api_key))
+            .send()
+            .await?;
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -728,6 +820,9 @@ impl UsageStore for DynamoDbBackend {
         let mut item = HashMap::new();
         item.insert("api_key".into(), av_s(&record.api_key));
         item.insert("sort_key".into(), av_s(&sort_key));
+        if let Some(ref key_id) = record.key_id {
+            item.insert("key_id".into(), av_s(key_id));
+        }
         item.insert("timestamp".into(), av_s(&record.timestamp));
         item.insert("request_id".into(), av_s(&record.request_id));
         item.insert("model".into(), av_s(&record.model));
@@ -904,7 +999,7 @@ impl UsageStore for DynamoDbBackend {
                 "day" => r.timestamp.chars().take(10).collect(),
                 "month" => r.timestamp.chars().take(7).collect(),
                 "provider" => r.provider.as_deref().unwrap_or("unknown").to_string(),
-                "api_key" => r.api_key.clone(),
+                "api_key" => r.key_id.clone().unwrap_or_else(|| r.api_key.clone()),
                 _ => r.timestamp.chars().take(13).collect(),
             }
         }

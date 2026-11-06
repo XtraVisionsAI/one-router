@@ -42,6 +42,8 @@ struct Metrics {
     /// `/v1/messages/count_tokens` calls, labeled by provider and whether the
     /// count came from the backend (`exact`) or a local estimate (`estimated`).
     count_tokens_total: IntCounterVec,
+    /// Requests rejected by a rate limiter, labeled by kind (rpm/tpm) and scope (key).
+    rate_limited_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -120,6 +122,15 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let rate_limited_total = IntCounterVec::new(
+            Opts::new(
+                "onerouter_rate_limited_total",
+                "Requests rejected by a rate limiter, by kind (rpm/tpm) and scope",
+            ),
+            &["kind", "scope"],
+        )
+        .expect("valid metric");
+
         let build_info = IntGaugeVec::new(
             Opts::new(
                 "onerouter_build_info",
@@ -157,6 +168,9 @@ impl Metrics {
         registry
             .register(Box::new(count_tokens_total.clone()))
             .expect("register count_tokens_total");
+        registry
+            .register(Box::new(rate_limited_total.clone()))
+            .expect("register rate_limited_total");
         // build_info is register-and-forget: the registry holds the clone, the
         // value never changes, and nothing reads it back.
         registry
@@ -173,6 +187,7 @@ impl Metrics {
             inflight_requests,
             auth_failures_total,
             count_tokens_total,
+            rate_limited_total,
         }
     }
 }
@@ -272,6 +287,14 @@ pub fn record_auth_failure(reason: &str) {
     metrics()
         .auth_failures_total
         .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record one rate-limit rejection. `kind` ∈ rpm/tpm, `scope` ∈ key (user/team later).
+pub fn record_rate_limited(kind: &str, scope: &str) {
+    metrics()
+        .rate_limited_total
+        .with_label_values(&[kind, scope])
         .inc();
 }
 

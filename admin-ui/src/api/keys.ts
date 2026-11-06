@@ -3,17 +3,21 @@ import { useApi } from '@/composables/useApi'
 
 export function useKeysApi() {
   const { request } = useApi()
+  const path = (keyId: string) => `/keys/${encodeURIComponent(keyId)}`
 
   return {
     list: () => request<ListResponse<ApiKey>>('GET', '/keys'),
 
-    create: (body: CreateKeyBody) => request<ApiKey & { api_key: string }>('POST', '/keys', body),
+    create: (body: CreateKeyBody) =>
+      request<{ key_id: string; api_key: string; name: string }>('POST', '/keys', body),
 
-    update: (key: string, body: UpdateKeyBody) => request<ApiKey>('PUT', `/keys/${encodeURIComponent(key)}`, body),
+    update: (keyId: string, body: UpdateKeyBody) => request<ApiKey>('PUT', path(keyId), body),
 
-    activate: (key: string) => request<{ ok: boolean }>('POST', `/keys/${encodeURIComponent(key)}/activate`),
+    activate: (keyId: string) => request<ApiKey>('POST', `${path(keyId)}/activate`),
 
-    deactivate: (key: string) =>
-      request<{ ok: boolean }>('DELETE', `/keys/${encodeURIComponent(key)}?action=deactivate`)
+    deactivate: (keyId: string) => request<{ ok: boolean }>('POST', `${path(keyId)}/deactivate`),
+
+    /** Permanent delete — usage history is kept. */
+    remove: (keyId: string) => request<{ ok: boolean }>('DELETE', `${path(keyId)}?action=delete`)
   }
 }

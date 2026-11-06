@@ -1,12 +1,13 @@
 <script setup lang="ts">
   import type { ApiKey } from '@/api/types'
-  import { NAlert, NButton, NTag, useMessage } from 'naive-ui'
+  import { NAlert, NButton, NTag, NTooltip, useDialog, useMessage } from 'naive-ui'
   import { h } from 'vue'
   import { useKeysApi } from '@/api/keys'
   import KeyModal from '@/components/KeyModal.vue'
   import { fmtMoney } from '@/utils/format'
 
   const message = useMessage()
+  const dialog = useDialog()
   const api = useKeysApi()
 
   const keys = ref<ApiKey[]>([])
@@ -40,16 +41,47 @@
   async function toggleActive(key: ApiKey) {
     try {
       if (key.is_active) {
-        await api.deactivate(key.name)
+        await api.deactivate(key.key_id)
         message.success('Key deactivated')
       } else {
-        await api.activate(key.name)
+        await api.activate(key.key_id)
         message.success('Key activated')
       }
       await load()
     } catch (e: any) {
       message.error(e.message)
     }
+  }
+
+  function confirmDelete(key: ApiKey) {
+    dialog.warning({
+      title: 'Delete API Key',
+      content: `Permanently delete "${key.name}" (${key.api_key})? Clients using it stop working immediately. Usage history is kept. This cannot be undone.`,
+      positiveText: 'Delete',
+      negativeText: 'Cancel',
+      onPositiveClick: async () => {
+        try {
+          await api.remove(key.key_id)
+          message.success('Key deleted')
+          await load()
+        } catch (e: any) {
+          message.error(e.message)
+        }
+      }
+    })
+  }
+
+  /** Status tag: legacy soft-deleted keys (pre key-id releases) are flagged so they can be purged. */
+  function statusTag(row: ApiKey) {
+    if (row.is_active) return h(NTag, { type: 'success', size: 'small' }, { default: () => 'active' })
+    const reason = row.deactivated_reason
+    const label = reason === 'deleted' ? 'deleted (legacy)' : reason === 'budget_exceeded' ? 'budget exceeded' : 'inactive'
+    const tag = h(NTag, { type: reason === 'deleted' ? 'default' : 'error', size: 'small' }, { default: () => label })
+    if (reason !== 'deleted') return tag
+    return h(NTooltip, null, {
+      trigger: () => tag,
+      default: () => 'Soft-deleted by an older version. Use Delete to remove it permanently.'
+    })
   }
 
   function onSaved(newKey?: string) {
@@ -72,7 +104,10 @@
     {
       title: 'Rate Limit',
       key: 'rate_limit',
-      render: (row: ApiKey) => (row.rate_limit > 0 ? `${row.rate_limit} rpm` : '—')
+      render: (row: ApiKey) =>
+        [row.rate_limit > 0 ? `${row.rate_limit} rpm` : null, row.tpm_limit ? `${row.tpm_limit} tpm` : null]
+          .filter(Boolean)
+          .join(' · ') || '—'
     },
     {
       title: 'Budget MTD',
@@ -83,12 +118,7 @@
     {
       title: 'Status',
       key: 'is_active',
-      render: (row: ApiKey) =>
-        h(
-          NTag,
-          { type: row.is_active ? 'success' : 'error', size: 'small' },
-          { default: () => (row.is_active ? 'active' : 'inactive') }
-        )
+      render: statusTag
     },
     {
       title: 'Actions',
@@ -104,7 +134,8 @@
               onClick: () => toggleActive(row)
             },
             { default: () => (row.is_active ? 'Deactivate' : 'Activate') }
-          )
+          ),
+          h(NButton, { size: 'small', type: 'error', ghost: true, onClick: () => confirmDelete(row) }, { default: () => 'Delete' })
         ])
     }
   ]

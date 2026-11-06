@@ -30,9 +30,10 @@ export interface UpsertBackendBody {
 
 // ── API Keys ──────────────────────────────────────────────────
 export interface ApiKey {
+  key_id: string // stable identifier used in admin API paths
   api_key: string // masked display form (e.g. "sk-abcd••••5678")
-  key_display: string
   name: string
+  deactivated_reason: string | null
   rate_limit: number
   monthly_budget: number | null
   budget_used_mtd: number | null
@@ -40,7 +41,9 @@ export interface ApiKey {
   cache_ttl: string | null
   cost_rate: number
   is_active: boolean
+  metadata: Record<string, unknown> | null
   created_at: number
+  updated_at: number | null
 }
 
 export interface CreateKeyBody {
@@ -50,6 +53,7 @@ export interface CreateKeyBody {
   tpm_limit?: number | null
   cache_ttl?: string | null
   cost_rate: number
+  metadata?: Record<string, unknown> | null
 }
 
 export interface UpdateKeyBody {
@@ -59,6 +63,7 @@ export interface UpdateKeyBody {
   tpm_limit?: number | null
   cache_ttl?: string | null
   cost_rate?: number
+  metadata?: Record<string, unknown> | null
 }
 
 // ── Model Mappings ────────────────────────────────────────────

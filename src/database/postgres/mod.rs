@@ -71,6 +71,35 @@ impl PostgresBackend {
     }
 }
 
+const API_KEY_COLS: &str = "api_key, key_id, key_display, name, is_active, rate_limit, cost_rate, \
+     monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
+     deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at";
+
+fn row_to_api_key(r: &sqlx::postgres::PgRow) -> ApiKeyRecord {
+    ApiKeyRecord {
+        api_key: r.get("api_key"),
+        key_id: r.get::<Option<String>, _>("key_id").unwrap_or_default(),
+        key_display: r
+            .get::<Option<String>, _>("key_display")
+            .unwrap_or_default(),
+        name: r.get("name"),
+        is_active: r.get("is_active"),
+        rate_limit: r.get("rate_limit"),
+        cost_rate: r.get("cost_rate"),
+        monthly_budget: r.get("monthly_budget"),
+        budget_used: r.get("budget_used"),
+        budget_used_mtd: r.get("budget_used_mtd"),
+        budget_mtd_month: r.get("budget_mtd_month"),
+        deactivated_reason: r.get("deactivated_reason"),
+        budget_history: r.get("budget_history"),
+        tpm_limit: r.get("tpm_limit"),
+        cache_ttl: r.get("cache_ttl"),
+        metadata: r.get("metadata"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -119,38 +148,15 @@ impl DatabaseService for PostgresBackend {
 #[async_trait]
 impl ApiKeyStore for PostgresBackend {
     async fn get_api_key(&self, api_key: &str) -> Result<Option<ApiKeyRecord>> {
-        let row = sqlx::query(
-            "SELECT api_key, key_display, name, is_active, rate_limit, cost_rate, \
-             monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
-             FROM api_keys WHERE api_key = $1",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {API_KEY_COLS} FROM api_keys WHERE api_key = $1"
+        ))
         .bind(api_key)
         .fetch_optional(&self.pool)
         .await?;
 
         match row {
-            Some(r) => Ok(Some(ApiKeyRecord {
-                api_key: r.get("api_key"),
-                key_display: r
-                    .get::<Option<String>, _>("key_display")
-                    .unwrap_or_default(),
-                name: r.get("name"),
-                is_active: r.get("is_active"),
-                rate_limit: r.get("rate_limit"),
-                cost_rate: r.get("cost_rate"),
-                monthly_budget: r.get("monthly_budget"),
-                budget_used: r.get("budget_used"),
-                budget_used_mtd: r.get("budget_used_mtd"),
-                budget_mtd_month: r.get("budget_mtd_month"),
-                deactivated_reason: r.get("deactivated_reason"),
-                budget_history: r.get("budget_history"),
-                tpm_limit: r.get("tpm_limit"),
-                cache_ttl: r.get("cache_ttl"),
-                metadata: r.get("metadata"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })),
+            Some(r) => Ok(Some(row_to_api_key(&r))),
             None => Ok(None),
         }
     }
@@ -158,12 +164,13 @@ impl ApiKeyStore for PostgresBackend {
     async fn create_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO api_keys \
-             (api_key, key_display, name, is_active, rate_limit, cost_rate, \
+             (api_key, key_id, key_display, name, is_active, rate_limit, cost_rate, \
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(&record.api_key)
+        .bind(&record.key_id)
         .bind(&record.key_display)
         .bind(&record.name)
         .bind(record.is_active)
@@ -253,14 +260,14 @@ impl ApiKeyStore for PostgresBackend {
         }
 
         let row =
-            sqlx::query("SELECT monthly_budget, budget_used FROM api_keys WHERE api_key = $1")
+            sqlx::query("SELECT monthly_budget, budget_used_mtd FROM api_keys WHERE api_key = $1")
                 .bind(api_key)
                 .fetch_optional(&self.pool)
                 .await?;
 
         if let Some(r) = row {
             let budget: Option<f64> = r.get("monthly_budget");
-            let used: f64 = r.get("budget_used");
+            let used: f64 = r.get("budget_used_mtd");
             if let Some(limit) = budget {
                 if used >= limit {
                     return Ok(true);
@@ -330,50 +337,21 @@ impl ApiKeyStore for PostgresBackend {
     }
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
-        let rows = sqlx::query(
-            "SELECT api_key, key_display, name, is_active, rate_limit, cost_rate, \
-             monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
-             FROM api_keys ORDER BY created_at DESC",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {API_KEY_COLS} FROM api_keys ORDER BY created_at DESC"
+        ))
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows
-            .iter()
-            .map(|r| ApiKeyRecord {
-                api_key: r.get("api_key"),
-                key_display: r
-                    .get::<Option<String>, _>("key_display")
-                    .unwrap_or_default(),
-                name: r.get("name"),
-                is_active: r.get("is_active"),
-                rate_limit: r.get("rate_limit"),
-                cost_rate: r.get("cost_rate"),
-                monthly_budget: r.get("monthly_budget"),
-                budget_used: r.get("budget_used"),
-                budget_used_mtd: r.get("budget_used_mtd"),
-                budget_mtd_month: r.get("budget_mtd_month"),
-                deactivated_reason: r.get("deactivated_reason"),
-                budget_history: r.get("budget_history"),
-                tpm_limit: r.get("tpm_limit"),
-                cache_ttl: r.get("cache_ttl"),
-                metadata: r.get("metadata"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect();
+        let records = rows.iter().map(row_to_api_key).collect();
 
         Ok(records)
     }
 
     async fn find_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKeyRecord>> {
-        let rows = sqlx::query(
-            "SELECT api_key, key_display, name, is_active, rate_limit, cost_rate, \
-             monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
-             FROM api_keys WHERE api_key LIKE $1 || '%' LIMIT 2",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {API_KEY_COLS} FROM api_keys WHERE api_key LIKE $1 || '%' LIMIT 2"
+        ))
         .bind(prefix)
         .fetch_all(&self.pool)
         .await?;
@@ -382,64 +360,39 @@ impl ApiKeyStore for PostgresBackend {
             anyhow::bail!("ambiguous_prefix");
         }
 
-        Ok(rows.first().map(|r| ApiKeyRecord {
-            api_key: r.get("api_key"),
-            key_display: r
-                .get::<Option<String>, _>("key_display")
-                .unwrap_or_default(),
-            name: r.get("name"),
-            is_active: r.get("is_active"),
-            rate_limit: r.get("rate_limit"),
-            cost_rate: r.get("cost_rate"),
-            monthly_budget: r.get("monthly_budget"),
-            budget_used: r.get("budget_used"),
-            budget_used_mtd: r.get("budget_used_mtd"),
-            budget_mtd_month: r.get("budget_mtd_month"),
-            deactivated_reason: r.get("deactivated_reason"),
-            budget_history: r.get("budget_history"),
-            tpm_limit: r.get("tpm_limit"),
-            cache_ttl: r.get("cache_ttl"),
-            metadata: r.get("metadata"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        }))
+        Ok(rows.first().map(row_to_api_key))
     }
 
     async fn get_api_key_by_name(&self, name: &str) -> Result<Option<ApiKeyRecord>> {
-        let row = sqlx::query(
-            "SELECT api_key, key_display, name, is_active, rate_limit, cost_rate, \
-             monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
-             deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, created_at, updated_at \
-             FROM api_keys WHERE name = $1",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {API_KEY_COLS} FROM api_keys WHERE name = $1"
+        ))
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
 
         match row {
-            Some(r) => Ok(Some(ApiKeyRecord {
-                api_key: r.get("api_key"),
-                key_display: r
-                    .get::<Option<String>, _>("key_display")
-                    .unwrap_or_default(),
-                name: r.get("name"),
-                is_active: r.get("is_active"),
-                rate_limit: r.get("rate_limit"),
-                cost_rate: r.get("cost_rate"),
-                monthly_budget: r.get("monthly_budget"),
-                budget_used: r.get("budget_used"),
-                budget_used_mtd: r.get("budget_used_mtd"),
-                budget_mtd_month: r.get("budget_mtd_month"),
-                deactivated_reason: r.get("deactivated_reason"),
-                budget_history: r.get("budget_history"),
-                tpm_limit: r.get("tpm_limit"),
-                cache_ttl: r.get("cache_ttl"),
-                metadata: r.get("metadata"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })),
+            Some(r) => Ok(Some(row_to_api_key(&r))),
             None => Ok(None),
         }
+    }
+
+    async fn get_api_key_by_id(&self, key_id: &str) -> Result<Option<ApiKeyRecord>> {
+        let row = sqlx::query(&format!(
+            "SELECT {API_KEY_COLS} FROM api_keys WHERE key_id = $1"
+        ))
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(row_to_api_key))
+    }
+
+    async fn delete_api_key(&self, api_key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM api_keys WHERE api_key = $1")
+            .bind(api_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -452,12 +405,13 @@ impl UsageStore for PostgresBackend {
     async fn record_usage(&self, record: &UsageRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage \
-             (api_key, timestamp, request_id, model, input_tokens, output_tokens, \
+             (api_key, key_id, timestamp, request_id, model, input_tokens, output_tokens, \
               cached_tokens, cache_write_tokens, cost, success, duration_ms, error_message, \
               provider, protocol) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(&record.api_key)
+        .bind(&record.key_id)
         .bind(&record.timestamp)
         .bind(&record.request_id)
         .bind(&record.model)
@@ -517,7 +471,7 @@ impl UsageStore for PostgresBackend {
         };
 
         let sql = format!(
-            "SELECT id, api_key, timestamp, request_id, model, \
+            "SELECT id, api_key, key_id, timestamp, request_id, model, \
              input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
              cost, success, duration_ms, error_message, provider, protocol \
              FROM usage {key_clause} {since_clause} {before_id_clause} \
@@ -545,6 +499,7 @@ impl UsageStore for PostgresBackend {
             .map(|r| UsageRecord {
                 id: r.get("id"),
                 api_key: r.get("api_key"),
+                key_id: r.get("key_id"),
                 timestamp: r.get("timestamp"),
                 request_id: r.get("request_id"),
                 model: r.get("model"),
@@ -582,7 +537,7 @@ impl UsageStore for PostgresBackend {
                     "to_char(date_trunc('month', timestamp::timestamptz), 'YYYY-MM')".to_string()
                 }
                 "provider" => "COALESCE(provider, 'unknown')".to_string(),
-                "api_key" => "api_key".to_string(),
+                "api_key" => "COALESCE(key_id, api_key)".to_string(),
                 _ => "to_char(date_trunc('hour', timestamp::timestamptz), 'YYYY-MM-DD\"T\"HH24')"
                     .to_string(),
             }

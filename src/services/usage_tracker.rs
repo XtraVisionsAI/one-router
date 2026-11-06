@@ -5,6 +5,7 @@
 use crate::database::models::UsageRecord;
 use crate::database::traits::DatabaseService;
 use crate::middleware::auth::ApiKeyInfo;
+use crate::middleware::rate_limit::TokenRateLimiter;
 use crate::schemas::anthropic::Usage;
 use crate::services::model_mapping::ModelMappingService;
 use chrono::Utc;
@@ -45,6 +46,8 @@ fn cache_write_price_for_ttl(
 pub struct UsageTracker {
     storage: Arc<dyn DatabaseService>,
     model_mapping: Arc<ModelMappingService>,
+    /// TPM meter shared with the rate-limit middleware.
+    token_limiter: Arc<TokenRateLimiter>,
 }
 
 impl UsageTracker {
@@ -52,7 +55,14 @@ impl UsageTracker {
         Self {
             storage,
             model_mapping,
+            token_limiter: Arc::new(TokenRateLimiter::new()),
         }
+    }
+
+    /// The TPM meter fed by [`record_usage`](Self::record_usage); the rate-limit
+    /// middleware checks against the same instance.
+    pub fn token_limiter(&self) -> Arc<TokenRateLimiter> {
+        self.token_limiter.clone()
     }
 
     /// Record usage for a completed request.
@@ -101,19 +111,26 @@ impl UsageTracker {
             }
         }
 
-        let record_api_key = if is_internal_key {
-            if key_info.is_master {
-                "__master__"
-            } else {
-                "__ephemeral__"
-            }
-        } else {
-            &key_info.raw_api_key
-        };
+        let record_api_key = key_info.usage_api_key();
+
+        // TPM metering (only keys with a limit; cache reads don't count, matching
+        // Anthropic's ITPM accounting).
+        if key_info.tpm_limit.is_some() {
+            let tokens = [
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens.unwrap_or(0),
+            ]
+            .iter()
+            .map(|t| (*t).max(0) as u64)
+            .sum();
+            self.token_limiter.record(&key_info.key_id, tokens).await;
+        }
 
         let mut record = UsageRecord {
             id: None,
             api_key: record_api_key.to_string(),
+            key_id: Some(key_info.key_id.clone()),
             timestamp: timestamp.to_rfc3339(),
             request_id: request_id.to_string(),
             model: model.to_string(),
@@ -168,7 +185,7 @@ impl UsageTracker {
                 tracing::warn!(
                     api_key = %key_info.api_key,
                     cost = cost,
-                    "Budget exceeded, key deactivated"
+                    "Monthly budget reached; further requests will be rejected"
                 );
             }
 

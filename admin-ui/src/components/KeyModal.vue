@@ -32,7 +32,8 @@
     monthly_budget: null as number | null,
     tpm_limit: null as number | null,
     cache_ttl: null as string | null,
-    cost_rate: 1.0
+    cost_rate: 1.0,
+    metadata: ''
   })
   const saving = ref(false)
 
@@ -46,15 +47,32 @@
           monthly_budget: props.existing?.monthly_budget ?? null,
           tpm_limit: props.existing?.tpm_limit ?? null,
           cache_ttl: props.existing?.cache_ttl ?? null,
-          cost_rate: props.existing?.cost_rate ?? 1.0
+          cost_rate: props.existing?.cost_rate ?? 1.0,
+          metadata: props.existing?.metadata ? JSON.stringify(props.existing.metadata, null, 2) : ''
         }
       }
     }
   )
 
+  /** Parse the metadata textarea: empty → null, otherwise a JSON object. `undefined` = invalid. */
+  function parseMetadata(): Record<string, unknown> | null | undefined {
+    const raw = form.value.metadata.trim()
+    if (!raw) return null
+    try {
+      const v = JSON.parse(raw)
+      if (v && typeof v === 'object' && !Array.isArray(v)) return v
+    } catch {}
+    return undefined
+  }
+
   async function save() {
     if (!form.value.name.trim()) {
       message.error('Name is required')
+      return
+    }
+    const metadata = parseMetadata()
+    if (metadata === undefined) {
+      message.error('Metadata must be a JSON object, e.g. {"owner": "alice"}')
       return
     }
 
@@ -69,7 +87,8 @@
         if (form.value.tpm_limit !== props.existing?.tpm_limit) body.tpm_limit = form.value.tpm_limit
         if (form.value.cache_ttl !== props.existing?.cache_ttl) body.cache_ttl = form.value.cache_ttl
         if (form.value.cost_rate !== props.existing?.cost_rate) body.cost_rate = form.value.cost_rate
-        await api.update(props.existing!.name, body)
+        if (JSON.stringify(metadata) !== JSON.stringify(props.existing?.metadata ?? null)) body.metadata = metadata
+        await api.update(props.existing!.key_id, body)
         message.success('Key updated')
         emit('update:show', false)
         emit('saved')
@@ -80,7 +99,8 @@
           monthly_budget: form.value.monthly_budget,
           tpm_limit: form.value.tpm_limit,
           cache_ttl: form.value.cache_ttl,
-          cost_rate: form.value.cost_rate
+          cost_rate: form.value.cost_rate,
+          metadata
         }
         const result = await api.create(body)
         message.success('Key created')
@@ -117,7 +137,7 @@
           <NInputNumber v-model:value="form.rate_limit" :min="0" class="w-full" />
         </NFormItem>
         <NFormItem label="TPM Limit" class="flex-1">
-          <NInputNumber v-model:value="form.tpm_limit" :min="0" placeholder="unlimited" class="w-full" />
+          <NInputNumber v-model:value="form.tpm_limit" :min="1" placeholder="unlimited" class="w-full" />
         </NFormItem>
       </div>
 
@@ -139,6 +159,16 @@
           <NInputNumber v-model:value="form.cost_rate" :min="0" :step="0.1" :precision="2" class="w-full" />
         </NFormItem>
       </div>
+
+      <NFormItem label="Metadata (JSON, optional)">
+        <NInput
+          v-model:value="form.metadata"
+          type="textarea"
+          :autosize="{ minRows: 2, maxRows: 6 }"
+          placeholder='{"owner": "alice", "ticket": "T123"}'
+          style="font-family: monospace; font-size: 12px"
+        />
+      </NFormItem>
     </div>
 
     <template #footer>

@@ -148,6 +148,21 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await?;
 
+    // Migration: stable key_id (UUID) on api_keys + usage attribution.
+    // gen_random_uuid() is built in since PostgreSQL 13.
+    sqlx::query("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_id TEXT")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE api_keys SET key_id = gen_random_uuid()::text WHERE key_id IS NULL OR key_id = ''",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_id ON api_keys(key_id)")
+        .execute(pool)
+        .await?;
+    usage_key_id_column(pool).await?;
+
     // --- backends ---
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS backends (
@@ -228,6 +243,35 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await?;
 
+    Ok(())
+}
+
+/// Add `usage.key_id`; on first add, attribute existing rows through the key
+/// hash (only possible while the api_keys row still exists).
+async fn usage_key_id_column(pool: &PgPool) -> Result<()> {
+    use sqlx::Row;
+
+    let row = sqlx::query(
+        "SELECT COUNT(*) as cnt FROM information_schema.columns \
+         WHERE table_name = 'usage' AND column_name = 'key_id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let exists: i64 = row.get("cnt");
+    if exists > 0 {
+        return Ok(());
+    }
+
+    sqlx::query("ALTER TABLE usage ADD COLUMN key_id TEXT")
+        .execute(pool)
+        .await?;
+    let res = sqlx::query(
+        "UPDATE usage SET key_id = k.key_id FROM api_keys k \
+         WHERE usage.api_key = k.api_key AND usage.key_id IS NULL",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!(rows = res.rows_affected(), "Backfilled usage.key_id");
     Ok(())
 }
 

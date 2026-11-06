@@ -137,7 +137,7 @@ pub async fn get_usage_summary(
         .database
         .usage()
         .query_usage_summary(
-            &key_info.api_key,
+            key_info.usage_api_key(),
             params.start_time.as_deref(),
             params.end_time.as_deref(),
             group_by,
@@ -160,7 +160,6 @@ pub async fn get_usage_summary(
     };
 
     // key_info already contains budget info (loaded from DB by auth middleware into Extension).
-    // api_key in ApiKeyInfo is the truncated string; use the fields already in key_info.
     let monthly_budget = key_info.monthly_budget;
     let budget_used_mtd = key_info.budget_used_mtd;
 
@@ -232,7 +231,7 @@ pub async fn get_usage_records(
         .database
         .usage()
         .get_usage_by_api_key(
-            &key_info.api_key,
+            key_info.usage_api_key(),
             params.start_time.as_deref(),
             Some(limit + 1),
             params.before_id,

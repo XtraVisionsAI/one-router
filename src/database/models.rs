@@ -10,7 +10,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
+    /// HMAC-SHA256 hash of the plaintext key — the storage primary key and the
+    /// auth lookup value. Never exposed through the admin API.
     pub api_key: String,
+    /// Stable, secret-independent identifier (UUIDv4). Used by the admin API,
+    /// usage attribution and the rate limiters.
+    #[serde(default)]
+    pub key_id: String,
     #[serde(default)]
     pub key_display: String,
     pub name: String,
@@ -31,6 +37,16 @@ pub struct ApiKeyRecord {
     pub updated_at: Option<i64>,
 }
 
+/// Generate a fresh `key_id` (UUIDv4, hyphenated).
+pub fn new_key_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// True when `s` has the shape of a `key_id` (hyphenated UUID).
+pub fn looks_like_key_id(s: &str) -> bool {
+    uuid::Uuid::try_parse(s).is_ok() && s.len() == 36
+}
+
 impl ApiKeyRecord {
     pub fn is_valid(&self) -> bool {
         self.is_active
@@ -48,7 +64,12 @@ impl ApiKeyRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub id: Option<i64>,
+    /// Key hash (or `__master__` / `__ephemeral__`). Kept for the DynamoDB
+    /// partition key and legacy rows.
     pub api_key: String,
+    /// Stable key identifier. `None` on rows written before key ids existed.
+    #[serde(default)]
+    pub key_id: Option<String>,
     pub timestamp: String,
     pub request_id: String,
     pub model: String,

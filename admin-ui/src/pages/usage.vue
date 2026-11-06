@@ -32,7 +32,7 @@
     { label: 'All keys', value: null },
     { label: 'Master Key', value: '__master__' },
     { label: 'Ephemeral Key', value: '__ephemeral__' },
-    ...keys.value.map((k) => ({ label: k.name, value: k.name }))
+    ...keys.value.map((k) => ({ label: k.name, value: k.key_id }))
   ])
 
   const groupByOptions = [
