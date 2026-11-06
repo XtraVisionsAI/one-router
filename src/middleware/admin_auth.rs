@@ -55,14 +55,14 @@ pub async fn require_admin_key(
 
     // Check master key
     if let Some(ref master_key) = state.settings.master_api_key {
-        if raw_key == *master_key {
+        if crate::utils::api_key::secret_eq(&raw_key, master_key) {
             return Ok(next.run(request).await);
         }
     }
 
     // Check ephemeral key
     if let Some(ref ephemeral_key) = state.settings.ephemeral_api_key {
-        if raw_key == *ephemeral_key {
+        if crate::utils::api_key::secret_eq(&raw_key, ephemeral_key) {
             return Ok(next.run(request).await);
         }
     }
@@ -105,6 +105,7 @@ mod tests {
             database: "sqlite://:memory:".to_string(),
             host: "127.0.0.1".to_string(),
             port: 8000,
+            metrics_public: false,
             log_level: "debug".to_string(),
             max_body_size_mb: crate::config::settings::DEFAULT_MAX_BODY_SIZE_MB,
             master_api_key: master.map(|s| s.to_string()),

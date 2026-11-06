@@ -24,6 +24,19 @@ pub fn hash_key(api_key: &str, secret: Option<&str>) -> String {
 /// `sk-abcd1234efgh5678` → `sk-abcd••••5678`
 ///
 /// Shows prefix (sk- + first 4 hex chars) and last 4 chars, masks the middle.
+/// Constant-time equality for secrets (keys, tokens). Both inputs are first
+/// reduced to SHA-256 digests so neither the content nor the length of the
+/// stored secret leaks through comparison timing.
+pub fn secret_eq(provided: &str, expected: &str) -> bool {
+    use sha2::Digest;
+    let a = Sha256::digest(provided.as_bytes());
+    let b = Sha256::digest(expected.as_bytes());
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 pub fn mask_key(api_key: &str) -> String {
     if let Some(hex_part) = api_key.strip_prefix("sk-") {
         if hex_part.len() >= 8 {
@@ -51,6 +64,14 @@ pub fn is_hashed(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_eq_matches_only_identical() {
+        assert!(secret_eq("sk-abc", "sk-abc"));
+        assert!(!secret_eq("sk-abd", "sk-abc"));
+        assert!(!secret_eq("sk-ab", "sk-abc"));
+        assert!(!secret_eq("", "sk-abc"));
+    }
 
     #[test]
     fn test_hash_key_deterministic() {

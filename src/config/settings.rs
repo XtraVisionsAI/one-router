@@ -35,6 +35,12 @@ pub struct Settings {
     /// conversation in a single request, easily exceeding axum's 2 MB default.
     pub max_body_size_mb: u64,
 
+    /// Serve `GET /metrics` without authentication (`METRICS_PUBLIC=true`).
+    /// Default `false`: the endpoint requires the master key / admin session.
+    /// Only enable when the listener is reachable solely from a private network
+    /// (e.g. a Prometheus sidecar).
+    pub metrics_public: bool,
+
     /// Master API key for admin access
     pub master_api_key: Option<String>,
 
@@ -61,6 +67,21 @@ pub struct Settings {
     pub ephemeral_api_key: Option<String>,
 }
 
+fn is_container_env() -> bool {
+    env::var("CONTAINER")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// Default bind host: loopback on bare metal, all interfaces in a container.
+fn default_host(container: bool) -> &'static str {
+    if container {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
+}
+
 impl Settings {
     /// Load settings from environment variables with sensible defaults.
     pub fn load() -> Result<Self> {
@@ -74,7 +95,14 @@ impl Settings {
             .parse()
             .context("Invalid PORT value")?;
 
-        let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+        // Private by default: loopback on bare metal. Inside a container
+        // (`CONTAINER=true`, set by every image) the published port is the
+        // boundary, so bind all interfaces there.
+        let host =
+            env::var("HOST").unwrap_or_else(|_| default_host(is_container_env()).to_string());
+        let metrics_public = env::var("METRICS_PUBLIC")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
 
         let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
 
@@ -114,6 +142,7 @@ impl Settings {
             host,
             log_level,
             max_body_size_mb,
+            metrics_public,
             master_api_key,
             encryption_key,
             web_search_provider,
@@ -337,6 +366,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_host_is_loopback_outside_containers() {
+        assert_eq!(default_host(false), "127.0.0.1");
+        assert_eq!(default_host(true), "0.0.0.0");
+    }
+
+    #[test]
     fn test_server_addr() {
         let settings = Settings {
             database: "sqlite://./test.db".into(),
@@ -344,6 +379,7 @@ mod tests {
             host: "127.0.0.1".into(),
             log_level: "debug".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
+            metrics_public: false,
             master_api_key: None,
             encryption_key: None,
             web_search_provider: None,
@@ -364,6 +400,7 @@ mod tests {
             host: "0.0.0.0".into(),
             log_level: "info".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
+            metrics_public: false,
             master_api_key: Some("changeme".into()),
             encryption_key: Some("a".repeat(32)),
             web_search_provider: None,
@@ -385,6 +422,7 @@ mod tests {
             host: "0.0.0.0".into(),
             log_level: "info".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
+            metrics_public: false,
             master_api_key: Some("sk-9f3c1a7e5b2d4f60a8c1e3d5b7f9a1c3".into()),
             encryption_key: Some("a".repeat(32)),
             web_search_provider: None,
@@ -410,6 +448,7 @@ mod tests {
             host: "0.0.0.0".into(),
             log_level: "info".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
+            metrics_public: false,
             master_api_key: None,
             encryption_key: None,
             web_search_provider: None,
@@ -438,6 +477,7 @@ mod tests {
             host: "0.0.0.0".into(),
             log_level: "info".into(),
             max_body_size_mb: DEFAULT_MAX_BODY_SIZE_MB,
+            metrics_public: false,
             master_api_key: None,
             encryption_key: None,
             web_search_provider: None,

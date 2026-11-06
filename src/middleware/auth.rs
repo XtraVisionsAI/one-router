@@ -371,7 +371,7 @@ pub async fn require_api_key(
 
     // Check ephemeral key
     if let Some(ref ephemeral_key) = auth_state.settings.ephemeral_api_key {
-        if api_key == *ephemeral_key {
+        if crate::utils::api_key::secret_eq(&api_key, ephemeral_key) {
             request
                 .extensions_mut()
                 .insert(ApiKeyInfo::ephemeral(&api_key));

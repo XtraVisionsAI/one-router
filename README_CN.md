@@ -48,7 +48,7 @@ One Router 是一个用 Rust 编写的高性能 API 网关，让你通过**一�
 - **热重载** — 通过 Admin 界面修改后端配置和系统设置后即时生效，无需重启
 - **CLI 配置** — 通过命令行参数覆盖任意设置（`--port`、`--database`、`--log-level`）
 - **健康检查** — 内置 `/health`、`/ready`、`/liveness` 端点
-- **Prometheus 指标** — 无鉴权的 `/metrics` 端点，暴露请求/token/费用计数器、HTTP 时延直方图、并发请求 gauge、认证失败计数器和构建信息（API Key 永不作为 label）
+- **Prometheus 指标** — `/metrics` 端点(默认需 master key;私有网络内可用 `METRICS_PUBLIC=true` 开放)，暴露请求/token/费用计数器、HTTP 时延直方图、并发请求 gauge、认证失败计数器和构建信息（API Key 永不作为 label）
 - **多架构 Docker** — 提供 `linux/amd64` 和 `linux/arm64` 镜像
 - **灵活部署** — Docker、AWS App Runner 或裸机部署
 
@@ -88,14 +88,14 @@ cargo build --release
   One Router v0.22.1
 ============================================================
   Database:  sqlite://./data/gateway.db
-  Listen:    0.0.0.0:8000
+  Listen:    127.0.0.1:8000
 
   Ephemeral API Key (valid for this session only):
   sk-ephemeral-xxxxxxxxxxxx
 
   Usage:
     export ANTHROPIC_API_KEY="sk-ephemeral-xxxxxxxxxxxx"
-    export ANTHROPIC_BASE_URL="http://0.0.0.0:8000"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
 ============================================================
 ```
 
@@ -350,7 +350,8 @@ One Router 使用环境变量配置基础设施。所有运行时设置存储在
 |---|---|---|
 | `DATABASE` | `sqlite://./data/gateway.db` | 存储后端 URI，支持 `sqlite://`、`postgres://`、`dynamodb://` |
 | `PORT` | `8000` | HTTP 监听端口 |
-| `HOST` | `0.0.0.0` | HTTP 绑定地址 |
+| `HOST` | `127.0.0.1`(`CONTAINER=true` 时为 `0.0.0.0`) | HTTP 绑定地址。裸机默认只监听本机;仅在防火墙 / TLS 反向代理之后才设置 `HOST=0.0.0.0` |
+| `METRICS_PUBLIC` | `false` | `/metrics` 免鉴权。默认需要 master key(`authorization: Bearer <MASTER_API_KEY>`)或管理会话 |
 | `LOG_LEVEL` | `info` | 日志级别：`trace`、`debug`、`info`、`warn`、`error` |
 | `MASTER_API_KEY` | _(自动生成)_ | 管理专用 API Key — 用于 `/admin` 界面登录和管理 API，不能调用 `/v1/*` 业务端点。裸机首次运行时自动生成并保存到 `.env` |
 | `ENCRYPTION_KEY` | _(自动生成)_ | AES-256 密钥，用于凭证加密和 API Key HMAC — 首次运行时自动生成 |

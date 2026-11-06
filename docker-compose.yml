@@ -5,7 +5,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "8000:8000"
+      # Host-local only. To reach the gateway from another machine, put it
+      # behind your TLS reverse proxy or use an SSH tunnel — not a wider publish.
+      - "127.0.0.1:8000:8000"
     environment:
       DATABASE: sqlite:///app/data/gateway.db
       PORT: "8000"
@@ -20,7 +22,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "8000:8000"
+      # Host-local only. To reach the gateway from another machine, put it
+      # behind your TLS reverse proxy or use an SSH tunnel — not a wider publish.
+      - "127.0.0.1:8000:8000"
     environment:
       DATABASE: dynamodb://us-east-1
       PORT: "8000"
@@ -37,7 +41,9 @@ services:
   dynamodb-local:
     image: amazon/dynamodb-local:latest
     ports:
-      - "8001:8000"
+      # DynamoDB Local has no authentication — never publish beyond loopback.
+      # The gateway reaches it over the compose network (dynamodb-local:8000).
+      - "127.0.0.1:8001:8000"
     command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
     profiles:
       - dynamodb

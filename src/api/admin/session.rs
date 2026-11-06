@@ -30,7 +30,7 @@ pub async fn login(
         .settings
         .master_api_key
         .as_deref()
-        .map(|mk| mk == key)
+        .map(|mk| crate::utils::api_key::secret_eq(key, mk))
         .unwrap_or(false);
 
     // Verify against ephemeral key
@@ -38,7 +38,7 @@ pub async fn login(
         .settings
         .ephemeral_api_key
         .as_deref()
-        .map(|ek| ek == key)
+        .map(|ek| crate::utils::api_key::secret_eq(key, ek))
         .unwrap_or(false);
 
     if !is_master && !is_ephemeral {

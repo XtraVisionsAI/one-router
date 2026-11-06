@@ -30,14 +30,27 @@ pub fn create_router(state: AppState) -> Router {
     // Claude Code sessions that ship the whole conversation per request).
     let body_limit = DefaultBodyLimit::max(state.settings.max_body_size_bytes());
 
-    // Health check routes (no authentication required)
+    // Health check routes (no authentication required — load-balancer probes)
     let health_routes = Router::new()
         .route("/health", get(health::health_check))
         .route("/ready", get(health::readiness))
-        .route("/liveness", get(health::liveness))
-        // Prometheus scrape endpoint (unauthenticated by convention; aggregate
-        // counters only, no API keys or request content). Protect at network layer.
-        .route("/metrics", get(health::metrics));
+        .route("/liveness", get(health::liveness));
+
+    // Prometheus scrape endpoint. Aggregate counters only (no API keys or
+    // request content), but model names, volumes and spend are not public:
+    // admin auth (master key / admin session, e.g. Prometheus
+    // `authorization: Bearer <MASTER_API_KEY>`) unless METRICS_PUBLIC=true.
+    let metrics_routes = {
+        let r = Router::new().route("/metrics", get(health::metrics));
+        if state.settings.metrics_public {
+            r
+        } else {
+            r.layer(middleware::from_fn_with_state(
+                AdminAuthState::new(state.settings.clone(), state.sessions.clone()),
+                require_admin_key,
+            ))
+        }
+    };
 
     // Create middleware state
     let auth_state = AuthState::new(state.settings.clone(), state.database.clone());
@@ -209,6 +222,7 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/v1", anthropic_routes)
         .nest("/v1", openai_routes)
         .merge(health_routes)
+        .merge(metrics_routes)
         .nest("/admin/api", admin_session_routes) // login/logout (no auth)
         .nest("/admin/api", admin_api_routes) // protected admin endpoints
         .nest("/admin", admin_static_routes) // broader wildcard second

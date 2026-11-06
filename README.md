@@ -48,7 +48,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Hot-Reload** — backend and settings changes via Admin UI take effect immediately without restart
 - **CLI Configuration** — override any setting via command-line flags (`--port`, `--database`, `--log-level`)
 - **Health Endpoints** — built-in `/health`, `/ready`, `/liveness` endpoints
-- **Prometheus Metrics** — unauthenticated `/metrics` endpoint exposing request/token/cost counters, an HTTP latency histogram, an in-flight-requests gauge, an auth-failure counter, and build info (the API key is never a label)
+- **Prometheus Metrics** — `/metrics` endpoint (master-key protected by default; `METRICS_PUBLIC=true` to open it on a private network) exposing request/token/cost counters, an HTTP latency histogram, an in-flight-requests gauge, an auth-failure counter, and build info (the API key is never a label)
 - **Multi-Arch Docker** — ships `linux/amd64` and `linux/arm64` images
 - **Deploy Anywhere** — Docker, AWS App Runner, or bare metal
 
@@ -88,14 +88,14 @@ On startup (debug builds only), One Router prints an **ephemeral API key** for i
   One Router v0.22.1
 ============================================================
   Database:  sqlite://./data/gateway.db
-  Listen:    0.0.0.0:8000
+  Listen:    127.0.0.1:8000
 
   Ephemeral API Key (valid for this session only):
   sk-ephemeral-xxxxxxxxxxxx
 
   Usage:
     export ANTHROPIC_API_KEY="sk-ephemeral-xxxxxxxxxxxx"
-    export ANTHROPIC_BASE_URL="http://0.0.0.0:8000"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
 ============================================================
 ```
 
@@ -346,7 +346,8 @@ One Router uses environment variables for infrastructure config. All runtime set
 |---|---|---|
 | `DATABASE` | `sqlite://./data/gateway.db` | Storage backend URI. Supports `sqlite://`, `postgres://`, `dynamodb://` |
 | `PORT` | `8000` | HTTP listen port |
-| `HOST` | `0.0.0.0` | HTTP bind host |
+| `HOST` | `127.0.0.1` (`0.0.0.0` when `CONTAINER=true`) | HTTP bind host. Loopback by default on bare metal; set `HOST=0.0.0.0` only behind a firewall / TLS reverse proxy |
+| `METRICS_PUBLIC` | `false` | Serve `/metrics` without authentication. Default requires the master key (`authorization: Bearer <MASTER_API_KEY>`) or an admin session |
 | `LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `MASTER_API_KEY` | _(auto-generated)_ | Admin-only key — for `/admin` UI login and admin API. Cannot call `/v1/*` business endpoints. Auto-generated and saved to `.env` on first bare-metal run |
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
