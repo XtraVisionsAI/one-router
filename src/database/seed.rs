@@ -1161,6 +1161,42 @@ pub fn default_system_settings() -> Vec<SystemSettingRecord> {
             updated_at: None,
         },
         SystemSettingRecord {
+            key: "budget_enforcement".into(),
+            value: "soft".into(),
+            description: "soft = check spend before a request, charge after (concurrent requests can \
+                          overshoot a budget). precharge = reserve an estimated cost on every budget \
+                          layer before the request and settle the difference after it."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"select","label":"Budget Enforcement","group":"Budgets","sort_order":30,"options":["soft","precharge"]}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "budget_precharge_output_cap".into(),
+            value: "8192".into(),
+            description: "Precharge only: output tokens assumed for the estimate are \
+                          min(max_tokens, this cap), so a large max_tokens does not block requests \
+                          near the end of a budget."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"number","label":"Precharge Output Token Cap","group":"Budgets","sort_order":40,"placeholder":"8192"}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
+            key: "rate_limit_store".into(),
+            value: "memory".into(),
+            description: "memory = RPM/TPM counted per instance (effective limit = configured × \
+                          instances). database = shared one-minute window counters in the database \
+                          (one extra write per request per limited bucket; fails open)."
+                .into(),
+            ui_schema: Some(
+                r#"{"type":"select","label":"Rate Limit Store","group":"General","sort_order":50,"options":["memory","database"]}"#.into(),
+            ),
+            updated_at: None,
+        },
+        SystemSettingRecord {
             key: "audit_log_retention_days".into(),
             value: "365".into(),
             description: "Delete audit log entries older than this many days (0 = keep forever). \

@@ -38,8 +38,8 @@ impl PostgresBackend {
              monthly_budget = $6, budget_used = $7, budget_used_mtd = $8, budget_mtd_month = $9, \
              deactivated_reason = $10, budget_history = $11, tpm_limit = $12, cache_ttl = $13, \
              metadata = $14, expires_at = $15, allowed_models = $16, allowed_cidrs = $17, \
-             budget_period = $18, default_tags = $19, rotated_to = $20, updated_at = $21 \
-             WHERE api_key = $22{extra_where}"
+             budget_period = $18, default_tags = $19, rotated_to = $20, max_concurrency = $21, \
+             updated_at = $22 WHERE api_key = $23{extra_where}"
         ))
         .bind(&record.user_id)
         .bind(&record.name)
@@ -61,6 +61,7 @@ impl PostgresBackend {
         .bind(record.budget_period.as_str())
         .bind(patterns_to_json(&record.default_tags))
         .bind(&record.rotated_to)
+        .bind(record.max_concurrency)
         .bind(unix_now())
         .bind(&record.api_key)
         .execute(&self.pool)
@@ -109,13 +110,42 @@ impl PostgresBackend {
     }
 }
 
+const TEAM_COLS: &str = "team_id, name, is_active, cost_rate, monthly_budget, budget_used, \
+     budget_used_mtd, budget_mtd_month, budget_history, budget_period, budget_alerts_sent, \
+     rate_limit, tpm_limit, max_concurrency, allowed_models, allowed_cidrs, metadata, \
+     created_at, updated_at";
+
+fn row_to_team(r: &sqlx::postgres::PgRow) -> TeamRecord {
+    TeamRecord {
+        team_id: r.get("team_id"),
+        name: r.get("name"),
+        is_active: r.get::<Option<bool>, _>("is_active").unwrap_or(true),
+        cost_rate: r.get::<Option<f64>, _>("cost_rate").unwrap_or(1.0),
+        monthly_budget: r.get("monthly_budget"),
+        budget_used: r.get::<Option<f64>, _>("budget_used").unwrap_or(0.0),
+        budget_used_mtd: r.get::<Option<f64>, _>("budget_used_mtd").unwrap_or(0.0),
+        budget_mtd_month: r.get("budget_mtd_month"),
+        budget_history: r.get("budget_history"),
+        budget_period: BudgetPeriod::parse(r.get::<Option<String>, _>("budget_period").as_deref()),
+        budget_alerts_sent: r.get("budget_alerts_sent"),
+        rate_limit: r.get("rate_limit"),
+        tpm_limit: r.get("tpm_limit"),
+        max_concurrency: r.get("max_concurrency"),
+        allowed_models: patterns_from_json(r.get("allowed_models")),
+        allowed_cidrs: patterns_from_json(r.get("allowed_cidrs")),
+        metadata: r.get("metadata"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
 const API_KEY_COLS: &str = "api_key, key_id, key_display, user_id, name, is_active, rate_limit, cost_rate, \
      monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
      deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, expires_at, allowed_models, \
      allowed_cidrs, budget_period, budget_alerts_sent, default_tags, last_used_at, rotated_to, \
-     created_at, updated_at";
+     max_concurrency, created_at, updated_at";
 
-const USER_COLS: &str = "user_id, name, email, is_active, cost_rate, monthly_budget, budget_used, \
+const USER_COLS: &str = "user_id, name, email, team_id, max_concurrency, is_active, cost_rate, monthly_budget, budget_used, \
      budget_used_mtd, budget_mtd_month, budget_history, rate_limit, tpm_limit, allowed_models, \
      cache_ttl, metadata, allowed_cidrs, budget_period, budget_alerts_sent, default_tags, \
      created_at, updated_at";
@@ -125,6 +155,8 @@ fn row_to_user(r: &sqlx::postgres::PgRow) -> UserRecord {
         user_id: r.get("user_id"),
         name: r.get("name"),
         email: r.get("email"),
+        team_id: r.get("team_id"),
+        max_concurrency: r.get("max_concurrency"),
         is_active: r.get::<Option<bool>, _>("is_active").unwrap_or(true),
         cost_rate: r.get::<Option<f64>, _>("cost_rate").unwrap_or(1.0),
         monthly_budget: r.get("monthly_budget"),
@@ -223,6 +255,10 @@ fn usage_where(f: &UsageFilter<'_>, idx: &mut usize) -> String {
         w.push_str(&format!(" AND user_id = ${idx}"));
         *idx += 1;
     }
+    if f.team_id.is_some() {
+        w.push_str(&format!(" AND team_id = ${idx}"));
+        *idx += 1;
+    }
     if f.tag.is_some() {
         w.push_str(&format!(
             " AND (',' || COALESCE(tags, '') || ',') LIKE ('%,' || ${idx} || ',%')"
@@ -241,6 +277,9 @@ fn bind_usage_filter<'q>(
     }
     if let Some(u) = f.user_id {
         q = q.bind(u);
+    }
+    if let Some(t) = f.team_id {
+        q = q.bind(t);
     }
     if let Some(t) = f.tag {
         q = q.bind(t);
@@ -332,6 +371,7 @@ fn row_to_api_key(r: &sqlx::postgres::PgRow) -> ApiKeyRecord {
         default_tags: patterns_from_json(r.get("default_tags")),
         last_used_at: r.get("last_used_at"),
         rotated_to: r.get("rotated_to"),
+        max_concurrency: r.get("max_concurrency"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     }
@@ -357,6 +397,15 @@ impl DatabaseService for PostgresBackend {
         self
     }
     fn audit(&self) -> &dyn AuditStore {
+        self
+    }
+    fn teams(&self) -> &dyn TeamStore {
+        self
+    }
+    fn budgets(&self) -> &dyn BudgetStore {
+        self
+    }
+    fn rate_counters(&self) -> &dyn RateCounterStore {
         self
     }
     fn usage(&self) -> &dyn UsageStore {
@@ -424,9 +473,9 @@ impl ApiKeyStore for PostgresBackend {
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, \
               expires_at, allowed_models, allowed_cidrs, budget_period, budget_alerts_sent, \
-              default_tags, last_used_at, rotated_to, created_at, updated_at) \
+              default_tags, last_used_at, rotated_to, max_concurrency, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-                     $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)",
+                     $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)",
         )
         .bind(&record.api_key)
         .bind(&record.key_id)
@@ -453,6 +502,7 @@ impl ApiKeyStore for PostgresBackend {
         .bind(patterns_to_json(&record.default_tags))
         .bind(record.last_used_at)
         .bind(&record.rotated_to)
+        .bind(record.max_concurrency)
         .bind(record.created_at)
         .bind(record.updated_at)
         .execute(&self.pool)
@@ -641,11 +691,13 @@ impl UserStore for PostgresBackend {
         sqlx::query(&format!(
             "INSERT INTO users ({USER_COLS}) VALUES \
              ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-              $18, $19, $20, $21)"
+              $18, $19, $20, $21, $22, $23)"
         ))
         .bind(&u.user_id)
         .bind(&u.name)
         .bind(&u.email)
+        .bind(&u.team_id)
+        .bind(u.max_concurrency)
         .bind(u.is_active)
         .bind(u.cost_rate)
         .bind(u.monthly_budget)
@@ -672,13 +724,15 @@ impl UserStore for PostgresBackend {
     async fn update_user(&self, u: &UserRecord) -> Result<()> {
         // Spend counters are owned by increment/reset — never overwritten here.
         sqlx::query(
-            "UPDATE users SET name = $1, email = $2, is_active = $3, cost_rate = $4, \
-             monthly_budget = $5, rate_limit = $6, tpm_limit = $7, allowed_models = $8, \
-             cache_ttl = $9, metadata = $10, allowed_cidrs = $11, budget_period = $12, \
-             default_tags = $13, updated_at = $14 WHERE user_id = $15",
+            "UPDATE users SET name = $1, email = $2, team_id = $3, max_concurrency = $4, \
+             is_active = $5, cost_rate = $6, monthly_budget = $7, rate_limit = $8, tpm_limit = $9, \
+             allowed_models = $10, cache_ttl = $11, metadata = $12, allowed_cidrs = $13, \
+             budget_period = $14, default_tags = $15, updated_at = $16 WHERE user_id = $17",
         )
         .bind(&u.name)
         .bind(&u.email)
+        .bind(&u.team_id)
+        .bind(u.max_concurrency)
         .bind(u.is_active)
         .bind(u.cost_rate)
         .bind(u.monthly_budget)
@@ -729,6 +783,222 @@ impl UserStore for PostgresBackend {
         threshold: f64,
     ) -> Result<bool> {
         claim_alert(&self.pool, "users", "user_id", user_id, period, threshold).await
+    }
+}
+
+// ============================================================================
+// TeamStore / BudgetStore / RateCounterStore
+// ============================================================================
+
+#[async_trait]
+impl TeamStore for PostgresBackend {
+    async fn get_team(&self, team_id: &str) -> Result<Option<TeamRecord>> {
+        let row = sqlx::query(&format!("SELECT {TEAM_COLS} FROM teams WHERE team_id = $1"))
+            .bind(team_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_to_team))
+    }
+
+    async fn get_team_by_name(&self, name: &str) -> Result<Option<TeamRecord>> {
+        let row = sqlx::query(&format!("SELECT {TEAM_COLS} FROM teams WHERE name = $1"))
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_to_team))
+    }
+
+    async fn list_teams(&self) -> Result<Vec<TeamRecord>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {TEAM_COLS} FROM teams ORDER BY created_at DESC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_team).collect())
+    }
+
+    async fn create_team(&self, t: &TeamRecord) -> Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO teams ({TEAM_COLS}) VALUES \
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"
+        ))
+        .bind(&t.team_id)
+        .bind(&t.name)
+        .bind(t.is_active)
+        .bind(t.cost_rate)
+        .bind(t.monthly_budget)
+        .bind(t.budget_used)
+        .bind(t.budget_used_mtd)
+        .bind(&t.budget_mtd_month)
+        .bind(&t.budget_history)
+        .bind(t.budget_period.as_str())
+        .bind(&t.budget_alerts_sent)
+        .bind(t.rate_limit)
+        .bind(t.tpm_limit)
+        .bind(t.max_concurrency)
+        .bind(patterns_to_json(&t.allowed_models))
+        .bind(patterns_to_json(&t.allowed_cidrs))
+        .bind(&t.metadata)
+        .bind(t.created_at)
+        .bind(t.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_team(&self, t: &TeamRecord) -> Result<()> {
+        sqlx::query(
+            "UPDATE teams SET name = $1, is_active = $2, cost_rate = $3, monthly_budget = $4, \
+             budget_period = $5, rate_limit = $6, tpm_limit = $7, max_concurrency = $8, \
+             allowed_models = $9, allowed_cidrs = $10, metadata = $11, updated_at = $12 \
+             WHERE team_id = $13",
+        )
+        .bind(&t.name)
+        .bind(t.is_active)
+        .bind(t.cost_rate)
+        .bind(t.monthly_budget)
+        .bind(t.budget_period.as_str())
+        .bind(t.rate_limit)
+        .bind(t.tpm_limit)
+        .bind(t.max_concurrency)
+        .bind(patterns_to_json(&t.allowed_models))
+        .bind(patterns_to_json(&t.allowed_cidrs))
+        .bind(&t.metadata)
+        .bind(unix_now())
+        .bind(&t.team_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_team(&self, team_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM teams WHERE team_id = $1")
+            .bind(team_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn increment_team_budget_used(&self, team_id: &str, amount: f64) -> Result<SpendAfter> {
+        increment_budget(&self.pool, "teams", "team_id", team_id, amount).await
+    }
+
+    async fn reset_team_monthly_budget(
+        &self,
+        team_id: &str,
+        period: &str,
+        prev_period: &str,
+        prev_used: f64,
+    ) -> Result<()> {
+        reset_budget(
+            &self.pool,
+            "teams",
+            "team_id",
+            team_id,
+            period,
+            prev_period,
+            prev_used,
+        )
+        .await
+    }
+
+    async fn claim_team_budget_alert(
+        &self,
+        team_id: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool> {
+        claim_alert(&self.pool, "teams", "team_id", team_id, period, threshold).await
+    }
+
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<UserRecord>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {USER_COLS} FROM users WHERE team_id = $1 ORDER BY name"
+        ))
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_user).collect())
+    }
+}
+
+#[async_trait]
+impl BudgetStore for PostgresBackend {
+    async fn reserve_budget(
+        &self,
+        layer: BudgetLayer,
+        id: &str,
+        amount: f64,
+        max_used_before: f64,
+    ) -> Result<bool> {
+        let (table, id_col) = layer.table();
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET budget_used = budget_used + $1, \
+             budget_used_mtd = budget_used_mtd + $1 \
+             WHERE {id_col} = $2 AND budget_used_mtd <= $3"
+        ))
+        .bind(amount)
+        .bind(id)
+        .bind(max_used_before)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+}
+
+#[async_trait]
+impl RateCounterStore for PostgresBackend {
+    async fn incr_window(
+        &self,
+        subject: &str,
+        window: i64,
+        requests: i64,
+        tokens: i64,
+        expires_at: i64,
+    ) -> Result<WindowCount> {
+        let row = sqlx::query(
+            "INSERT INTO rate_counters (subject, window_start, requests, tokens, expires_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (subject, window_start) DO UPDATE SET \
+             requests = rate_counters.requests + EXCLUDED.requests, \
+             tokens = rate_counters.tokens + EXCLUDED.tokens \
+             RETURNING requests, tokens",
+        )
+        .bind(subject)
+        .bind(window)
+        .bind(requests)
+        .bind(tokens)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(WindowCount {
+            requests: row.get("requests"),
+            tokens: row.get("tokens"),
+        })
+    }
+
+    async fn get_window(&self, subject: &str, window: i64) -> Result<WindowCount> {
+        let row = sqlx::query(
+            "SELECT requests, tokens FROM rate_counters WHERE subject = $1 AND window_start = $2",
+        )
+        .bind(subject)
+        .bind(window)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| WindowCount {
+                requests: r.get("requests"),
+                tokens: r.get("tokens"),
+            })
+            .unwrap_or_default())
+    }
+
+    async fn purge_windows(&self, now: i64) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM rate_counters WHERE expires_at < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 }
 
@@ -815,14 +1085,15 @@ impl UsageStore for PostgresBackend {
     async fn record_usage(&self, record: &UsageRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage \
-             (api_key, key_id, user_id, tags, timestamp, request_id, model, input_tokens, \
+             (api_key, key_id, user_id, team_id, tags, timestamp, request_id, model, input_tokens, \
               output_tokens, cached_tokens, cache_write_tokens, cost, success, duration_ms, \
               error_message, provider, protocol) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(&record.api_key)
         .bind(&record.key_id)
         .bind(&record.user_id)
+        .bind(&record.team_id)
         .bind(&record.tags)
         .bind(&record.timestamp)
         .bind(&record.request_id)
@@ -874,7 +1145,7 @@ impl UsageStore for PostgresBackend {
         };
 
         let sql = format!(
-            "SELECT id, api_key, key_id, user_id, tags, timestamp, request_id, model, \
+            "SELECT id, api_key, key_id, user_id, team_id, tags, timestamp, request_id, model, \
              input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
              cost, success, duration_ms, error_message, provider, protocol \
              FROM usage {key_clause} {since_clause} {before_id_clause} \
@@ -901,6 +1172,7 @@ impl UsageStore for PostgresBackend {
                 api_key: r.get("api_key"),
                 key_id: r.get("key_id"),
                 user_id: r.get("user_id"),
+                team_id: r.get("team_id"),
                 tags: r.get("tags"),
                 timestamp: r.get("timestamp"),
                 request_id: r.get("request_id"),
@@ -941,6 +1213,7 @@ impl UsageStore for PostgresBackend {
                 "provider" => "COALESCE(provider, 'unknown')".to_string(),
                 "api_key" => "COALESCE(key_id, api_key)".to_string(),
                 "user" => "COALESCE(user_id, '')".to_string(),
+                "team" => "COALESCE(team_id, '')".to_string(),
                 "tags" => "COALESCE(tags, '')".to_string(),
                 _ => "to_char(date_trunc('hour', timestamp::timestamptz), 'YYYY-MM-DD\"T\"HH24')"
                     .to_string(),

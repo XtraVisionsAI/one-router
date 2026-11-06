@@ -88,6 +88,31 @@ pub async fn create_tables(backend: &DynamoDbBackend) -> Result<()> {
     )
     .await?;
 
+    // --- teams (PK: team_id) ---
+    create_table_if_not_exists(
+        backend,
+        "teams",
+        vec![attr_def("team_id", ScalarAttributeType::S)],
+        vec![key_schema("team_id", KeyType::Hash)],
+    )
+    .await?;
+
+    // --- rate_counters (PK: subject, SK: window_start; TTL on expires_at) ---
+    create_table_if_not_exists(
+        backend,
+        "rate_counters",
+        vec![
+            attr_def("subject", ScalarAttributeType::S),
+            attr_def("window_start", ScalarAttributeType::N),
+        ],
+        vec![
+            key_schema("subject", KeyType::Hash),
+            key_schema("window_start", KeyType::Range),
+        ],
+    )
+    .await?;
+    ensure_ttl(backend, "rate_counters", "expires_at").await;
+
     // --- audit_logs (PK: month, SK: timestamp#id) ---
     create_table_if_not_exists(
         backend,
@@ -189,6 +214,31 @@ async fn ensure_name_gsi(backend: &DynamoDbBackend) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Enable TTL on `attribute` (best-effort: logs and continues on failure, e.g.
+/// while the table is still being created or TTL is already enabled).
+async fn ensure_ttl(backend: &DynamoDbBackend, logical_name: &str, attribute: &str) {
+    use aws_sdk_dynamodb::types::TimeToLiveSpecification;
+    let table = DynamoDbBackend::table_name(logical_name);
+    let spec = TimeToLiveSpecification::builder()
+        .attribute_name(attribute)
+        .enabled(true)
+        .build();
+    let Ok(spec) = spec else { return };
+    if let Err(e) = backend
+        .client
+        .update_time_to_live()
+        .table_name(&table)
+        .time_to_live_specification(spec)
+        .send()
+        .await
+    {
+        let msg = e.into_service_error().to_string();
+        if !msg.contains("already enabled") {
+            tracing::debug!(table = %table, error = %msg, "Could not enable TTL (may already be on)");
+        }
+    }
 }
 
 async fn create_table_if_not_exists(

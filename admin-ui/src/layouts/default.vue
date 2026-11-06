@@ -14,6 +14,7 @@
 
   const menuOptions: MenuOption[] = [
     { key: '/dashboard', label: 'Dashboard', icon: () => h('span', { class: 'i-carbon-dashboard text-base' }) },
+    { key: '/teams', label: 'Teams', icon: () => h('span', { class: 'i-carbon-group text-base' }) },
     { key: '/users', label: 'Users', icon: () => h('span', { class: 'i-carbon-user-multiple text-base' }) },
     { key: '/keys', label: 'API Keys', icon: () => h('span', { class: 'i-carbon-api text-base' }) },
     { key: '/backends', label: 'Backends', icon: () => h('span', { class: 'i-carbon-server-dns text-base' }) },

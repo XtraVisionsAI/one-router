@@ -85,6 +85,7 @@ fn target_type_of(resource: &str) -> &'static str {
     match resource {
         "keys" => "api_key",
         "users" => "user",
+        "teams" => "team",
         "backends" => "backend",
         "mappings" => "mapping",
         "settings" => "setting",

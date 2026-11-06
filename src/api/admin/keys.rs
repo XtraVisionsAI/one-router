@@ -76,6 +76,7 @@ pub struct AdminKeyItem {
     pub last_used_at: Option<i64>,
     /// `key_id` of the replacement if this key was rotated.
     pub rotated_to: Option<String>,
+    pub max_concurrency: Option<i32>,
     pub metadata: Option<serde_json::Value>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
@@ -113,6 +114,7 @@ impl AdminKeyItem {
             default_tags: r.default_tags.clone(),
             last_used_at: r.last_used_at,
             rotated_to: r.rotated_to.clone(),
+            max_concurrency: r.max_concurrency,
             metadata: decode_metadata(r.metadata.as_deref()),
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -168,6 +170,7 @@ pub struct CreateKeyRequest {
     /// `monthly` (default) / `weekly` / `daily` — period of the key sub-budget.
     pub budget_period: Option<String>,
     pub default_tags: Option<Vec<String>>,
+    pub max_concurrency: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +198,8 @@ pub struct UpdateKeyRequest {
     pub budget_period: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub default_tags: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub max_concurrency: Option<Option<i32>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -418,6 +423,7 @@ async fn create_key_inner(
     let allowed_cidrs = validate_cidrs(body.allowed_cidrs)?;
     let default_tags = validate_tags(body.default_tags)?;
     let budget_period = parse_budget_period(body.budget_period.as_deref())?.unwrap_or_default();
+    validate_positive("max_concurrency", body.max_concurrency)?;
     let now = Utc::now().timestamp();
 
     // Owner: explicit user, or (legacy) a new user carrying the limit fields.
@@ -490,6 +496,7 @@ async fn create_key_inner(
         default_tags,
         last_used_at: None,
         rotated_to: None,
+        max_concurrency: body.max_concurrency,
         created_at: now,
         updated_at: None,
     };
@@ -602,6 +609,10 @@ async fn update_key_inner(
     }
     if let Some(tags) = body.default_tags {
         record.default_tags = validate_tags(tags)?;
+    }
+    if let Some(c) = body.max_concurrency {
+        validate_positive("max_concurrency", c)?;
+        record.max_concurrency = c;
     }
 
     match state.database.api_keys().update_api_key(&record).await {
@@ -861,6 +872,7 @@ mod tests {
             default_tags: None,
             last_used_at: None,
             rotated_to: None,
+            max_concurrency: None,
             created_at: 0,
             updated_at: None,
         }

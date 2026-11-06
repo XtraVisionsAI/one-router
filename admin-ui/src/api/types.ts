@@ -35,6 +35,8 @@ export interface User {
   user_id: string
   name: string
   email: string | null
+  team_id: string | null
+  max_concurrency: number | null
   is_active: boolean
   cost_rate: number
   monthly_budget: number | null
@@ -61,6 +63,8 @@ export interface UserDetail extends User {
 export interface UserBody {
   name?: string
   email?: string | null
+  team?: string | null
+  max_concurrency?: number | null
   cost_rate?: number
   monthly_budget?: number | null
   rate_limit?: number | null
@@ -94,6 +98,7 @@ export interface ApiKey {
   default_tags: string[] | null
   last_used_at: number | null
   rotated_to: string | null
+  max_concurrency: number | null
   is_active: boolean
   metadata: Record<string, unknown> | null
   created_at: number
@@ -112,6 +117,7 @@ export interface CreateKeyBody {
   allowed_cidrs?: string[] | null
   budget_period?: BudgetPeriod
   default_tags?: string[] | null
+  max_concurrency?: number | null
   metadata?: Record<string, unknown> | null
 }
 
@@ -126,6 +132,7 @@ export interface UpdateKeyBody {
   allowed_cidrs?: string[] | null
   budget_period?: BudgetPeriod
   default_tags?: string[] | null
+  max_concurrency?: number | null
   metadata?: Record<string, unknown> | null
 }
 
@@ -257,4 +264,37 @@ export interface AuditListResponse {
   object: 'list'
   data: AuditEntry[]
   has_more: boolean
+}
+
+// ── Teams ─────────────────────────────────────────────────────
+export interface Team {
+  team_id: string
+  name: string
+  is_active: boolean
+  cost_rate: number
+  monthly_budget: number | null
+  budget_period: BudgetPeriod
+  budget_used_mtd: number
+  budget_used: number
+  rate_limit: number | null
+  tpm_limit: number | null
+  max_concurrency: number | null
+  allowed_models: string[] | null
+  allowed_cidrs: string[] | null
+  metadata: Record<string, unknown> | null
+  member_count: number
+  created_at: number
+}
+
+export interface TeamBody {
+  name?: string
+  cost_rate?: number
+  monthly_budget?: number | null
+  budget_period?: BudgetPeriod
+  rate_limit?: number | null
+  tpm_limit?: number | null
+  max_concurrency?: number | null
+  allowed_models?: string[] | null
+  allowed_cidrs?: string[] | null
+  metadata?: Record<string, unknown> | null
 }

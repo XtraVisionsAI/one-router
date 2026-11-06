@@ -546,9 +546,64 @@ fn api_key_from_item(item: &HashMap<String, AttributeValue>) -> ApiKeyRecord {
         default_tags: patterns_from_json(get_opt_s(item, "default_tags")),
         last_used_at: get_opt_i64(item, "last_used_at"),
         rotated_to: get_opt_s(item, "rotated_to"),
+        max_concurrency: get_opt_i32(item, "max_concurrency"),
         created_at: get_i64(item, "created_at"),
         updated_at: get_opt_i64(item, "updated_at"),
     }
+}
+
+fn team_from_item(item: &HashMap<String, AttributeValue>) -> TeamRecord {
+    TeamRecord {
+        team_id: get_s(item, "team_id"),
+        name: get_s(item, "name"),
+        is_active: get_bool(item, "is_active"),
+        cost_rate: get_opt_f64(item, "cost_rate").unwrap_or(1.0),
+        monthly_budget: get_opt_f64(item, "monthly_budget"),
+        budget_used: get_f64(item, "budget_used"),
+        budget_used_mtd: get_f64(item, "budget_used_mtd"),
+        budget_mtd_month: get_opt_s(item, "budget_mtd_month"),
+        budget_history: get_opt_s(item, "budget_history"),
+        budget_period: BudgetPeriod::parse(get_opt_s(item, "budget_period").as_deref()),
+        budget_alerts_sent: get_opt_s(item, "budget_alerts_sent"),
+        rate_limit: get_opt_i32(item, "rate_limit"),
+        tpm_limit: get_opt_i32(item, "tpm_limit"),
+        max_concurrency: get_opt_i32(item, "max_concurrency"),
+        allowed_models: patterns_from_json(get_opt_s(item, "allowed_models")),
+        allowed_cidrs: patterns_from_json(get_opt_s(item, "allowed_cidrs")),
+        metadata: get_opt_s(item, "metadata"),
+        created_at: get_i64(item, "created_at"),
+        updated_at: get_opt_i64(item, "updated_at"),
+    }
+}
+
+fn team_to_item(t: &TeamRecord) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert("team_id".into(), av_s(&t.team_id));
+    item.insert("name".into(), av_s(&t.name));
+    item.insert("is_active".into(), av_bool(t.is_active));
+    item.insert("cost_rate".into(), av_n_f64(t.cost_rate));
+    item.insert("monthly_budget".into(), av_opt_n_f64(t.monthly_budget));
+    item.insert("budget_used".into(), av_n_f64(t.budget_used));
+    item.insert("budget_used_mtd".into(), av_n_f64(t.budget_used_mtd));
+    item.insert("budget_mtd_month".into(), av_opt_s(&t.budget_mtd_month));
+    item.insert("budget_history".into(), av_opt_s(&t.budget_history));
+    item.insert("budget_period".into(), av_s(t.budget_period.as_str()));
+    item.insert("budget_alerts_sent".into(), av_opt_s(&t.budget_alerts_sent));
+    item.insert("rate_limit".into(), av_opt_n_i32(t.rate_limit));
+    item.insert("tpm_limit".into(), av_opt_n_i32(t.tpm_limit));
+    item.insert("max_concurrency".into(), av_opt_n_i32(t.max_concurrency));
+    item.insert(
+        "allowed_models".into(),
+        av_opt_s(&patterns_to_json(&t.allowed_models)),
+    );
+    item.insert(
+        "allowed_cidrs".into(),
+        av_opt_s(&patterns_to_json(&t.allowed_cidrs)),
+    );
+    item.insert("metadata".into(), av_opt_s(&t.metadata));
+    item.insert("created_at".into(), av_n(t.created_at));
+    item.insert("updated_at".into(), av_opt_n_i64(t.updated_at));
+    item
 }
 
 fn spend_after(attrs: Option<&HashMap<String, AttributeValue>>) -> SpendAfter {
@@ -589,6 +644,8 @@ fn user_from_item(item: &HashMap<String, AttributeValue>) -> UserRecord {
         user_id: get_s(item, "user_id"),
         name: get_s(item, "name"),
         email: get_opt_s(item, "email"),
+        team_id: get_opt_s(item, "team_id"),
+        max_concurrency: get_opt_i32(item, "max_concurrency"),
         is_active: get_bool(item, "is_active"),
         cost_rate: get_opt_f64(item, "cost_rate").unwrap_or(1.0),
         monthly_budget: get_opt_f64(item, "monthly_budget"),
@@ -615,6 +672,8 @@ fn user_to_item(u: &UserRecord) -> HashMap<String, AttributeValue> {
     item.insert("user_id".into(), av_s(&u.user_id));
     item.insert("name".into(), av_s(&u.name));
     item.insert("email".into(), av_opt_s(&u.email));
+    item.insert("team_id".into(), av_opt_s(&u.team_id));
+    item.insert("max_concurrency".into(), av_opt_n_i32(u.max_concurrency));
     item.insert("is_active".into(), av_bool(u.is_active));
     item.insert("cost_rate".into(), av_n_f64(u.cost_rate));
     item.insert("monthly_budget".into(), av_opt_n_f64(u.monthly_budget));
@@ -696,6 +755,10 @@ fn api_key_to_item(record: &ApiKeyRecord) -> HashMap<String, AttributeValue> {
     );
     item.insert("last_used_at".into(), av_opt_n_i64(record.last_used_at));
     item.insert("rotated_to".into(), av_opt_s(&record.rotated_to));
+    item.insert(
+        "max_concurrency".into(),
+        av_opt_n_i32(record.max_concurrency),
+    );
     item.insert("created_at".into(), av_n(record.created_at));
     item.insert("updated_at".into(), av_opt_n_i64(record.updated_at));
     item
@@ -707,6 +770,7 @@ fn usage_from_item(item: &HashMap<String, AttributeValue>) -> UsageRecord {
         api_key: get_s(item, "api_key"),
         key_id: get_opt_s(item, "key_id"),
         user_id: get_opt_s(item, "user_id"),
+        team_id: get_opt_s(item, "team_id"),
         tags: get_opt_s(item, "tags"),
         timestamp: get_s(item, "timestamp"),
         request_id: get_s(item, "request_id"),
@@ -781,6 +845,15 @@ impl DatabaseService for DynamoDbBackend {
         self
     }
     fn audit(&self) -> &dyn AuditStore {
+        self
+    }
+    fn teams(&self) -> &dyn TeamStore {
+        self
+    }
+    fn budgets(&self) -> &dyn BudgetStore {
+        self
+    }
+    fn rate_counters(&self) -> &dyn RateCounterStore {
         self
     }
     fn usage(&self) -> &dyn UsageStore {
@@ -1310,6 +1383,267 @@ impl AuditStore for DynamoDbBackend {
 }
 
 // ============================================================================
+// TeamStore / BudgetStore / RateCounterStore
+// ============================================================================
+
+#[async_trait]
+impl TeamStore for DynamoDbBackend {
+    async fn get_team(&self, team_id: &str) -> Result<Option<TeamRecord>> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(Self::table_name("teams"))
+            .key("team_id", av_s(team_id))
+            .send()
+            .await?;
+        Ok(result.item().map(team_from_item))
+    }
+
+    async fn get_team_by_name(&self, name: &str) -> Result<Option<TeamRecord>> {
+        Ok(self
+            .scan_all("teams", Some(("#n = :name", &[(":name", av_s(name))])))
+            .await?
+            .first()
+            .map(team_from_item))
+    }
+
+    async fn list_teams(&self) -> Result<Vec<TeamRecord>> {
+        let mut teams: Vec<TeamRecord> = self
+            .scan_all("teams", None)
+            .await?
+            .iter()
+            .map(team_from_item)
+            .collect();
+        teams.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+        Ok(teams)
+    }
+
+    async fn create_team(&self, t: &TeamRecord) -> Result<()> {
+        if self.get_team_by_name(&t.name).await?.is_some() {
+            return Err(anyhow::anyhow!("UNIQUE constraint failed: teams.name"));
+        }
+        self.client
+            .put_item()
+            .table_name(Self::table_name("teams"))
+            .set_item(Some(team_to_item(t)))
+            .condition_expression("attribute_not_exists(team_id)")
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn update_team(&self, t: &TeamRecord) -> Result<()> {
+        if let Some(other) = self.get_team_by_name(&t.name).await? {
+            if other.team_id != t.team_id {
+                return Err(anyhow::anyhow!("UNIQUE constraint failed: teams.name"));
+            }
+        }
+        self.client
+            .update_item()
+            .table_name(Self::table_name("teams"))
+            .key("team_id", av_s(&t.team_id))
+            .condition_expression("attribute_exists(team_id)")
+            .update_expression(
+                "SET #n = :name, is_active = :active, cost_rate = :rate, monthly_budget = :budget, \
+                 budget_period = :period, rate_limit = :rpm, tpm_limit = :tpm, \
+                 max_concurrency = :conc, allowed_models = :models, allowed_cidrs = :cidrs, \
+                 metadata = :meta, updated_at = :now",
+            )
+            .expression_attribute_names("#n", "name")
+            .expression_attribute_values(":name", av_s(&t.name))
+            .expression_attribute_values(":active", av_bool(t.is_active))
+            .expression_attribute_values(":rate", av_n_f64(t.cost_rate))
+            .expression_attribute_values(":budget", av_opt_n_f64(t.monthly_budget))
+            .expression_attribute_values(":period", av_s(t.budget_period.as_str()))
+            .expression_attribute_values(":rpm", av_opt_n_i32(t.rate_limit))
+            .expression_attribute_values(":tpm", av_opt_n_i32(t.tpm_limit))
+            .expression_attribute_values(":conc", av_opt_n_i32(t.max_concurrency))
+            .expression_attribute_values(":models", av_opt_s(&patterns_to_json(&t.allowed_models)))
+            .expression_attribute_values(":cidrs", av_opt_s(&patterns_to_json(&t.allowed_cidrs)))
+            .expression_attribute_values(":meta", av_opt_s(&t.metadata))
+            .expression_attribute_values(":now", av_n(unix_now()))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_team(&self, team_id: &str) -> Result<()> {
+        self.client
+            .delete_item()
+            .table_name(Self::table_name("teams"))
+            .key("team_id", av_s(team_id))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn increment_team_budget_used(&self, team_id: &str, amount: f64) -> Result<SpendAfter> {
+        let result = self
+            .client
+            .update_item()
+            .table_name(Self::table_name("teams"))
+            .key("team_id", av_s(team_id))
+            .condition_expression("attribute_exists(team_id)")
+            .update_expression(
+                "SET budget_used = budget_used + :amount, \
+                 budget_used_mtd = budget_used_mtd + :amount, updated_at = :now",
+            )
+            .expression_attribute_values(":amount", av_n_f64(amount))
+            .expression_attribute_values(":now", av_n(unix_now()))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
+            .send()
+            .await?;
+        Ok(spend_after(result.attributes()))
+    }
+
+    async fn reset_team_monthly_budget(
+        &self,
+        team_id: &str,
+        period: &str,
+        prev_period: &str,
+        prev_used: f64,
+    ) -> Result<()> {
+        let existing = self.get_team(team_id).await?.and_then(|t| t.budget_history);
+        let mut history: HashMap<String, f64> = existing
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        if prev_used > 0.0 && !prev_period.is_empty() {
+            history.insert(prev_period.to_string(), (prev_used * 100.0).round() / 100.0);
+        }
+        let history = serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string());
+        self.client
+            .update_item()
+            .table_name(Self::table_name("teams"))
+            .key("team_id", av_s(team_id))
+            .update_expression(
+                "SET budget_used_mtd = :zero, budget_mtd_month = :month, \
+                 budget_history = :history, updated_at = :now",
+            )
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
+            .expression_attribute_values(":month", av_s(period))
+            .expression_attribute_values(":history", av_s(&history))
+            .expression_attribute_values(":now", av_n(unix_now()))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("DynamoDB reset_team_monthly_budget: {e}"))?;
+        Ok(())
+    }
+
+    async fn claim_team_budget_alert(
+        &self,
+        team_id: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool> {
+        self.claim_alert("teams", "team_id", team_id, period, threshold)
+            .await
+    }
+
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<UserRecord>> {
+        let mut users: Vec<UserRecord> = self
+            .scan_all("users", Some(("team_id = :t", &[(":t", av_s(team_id))])))
+            .await?
+            .iter()
+            .map(user_from_item)
+            .collect();
+        users.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(users)
+    }
+}
+
+#[async_trait]
+impl BudgetStore for DynamoDbBackend {
+    async fn reserve_budget(
+        &self,
+        layer: BudgetLayer,
+        id: &str,
+        amount: f64,
+        max_used_before: f64,
+    ) -> Result<bool> {
+        let (table, id_col) = layer.table();
+        let res = self
+            .client
+            .update_item()
+            .table_name(Self::table_name(table))
+            .key(id_col, av_s(id))
+            .update_expression(
+                "SET budget_used = budget_used + :a, budget_used_mtd = budget_used_mtd + :a",
+            )
+            .condition_expression("budget_used_mtd <= :max")
+            .expression_attribute_values(":a", av_n_f64(amount))
+            .expression_attribute_values(":max", av_n_f64(max_used_before))
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_conditional_check_failed_exception() {
+                    Ok(false)
+                } else {
+                    Err(anyhow::anyhow!("reserve_budget: {svc}"))
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl RateCounterStore for DynamoDbBackend {
+    async fn incr_window(
+        &self,
+        subject: &str,
+        window: i64,
+        requests: i64,
+        tokens: i64,
+        expires_at: i64,
+    ) -> Result<WindowCount> {
+        let result = self
+            .client
+            .update_item()
+            .table_name(Self::table_name("rate_counters"))
+            .key("subject", av_s(subject))
+            .key("window_start", av_n(window))
+            .update_expression("ADD requests :r, tokens :t SET expires_at = :e")
+            .expression_attribute_values(":r", av_n(requests))
+            .expression_attribute_values(":t", av_n(tokens))
+            .expression_attribute_values(":e", av_n(expires_at))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
+            .send()
+            .await?;
+        let a = result.attributes();
+        Ok(WindowCount {
+            requests: a.map(|a| get_i64(a, "requests")).unwrap_or(0),
+            tokens: a.map(|a| get_i64(a, "tokens")).unwrap_or(0),
+        })
+    }
+
+    async fn get_window(&self, subject: &str, window: i64) -> Result<WindowCount> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(Self::table_name("rate_counters"))
+            .key("subject", av_s(subject))
+            .key("window_start", av_n(window))
+            .send()
+            .await?;
+        Ok(result
+            .item()
+            .map(|a| WindowCount {
+                requests: get_i64(a, "requests"),
+                tokens: get_i64(a, "tokens"),
+            })
+            .unwrap_or_default())
+    }
+
+    /// Old windows are removed by the table's TTL on `expires_at`.
+    async fn purge_windows(&self, _now: i64) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+// ============================================================================
 // UserStore
 // ============================================================================
 
@@ -1377,7 +1711,7 @@ impl UserStore for DynamoDbBackend {
                  monthly_budget = :budget, rate_limit = :rpm, tpm_limit = :tpm, \
                  allowed_models = :models, cache_ttl = :ttl, metadata = :meta, \
                  allowed_cidrs = :cidrs, budget_period = :period, default_tags = :tags, \
-                 updated_at = :now",
+                 team_id = :team, max_concurrency = :conc, updated_at = :now",
             )
             .expression_attribute_names("#n", "name")
             .expression_attribute_values(":name", av_s(&u.name))
@@ -1393,6 +1727,8 @@ impl UserStore for DynamoDbBackend {
             .expression_attribute_values(":cidrs", av_opt_s(&patterns_to_json(&u.allowed_cidrs)))
             .expression_attribute_values(":period", av_s(u.budget_period.as_str()))
             .expression_attribute_values(":tags", av_opt_s(&patterns_to_json(&u.default_tags)))
+            .expression_attribute_values(":team", av_opt_s(&u.team_id))
+            .expression_attribute_values(":conc", av_opt_n_i32(u.max_concurrency))
             .expression_attribute_values(":now", av_n(unix_now()))
             .send()
             .await?;
@@ -1490,6 +1826,9 @@ impl UsageStore for DynamoDbBackend {
         if let Some(ref user_id) = record.user_id {
             item.insert("user_id".into(), av_s(user_id));
         }
+        if let Some(ref team_id) = record.team_id {
+            item.insert("team_id".into(), av_s(team_id));
+        }
         if let Some(ref tags) = record.tags {
             item.insert("tags".into(), av_s(tags));
         }
@@ -1531,6 +1870,7 @@ impl UsageStore for DynamoDbBackend {
         let UsageFilter {
             api_key,
             user_id,
+            team_id,
             tag,
         } = filter;
         // Empty api_key means "all keys" — use Scan instead of Query
@@ -1551,6 +1891,9 @@ impl UsageStore for DynamoDbBackend {
             }
             if let Some(u) = user_id {
                 records.retain(|r| r.user_id.as_deref() == Some(u));
+            }
+            if let Some(t) = team_id {
+                records.retain(|r| r.team_id.as_deref() == Some(t));
             }
             records.retain(|r| tag_matches(r, tag));
             records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -1580,6 +1923,7 @@ impl UsageStore for DynamoDbBackend {
                 .iter()
                 .map(usage_from_item)
                 .filter(|r| user_id.is_none() || r.user_id.as_deref() == user_id)
+                .filter(|r| team_id.is_none() || r.team_id.as_deref() == team_id)
                 .filter(|r| tag_matches(r, tag))
                 .collect()
         };
@@ -1602,6 +1946,7 @@ impl UsageStore for DynamoDbBackend {
         let UsageFilter {
             api_key,
             user_id,
+            team_id,
             tag,
         } = filter;
         let filter_by_key = !api_key.is_empty();
@@ -1621,6 +1966,10 @@ impl UsageStore for DynamoDbBackend {
         if let Some(u) = user_id {
             filter_parts.push("user_id = :uid".to_string());
             expr_values.push((":uid".to_string(), av_s(u)));
+        }
+        if let Some(t) = team_id {
+            filter_parts.push("team_id = :tid".to_string());
+            expr_values.push((":tid".to_string(), av_s(t)));
         }
         if let Some(t) = tag {
             // Substring pre-filter; exact per-tag match applied after fetch.
@@ -1707,6 +2056,7 @@ impl UsageStore for DynamoDbBackend {
                 "provider" => r.provider.as_deref().unwrap_or("unknown").to_string(),
                 "api_key" => r.key_id.clone().unwrap_or_else(|| r.api_key.clone()),
                 "user" => r.user_id.clone().unwrap_or_default(),
+                "team" => r.team_id.clone().unwrap_or_default(),
                 "tags" => r.tags.clone().unwrap_or_default(),
                 _ => r.timestamp.chars().take(13).collect(),
             }

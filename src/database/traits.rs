@@ -97,6 +97,67 @@ pub trait UserStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait TeamStore: Send + Sync {
+    async fn get_team(&self, team_id: &str) -> Result<Option<TeamRecord>>;
+    async fn get_team_by_name(&self, name: &str) -> Result<Option<TeamRecord>>;
+    async fn list_teams(&self) -> Result<Vec<TeamRecord>>;
+    /// Duplicate name → error containing `UNIQUE constraint failed: teams.name`.
+    async fn create_team(&self, record: &TeamRecord) -> Result<()>;
+    /// Never overwrites spend counters / alert state.
+    async fn update_team(&self, record: &TeamRecord) -> Result<()>;
+    async fn delete_team(&self, team_id: &str) -> Result<()>;
+    async fn increment_team_budget_used(&self, team_id: &str, amount: f64) -> Result<SpendAfter>;
+    async fn reset_team_monthly_budget(
+        &self,
+        team_id: &str,
+        period: &str,
+        prev_period: &str,
+        prev_used: f64,
+    ) -> Result<()>;
+    async fn claim_team_budget_alert(
+        &self,
+        team_id: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool>;
+    /// Members of a team.
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<UserRecord>>;
+}
+
+/// Budget precharge (reserve before the request, settle after).
+#[async_trait]
+pub trait BudgetStore: Send + Sync {
+    /// Atomically add `amount` to the layer's spend **only if** its current
+    /// period spend is `<= max_used_before` (the caller passes
+    /// `budget - amount`). Returns `false` (nothing changed) otherwise.
+    async fn reserve_budget(
+        &self,
+        layer: BudgetLayer,
+        id: &str,
+        amount: f64,
+        max_used_before: f64,
+    ) -> Result<bool>;
+}
+
+/// Shared fixed-window rate-limit counters (database rate-limit store).
+#[async_trait]
+pub trait RateCounterStore: Send + Sync {
+    /// Atomically add to `(subject, window)` and return the new totals.
+    /// `expires_at` (unix seconds) lets the store discard old windows.
+    async fn incr_window(
+        &self,
+        subject: &str,
+        window: i64,
+        requests: i64,
+        tokens: i64,
+        expires_at: i64,
+    ) -> Result<WindowCount>;
+    async fn get_window(&self, subject: &str, window: i64) -> Result<WindowCount>;
+    /// Delete windows whose `expires_at` is before `now`. Returns rows removed.
+    async fn purge_windows(&self, now: i64) -> Result<u64>;
+}
+
+#[async_trait]
 pub trait AuditStore: Send + Sync {
     async fn record_audit(&self, record: &AuditLogRecord) -> Result<()>;
     /// Newest first, at most `query.limit` rows.
@@ -111,6 +172,7 @@ pub struct UsageFilter<'a> {
     /// Stored `usage.api_key` value (key hash / internal id). Empty = any.
     pub api_key: &'a str,
     pub user_id: Option<&'a str>,
+    pub team_id: Option<&'a str>,
     /// Rows whose tag list contains this tag.
     pub tag: Option<&'a str>,
 }
@@ -127,7 +189,7 @@ pub trait UsageStore: Send + Sync {
         before_id: Option<i64>,
     ) -> Result<Vec<UsageRecord>>;
     /// Aggregate usage query, grouped by group_by ("hour", "day", "month", "model",
-    /// "provider", "api_key", "user", "tags" — the raw comma-joined tag list;
+    /// "provider", "api_key", "user", "team", "tags" — the raw comma-joined tag list;
     /// callers explode it per tag). Optional split_by adds a secondary grouping
     /// dimension. start / end are RFC3339 strings, both optional.
     async fn query_usage_summary(
@@ -279,6 +341,9 @@ pub trait DatabaseService: Send + Sync {
     fn api_keys(&self) -> &dyn ApiKeyStore;
     fn users(&self) -> &dyn UserStore;
     fn audit(&self) -> &dyn AuditStore;
+    fn teams(&self) -> &dyn TeamStore;
+    fn budgets(&self) -> &dyn BudgetStore;
+    fn rate_counters(&self) -> &dyn RateCounterStore;
     fn usage(&self) -> &dyn UsageStore;
     fn model_mapping(&self) -> &dyn ModelMappingStore;
     fn backends(&self) -> &dyn BackendConfigStore;

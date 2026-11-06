@@ -1,6 +1,6 @@
 # API Key 管理重构:用户维度计费 + Key 生命周期 + 审计
 
-日期:2026-11-06 · 状态:P0、P1、P2 已实施(2026-11-06,单测 + 本地烟囱测试验证,含用 P0 二进制建库后升级);P3 设计中
+日期:2026-11-06 · 状态:P0–P3 全部已实施(2026-11-06,单测 + 本地烟囱测试验证,含用 P0 二进制建库后升级)
 
 ## 背景与目标
 
@@ -481,6 +481,21 @@ App Runner 部署需要配置为其负载均衡的地址段,文档给出示例�
 
 ## P3:团队、预扣、共享限流
 
+### 实施记录:与下文初稿的差异
+
+| 主题 | 初稿 | 实现 |
+|---|---|---|
+| 团队 `cost_rate` | 用户为空时取团队 | 用户的 `cost_rate` 不可为空,所以改为**相乘**:有效倍率 = 用户倍率 × 团队倍率(团队默认 1.0,可表达团队折扣) |
+| 团队成员管理 | 单独的成员增删接口 | 通过 `PUT /admin/api/users/:user {"team": <id 或名称> / null}`;团队详情返回成员列表。删除有成员的团队返回 409,`?force=true` 先把成员移出团队 |
+| 团队 RPM | — | 只有显式设置时才限制(不回退到全局默认,全局默认只作用于用户层) |
+| 并发上限 | 进程内信号量;数据库模式用租约 | **只做进程内**(三层计数器,任一层满即 429 `kind=concurrency`),槽位在响应 body 结束(或客户端断开)时释放,流式响应全程占用。数据库租约未实现 |
+| 共享限流 | `rate_counters` 固定窗口 + 两窗口加权 | 已实现:RPM 先计数后判断,超限时**回退本次计数**;TPM 读两个窗口判断、响应后累加。SQLite/Postgres 用 `INSERT … ON CONFLICT … RETURNING`;DynamoDB 用 `ADD` 原子更新 + 表 TTL;SQL 后端每 10 分钟清理过期窗口。存储出错时**放行**并计入 `onerouter_rate_limit_store_errors_total` |
+| 预扣估算 | 输入用 `utils/tokens` 估算 | 输入按 body 字节数 / 4 估算(上限 200k tokens,不解析 body——各协议 body 形态不同,而多估的部分结算时会退回);输出 = `min(max_tokens / max_output_tokens / max_completion_tokens, cap)` |
+| 预扣原子性 | 各层同事务 / `TransactWriteItems` | 各层分别做**条件增量**(`spend <= budget - estimate`,阈值由客户端算出,因为 DynamoDB 条件表达式不能做加法);任一层失败则回滚已预扣的层并 403 |
+| 结算时机 | 请求结束后按差额修正 | 结算挂在**响应 body 结束时**(含流式、含客户端断开),而不是 `record_usage` 里——这样 handler 的任何错误路径(没调用 `record_usage`)都会按实际花费 0 全额退回。`record_usage` 只把实际花费累加进结算单,不再自己累加预算 |
+| 预扣适用范围 | — | 仅 `POST /v1/messages`、`/v1/chat/completions`、`/v1/responses`、`/v1/embeddings`,且调用方至少有一层设置了预算;存储出错时本请求退回 soft 模式 |
+| 周期滚动 | — | 预扣前先做各层的懒重置并同步到请求上下文,避免"预扣后被月初重置抹掉" |
+
 ### P3-1 团队
 
 `teams` 表:`team_id`、`name`、`is_active`、`cost_rate`、预算全套字段
@@ -590,7 +605,7 @@ key / user / team 层 `max_concurrency`。进程内信号量在请求开始时�
 | P0 ✅ | key_id + 回填、硬删除、`/keys/:key_id`(兼容 name)、TPM、限流缓存键、全局 RPM 热更新、metadata、`/v1/usage` 修复 | 完全向后兼容(无参 `DELETE` 仍为停用) |
 | P1 ✅ | users 表 + 自动迁移、多 Key、用户级计费、过期、模型白名单、UI 用户页 | 行为不变;**不可无损回退** |
 | P2 ✅ | 审计日志、预算周期、告警、轮换、last_used、鉴权缓存、IP 白名单、标签、Key 前缀 | 向后兼容(name 路径兼容与无参 `DELETE` 的停用语义暂未移除,留待下个 minor 版本) |
-| P3 | 团队、并发上限、共享限流、预扣 | 新能力默认关闭 |
+| P3 ✅ | 团队、并发上限、共享限流、预扣 | 新能力默认关闭(`rate_limit_store = memory`、`budget_enforcement = soft`) |
 
 建议 P0 与 P1 分两个 minor 版本发布:P0 完全向后兼容、可随时回退;P1 的用户
 迁移不可无损回退,单独发布便于在出问题时定位。

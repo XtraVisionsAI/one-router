@@ -173,9 +173,63 @@ impl SqliteBackend {
             "ALTER TABLE users ADD COLUMN budget_period TEXT",
             "ALTER TABLE users ADD COLUMN budget_alerts_sent TEXT",
             "ALTER TABLE users ADD COLUMN default_tags TEXT",
+            // P3
+            "ALTER TABLE users ADD COLUMN team_id TEXT",
+            "ALTER TABLE users ADD COLUMN max_concurrency INTEGER",
+            "ALTER TABLE api_keys ADD COLUMN max_concurrency INTEGER",
+            "ALTER TABLE usage ADD COLUMN team_id TEXT",
         ] {
             sqlx::query(ddl).execute(&self.pool).await.ok(); // duplicate column → already applied
         }
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_team ON users(team_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_team_ts ON usage(team_id, timestamp)")
+            .execute(&self.pool)
+            .await
+            .ok(); // usage table is created later on a fresh database
+
+        // --- teams ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS teams (
+                team_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                is_active INTEGER DEFAULT 1,
+                cost_rate REAL DEFAULT 1.0,
+                monthly_budget REAL,
+                budget_used REAL DEFAULT 0.0,
+                budget_used_mtd REAL DEFAULT 0.0,
+                budget_mtd_month TEXT,
+                budget_history TEXT,
+                budget_period TEXT,
+                budget_alerts_sent TEXT,
+                rate_limit INTEGER,
+                tpm_limit INTEGER,
+                max_concurrency INTEGER,
+                allowed_models TEXT,
+                allowed_cidrs TEXT,
+                metadata TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // --- rate_counters (shared rate-limit store) ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS rate_counters (
+                subject TEXT NOT NULL,
+                window_start INTEGER NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                tokens INTEGER NOT NULL DEFAULT 0,
+                expires_at INTEGER NOT NULL,
+                PRIMARY KEY (subject, window_start)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
 
         // --- audit_logs ---
         sqlx::query(
@@ -245,6 +299,15 @@ impl SqliteBackend {
             .execute(&self.pool)
             .await
             .ok();
+
+        // Migration: usage.team_id (denormalized)
+        sqlx::query("ALTER TABLE usage ADD COLUMN team_id TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_team_ts ON usage(team_id, timestamp)")
+            .execute(&self.pool)
+            .await?;
 
         // Migration: usage.tags (comma-joined)
         sqlx::query("ALTER TABLE usage ADD COLUMN tags TEXT")
@@ -461,7 +524,7 @@ impl SqliteBackend {
              monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
              deactivated_reason = ?, budget_history = ?, tpm_limit = ?, cache_ttl = ?, metadata = ?, \
              expires_at = ?, allowed_models = ?, allowed_cidrs = ?, budget_period = ?, \
-             default_tags = ?, rotated_to = ?, updated_at = ? \
+             default_tags = ?, rotated_to = ?, max_concurrency = ?, updated_at = ? \
              WHERE api_key = ?{extra_where}"
         ))
         .bind(&record.user_id)
@@ -484,6 +547,7 @@ impl SqliteBackend {
         .bind(record.budget_period.as_str())
         .bind(patterns_to_json(&record.default_tags))
         .bind(&record.rotated_to)
+        .bind(record.max_concurrency)
         .bind(unix_now())
         .bind(&record.api_key)
         .execute(&self.pool)
@@ -641,13 +705,42 @@ impl SqliteBackend {
 // Helper: api_keys row mapping
 // ============================================================================
 
+const TEAM_COLS: &str = "team_id, name, is_active, cost_rate, monthly_budget, budget_used, \
+     budget_used_mtd, budget_mtd_month, budget_history, budget_period, budget_alerts_sent, \
+     rate_limit, tpm_limit, max_concurrency, allowed_models, allowed_cidrs, metadata, \
+     created_at, updated_at";
+
+fn row_to_team(r: &sqlx::sqlite::SqliteRow) -> TeamRecord {
+    TeamRecord {
+        team_id: r.get("team_id"),
+        name: r.get("name"),
+        is_active: r.get::<i32, _>("is_active") != 0,
+        cost_rate: r.get::<Option<f64>, _>("cost_rate").unwrap_or(1.0),
+        monthly_budget: r.get("monthly_budget"),
+        budget_used: r.get::<Option<f64>, _>("budget_used").unwrap_or(0.0),
+        budget_used_mtd: r.get::<Option<f64>, _>("budget_used_mtd").unwrap_or(0.0),
+        budget_mtd_month: r.get("budget_mtd_month"),
+        budget_history: r.get("budget_history"),
+        budget_period: BudgetPeriod::parse(r.get::<Option<String>, _>("budget_period").as_deref()),
+        budget_alerts_sent: r.get("budget_alerts_sent"),
+        rate_limit: r.get("rate_limit"),
+        tpm_limit: r.get("tpm_limit"),
+        max_concurrency: r.get("max_concurrency"),
+        allowed_models: patterns_from_json(r.get("allowed_models")),
+        allowed_cidrs: patterns_from_json(r.get("allowed_cidrs")),
+        metadata: r.get("metadata"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
 const API_KEY_COLS: &str = "api_key, key_id, key_display, user_id, name, is_active, rate_limit, cost_rate, \
      monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
      deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, expires_at, allowed_models, \
      allowed_cidrs, budget_period, budget_alerts_sent, default_tags, last_used_at, rotated_to, \
-     created_at, updated_at";
+     max_concurrency, created_at, updated_at";
 
-const USER_COLS: &str = "user_id, name, email, is_active, cost_rate, monthly_budget, budget_used, \
+const USER_COLS: &str = "user_id, name, email, team_id, max_concurrency, is_active, cost_rate, monthly_budget, budget_used, \
      budget_used_mtd, budget_mtd_month, budget_history, rate_limit, tpm_limit, allowed_models, \
      cache_ttl, metadata, allowed_cidrs, budget_period, budget_alerts_sent, default_tags, \
      created_at, updated_at";
@@ -657,6 +750,8 @@ fn row_to_user(r: &sqlx::sqlite::SqliteRow) -> UserRecord {
         user_id: r.get("user_id"),
         name: r.get("name"),
         email: r.get("email"),
+        team_id: r.get("team_id"),
+        max_concurrency: r.get("max_concurrency"),
         is_active: r.get::<i32, _>("is_active") != 0,
         cost_rate: r.get::<Option<f64>, _>("cost_rate").unwrap_or(1.0),
         monthly_budget: r.get("monthly_budget"),
@@ -768,6 +863,9 @@ fn usage_where(f: &UsageFilter<'_>) -> String {
     if f.user_id.is_some() {
         w.push_str(" AND user_id = ?");
     }
+    if f.team_id.is_some() {
+        w.push_str(" AND team_id = ?");
+    }
     if f.tag.is_some() {
         w.push_str(" AND (',' || COALESCE(tags, '') || ',') LIKE ('%,' || ? || ',%')");
     }
@@ -783,6 +881,9 @@ fn bind_usage_filter<'q>(
     }
     if let Some(u) = f.user_id {
         q = q.bind(u);
+    }
+    if let Some(t) = f.team_id {
+        q = q.bind(t);
     }
     if let Some(t) = f.tag {
         q = q.bind(t);
@@ -865,6 +966,7 @@ fn row_to_api_key(r: &sqlx::sqlite::SqliteRow) -> ApiKeyRecord {
         default_tags: patterns_from_json(r.get("default_tags")),
         last_used_at: r.get("last_used_at"),
         rotated_to: r.get("rotated_to"),
+        max_concurrency: r.get("max_concurrency"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     }
@@ -914,6 +1016,18 @@ impl DatabaseService for SqliteBackend {
     }
 
     fn audit(&self) -> &dyn AuditStore {
+        self
+    }
+
+    fn teams(&self) -> &dyn TeamStore {
+        self
+    }
+
+    fn budgets(&self) -> &dyn BudgetStore {
+        self
+    }
+
+    fn rate_counters(&self) -> &dyn RateCounterStore {
         self
     }
 
@@ -986,8 +1100,8 @@ impl ApiKeyStore for SqliteBackend {
               monthly_budget, budget_used, budget_used_mtd, budget_mtd_month, \
               deactivated_reason, budget_history, tpm_limit, cache_ttl, metadata, \
               expires_at, allowed_models, allowed_cidrs, budget_period, budget_alerts_sent, \
-              default_tags, last_used_at, rotated_to, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              default_tags, last_used_at, rotated_to, max_concurrency, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
         .bind(&record.key_id)
@@ -1014,6 +1128,7 @@ impl ApiKeyStore for SqliteBackend {
         .bind(patterns_to_json(&record.default_tags))
         .bind(record.last_used_at)
         .bind(&record.rotated_to)
+        .bind(record.max_concurrency)
         .bind(record.created_at)
         .bind(record.updated_at)
         .execute(&self.pool)
@@ -1200,11 +1315,13 @@ impl UserStore for SqliteBackend {
 
     async fn create_user(&self, u: &UserRecord) -> Result<()> {
         sqlx::query(&format!(
-            "INSERT INTO users ({USER_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO users ({USER_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ))
         .bind(&u.user_id)
         .bind(&u.name)
         .bind(&u.email)
+        .bind(&u.team_id)
+        .bind(u.max_concurrency)
         .bind(u.is_active as i32)
         .bind(u.cost_rate)
         .bind(u.monthly_budget)
@@ -1232,13 +1349,16 @@ impl UserStore for SqliteBackend {
         // Spend counters are owned by increment/reset — never overwritten here,
         // so an admin edit racing a request cannot lose spend.
         sqlx::query(
-            "UPDATE users SET name = ?, email = ?, is_active = ?, cost_rate = ?, \
+            "UPDATE users SET name = ?, email = ?, team_id = ?, max_concurrency = ?, \
+             is_active = ?, cost_rate = ?, \
              monthly_budget = ?, rate_limit = ?, tpm_limit = ?, allowed_models = ?, \
              cache_ttl = ?, metadata = ?, allowed_cidrs = ?, budget_period = ?, default_tags = ?, \
              updated_at = ? WHERE user_id = ?",
         )
         .bind(&u.name)
         .bind(&u.email)
+        .bind(&u.team_id)
+        .bind(u.max_concurrency)
         .bind(u.is_active as i32)
         .bind(u.cost_rate)
         .bind(u.monthly_budget)
@@ -1289,6 +1409,222 @@ impl UserStore for SqliteBackend {
         threshold: f64,
     ) -> Result<bool> {
         claim_alert(&self.pool, "users", "user_id", user_id, period, threshold).await
+    }
+}
+
+// ============================================================================
+// TeamStore / BudgetStore / RateCounterStore
+// ============================================================================
+
+#[async_trait]
+impl TeamStore for SqliteBackend {
+    async fn get_team(&self, team_id: &str) -> Result<Option<TeamRecord>> {
+        let row = sqlx::query(&format!("SELECT {TEAM_COLS} FROM teams WHERE team_id = ?"))
+            .bind(team_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_to_team))
+    }
+
+    async fn get_team_by_name(&self, name: &str) -> Result<Option<TeamRecord>> {
+        let row = sqlx::query(&format!("SELECT {TEAM_COLS} FROM teams WHERE name = ?"))
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_to_team))
+    }
+
+    async fn list_teams(&self) -> Result<Vec<TeamRecord>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {TEAM_COLS} FROM teams ORDER BY created_at DESC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_team).collect())
+    }
+
+    async fn create_team(&self, t: &TeamRecord) -> Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO teams ({TEAM_COLS}) VALUES \
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
+        .bind(&t.team_id)
+        .bind(&t.name)
+        .bind(t.is_active as i32)
+        .bind(t.cost_rate)
+        .bind(t.monthly_budget)
+        .bind(t.budget_used)
+        .bind(t.budget_used_mtd)
+        .bind(&t.budget_mtd_month)
+        .bind(&t.budget_history)
+        .bind(t.budget_period.as_str())
+        .bind(&t.budget_alerts_sent)
+        .bind(t.rate_limit)
+        .bind(t.tpm_limit)
+        .bind(t.max_concurrency)
+        .bind(patterns_to_json(&t.allowed_models))
+        .bind(patterns_to_json(&t.allowed_cidrs))
+        .bind(&t.metadata)
+        .bind(t.created_at)
+        .bind(t.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_team(&self, t: &TeamRecord) -> Result<()> {
+        sqlx::query(
+            "UPDATE teams SET name = ?, is_active = ?, cost_rate = ?, monthly_budget = ?, \
+             budget_period = ?, rate_limit = ?, tpm_limit = ?, max_concurrency = ?, \
+             allowed_models = ?, allowed_cidrs = ?, metadata = ?, updated_at = ? \
+             WHERE team_id = ?",
+        )
+        .bind(&t.name)
+        .bind(t.is_active as i32)
+        .bind(t.cost_rate)
+        .bind(t.monthly_budget)
+        .bind(t.budget_period.as_str())
+        .bind(t.rate_limit)
+        .bind(t.tpm_limit)
+        .bind(t.max_concurrency)
+        .bind(patterns_to_json(&t.allowed_models))
+        .bind(patterns_to_json(&t.allowed_cidrs))
+        .bind(&t.metadata)
+        .bind(unix_now())
+        .bind(&t.team_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_team(&self, team_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM teams WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn increment_team_budget_used(&self, team_id: &str, amount: f64) -> Result<SpendAfter> {
+        increment_budget(&self.pool, "teams", "team_id", team_id, amount).await
+    }
+
+    async fn reset_team_monthly_budget(
+        &self,
+        team_id: &str,
+        period: &str,
+        prev_period: &str,
+        prev_used: f64,
+    ) -> Result<()> {
+        reset_budget(
+            &self.pool,
+            "teams",
+            "team_id",
+            team_id,
+            period,
+            prev_period,
+            prev_used,
+        )
+        .await
+    }
+
+    async fn claim_team_budget_alert(
+        &self,
+        team_id: &str,
+        period: &str,
+        threshold: f64,
+    ) -> Result<bool> {
+        claim_alert(&self.pool, "teams", "team_id", team_id, period, threshold).await
+    }
+
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<UserRecord>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {USER_COLS} FROM users WHERE team_id = ? ORDER BY name"
+        ))
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_user).collect())
+    }
+}
+
+#[async_trait]
+impl BudgetStore for SqliteBackend {
+    async fn reserve_budget(
+        &self,
+        layer: BudgetLayer,
+        id: &str,
+        amount: f64,
+        max_used_before: f64,
+    ) -> Result<bool> {
+        let (table, id_col) = layer.table();
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET budget_used = budget_used + ?, \
+             budget_used_mtd = budget_used_mtd + ? \
+             WHERE {id_col} = ? AND budget_used_mtd <= ?"
+        ))
+        .bind(amount)
+        .bind(amount)
+        .bind(id)
+        .bind(max_used_before)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+}
+
+#[async_trait]
+impl RateCounterStore for SqliteBackend {
+    async fn incr_window(
+        &self,
+        subject: &str,
+        window: i64,
+        requests: i64,
+        tokens: i64,
+        expires_at: i64,
+    ) -> Result<WindowCount> {
+        let row = sqlx::query(
+            "INSERT INTO rate_counters (subject, window_start, requests, tokens, expires_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (subject, window_start) DO UPDATE SET \
+             requests = requests + excluded.requests, tokens = tokens + excluded.tokens \
+             RETURNING requests, tokens",
+        )
+        .bind(subject)
+        .bind(window)
+        .bind(requests)
+        .bind(tokens)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(WindowCount {
+            requests: row.get("requests"),
+            tokens: row.get("tokens"),
+        })
+    }
+
+    async fn get_window(&self, subject: &str, window: i64) -> Result<WindowCount> {
+        let row = sqlx::query(
+            "SELECT requests, tokens FROM rate_counters WHERE subject = ? AND window_start = ?",
+        )
+        .bind(subject)
+        .bind(window)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| WindowCount {
+                requests: r.get("requests"),
+                tokens: r.get("tokens"),
+            })
+            .unwrap_or_default())
+    }
+
+    async fn purge_windows(&self, now: i64) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM rate_counters WHERE expires_at < ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 }
 
@@ -1371,14 +1707,15 @@ impl UsageStore for SqliteBackend {
     async fn record_usage(&self, record: &UsageRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage \
-             (api_key, key_id, user_id, tags, timestamp, request_id, model, input_tokens, \
+             (api_key, key_id, user_id, team_id, tags, timestamp, request_id, model, input_tokens, \
               output_tokens, cached_tokens, cache_write_tokens, cost, success, duration_ms, \
               error_message, provider, protocol) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.api_key)
         .bind(&record.key_id)
         .bind(&record.user_id)
+        .bind(&record.team_id)
         .bind(&record.tags)
         .bind(&record.timestamp)
         .bind(&record.request_id)
@@ -1420,7 +1757,7 @@ impl UsageStore for SqliteBackend {
         let limit_clause = if limit.is_some() { "LIMIT ?" } else { "" };
 
         let sql = format!(
-            "SELECT id, api_key, key_id, user_id, tags, timestamp, request_id, model, \
+            "SELECT id, api_key, key_id, user_id, team_id, tags, timestamp, request_id, model, \
              input_tokens, output_tokens, cached_tokens, cache_write_tokens, \
              cost, success, duration_ms, error_message, provider, protocol \
              FROM usage {key_clause} {since_clause} {before_id_clause} \
@@ -1447,6 +1784,7 @@ impl UsageStore for SqliteBackend {
                 api_key: r.get("api_key"),
                 key_id: r.get("key_id"),
                 user_id: r.get("user_id"),
+                team_id: r.get("team_id"),
                 tags: r.get("tags"),
                 timestamp: r.get("timestamp"),
                 request_id: r.get("request_id"),
@@ -1483,6 +1821,7 @@ impl UsageStore for SqliteBackend {
                 "provider" => "COALESCE(provider, 'unknown')",
                 "api_key" => "COALESCE(key_id, api_key)",
                 "user" => "COALESCE(user_id, '')",
+                "team" => "COALESCE(team_id, '')",
                 "tags" => "COALESCE(tags, '')",
                 _ => "strftime('%Y-%m-%dT%H', timestamp)",
             }
@@ -2026,6 +2365,7 @@ mod tests {
             default_tags: None,
             last_used_at: None,
             rotated_to: None,
+            max_concurrency: None,
             created_at: 0,
             updated_at: None,
         }
@@ -2037,6 +2377,7 @@ mod tests {
             api_key: hash.into(),
             key_id: key_id.map(String::from),
             user_id: None,
+            team_id: None,
             tags: None,
             timestamp: "2026-11-06T10:00:00+00:00".into(),
             request_id: new_key_id(),
@@ -2552,6 +2893,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn teams_crud_members_and_budget() {
+        let db = in_memory_db().await;
+        let mut t = TeamRecord::new("infra", 1);
+        t.monthly_budget = Some(10.0);
+        t.allowed_models = Some(vec!["claude-*".into()]);
+        db.teams().create_team(&t).await.unwrap();
+        assert!(db
+            .teams()
+            .create_team(&TeamRecord::new("infra", 2))
+            .await
+            .is_err());
+
+        let mut u = UserRecord::new("member", 1);
+        u.team_id = Some(t.team_id.clone());
+        u.max_concurrency = Some(3);
+        db.users().create_user(&u).await.unwrap();
+        let members = db.teams().list_team_members(&t.team_id).await.unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].max_concurrency, Some(3));
+
+        assert!(!db
+            .teams()
+            .increment_team_budget_used(&t.team_id, 4.0)
+            .await
+            .unwrap()
+            .exceeded());
+        assert!(db
+            .teams()
+            .increment_team_budget_used(&t.team_id, 6.0)
+            .await
+            .unwrap()
+            .exceeded());
+        assert!(db
+            .teams()
+            .claim_team_budget_alert(&t.team_id, "2026-11", 1.0)
+            .await
+            .unwrap());
+        assert!(!db
+            .teams()
+            .claim_team_budget_alert(&t.team_id, "2026-11", 1.0)
+            .await
+            .unwrap());
+
+        let mut edit = db.teams().get_team(&t.team_id).await.unwrap().unwrap();
+        edit.budget_used_mtd = 0.0; // ignored by update_team
+        edit.rate_limit = Some(600);
+        db.teams().update_team(&edit).await.unwrap();
+        let got = db.teams().get_team_by_name("infra").await.unwrap().unwrap();
+        assert_eq!(got.rate_limit, Some(600));
+        assert_eq!(got.budget_used_mtd, 10.0);
+        assert_eq!(got.allowed_models, Some(vec!["claude-*".to_string()]));
+
+        db.teams().delete_team(&t.team_id).await.unwrap();
+        assert!(db.teams().list_teams().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn budget_reserve_is_conditional() {
+        let db = in_memory_db().await;
+        let u = UserRecord::new("res", 0);
+        db.users().create_user(&u).await.unwrap();
+        let b = db.budgets();
+        // budget 10: reserve 4 (max_before 6) twice → second still fits (used 4 <= 6).
+        assert!(b
+            .reserve_budget(BudgetLayer::User, &u.user_id, 4.0, 6.0)
+            .await
+            .unwrap());
+        assert!(b
+            .reserve_budget(BudgetLayer::User, &u.user_id, 4.0, 6.0)
+            .await
+            .unwrap());
+        // used 8 > 6 → refused, nothing changed.
+        assert!(!b
+            .reserve_budget(BudgetLayer::User, &u.user_id, 4.0, 6.0)
+            .await
+            .unwrap());
+        let got = db.users().get_user(&u.user_id).await.unwrap().unwrap();
+        assert_eq!(got.budget_used_mtd, 8.0);
+        // Settlement refunds via a negative increment.
+        db.users()
+            .increment_user_budget_used(&u.user_id, -3.0)
+            .await
+            .unwrap();
+        let got = db.users().get_user(&u.user_id).await.unwrap().unwrap();
+        assert_eq!(got.budget_used_mtd, 5.0);
+        assert!(!b
+            .reserve_budget(BudgetLayer::Team, "missing", 1.0, 9.0)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn rate_counter_windows() {
+        let db = in_memory_db().await;
+        let rc = db.rate_counters();
+        let c = rc.incr_window("user:u", 100, 1, 0, 1000).await.unwrap();
+        assert_eq!((c.requests, c.tokens), (1, 0));
+        let c = rc.incr_window("user:u", 100, 1, 50, 1000).await.unwrap();
+        assert_eq!((c.requests, c.tokens), (2, 50));
+        let c = rc.incr_window("user:u", 100, -1, 0, 1000).await.unwrap();
+        assert_eq!(c.requests, 1);
+        assert_eq!(rc.get_window("user:u", 100).await.unwrap().tokens, 50);
+        assert_eq!(
+            rc.get_window("user:u", 99).await.unwrap(),
+            WindowCount::default()
+        );
+        assert_eq!(rc.purge_windows(999).await.unwrap(), 0);
+        assert_eq!(rc.purge_windows(1001).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn budget_exceeded_uses_month_to_date() {
         let db = in_memory_db().await;
         let mut rec = key_record("hash-b", "budget");
@@ -2602,6 +3054,7 @@ mod tests {
             default_tags: None,
             last_used_at: None,
             rotated_to: None,
+            max_concurrency: None,
             created_at: 0,
             updated_at: None,
         };
@@ -2656,6 +3109,7 @@ mod tests {
             default_tags: None,
             last_used_at: None,
             rotated_to: None,
+            max_concurrency: None,
             created_at: 0,
             updated_at: None,
         };
@@ -2703,6 +3157,7 @@ mod tests {
             default_tags: None,
             last_used_at: None,
             rotated_to: None,
+            max_concurrency: None,
             created_at: 0,
             updated_at: None,
         };

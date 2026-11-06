@@ -1,11 +1,12 @@
 <script setup lang="ts">
-  import type { BudgetPeriod, User, UserBody } from '@/api/types'
+  import type { BudgetPeriod, Team, User, UserBody } from '@/api/types'
   import { useMessage } from 'naive-ui'
   import { useUsersApi } from '@/api/users'
 
   const props = defineProps<{
     show: boolean
     existing?: User
+    teams?: Team[]
   }>()
 
   const emit = defineEmits<{
@@ -18,6 +19,11 @@
 
   const isEdit = computed(() => !!props.existing)
   const title = computed(() => (isEdit.value ? 'Edit User' : 'Create User'))
+
+  const teamOptions = computed(() => [
+    { label: 'No team', value: null },
+    ...(props.teams ?? []).map((t) => ({ label: t.name, value: t.team_id }))
+  ])
 
   const periodOptions = [
     { label: 'Monthly', value: 'monthly' },
@@ -39,6 +45,8 @@
     rate_limit: null as number | null,
     tpm_limit: null as number | null,
     allowed_models: [] as string[],
+    team_id: null as string | null,
+    max_concurrency: null as number | null,
     allowed_cidrs: [] as string[],
     default_tags: [] as string[],
     budget_period: 'monthly' as BudgetPeriod,
@@ -62,6 +70,8 @@
             rate_limit: u.rate_limit,
             tpm_limit: u.tpm_limit,
             allowed_models: [...(u.allowed_models ?? [])],
+            team_id: u.team_id,
+            max_concurrency: u.max_concurrency,
             allowed_cidrs: [...(u.allowed_cidrs ?? [])],
             default_tags: [...(u.default_tags ?? [])],
             budget_period: u.budget_period ?? 'monthly',
@@ -100,6 +110,8 @@
       rate_limit: form.value.rate_limit || null,
       tpm_limit: form.value.tpm_limit || null,
       allowed_models: form.value.allowed_models.length ? form.value.allowed_models : null,
+      team: form.value.team_id,
+      max_concurrency: form.value.max_concurrency || null,
       allowed_cidrs: form.value.allowed_cidrs.length ? form.value.allowed_cidrs : null,
       default_tags: form.value.default_tags.length ? form.value.default_tags : null,
       budget_period: form.value.budget_period,
@@ -153,6 +165,15 @@
         </NFormItem>
         <NFormItem label="TPM Limit (all keys)" class="flex-1">
           <NInputNumber v-model:value="form.tpm_limit" :min="1" placeholder="unlimited" class="w-full" />
+        </NFormItem>
+      </div>
+
+      <div class="flex gap-4">
+        <NFormItem label="Team" class="flex-1">
+          <NSelect v-model:value="form.team_id" :options="teamOptions" filterable />
+        </NFormItem>
+        <NFormItem label="Max Concurrent Requests" class="flex-1">
+          <NInputNumber v-model:value="form.max_concurrency" :min="1" placeholder="unlimited" class="w-full" />
         </NFormItem>
       </div>
 

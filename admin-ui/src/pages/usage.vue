@@ -53,6 +53,7 @@
     { label: 'By Month', value: 'month' },
     { label: 'By Model', value: 'model' },
     { label: 'By Provider', value: 'provider' },
+    { label: 'By Team', value: 'team' },
     { label: 'By User', value: 'user' },
     { label: 'By Tag', value: 'tag' },
     { label: 'By API Key', value: 'api_key' }
@@ -65,7 +66,7 @@
 
   const groupByLabel: Record<string, string> = {
     hour: 'Hour', day: 'Day', month: 'Month',
-    model: 'Model', provider: 'Provider', api_key: 'API Key', user: 'User', tag: 'Tag',
+    model: 'Model', provider: 'Provider', api_key: 'API Key', user: 'User', team: 'Team', tag: 'Tag',
   }
 
   const isTimeDimension = computed(() => ['hour', 'day', 'month'].includes(groupBy.value))

@@ -67,6 +67,9 @@ pub struct ApiKeyRecord {
     /// Set on a key that was rotated: the replacement's `key_id`.
     #[serde(default)]
     pub rotated_to: Option<String>,
+    /// Max in-flight requests on this key. `None` = unlimited.
+    #[serde(default)]
+    pub max_concurrency: Option<i32>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
 }
@@ -172,6 +175,12 @@ pub struct UserRecord {
     /// Globally unique display / login name.
     pub name: String,
     pub email: Option<String>,
+    /// Team the user belongs to (at most one). `None` = no team.
+    #[serde(default)]
+    pub team_id: Option<String>,
+    /// Max in-flight requests across all of the user's keys. `None` = unlimited.
+    #[serde(default)]
+    pub max_concurrency: Option<i32>,
     /// `false` disables every key of the user.
     pub is_active: bool,
     pub cost_rate: f64,
@@ -207,6 +216,8 @@ impl UserRecord {
             user_id: new_key_id(),
             name: name.into(),
             email: None,
+            team_id: None,
+            max_concurrency: None,
             is_active: true,
             cost_rate: 1.0,
             monthly_budget: None,
@@ -227,6 +238,102 @@ impl UserRecord {
             updated_at: None,
         }
     }
+}
+
+// ============================================================================
+// teams
+// ============================================================================
+
+/// A group of users sharing an aggregate budget and limits (no permissions).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamRecord {
+    pub team_id: String,
+    /// Globally unique.
+    pub name: String,
+    /// `false` disables every key of every member.
+    pub is_active: bool,
+    /// Multiplies each member's own cost rate (team-wide discount / markup).
+    pub cost_rate: f64,
+    pub monthly_budget: Option<f64>,
+    pub budget_used: f64,
+    pub budget_used_mtd: f64,
+    /// Period key of `budget_used_mtd` (see [`BudgetPeriod`]).
+    pub budget_mtd_month: Option<String>,
+    pub budget_history: Option<String>,
+    #[serde(default)]
+    pub budget_period: BudgetPeriod,
+    #[serde(default)]
+    pub budget_alerts_sent: Option<String>,
+    /// Team-wide RPM / TPM (shared by every member's keys). `None` = no team limit.
+    pub rate_limit: Option<i32>,
+    pub tpm_limit: Option<i32>,
+    pub max_concurrency: Option<i32>,
+    pub allowed_models: Option<Vec<String>>,
+    pub allowed_cidrs: Option<Vec<String>>,
+    pub metadata: Option<String>,
+    pub created_at: i64,
+    pub updated_at: Option<i64>,
+}
+
+impl TeamRecord {
+    pub fn new(name: impl Into<String>, now: i64) -> Self {
+        Self {
+            team_id: new_key_id(),
+            name: name.into(),
+            is_active: true,
+            cost_rate: 1.0,
+            monthly_budget: None,
+            budget_used: 0.0,
+            budget_used_mtd: 0.0,
+            budget_mtd_month: None,
+            budget_history: None,
+            budget_period: BudgetPeriod::Monthly,
+            budget_alerts_sent: None,
+            rate_limit: None,
+            tpm_limit: None,
+            max_concurrency: None,
+            allowed_models: None,
+            allowed_cidrs: None,
+            metadata: None,
+            created_at: now,
+            updated_at: None,
+        }
+    }
+}
+
+/// Which budget-carrying row a budget operation targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetLayer {
+    Key,
+    User,
+    Team,
+}
+
+impl BudgetLayer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetLayer::Key => "key",
+            BudgetLayer::User => "user",
+            BudgetLayer::Team => "team",
+        }
+    }
+
+    /// `(table, id column)` in the SQL schemas.
+    pub fn table(self) -> (&'static str, &'static str) {
+        match self {
+            BudgetLayer::Key => ("api_keys", "api_key"),
+            BudgetLayer::User => ("users", "user_id"),
+            BudgetLayer::Team => ("teams", "team_id"),
+        }
+    }
+}
+
+/// One shared rate-limit window counter (database rate-limit store).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowCount {
+    pub requests: i64,
+    pub tokens: i64,
 }
 
 // ============================================================================
@@ -327,6 +434,9 @@ pub struct UsageRecord {
     /// users that could not be attributed (key already deleted).
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Owning user's team at request time (denormalized).
+    #[serde(default)]
+    pub team_id: Option<String>,
     /// Comma-joined usage tags (request `x-onerouter-tags` + key/user defaults).
     #[serde(default)]
     pub tags: Option<String>,

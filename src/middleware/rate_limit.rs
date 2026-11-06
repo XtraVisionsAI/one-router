@@ -8,8 +8,19 @@
 //!   *checked before* the next request. One request can overshoot the window;
 //!   that is inherent to post-hoc metering.
 //!
-//! Both are in-process: with several gateway instances the effective limit is
-//! the configured value × instance count.
+//! - **Concurrency** — in-flight request caps (`max_concurrency` on key / user
+//!   / team). A slot is held until the response **body** finishes (streams
+//!   count until their last byte, or until the client disconnects).
+//!
+//! Buckets exist per key (`key_id`), per user (`user:<id>`, shared by all of
+//! the user's keys) and per team (`team:<id>`). Every bucket must pass.
+//!
+//! **Stores** (`rate_limit_store` setting): `memory` (default) keeps RPM / TPM
+//! per instance (effective limit = configured × instances); `database` keeps
+//! them in shared fixed one-minute window counters (`rate_counters`), weighted
+//! across two windows. Database errors **fail open** (logged): rate limiting is
+//! a protection, not a reason to take the gateway down. Concurrency caps are
+//! always per instance.
 
 use axum::{
     body::Body,
@@ -30,9 +41,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
+use crate::database::traits::DatabaseService;
 use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::state::DynamicConfig;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 type KeyedRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
@@ -77,6 +90,9 @@ impl TokenWindow {
 /// Per-key tokens-per-minute meter. Keyed by `key_id`.
 pub struct TokenRateLimiter {
     windows: Cache<String, Arc<Mutex<TokenWindow>>>,
+    /// `true` = use the shared database store (RPM + TPM).
+    shared: AtomicBool,
+    db: std::sync::OnceLock<Arc<dyn DatabaseService>>,
 }
 
 impl Default for TokenRateLimiter {
@@ -92,6 +108,83 @@ impl TokenRateLimiter {
                 .max_capacity(LIMITER_CAPACITY)
                 .time_to_idle(LIMITER_IDLE)
                 .build(),
+            shared: AtomicBool::new(false),
+            db: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Attach the database used by the shared store.
+    pub fn set_store(&self, db: Arc<dyn DatabaseService>) {
+        let _ = self.db.set(db);
+    }
+
+    /// Switch between the in-memory and the shared database store (hot reload).
+    pub fn set_shared(&self, shared: bool) {
+        self.shared.store(shared, Ordering::Relaxed);
+    }
+
+    fn shared_db(&self) -> Option<&Arc<dyn DatabaseService>> {
+        if self.shared.load(Ordering::Relaxed) {
+            self.db.get()
+        } else {
+            None
+        }
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.shared_db().is_some()
+    }
+
+    /// `(prev, curr)` window counts from the shared store.
+    async fn shared_windows(
+        db: &Arc<dyn DatabaseService>,
+        bucket: &str,
+        minute: i64,
+    ) -> anyhow::Result<(
+        crate::database::models::WindowCount,
+        crate::database::models::WindowCount,
+    )> {
+        let store = db.rate_counters();
+        Ok((
+            store.get_window(bucket, minute - 1).await?,
+            store.get_window(bucket, minute).await?,
+        ))
+    }
+
+    fn weighted(prev: i64, curr: i64, secs: f64) -> f64 {
+        let w = (1.0 - secs / 60.0).clamp(0.0, 1.0);
+        prev as f64 * w + curr as f64
+    }
+
+    /// Shared-store RPM: count this request, reject (and un-count) when the
+    /// weighted window exceeds `limit`. `Err(retry_after_secs)`.
+    pub async fn check_rpm_shared(&self, bucket: &str, limit: u32) -> Result<(), u64> {
+        let Some(db) = self.shared_db() else {
+            return Ok(());
+        };
+        let (minute, secs) = Self::now();
+        let minute = minute as i64;
+        let expires = (minute + 3) * 60;
+        let store = db.rate_counters();
+        let counted = async {
+            let curr = store.incr_window(bucket, minute, 1, 0, expires).await?;
+            let prev = store.get_window(bucket, minute - 1).await?;
+            anyhow::Ok((prev, curr))
+        }
+        .await;
+        match counted {
+            Ok((prev, curr))
+                if Self::weighted(prev.requests, curr.requests, secs) > limit as f64 =>
+            {
+                let _ = store.incr_window(bucket, minute, -1, 0, expires).await;
+                Err(((60.0 - secs).ceil() as u64).max(1))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "Shared rate-limit store unavailable; allowing request");
+                crate::observability::metrics::record_rate_limit_store_error();
+                Ok(())
+            }
         }
     }
 
@@ -103,8 +196,24 @@ impl TokenRateLimiter {
         ((secs / 60.0) as u64, secs % 60.0)
     }
 
-    /// `Err(retry_after_secs)` when the key's window is already at/over `limit`.
+    /// `Err(retry_after_secs)` when the bucket's window is already at/over `limit`.
     pub async fn check(&self, key_id: &str, limit: u32) -> Result<(), u64> {
+        if let Some(db) = self.shared_db() {
+            let (minute, secs) = Self::now();
+            return match Self::shared_windows(db, key_id, minute as i64).await {
+                Ok((prev, curr))
+                    if Self::weighted(prev.tokens, curr.tokens, secs) >= limit as f64 =>
+                {
+                    Err(((60.0 - secs).ceil() as u64).max(1))
+                }
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Shared rate-limit store unavailable; allowing request");
+                    crate::observability::metrics::record_rate_limit_store_error();
+                    Ok(())
+                }
+            };
+        }
         let Some(window) = self.windows.get(key_id).await else {
             return Ok(());
         };
@@ -134,6 +243,19 @@ impl TokenRateLimiter {
         if tokens == 0 {
             return;
         }
+        if let Some(db) = self.shared_db() {
+            let (minute, _) = Self::now();
+            let minute = minute as i64;
+            if let Err(e) = db
+                .rate_counters()
+                .incr_window(key_id, minute, 0, tokens as i64, (minute + 3) * 60)
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to record tokens in shared rate-limit store");
+                crate::observability::metrics::record_rate_limit_store_error();
+            }
+            return;
+        }
         let window = self
             .windows
             .get_with(key_id.to_string(), async {
@@ -161,6 +283,7 @@ pub struct RateLimitState {
     /// invalidation needed.
     limiters: Cache<String, Arc<KeyedRateLimiter>>,
     tokens: Arc<TokenRateLimiter>,
+    concurrency: Arc<ConcurrencyLimiter>,
 }
 
 impl RateLimitState {
@@ -174,6 +297,7 @@ impl RateLimitState {
             dynamic,
             limiters,
             tokens,
+            concurrency: Arc::new(ConcurrencyLimiter::default()),
         }
     }
 
@@ -214,6 +338,7 @@ impl IntoResponse for RateLimitError {
     fn into_response(self) -> Response {
         let what = match self.kind {
             "tpm" => "Token rate limit (TPM) exceeded",
+            "concurrency" => "Too many concurrent requests",
             _ => "Rate limit exceeded",
         };
         let error_response = ErrorResponse::new(
@@ -236,26 +361,47 @@ impl IntoResponse for RateLimitError {
 // Middleware
 // ============================================================================
 
-/// TPM / RPM bucket of a user (shared by all of the user's keys).
+/// TPM / RPM / concurrency bucket of a user (shared by all of the user's keys).
 pub fn user_bucket(user_id: &str) -> String {
     format!("user:{user_id}")
+}
+
+/// Bucket of a team (shared by every member's keys).
+pub fn team_bucket(team_id: &str) -> String {
+    format!("team:{team_id}")
 }
 
 /// One limiter a request must pass: (bucket id, limit, metric scope).
 type Bucket = (String, u32, &'static str);
 
-/// The TPM and RPM buckets for a caller, user scope first. The user's RPM
-/// falls back to the global default; a key-level RPM applies only when set —
-/// except for an ownerless key, which keeps the pre-users behavior (key RPM,
-/// else the global default).
-fn buckets(key_info: &ApiKeyInfo, default_rpm: u32) -> (Vec<Bucket>, Vec<Bucket>) {
+/// The TPM, RPM and concurrency buckets for a caller (team, user, key order).
+/// The user's RPM falls back to the global default; key / team RPM apply only
+/// when set — except for an ownerless key, which keeps the pre-users behavior
+/// (key RPM, else the global default).
+fn buckets(key_info: &ApiKeyInfo, default_rpm: u32) -> (Vec<Bucket>, Vec<Bucket>, Vec<Bucket>) {
     let mut tpm = Vec::new();
     let mut rpm = Vec::new();
+    let mut conc = Vec::new();
+    if let Some(team) = &key_info.team {
+        let b = team_bucket(&team.team_id);
+        if let Some(t) = team.tpm_limit {
+            tpm.push((b.clone(), t, "team"));
+        }
+        if let Some(r) = team.rate_limit {
+            rpm.push((b.clone(), r, "team"));
+        }
+        if let Some(c) = team.max_concurrency {
+            conc.push((b, c, "team"));
+        }
+    }
     match &key_info.user {
         Some(user) => {
             let bucket = user_bucket(&user.user_id);
             if let Some(t) = user.tpm_limit {
                 tpm.push((bucket.clone(), t, "user"));
+            }
+            if let Some(c) = user.max_concurrency {
+                conc.push((bucket.clone(), c, "user"));
             }
             rpm.push((bucket, user.rate_limit.unwrap_or(default_rpm), "user"));
             if let Some(r) = key_info.rate_limit {
@@ -271,7 +417,67 @@ fn buckets(key_info: &ApiKeyInfo, default_rpm: u32) -> (Vec<Bucket>, Vec<Bucket>
     if let Some(t) = key_info.tpm_limit {
         tpm.push((key_info.key_id.clone(), t, "key"));
     }
-    (tpm, rpm)
+    if let Some(c) = key_info.max_concurrency {
+        conc.push((key_info.key_id.clone(), c, "key"));
+    }
+    (tpm, rpm, conc)
+}
+
+/// Per-instance in-flight counters.
+pub struct ConcurrencyLimiter {
+    counters: moka::sync::Cache<String, Arc<AtomicUsize>>,
+}
+
+impl Default for ConcurrencyLimiter {
+    fn default() -> Self {
+        Self {
+            counters: moka::sync::Cache::builder()
+                .max_capacity(LIMITER_CAPACITY)
+                .time_to_idle(LIMITER_IDLE)
+                .build(),
+        }
+    }
+}
+
+/// Held slots; releasing happens on drop.
+pub struct ConcurrencyGuard(Vec<Arc<AtomicUsize>>);
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        for c in &self.0 {
+            c.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl ConcurrencyLimiter {
+    /// Take one slot in every bucket, or none: `Err(scope)` of the first full one.
+    pub fn acquire(&self, buckets: &[Bucket]) -> Result<ConcurrencyGuard, &'static str> {
+        let mut held = Vec::with_capacity(buckets.len());
+        for (bucket, limit, scope) in buckets {
+            let c = self
+                .counters
+                .get_with(bucket.clone(), || Arc::new(AtomicUsize::new(0)));
+            if c.fetch_add(1, Ordering::AcqRel) >= *limit as usize {
+                c.fetch_sub(1, Ordering::AcqRel);
+                drop(ConcurrencyGuard(held)); // release what we took
+                return Err(scope);
+            }
+            held.push(c);
+        }
+        Ok(ConcurrencyGuard(held))
+    }
+}
+
+/// Keep `guard` alive until the response body is fully sent (or dropped).
+fn hold_until_body_done(resp: Response, guard: ConcurrencyGuard) -> Response {
+    use futures::StreamExt;
+    let (parts, body) = resp.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        let _held = &guard;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 pub async fn rate_limit(
@@ -294,7 +500,7 @@ pub async fn rate_limit(
         return Ok(next.run(request).await);
     }
 
-    let (tpm_buckets, rpm_buckets) = buckets(&key_info, default_rpm);
+    let (tpm_buckets, rpm_buckets, conc_buckets) = buckets(&key_info, default_rpm);
 
     // TPM checks don't consume anything — run them all first.
     for (bucket, limit, scope) in &tpm_buckets {
@@ -307,19 +513,45 @@ pub async fn rate_limit(
         }
     }
 
+    let shared = rate_state.tokens.is_shared();
     for (bucket, limit, scope) in &rpm_buckets {
-        let limiter = rate_state.get_limiter(bucket, *limit).await;
-        if let Err(not_until) = limiter.check() {
-            let retry_after = not_until.wait_time_from(DefaultClock::default().now());
+        let rejected = if shared {
+            rate_state
+                .tokens
+                .check_rpm_shared(bucket, *limit)
+                .await
+                .err()
+        } else {
+            let limiter = rate_state.get_limiter(bucket, *limit).await;
+            limiter.check().err().map(|not_until| {
+                not_until
+                    .wait_time_from(DefaultClock::default().now())
+                    .as_secs()
+                    .max(1)
+            })
+        };
+        if let Some(retry_after_seconds) = rejected {
             crate::observability::metrics::record_rate_limited("rpm", scope);
             return Err(RateLimitError {
-                retry_after_seconds: retry_after.as_secs().max(1),
+                retry_after_seconds,
                 kind: "rpm",
             });
         }
     }
 
-    Ok(next.run(request).await)
+    if conc_buckets.is_empty() {
+        return Ok(next.run(request).await);
+    }
+    match rate_state.concurrency.acquire(&conc_buckets) {
+        Ok(guard) => Ok(hold_until_body_done(next.run(request).await, guard)),
+        Err(scope) => {
+            crate::observability::metrics::record_rate_limited("concurrency", scope);
+            Err(RateLimitError {
+                retry_after_seconds: 1,
+                kind: "concurrency",
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -389,17 +621,18 @@ mod tests {
             budget_used_mtd: 0.0,
             budget_mtd_month: None,
             budget_period: Default::default(),
+            max_concurrency: Some(2),
         });
         info
     }
 
     #[test]
     fn user_bucket_uses_default_and_key_sub_limit_is_optional() {
-        let (tpm, rpm) = buckets(&principal(None, None), 100);
+        let (tpm, rpm, _) = buckets(&principal(None, None), 100);
         assert_eq!(tpm, vec![("user:u1".to_string(), 5000, "user")]);
         assert_eq!(rpm, vec![("user:u1".to_string(), 100, "user")]);
 
-        let (_, rpm) = buckets(&principal(Some(30), Some(5)), 100);
+        let (_, rpm, _) = buckets(&principal(Some(30), Some(5)), 100);
         assert_eq!(
             rpm,
             vec![
@@ -413,8 +646,49 @@ mod tests {
     fn ownerless_key_keeps_legacy_rpm() {
         let mut info = principal(None, None);
         info.user = None;
-        let (_, rpm) = buckets(&info, 100);
+        let (_, rpm, _) = buckets(&info, 100);
         assert_eq!(rpm, vec![("k1".to_string(), 100, "key")]);
+    }
+
+    #[test]
+    fn team_buckets_and_concurrency() {
+        let mut info = principal(None, None);
+        info.max_concurrency = Some(1);
+        info.team = Some(crate::middleware::auth::TeamPrincipal {
+            team_id: "t1".into(),
+            name: "infra".into(),
+            rate_limit: Some(500),
+            tpm_limit: None,
+            max_concurrency: Some(10),
+            monthly_budget: None,
+            budget_used_mtd: 0.0,
+            budget_mtd_month: None,
+            budget_period: Default::default(),
+        });
+        let (_, rpm, conc) = buckets(&info, 100);
+        assert_eq!(rpm[0], ("team:t1".to_string(), 500, "team"));
+        assert_eq!(
+            conc,
+            vec![
+                ("team:t1".to_string(), 10, "team"),
+                ("user:u1".to_string(), 2, "user"),
+                ("k1".to_string(), 1, "key"),
+            ]
+        );
+
+        let limiter = ConcurrencyLimiter::default();
+        let g1 = limiter.acquire(&conc).unwrap();
+        // Key allows 1 in flight → second is rejected at the key scope, and the
+        // team/user slots it briefly took are released.
+        assert_eq!(limiter.acquire(&conc).err(), Some("key"));
+        drop(g1);
+        let _g2 = limiter.acquire(&conc).unwrap();
+    }
+
+    #[test]
+    fn shared_window_weighting() {
+        assert!((TokenRateLimiter::weighted(60, 10, 30.0) - 40.0).abs() < 1e-9);
+        assert!((TokenRateLimiter::weighted(60, 10, 60.0) - 10.0).abs() < 1e-9);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod inference_profile;
 pub mod litellm_catalog;
 pub mod model_mapping;
 pub mod passthrough;
+pub mod precharge;
 pub mod pricing_sync;
 pub mod ptc;
 pub mod responses_context;

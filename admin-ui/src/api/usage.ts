@@ -1,7 +1,7 @@
 import type { UsageSummaryResponse } from './types'
 import { useApi } from '@/composables/useApi'
 
-export type GroupByDimension = 'hour' | 'day' | 'month' | 'model' | 'provider' | 'api_key' | 'user' | 'tag'
+export type GroupByDimension = 'hour' | 'day' | 'month' | 'model' | 'provider' | 'api_key' | 'user' | 'team' | 'tag'
 
 export interface UsageSummaryParams {
   group_by: GroupByDimension

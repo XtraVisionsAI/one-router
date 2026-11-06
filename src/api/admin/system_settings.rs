@@ -56,6 +56,18 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
             Ok(n) if n >= 0 => Ok(()),
             _ => Err("audit_log_retention_days must be an integer >= 0 (0 = keep forever)"),
         },
+        "budget_enforcement" => match value.trim() {
+            "soft" | "precharge" => Ok(()),
+            _ => Err("budget_enforcement must be 'soft' or 'precharge'"),
+        },
+        "budget_precharge_output_cap" => match value.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Ok(()),
+            _ => Err("budget_precharge_output_cap must be a positive integer (tokens)"),
+        },
+        "rate_limit_store" => match value.trim() {
+            "memory" | "database" => Ok(()),
+            _ => Err("rate_limit_store must be 'memory' or 'database'"),
+        },
         "auth_cache_ttl_secs" => match value.trim().parse::<u64>() {
             Ok(n) if n <= crate::services::auth_cache::MAX_TTL_SECS => Ok(()),
             _ => Err("auth_cache_ttl_secs must be an integer between 0 and 300"),

@@ -184,6 +184,21 @@ impl App {
                 }
             }
         });
+        // Expired shared rate-limit windows (`rate_limit_store = database`).
+        let rc_db = self.state.database.clone();
+        let rc_limiter = self.state.usage_tracker.token_limiter();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                if rc_limiter.is_shared() {
+                    let now = chrono::Utc::now().timestamp();
+                    if let Err(e) = rc_db.rate_counters().purge_windows(now).await {
+                        tracing::debug!(error = %e, "Rate counter purge failed");
+                    }
+                }
+            }
+        });
+
         // Daily audit-log retention purge (`audit_log_retention_days`).
         let audit_db = self.state.database.clone();
         tokio::spawn(async move {
@@ -731,8 +746,8 @@ pub async fn reload_dynamic_config(state: &AppState) {
     tracing::info!("Dynamic config reloaded");
 }
 
-/// Push `auth_cache_ttl_secs` and the budget-alert settings into the services
-/// that hold them (startup + every reload).
+/// Push runtime settings held by services (auth cache TTL, budget alerts,
+/// precharge mode, rate-limit store) into them — startup + every reload.
 async fn apply_auth_and_alert_settings(state: &AppState) {
     let ttl = load_string_setting(&state.database, "auth_cache_ttl_secs")
         .await
@@ -757,6 +772,23 @@ async fn apply_auth_and_alert_settings(state: &AppState) {
         }
     }
     state.usage_tracker.set_alert_config(cfg);
+
+    let precharge = crate::services::precharge::PrechargeConfig {
+        enabled: load_string_setting(&state.database, "budget_enforcement")
+            .await
+            .is_some_and(|v| v.trim() == "precharge"),
+        output_cap: load_string_setting(&state.database, "budget_precharge_output_cap")
+            .await
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(8192),
+    };
+    state.usage_tracker.set_precharge_config(precharge);
+
+    let shared = load_string_setting(&state.database, "rate_limit_store")
+        .await
+        .is_some_and(|v| v.trim() == "database");
+    state.usage_tracker.token_limiter().set_shared(shared);
 }
 
 /// Load a setting's raw value, including an explicit empty string

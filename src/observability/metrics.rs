@@ -14,8 +14,8 @@
 //! we intentionally do not copy that.)
 
 use prometheus::{
-    CounterVec, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    CounterVec, Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::sync::OnceLock;
 
@@ -48,6 +48,10 @@ struct Metrics {
     budget_alerts_total: IntCounterVec,
     /// Audit log writes that failed (the admin operation itself succeeded).
     audit_write_failures_total: IntCounterVec,
+    /// Shared rate-limit store errors (requests were allowed — fail open).
+    rate_limit_store_errors_total: IntCounter,
+    /// Budget precharge outcomes (reserved / rejected / settled).
+    precharge_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -153,6 +157,21 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let rate_limit_store_errors_total = IntCounter::new(
+            "onerouter_rate_limit_store_errors_total",
+            "Shared rate-limit store errors (the request was allowed)",
+        )
+        .expect("valid metric");
+
+        let precharge_total = IntCounterVec::new(
+            Opts::new(
+                "onerouter_budget_precharge_total",
+                "Budget precharge outcomes (reserved / rejected / settled)",
+            ),
+            &["result"],
+        )
+        .expect("valid metric");
+
         let build_info = IntGaugeVec::new(
             Opts::new(
                 "onerouter_build_info",
@@ -199,6 +218,12 @@ impl Metrics {
         registry
             .register(Box::new(audit_write_failures_total.clone()))
             .expect("register audit_write_failures_total");
+        registry
+            .register(Box::new(rate_limit_store_errors_total.clone()))
+            .expect("register rate_limit_store_errors_total");
+        registry
+            .register(Box::new(precharge_total.clone()))
+            .expect("register precharge_total");
         // build_info is register-and-forget: the registry holds the clone, the
         // value never changes, and nothing reads it back.
         registry
@@ -218,6 +243,8 @@ impl Metrics {
             rate_limited_total,
             budget_alerts_total,
             audit_write_failures_total,
+            rate_limit_store_errors_total,
+            precharge_total,
         }
     }
 }
@@ -343,6 +370,14 @@ pub fn record_audit_write_failure(action: &str) {
         .audit_write_failures_total
         .with_label_values(&[action])
         .inc();
+}
+
+pub fn record_precharge(result: &str) {
+    metrics().precharge_total.with_label_values(&[result]).inc();
+}
+
+pub fn record_rate_limit_store_error() {
+    metrics().rate_limit_store_errors_total.inc();
 }
 
 /// Encode all metrics in the Prometheus text exposition format.

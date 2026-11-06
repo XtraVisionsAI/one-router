@@ -1,8 +1,9 @@
 <script setup lang="ts">
-  import type { User } from '@/api/types'
+  import type { Team, User } from '@/api/types'
   import { NButton, NProgress, NTag, useDialog, useMessage } from 'naive-ui'
   import { h } from 'vue'
   import { useRouter } from 'vue-router'
+  import { useTeamsApi } from '@/api/teams'
   import { useUsersApi } from '@/api/users'
   import UserModal from '@/components/UserModal.vue'
   import { fmtMoney } from '@/utils/format'
@@ -13,6 +14,9 @@
   const api = useUsersApi()
 
   const users = ref<User[]>([])
+  const teams = ref<Team[]>([])
+  const teamsApi = useTeamsApi()
+  const teamName = (id: string | null) => (id ? (teams.value.find((t) => t.team_id === id)?.name ?? id.slice(0, 8)) : '—')
   const loading = ref(true)
   const modalShow = ref(false)
   const editing = ref<User | undefined>()
@@ -20,7 +24,9 @@
   async function load() {
     loading.value = true
     try {
-      users.value = (await api.list()).data
+      const [u, t] = await Promise.all([api.list(), teamsApi.list()])
+      users.value = u.data
+      teams.value = t.data
     } catch (e: any) {
       message.error(e.message)
     } finally {
@@ -87,6 +93,7 @@
 
   const columns = [
     { title: 'Name', key: 'name' },
+    { title: 'Team', key: 'team_id', render: (u: User) => teamName(u.team_id) },
     { title: 'Keys', key: 'key_count', width: 70 },
     { title: 'Budget MTD', key: 'budget', render: budgetCell },
     {
@@ -153,6 +160,6 @@
       </template>
     </NDataTable>
 
-    <user-modal v-model:show="modalShow" :existing="editing" @saved="load" />
+    <user-modal v-model:show="modalShow" :existing="editing" :teams="teams" @saved="load" />
   </div>
 </template>

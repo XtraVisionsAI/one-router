@@ -44,6 +44,7 @@
     cache_ttl: null as string | null,
     expires_at: null as number | null, // ms for the date picker
     allowed_models: [] as string[],
+    max_concurrency: null as number | null,
     allowed_cidrs: [] as string[],
     default_tags: [] as string[],
     budget_period: 'monthly' as BudgetPeriod,
@@ -67,6 +68,7 @@
             cache_ttl: k.cache_ttl,
             expires_at: k.expires_at ? k.expires_at * 1000 : null,
             allowed_models: [...(k.allowed_models ?? [])],
+            max_concurrency: k.max_concurrency,
             allowed_cidrs: [...(k.allowed_cidrs ?? [])],
             default_tags: [...(k.default_tags ?? [])],
             budget_period: k.budget_period ?? 'monthly',
@@ -109,6 +111,7 @@
       cache_ttl: form.value.cache_ttl,
       expires_at: form.value.expires_at ? Math.floor(form.value.expires_at / 1000) : null,
       allowed_models: form.value.allowed_models.length ? form.value.allowed_models : null,
+      max_concurrency: form.value.max_concurrency || null,
       allowed_cidrs: form.value.allowed_cidrs.length ? form.value.allowed_cidrs : null,
       default_tags: form.value.default_tags.length ? form.value.default_tags : null,
       budget_period: form.value.budget_period,
@@ -180,6 +183,10 @@
           <NDatePicker v-model:value="form.expires_at" type="datetime" clearable placeholder="never" class="w-full" />
         </NFormItem>
       </div>
+
+      <NFormItem label="Max Concurrent Requests">
+        <NInputNumber v-model:value="form.max_concurrency" :min="1" placeholder="user / team limit" class="w-full" />
+      </NFormItem>
 
       <NFormItem label="Allowed Models (glob, !exclude — empty = user's)">
         <NDynamicTags v-model:value="form.allowed_models" />

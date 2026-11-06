@@ -36,6 +36,8 @@ pub struct AdminUserItem {
     pub user_id: String,
     pub name: String,
     pub email: Option<String>,
+    pub team_id: Option<String>,
+    pub max_concurrency: Option<i32>,
     pub is_active: bool,
     pub cost_rate: f64,
     pub monthly_budget: Option<f64>,
@@ -64,6 +66,8 @@ impl AdminUserItem {
             user_id: u.user_id.clone(),
             name: u.name.clone(),
             email: u.email.clone(),
+            team_id: u.team_id.clone(),
+            max_concurrency: u.max_concurrency,
             is_active: u.is_active,
             cost_rate: u.cost_rate,
             monthly_budget: u.monthly_budget,
@@ -102,6 +106,9 @@ pub struct UserListResponse {
 pub struct CreateUserRequest {
     pub name: String,
     pub email: Option<String>,
+    /// Team (`team_id` or name).
+    pub team: Option<String>,
+    pub max_concurrency: Option<i32>,
     pub cost_rate: Option<f64>,
     pub monthly_budget: Option<f64>,
     pub rate_limit: Option<i32>,
@@ -118,6 +125,11 @@ pub struct CreateUserRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateUserRequest {
     pub name: Option<String>,
+    /// Team (`team_id` or name); `null` removes the user from its team.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub team: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub max_concurrency: Option<Option<i32>>,
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub email: Option<Option<String>>,
     pub cost_rate: Option<f64>,
@@ -257,6 +269,11 @@ pub async fn create_user(
         )?;
         let mut user = UserRecord::new(body.name.trim(), Utc::now().timestamp());
         user.email = body.email.filter(|e| !e.trim().is_empty());
+        validate_positive("max_concurrency", body.max_concurrency)?;
+        user.max_concurrency = body.max_concurrency;
+        if let Some(team) = body.team.as_deref().filter(|t| !t.is_empty()) {
+            user.team_id = Some(super::teams::resolve_team(&state, team).await?.team_id);
+        }
         user.cost_rate = body.cost_rate.unwrap_or(1.0);
         user.monthly_budget = body.monthly_budget;
         user.rate_limit = body.rate_limit;
@@ -328,6 +345,16 @@ pub async fn update_user(
             }
             if let Some(email) = body.email {
                 user.email = email.filter(|e| !e.trim().is_empty());
+            }
+            if let Some(team) = body.team {
+                user.team_id = match team.as_deref().filter(|t| !t.is_empty()) {
+                    Some(t) => Some(super::teams::resolve_team(&state, t).await?.team_id),
+                    None => None,
+                };
+            }
+            if let Some(c) = body.max_concurrency {
+                validate_positive("max_concurrency", c)?;
+                user.max_concurrency = c;
             }
             if let Some(rate) = body.cost_rate {
                 user.cost_rate = rate;

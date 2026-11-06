@@ -1,6 +1,6 @@
 //! Authentication lookup cache + `last_used_at` debounce.
 //!
-//! Caches `key hash → (ApiKeyRecord, owning UserRecord)` for
+//! Caches `key hash → (ApiKeyRecord, owning UserRecord, user's TeamRecord)` for
 //! `auth_cache_ttl_secs` (system setting, default 30; `0` disables) and unknown
 //! hashes for a short negative TTL so invalid keys cannot hammer the database.
 //!
@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::database::models::{ApiKeyRecord, UserRecord};
+use crate::database::models::{ApiKeyRecord, TeamRecord, UserRecord};
+
+/// A key with its owning user and that user's team.
+pub type Principals = (ApiKeyRecord, Option<UserRecord>, Option<TeamRecord>);
 
 /// Negative entries (unknown hash) live this long regardless of the TTL setting.
 const NEGATIVE_TTL: Duration = Duration::from_secs(5);
@@ -27,7 +30,7 @@ const LAST_USED_DEBOUNCE: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 enum Entry {
-    Found(Arc<(ApiKeyRecord, Option<UserRecord>)>),
+    Found(Arc<Principals>),
     Missing,
 }
 
@@ -74,7 +77,7 @@ impl AuthCache {
     /// `Some(Some(..))` = cached hit, `Some(None)` = cached "unknown key",
     /// `None` = not cached (or expired).
     #[allow(clippy::type_complexity)]
-    pub fn get(&self, hash: &str) -> Option<Option<Arc<(ApiKeyRecord, Option<UserRecord>)>>> {
+    pub fn get(&self, hash: &str) -> Option<Option<Arc<Principals>>> {
         let ttl = self.ttl_secs();
         if ttl == 0 {
             return None;
@@ -94,7 +97,7 @@ impl AuthCache {
         })
     }
 
-    pub fn put(&self, hash: &str, value: Option<(ApiKeyRecord, Option<UserRecord>)>) {
+    pub fn put(&self, hash: &str, value: Option<Principals>) {
         if self.ttl_secs() == 0 {
             return;
         }
@@ -141,7 +144,7 @@ mod tests {
     fn hit_miss_negative_and_invalidate() {
         let c = AuthCache::new(30);
         assert!(c.get("h").is_none());
-        c.put("h", Some((rec(), None)));
+        c.put("h", Some((rec(), None, None)));
         assert!(matches!(c.get("h"), Some(Some(_))));
         c.put("x", None);
         assert!(matches!(c.get("x"), Some(None)));
@@ -152,10 +155,10 @@ mod tests {
     #[test]
     fn zero_ttl_disables() {
         let c = AuthCache::new(0);
-        c.put("h", Some((rec(), None)));
+        c.put("h", Some((rec(), None, None)));
         assert!(c.get("h").is_none());
         let c = AuthCache::new(30);
-        c.put("h", Some((rec(), None)));
+        c.put("h", Some((rec(), None, None)));
         c.set_ttl(0);
         assert!(c.get("h").is_none());
     }

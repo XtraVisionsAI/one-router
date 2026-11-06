@@ -25,6 +25,7 @@ pub mod pricing;
 pub mod session;
 pub mod status;
 pub mod system_settings;
+pub mod teams;
 pub mod update;
 pub mod users;
 

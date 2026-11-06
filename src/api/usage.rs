@@ -186,6 +186,7 @@ pub async fn get_usage_summary(
             UsageFilter {
                 api_key: key_filter,
                 user_id: user_filter,
+                team_id: None,
                 tag: params.tag.as_deref(),
             },
             params.start_time.as_deref(),
@@ -310,6 +311,7 @@ pub async fn get_usage_records(
             UsageFilter {
                 api_key: key_filter,
                 user_id: user_filter,
+                team_id: None,
                 tag: None,
             },
             params.start_time.as_deref(),

@@ -23,7 +23,8 @@ scripts/migrations/
 │   ├── 005_backend_models.sql                  # backend models filter
 │   ├── 006_api_key_id.sql                      # api_keys/usage key_id
 │   ├── 007_users.sql                           # users table, per-user key names
-│   └── 008_p2_audit_periods_tags.sql           # audit log, budget periods, tags, CIDRs
+│   ├── 008_p2_audit_periods_tags.sql           # audit log, budget periods, tags, CIDRs
+│   └── 009_p3_teams_rate_counters.sql          # teams, concurrency, shared rate counters
 ├── postgres/
 │   ├── 001_model_mapping_pattern_index.sql     # text_pattern_ops index
 │   ├── 002_api_key_display.sql                 # key_display column
@@ -32,13 +33,15 @@ scripts/migrations/
 │   ├── 005_backend_models.sql                  # backend models filter
 │   ├── 006_api_key_id.sql                      # api_keys/usage key_id
 │   ├── 007_users.sql                           # users table, per-user key names
-│   └── 008_p2_audit_periods_tags.sql           # audit log, budget periods, tags, CIDRs
+│   ├── 008_p2_audit_periods_tags.sql           # audit log, budget periods, tags, CIDRs
+│   └── 009_p3_teams_rate_counters.sql          # teams, concurrency, shared rate counters
 └── dynamodb/
     ├── 001_apikeys_name_gsi.sh                 # name-index GSI
     ├── 002_model_pricing.sh                    # model pricing backfill
     ├── 003_api_key_ids.sh                      # api_keys key_id backfill
     ├── 004_users_table.sh                      # users table
-    └── 005_audit_logs_table.sh                 # audit_logs table
+    ├── 005_audit_logs_table.sh                 # audit_logs table
+    └── 006_teams_rate_counters.sh              # teams + rate_counters (TTL)
 ```
 
 Migrations are numbered `NNN_description` and execute in lexicographic order.
@@ -163,6 +166,14 @@ no budget (it moved to the user) — back up the database first.
 `last_used_at`, `rotated_to`); `usage.tags`. All additive — no data migration.
 DynamoDB attributes need no schema change; only the `audit_logs` table
 (PK `month`, SK `sort_key`) is created.
+
+### SQLite/PostgreSQL 009 & DynamoDB 006: Teams, concurrency, shared rate counters
+
+`teams` table; `users.team_id`, `users.max_concurrency`,
+`api_keys.max_concurrency`, `usage.team_id`; `rate_counters`
+(`subject`, `window_start`) for `rate_limit_store = database`. DynamoDB:
+`teams` and `rate_counters` tables, TTL on `rate_counters.expires_at`.
+Additive — no data migration.
 
 ## Adding new migrations
 

@@ -30,6 +30,8 @@ pub struct AdminUsageQueryParams {
     pub api_key: Option<String>,
     /// Filter by user: `user_id` or user name. Combines with `api_key` (AND).
     pub user: Option<String>,
+    /// Filter by team: `team_id` or team name.
+    pub team: Option<String>,
     /// Only rows carrying this usage tag.
     pub tag: Option<String>,
     pub start_time: Option<String>,
@@ -48,6 +50,7 @@ fn default_group_by() -> String {
 pub struct AdminRecordsQueryParams {
     pub api_key: Option<String>,
     pub user: Option<String>,
+    pub team: Option<String>,
     pub tag: Option<String>,
     pub start_time: Option<String>,
     pub limit: Option<i64>,
@@ -104,6 +107,7 @@ pub struct UsageRecordItem {
     /// Owning user's display label (name, `deleted user · <id>`, or `unattributed`).
     pub user: String,
     pub user_id: Option<String>,
+    pub team_id: Option<String>,
     pub tags: Vec<String>,
     pub timestamp: String,
     pub request_id: String,
@@ -209,6 +213,64 @@ async fn resolve_user_filter(
     }
 }
 
+/// Resolve a `team` query parameter (`team_id` or name) to a `team_id`.
+async fn resolve_team_filter(
+    state: &AppState,
+    ident: Option<&str>,
+) -> Result<Option<String>, Box<axum::response::Response>> {
+    let Some(ident) = ident.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let teams = state.database.teams();
+    let found = match teams.get_team(ident).await {
+        Ok(Some(t)) => Ok(Some(t)),
+        Ok(None) => teams.get_team_by_name(ident).await,
+        Err(e) => Err(e),
+    };
+    match found {
+        Ok(Some(t)) => Ok(Some(t.team_id)),
+        Ok(None) => Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "not_found_error",
+                    format!("Team '{ident}' not found"),
+                )),
+            )
+                .into_response(),
+        )),
+        Err(e) => Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("api_error", e.to_string())),
+            )
+                .into_response(),
+        )),
+    }
+}
+
+/// `team_id` → team name.
+async fn build_team_labels(state: &AppState) -> HashMap<String, String> {
+    state
+        .database
+        .teams()
+        .list_teams()
+        .await
+        .map(|ts| ts.into_iter().map(|t| (t.team_id, t.name)).collect())
+        .unwrap_or_default()
+}
+
+/// Display label for a usage row's `team_id` ("" / None = no team).
+fn resolve_team_name(raw: Option<&str>, labels: &HashMap<String, String>) -> String {
+    match raw.filter(|s| !s.is_empty()) {
+        None => "(no team)".to_string(),
+        Some(id) => labels.get(id).cloned().unwrap_or_else(|| {
+            let short: String = id.chars().take(8).collect();
+            format!("deleted team · {short}")
+        }),
+    }
+}
+
 /// `user_id` → user name.
 async fn build_user_labels(state: &AppState) -> HashMap<String, String> {
     state
@@ -266,7 +328,7 @@ pub async fn get_usage_summary(
     Query(params): Query<AdminUsageQueryParams>,
 ) -> impl IntoResponse {
     const VALID_GROUP_BY: &[&str] = &[
-        "hour", "day", "month", "model", "provider", "api_key", "user", "tag",
+        "hour", "day", "month", "model", "provider", "api_key", "user", "team", "tag",
     ];
     if !VALID_GROUP_BY.contains(&params.group_by.as_str()) {
         return (
@@ -301,6 +363,10 @@ pub async fn get_usage_summary(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    let team_filter = match resolve_team_filter(&state, params.team.as_deref()).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
 
     let rows = match state
         .database
@@ -309,6 +375,7 @@ pub async fn get_usage_summary(
             UsageFilter {
                 api_key: &api_key_filter,
                 user_id: user_filter.as_deref(),
+                team_id: team_filter.as_deref(),
                 tag: params.tag.as_deref(),
             },
             params.start_time.as_deref(),
@@ -359,11 +426,20 @@ pub async fn get_usage_summary(
     } else {
         HashMap::new()
     };
-    let label = |raw: String, key_dim: bool, user_dim: bool| {
+    let team_group = params.group_by == "team";
+    let team_split = params.split_by.as_deref() == Some("team");
+    let team_labels = if team_group || team_split {
+        build_team_labels(&state).await
+    } else {
+        HashMap::new()
+    };
+    let label = |raw: String, key_dim: bool, user_dim: bool, team_dim: bool| {
         if key_dim {
             resolve_display_name(&raw, &labels)
         } else if user_dim {
             resolve_user_name(Some(&raw), &user_labels)
+        } else if team_dim {
+            resolve_team_name(Some(&raw), &team_labels)
         } else {
             raw
         }
@@ -372,8 +448,10 @@ pub async fn get_usage_summary(
     let data = rows
         .into_iter()
         .map(|r| UsageBucket {
-            group_key: label(r.group_key, resolve_group, user_group),
-            split_key: r.split_key.map(|sk| label(sk, resolve_split, user_split)),
+            group_key: label(r.group_key, resolve_group, user_group, team_group),
+            split_key: r
+                .split_key
+                .map(|sk| label(sk, resolve_split, user_split, team_split)),
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
             cached_tokens: r.cached_tokens,
@@ -412,6 +490,10 @@ pub async fn get_usage_records(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    let team_filter = match resolve_team_filter(&state, params.team.as_deref()).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
 
     // Fetch limit+1 rows so we can detect has_more without an extra query.
     // Passes the limit directly to the DB to avoid loading unbounded rows into RAM.
@@ -422,6 +504,7 @@ pub async fn get_usage_records(
             UsageFilter {
                 api_key: &api_key_filter,
                 user_id: user_filter.as_deref(),
+                team_id: team_filter.as_deref(),
                 tag: params.tag.as_deref(),
             },
             params.start_time.as_deref(),
@@ -461,6 +544,7 @@ pub async fn get_usage_records(
             key_id: r.key_id,
             user: resolve_user_name(r.user_id.as_deref(), &user_labels),
             user_id: r.user_id,
+            team_id: r.team_id,
             tags: r
                 .tags
                 .as_deref()

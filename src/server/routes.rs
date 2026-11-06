@@ -24,7 +24,7 @@ use crate::server::state::AppState;
 
 /// Create the main application router.
 ///
-/// Business routes run: auth → model allowlist → rate limit → handler.
+/// Business routes run: auth → model allowlist → rate limit → budget precharge → handler.
 pub fn create_router(state: AppState) -> Router {
     // Request body cap (axum defaults to 2 MB, far too small for long Codex /
     // Claude Code sessions that ship the whole conversation per request).
@@ -68,11 +68,22 @@ pub fn create_router(state: AppState) -> Router {
     let model_access_state = ModelAccessState {
         max_body_bytes: state.settings.max_body_size_bytes(),
     };
+    // Innermost business layer: budget precharge (after rate limiting, so a
+    // rate-limited request never reserves budget).
+    let precharge_state = crate::services::precharge::PrechargeState {
+        database: state.database.clone(),
+        usage_tracker: state.usage_tracker.clone(),
+        max_body_bytes: state.settings.max_body_size_bytes(),
+    };
 
     // Anthropic API routes (POST /v1/messages)
     let anthropic_routes = Router::new()
         .route("/messages", post(messages::create_message))
         .route("/messages/count_tokens", post(messages::count_tokens))
+        .layer(middleware::from_fn_with_state(
+            precharge_state.clone(),
+            crate::services::precharge::budget_precharge,
+        ))
         .layer(middleware::from_fn_with_state(
             rate_limit_state.clone(),
             rate_limit,
@@ -112,6 +123,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/models/:model_id", get(models::get_model))
         .route("/usage", get(usage::get_usage_summary))
         .route("/usage/records", get(usage::get_usage_records))
+        .layer(middleware::from_fn_with_state(
+            precharge_state,
+            crate::services::precharge::budget_precharge,
+        ))
         .layer(middleware::from_fn_with_state(
             rate_limit_state_clone,
             rate_limit,
@@ -162,6 +177,21 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/keys/:key_id/rotate", post(admin::keys::rotate_key))
         .route("/audit", get(admin::audit::list_audit))
+        .route(
+            "/teams",
+            get(admin::teams::list_teams).post(admin::teams::create_team),
+        )
+        .route(
+            "/teams/:team",
+            get(admin::teams::get_team)
+                .put(admin::teams::update_team)
+                .delete(admin::teams::delete_team),
+        )
+        .route("/teams/:team/activate", post(admin::teams::activate_team))
+        .route(
+            "/teams/:team/deactivate",
+            post(admin::teams::deactivate_team),
+        )
         .route("/users/:user/activate", post(admin::users::activate_user))
         .route(
             "/users/:user/deactivate",
