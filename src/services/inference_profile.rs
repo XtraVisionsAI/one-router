@@ -129,7 +129,10 @@ async fn fetch_underlying_model_arn(arn: &str, creds: &ResolverCreds) -> Result<
         .map_err(|e| e.to_string())?
         .into_parts();
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
     let mut req = client.get(&url).header("host", &host);
     for (name, value) in signing_instructions.headers() {
         req = req.header(name, value);

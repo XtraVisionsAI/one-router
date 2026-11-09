@@ -5,6 +5,7 @@ export interface UpdateInfo {
   latest_version: string | null
   download_url: string | null
   checksum_url: string | null
+  signature_url?: string | null
   release_notes: string | null
   published_at: string | null
   update_available: boolean

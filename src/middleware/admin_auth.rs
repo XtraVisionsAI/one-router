@@ -52,7 +52,27 @@ pub async fn require_admin_key(
 
     // Path 1: Check session cookie
     if let Some(token) = extract_session_cookie(request.headers()) {
-        if state.sessions.read().await.contains(&token) {
+        let key = crate::server::state::session_key(&token);
+        let valid = {
+            let mut sessions = state.sessions.write().await;
+            match sessions.get_mut(&key) {
+                Some(s) if !s.is_expired() => {
+                    s.last_seen = std::time::Instant::now();
+                    true
+                }
+                Some(_) => {
+                    sessions.remove(&key);
+                    false
+                }
+                None => false,
+            }
+        };
+        if valid {
+            // Cookie-authenticated writes must come from our own UI (CSRF):
+            // same-origin per Fetch Metadata, or the UI's explicit header.
+            if !is_safe_method(request.method()) && !is_same_origin_request(request.headers()) {
+                return Err(AdminAuthError::CrossSite);
+            }
             request
                 .extensions_mut()
                 .insert(AdminActor(session_actor(&token)));
@@ -91,6 +111,32 @@ pub async fn require_admin_key(
 pub enum AdminAuthError {
     Missing,
     Forbidden,
+    CrossSite,
+}
+
+fn is_safe_method(m: &axum::http::Method) -> bool {
+    matches!(
+        *m,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    )
+}
+
+/// Header the admin UI sends on every request. A cross-site page cannot set a
+/// custom header on a credentialed request without a CORS preflight, and the
+/// admin API answers no preflights.
+pub const CSRF_HEADER: &str = "x-one-router-admin";
+
+/// `true` when the browser says the request is same-origin (Fetch Metadata:
+/// `Sec-Fetch-Site: same-origin` / `none` for user-initiated), or the UI's
+/// custom header is present. Same-*site* (another port / subdomain) is rejected.
+fn is_same_origin_request(headers: &axum::http::HeaderMap) -> bool {
+    if headers.contains_key(CSRF_HEADER) {
+        return true;
+    }
+    matches!(
+        headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()),
+        Some("same-origin") | Some("none")
+    )
 }
 
 impl IntoResponse for AdminAuthError {
@@ -104,6 +150,9 @@ impl IntoResponse for AdminAuthError {
                 StatusCode::FORBIDDEN,
                 "This API key does not have admin access.",
             ),
+            AdminAuthError::CrossSite => {
+                (StatusCode::FORBIDDEN, "Cross-site admin request rejected.")
+            }
         };
         (
             status,

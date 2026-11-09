@@ -95,7 +95,11 @@ impl BedrockService {
             pool: std::sync::Arc::new(pool),
             service_tiers,
             credential_providers,
-            http_client: reqwest::Client::new(),
+            // SigV4-signed (security token attached): never follow redirects.
+            http_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
             max_request_bytes: (DEFAULT_MAX_REQUEST_MB as usize) * 1024 * 1024,
         }
     }
@@ -964,6 +968,15 @@ impl BedrockService {
 /// 2026-09-09). The paths REQUIRE the `/openai` prefix — without it
 /// bedrock-runtime answers HTTP 200 with a coral `UnknownOperationException`
 /// body that then fails response parsing.
+/// Unmodeled AWS SDK error: its Debug dump can contain raw response headers,
+/// credential-provider details (profile names, role ARNs) and connector errors.
+/// Log it in full; give the client a generic message.
+fn opaque_sdk_error<E: std::fmt::Debug>(err: &E) -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    tracing::error!(error_ref = %id, error = ?err, "Unmodeled Bedrock SDK error");
+    format!("Upstream Bedrock request failed (error ref {id}; details in gateway logs)")
+}
+
 enum MantleHost {
     Runtime,
     Mantle,
@@ -1000,6 +1013,11 @@ impl MantleHost {
 /// models exist only behind a cross-region inference profile on the runtime
 /// host, so the fix is a `global.`-prefixed target model id, not a retry.
 fn mantle_http_error(status: u16, body: String, target_model_id: &str) -> BedrockError {
+    if status == 401 || status == 403 {
+        // SigV4 / IAM failures name the access key id, role and account.
+        tracing::warn!(status, body = %body, "Bedrock Mantle rejected credentials");
+        return BedrockError::AccessDenied(format!("HTTP {status}: {body}"));
+    }
     let mut message = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| {
@@ -1765,10 +1783,10 @@ impl BedrockError {
                     ConverseError::ResourceNotFoundException(e) => BedrockError::ModelNotFound(
                         e.message().unwrap_or("Resource not found").to_string(),
                     ),
-                    _ => BedrockError::Unknown(format!("{error:?}")),
+                    _ => BedrockError::Unknown(opaque_sdk_error(&error)),
                 }
             }
-            _ => BedrockError::Unknown(format!("{err:?}")),
+            _ => BedrockError::Unknown(opaque_sdk_error(&err)),
         }
     }
 
@@ -1817,10 +1835,10 @@ impl BedrockError {
                         error_type: BedrockErrorType::Server,
                         is_retryable: true,
                     },
-                    _ => BedrockError::Unknown(format!("{error:?}")),
+                    _ => BedrockError::Unknown(opaque_sdk_error(&error)),
                 }
             }
-            _ => BedrockError::Unknown(format!("{err:?}")),
+            _ => BedrockError::Unknown(opaque_sdk_error(&err)),
         }
     }
 
@@ -1879,10 +1897,10 @@ impl BedrockError {
                             is_retryable: true,
                         }
                     }
-                    _ => BedrockError::Unknown(format!("{error:?}")),
+                    _ => BedrockError::Unknown(opaque_sdk_error(&error)),
                 }
             }
-            _ => BedrockError::Unknown(format!("{err:?}")),
+            _ => BedrockError::Unknown(opaque_sdk_error(&err)),
         }
     }
 
@@ -1916,7 +1934,7 @@ impl BedrockError {
                     error_type: BedrockErrorType::Server,
                     is_retryable: true,
                 },
-                other => BedrockError::Unknown(format!("{other:?}")),
+                other => BedrockError::Unknown(opaque_sdk_error(&other)),
             },
             other => BedrockError::Unknown(format!("Stream transport error: {other:?}")),
         }
@@ -1966,10 +1984,10 @@ impl BedrockError {
                             e.message().unwrap_or("Service unavailable").to_string(),
                         )
                     }
-                    _ => BedrockError::Unknown(format!("{error:?}")),
+                    _ => BedrockError::Unknown(opaque_sdk_error(&error)),
                 }
             }
-            _ => BedrockError::Unknown(format!("{err:?}")),
+            _ => BedrockError::Unknown(opaque_sdk_error(&err)),
         }
     }
 
@@ -2014,10 +2032,10 @@ impl BedrockError {
                         error_type: BedrockErrorType::Server,
                         is_retryable: true,
                     },
-                    _ => BedrockError::Unknown(format!("{error:?}")),
+                    _ => BedrockError::Unknown(opaque_sdk_error(&error)),
                 }
             }
-            _ => BedrockError::Unknown(format!("{err:?}")),
+            _ => BedrockError::Unknown(opaque_sdk_error(&err)),
         }
     }
 

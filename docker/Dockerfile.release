@@ -4,10 +4,14 @@ FROM debian:bookworm-slim
 ARG VERSION
 ARG TARGETARCH
 ARG GITHUB_REPO=xtravisions/one-router
+# Base64 Ed25519 public key (SPKI DER) of the release signing key — the same
+# value as the RELEASE_PUBLIC_KEY repository variable. Required.
+ARG RELEASE_PUBLIC_KEY
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Map Docker TARGETARCH to release artifact naming
@@ -17,9 +21,20 @@ RUN set -eux; \
         arm64) ARCH="aarch64-unknown-linux-gnu" ;; \
         *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/one-router-${ARCH}.tar.gz" \
-        | tar -xzf - -C /usr/local/bin/; \
-    chmod +x /usr/local/bin/one-router
+    test -n "${RELEASE_PUBLIC_KEY}" || { echo "RELEASE_PUBLIC_KEY build-arg is required"; exit 1; }; \
+    BASE="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/one-router-${ARCH}.tar.gz"; \
+    cd /tmp; \
+    curl -fsSLo "one-router-${ARCH}.tar.gz" "${BASE}"; \
+    curl -fsSLo "one-router-${ARCH}.tar.gz.sha256" "${BASE}.sha256"; \
+    curl -fsSLo "one-router-${ARCH}.tar.gz.sha256.sig" "${BASE}.sha256.sig"; \
+    echo "${RELEASE_PUBLIC_KEY}" | base64 -d > release.pub.der; \
+    openssl pkey -pubin -inform DER -in release.pub.der -out release.pub.pem; \
+    openssl pkeyutl -verify -pubin -inkey release.pub.pem -rawin \
+        -in "one-router-${ARCH}.tar.gz.sha256" -sigfile "one-router-${ARCH}.tar.gz.sha256.sig"; \
+    sha256sum -c "one-router-${ARCH}.tar.gz.sha256"; \
+    tar -xzf "one-router-${ARCH}.tar.gz" -C /usr/local/bin/; \
+    chmod +x /usr/local/bin/one-router; \
+    rm -f /tmp/one-router-* /tmp/release.pub.*
 
 # Keep curl for healthcheck (already installed for download)
 

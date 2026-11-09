@@ -112,6 +112,12 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
 // Handlers
 // ============================================================================
 
+/// Placeholder returned for sensitive values.
+const MASKED_VALUE: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+
+/// Settings that hold secrets regardless of their stored ui_schema.
+pub const SENSITIVE_KEYS: &[&str] = &["web_search_api_key", "budget_alert_webhook_url"];
+
 /// Check if a setting's ui_schema marks it as sensitive
 fn is_sensitive(ui_schema: &Option<String>) -> bool {
     ui_schema
@@ -129,10 +135,11 @@ pub async fn list_settings(State(state): State<AppState>) -> impl IntoResponse {
                     .starts_with(crate::database::traits::INTERNAL_SETTING_PREFIX)
             });
             for record in &mut records {
-                if is_sensitive(&record.ui_schema) && !record.value.is_empty() {
-                    record.value =
-                        "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
-                            .to_string();
+                if (is_sensitive(&record.ui_schema)
+                    || SENSITIVE_KEYS.contains(&record.key.as_str()))
+                    && !record.value.is_empty()
+                {
+                    record.value = MASKED_VALUE.to_string();
                 }
             }
             (
@@ -190,9 +197,22 @@ pub async fn upsert_setting(
         .await
         .ok()
         .flatten();
-    let sensitive = existing
-        .as_ref()
-        .is_some_and(|e| is_sensitive(&e.ui_schema));
+    let sensitive = SENSITIVE_KEYS.contains(&key.as_str())
+        || existing
+            .as_ref()
+            .is_some_and(|e| is_sensitive(&e.ui_schema));
+    // The list endpoint returns this placeholder for sensitive values; saving
+    // it back would overwrite the real secret.
+    if sensitive && body.value.trim() == MASKED_VALUE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "This is the masked placeholder; send the real value (or leave the setting unchanged)",
+            )),
+        )
+            .into_response();
+    }
     let shown = |v: &str| {
         if sensitive {
             serde_json::json!({"value": "<redacted>"})
@@ -204,9 +224,16 @@ pub async fn upsert_setting(
         .before(&existing.as_ref().map(|e| shown(&e.value)))
         .after(&shown(&body.value));
 
+    // Sensitive values are encrypted at rest like backend configs (readers use
+    // `Encryptor::decrypt`, which also accepts legacy plaintext).
+    let stored_value = if sensitive && !body.value.is_empty() {
+        state.encryptor.encrypt(&body.value)
+    } else {
+        body.value
+    };
     let record = SystemSettingRecord {
         key: key.clone(),
-        value: body.value,
+        value: stored_value,
         description: body.description,
         ui_schema: None,
         updated_at: None,
@@ -222,7 +249,12 @@ pub async fn upsert_setting(
             reload_dynamic_config(&state).await;
             // Return the freshly saved record
             let resp = match state.database.system_settings().get_setting(&key).await {
-                Ok(Some(saved)) => (StatusCode::OK, Json(saved)).into_response(),
+                Ok(Some(mut saved)) => {
+                    if sensitive && !saved.value.is_empty() {
+                        saved.value = MASKED_VALUE.to_string();
+                    }
+                    (StatusCode::OK, Json(saved)).into_response()
+                }
                 _ => StatusCode::OK.into_response(),
             };
             detail.attach(resp)

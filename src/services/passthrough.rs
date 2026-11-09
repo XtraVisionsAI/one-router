@@ -88,6 +88,9 @@ impl PassthroughService {
     ) -> Result<Self, PassthroughError> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_seconds))
+            // Never follow redirects: a 3xx to another host would carry the
+            // provider key (reqwest strips only Authorization/Cookie).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(PassthroughError::HttpError)?;
 

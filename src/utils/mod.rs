@@ -4,6 +4,7 @@ pub mod api_key;
 pub mod client_ip;
 pub mod glob;
 pub mod image;
+pub mod redact;
 pub mod retry;
 pub mod string;
 pub mod timeout;

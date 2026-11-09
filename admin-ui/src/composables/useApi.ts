@@ -10,6 +10,9 @@ export function useApi() {
       method,
       credentials: 'same-origin',
       headers: {
+        // CSRF guard: the server requires this (or same-origin Fetch Metadata)
+        // on cookie-authenticated writes.
+        'X-One-Router-Admin': '1',
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
       },
       body: body !== undefined ? JSON.stringify(body) : undefined

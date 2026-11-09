@@ -21,6 +21,7 @@ use crate::database::models::BackendRecord;
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::app::reload_dynamic_config;
 use crate::server::state::AppState;
+use crate::services::backend_pool::secure_config;
 
 // ============================================================================
 // Response types
@@ -330,6 +331,18 @@ pub async fn create_backend(
         }
     };
 
+    if let Err(msg) = secure_config::validate_backend_config(
+        &body.backend_type,
+        &config_val,
+        secure_config::CredentialPolicy::global(),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", &msg)),
+        )
+            .into_response();
+    }
+
     let config_json = match serde_json::to_string(&config_val) {
         Ok(s) => s,
         Err(e) => {
@@ -415,8 +428,27 @@ pub async fn update_backend(
         }
     };
 
-    // Encrypt new config if provided, otherwise keep existing
+    // Encrypt new config if provided, otherwise keep existing. Masked secrets
+    // (as returned by GET …/config) are replaced with the stored values first.
     let config = if let Some(config_val) = body.config {
+        let stored: Value = state
+            .encryptor
+            .decrypt(&existing.config)
+            .ok()
+            .and_then(|p| serde_json::from_str(&p).ok())
+            .unwrap_or(Value::Null);
+        let config_val = secure_config::merge_masked(config_val, &stored);
+        if let Err(msg) = secure_config::validate_backend_config(
+            &existing.backend_type,
+            &config_val,
+            secure_config::CredentialPolicy::global(),
+        ) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid_request_error", &msg)),
+            )
+                .into_response();
+        }
         match serde_json::to_string(&config_val) {
             Ok(json) => state.encryptor.encrypt(&json),
             Err(e) => {
@@ -571,11 +603,39 @@ pub async fn toggle_backend(
     }
 }
 
-/// GET /admin/api/backends/:name/config — return decrypted config JSON
+/// GET /admin/api/backends/:name/config — return the config with every secret
+/// masked (`••••<last4>`). Secrets are write-only: send a masked value back on
+/// update to keep the stored one.
 pub async fn get_backend_config(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    actor: Option<axum::Extension<crate::services::audit::AdminActor>>,
+    connect: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    // Config reads are audited (the write-audit middleware skips GETs).
+    {
+        let (source_ip, user_agent) =
+            crate::services::audit::meta(connect.map(|c| c.0), &headers, &state.settings);
+        crate::services::audit::write(
+            state.database.clone(),
+            crate::database::models::AuditLogRecord {
+                id: uuid::Uuid::now_v7().to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                actor: actor.map(|a| a.0 .0).unwrap_or_else(|| "unknown".into()),
+                source_ip,
+                user_agent,
+                action: "backend.read_config".into(),
+                target_type: Some("backend".into()),
+                target_id: Some(name.clone()),
+                before: None,
+                after: None,
+                status: 200,
+                method: "GET".into(),
+                path: format!("/admin/api/backends/{name}/config"),
+            },
+        );
+    }
     let record = match state.database.backends().get_backend(&name).await {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -625,10 +685,10 @@ pub async fn get_backend_config(
         }
     };
 
-    tracing::info!(backend = %name, "Admin accessed decrypted backend config");
+    tracing::info!(backend = %name, "Admin read (masked) backend config");
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "config": config_val })),
+        Json(serde_json::json!({ "config": secure_config::mask_backend_config(&config_val) })),
     )
         .into_response()
 }

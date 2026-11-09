@@ -77,6 +77,18 @@ impl FetchProvider for ReqwestFetchProvider {
     }
 }
 
+/// `host` is `domain` or a subdomain of it (label-aligned: `notgood.com` does
+/// not match `good.com`). Case- and trailing-dot-insensitive.
+fn domain_matches(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let domain = domain
+        .trim()
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    !domain.is_empty() && (host == domain || host.ends_with(&format!(".{domain}")))
+}
+
 fn check_domain_filters(
     url: &str,
     allowed_domains: Option<&[String]>,
@@ -84,14 +96,14 @@ fn check_domain_filters(
 ) -> Result<(), WebToolError> {
     let host = extract_host(url);
     if let Some(blocked) = blocked_domains {
-        if blocked.iter().any(|d| host.ends_with(d.as_str())) {
+        if blocked.iter().any(|d| domain_matches(&host, d)) {
             return Err(WebToolError::FetchError(format!(
                 "Domain '{host}' is blocked"
             )));
         }
     }
     if let Some(allowed) = allowed_domains {
-        if !allowed.is_empty() && !allowed.iter().any(|d| host.ends_with(d.as_str())) {
+        if !allowed.is_empty() && !allowed.iter().any(|d| domain_matches(&host, d)) {
             return Err(WebToolError::FetchError(format!(
                 "Domain '{host}' is not in allowed list"
             )));
@@ -111,6 +123,7 @@ impl TavilyExtractProvider {
     pub fn new(api_key: String) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build reqwest client");
         Self { client, api_key }
@@ -269,6 +282,16 @@ fn remove_script_style(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn domain_match_is_label_aligned() {
+        assert!(domain_matches("good.com", "good.com"));
+        assert!(domain_matches("docs.good.com", "good.com"));
+        assert!(domain_matches("Docs.Good.com.", ".good.com"));
+        assert!(!domain_matches("notgood.com", "good.com"));
+        assert!(!domain_matches("good.com.evil.net", "good.com"));
+        assert!(!domain_matches("good.com", ""));
+    }
 
     #[test]
     fn test_strip_html_basic() {

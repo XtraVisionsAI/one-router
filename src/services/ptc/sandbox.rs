@@ -75,6 +75,11 @@ impl CodeExecutor for OneshotExecutor {
 /// Default Docker image for sandbox execution
 pub const DEFAULT_SANDBOX_IMAGE: &str = "python:3.11-slim";
 
+/// uid:gid code runs as inside sandbox containers (`nobody`).
+const SANDBOX_USER: &str = "65534:65534";
+/// Max processes / threads per sandbox container.
+const SANDBOX_PIDS_LIMIT: i64 = 128;
+
 /// Default memory limit for containers (256MB)
 pub const DEFAULT_MEMORY_LIMIT: i64 = 256 * 1024 * 1024;
 
@@ -363,12 +368,17 @@ impl SandboxExecutor {
             },
             security_opt: Some(vec!["no-new-privileges".to_string()]),
             cap_drop: Some(vec!["ALL".to_string()]),
+            // Fork-bomb guard for model-written code.
+            pids_limit: Some(SANDBOX_PIDS_LIMIT),
             ..Default::default()
         };
 
         let config = Config {
             image: Some(self.config.image.clone()),
             working_dir: Some(self.config.working_dir.clone()),
+            // Unprivileged inside the container (files are uploaded 0644 into
+            // the world-writable /tmp, so the runner can still read them).
+            user: Some(SANDBOX_USER.to_string()),
             host_config: Some(host_config),
             tty: Some(false), // Disable TTY for multiplexed stdout/stderr separation
             attach_stdin: Some(true),
@@ -563,6 +573,7 @@ impl SandboxExecutor {
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             working_dir: Some(self.config.working_dir.clone()),
+            user: Some(SANDBOX_USER.to_string()),
             ..Default::default()
         };
 

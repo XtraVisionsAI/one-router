@@ -17,7 +17,6 @@ use crate::{
     },
 };
 use anyhow::Result;
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,7 +48,10 @@ impl App {
         }
 
         // 1. Create database backend
-        tracing::info!(database = %settings.database, "Initializing database backend");
+        tracing::info!(
+            database = %crate::config::settings::redact_database_uri(&settings.database),
+            "Initializing database backend"
+        );
         let database = database::create_database(&settings.database).await?;
 
         // 2. Initialize database (auto-create tables + seed defaults + backfill key hashes)
@@ -98,7 +100,7 @@ impl App {
             responses_context: Arc::new(
                 crate::services::responses_context::ResponsesContextStore::new(),
             ),
-            sessions: Arc::new(RwLock::new(HashSet::new())),
+            sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             dynamic,
             auth_cache: Arc::new(crate::services::auth_cache::AuthCache::default()),
         };
@@ -269,6 +271,13 @@ async fn init_bedrock_from_backends(
         let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
             anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
         })?;
+        if let Err(msg) = crate::services::backend_pool::secure_config::check_stored(
+            &backend.backend_type,
+            &decrypted_config,
+        ) {
+            tracing::error!(backend = %backend.name, error = %msg, "Skipping backend with an unsafe config");
+            continue;
+        }
         let cfg: BedrockBackendConfig = serde_json::from_str(&decrypted_config)
             .map_err(|e| anyhow::anyhow!("Invalid bedrock config for '{}': {}", backend.name, e))?;
 
@@ -364,6 +373,13 @@ async fn init_gemini_from_backends(
         let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
             anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
         })?;
+        if let Err(msg) = crate::services::backend_pool::secure_config::check_stored(
+            &backend.backend_type,
+            &decrypted_config,
+        ) {
+            tracing::error!(backend = %backend.name, error = %msg, "Skipping backend with an unsafe config");
+            continue;
+        }
         let cfg: GeminiBackendConfig = serde_json::from_str(&decrypted_config)
             .map_err(|e| anyhow::anyhow!("Invalid gemini config for '{}': {}", backend.name, e))?;
 
@@ -449,6 +465,13 @@ async fn init_passthrough_from_backends(
         let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
             anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
         })?;
+        if let Err(msg) = crate::services::backend_pool::secure_config::check_stored(
+            &backend.backend_type,
+            &decrypted_config,
+        ) {
+            tracing::error!(backend = %backend.name, error = %msg, "Skipping backend with an unsafe config");
+            continue;
+        }
 
         if i == 0 {
             pool_config = PoolConfig {
@@ -664,6 +687,8 @@ async fn build_dynamic_config(
             .or_else(|| settings.web_search_provider.clone());
         let api_key = load_string_setting(database, "web_search_api_key")
             .await
+            .and_then(|v| encryptor.decrypt(&v).ok())
+            .filter(|v| !v.is_empty())
             .or_else(|| settings.web_search_api_key.clone());
         let max_kb = load_string_setting(database, "web_fetch_max_content_kb")
             .await
@@ -763,7 +788,10 @@ async fn apply_auth_and_alert_settings(state: &AppState) {
             Err(e) => tracing::warn!(error = %e, "Invalid budget_alert_thresholds; using default"),
         }
     }
-    if let Some(raw) = load_string_setting(&state.database, "budget_alert_webhook_url").await {
+    if let Some(raw) = load_string_setting(&state.database, "budget_alert_webhook_url")
+        .await
+        .and_then(|v| state.encryptor.decrypt(&v).ok())
+    {
         match parse_webhook_url(&raw) {
             Ok(u) => cfg.webhook_url = u,
             Err(e) => {

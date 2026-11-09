@@ -136,7 +136,10 @@ pub fn emit(alert: BudgetAlert, webhook_url: Option<String>, http: Arc<reqwest::
                 Ok(r) => {
                     tracing::warn!(status = %r.status(), attempt, "Budget alert webhook rejected")
                 }
-                Err(e) => tracing::warn!(error = %e, attempt, "Budget alert webhook failed"),
+                // without_url(): the webhook URL is itself a secret (Slack token).
+                Err(e) => {
+                    tracing::warn!(error = %e.without_url(), attempt, "Budget alert webhook failed")
+                }
             }
             tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
         }

@@ -78,7 +78,14 @@ impl UsageTracker {
             token_limiter,
             alerts: Arc::new(std::sync::RwLock::new(BudgetAlertConfig::default())),
             precharge: Arc::new(std::sync::RwLock::new(PrechargeConfig::default())),
-            http: Arc::new(reqwest::Client::new()),
+            // Webhook URL is admin-supplied: guarded DNS, no proxy, no redirects.
+            http: Arc::new(
+                crate::services::web_tools::ssrf::guarded_client(
+                    std::time::Duration::from_secs(5),
+                    "one-router-budget-alerts",
+                )
+                .unwrap_or_default(),
+            ),
         }
     }
 

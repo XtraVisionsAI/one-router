@@ -16,7 +16,7 @@ use std::io::Write;
 pub const DEFAULT_MAX_BODY_SIZE_MB: u64 = 64;
 
 /// Main application settings — loaded from a minimal set of env vars.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Settings {
     /// Database connection string (scheme selects backend: sqlite://, postgres://, dynamodb://)
     pub database: String,
@@ -72,6 +72,57 @@ pub struct Settings {
     pub ephemeral_api_key: Option<String>,
 }
 
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("database", &redact_database_uri(&self.database))
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field("log_level", &self.log_level)
+            .field("max_body_size_mb", &self.max_body_size_mb)
+            .field("metrics_public", &self.metrics_public)
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
+            .field(
+                "master_api_key",
+                &self.master_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "encryption_key",
+                &self.encryption_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("web_search_provider", &self.web_search_provider)
+            .field(
+                "web_search_api_key",
+                &self.web_search_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("web_fetch_max_content_kb", &self.web_fetch_max_content_kb)
+            .field("seed_defaults", &self.seed_defaults)
+            .field("app_version", &self.app_version)
+            .field(
+                "ephemeral_api_key",
+                &self.ephemeral_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// The `DATABASE` URI with any password removed, for logs / stdout.
+pub fn redact_database_uri(uri: &str) -> String {
+    match reqwest::Url::parse(uri) {
+        Ok(mut url) if url.password().is_some() => {
+            let _ = url.set_password(Some("****"));
+            url.to_string()
+        }
+        Ok(_) => uri.to_string(),
+        // Not URL-shaped: drop anything that looks like `user:pass@`.
+        Err(_) => match (uri.find("://"), uri.rfind('@')) {
+            (Some(i), Some(j)) if j > i => format!("{}****@{}", &uri[..i + 3], &uri[j + 1..]),
+            _ => uri.to_string(),
+        },
+    }
+}
+
 fn is_container_env() -> bool {
     env::var("CONTAINER")
         .map(|v| v == "true" || v == "1")
@@ -90,7 +141,9 @@ fn default_host(container: bool) -> &'static str {
 impl Settings {
     /// Load settings from environment variables with sensible defaults.
     pub fn load() -> Result<Self> {
-        dotenvy::dotenv().ok();
+        // Only `./.env` — not `dotenv()`, which also walks parent directories
+        // and could pick up an unrelated `.env` holding other keys.
+        dotenvy::from_path(".env").ok();
 
         let database =
             env::var("DATABASE").unwrap_or_else(|_| "sqlite://./data/gateway.db".to_string());
@@ -145,7 +198,7 @@ impl Settings {
             _ => crate::database::seed::SeedMode::default(),
         };
 
-        let mut settings = Self {
+        let settings = Self {
             database,
             port,
             host,
@@ -163,8 +216,9 @@ impl Settings {
             ephemeral_api_key: None,
         };
 
-        settings.ensure_required_keys()?;
-
+        // Key generation happens in `ensure_required_keys`, called by main
+        // *after* CLI overrides — so `--master-api-key` / `--encryption-key`
+        // never trigger generating (and persisting) unused keys.
         Ok(settings)
     }
 
@@ -172,7 +226,7 @@ impl Settings {
     ///
     /// - **Container** (`CONTAINER=true`): error and abort if missing.
     /// - **Bare metal**: auto-generate missing keys and append to `.env` file.
-    fn ensure_required_keys(&mut self) -> Result<()> {
+    pub fn ensure_required_keys(&mut self) -> Result<()> {
         let is_container = env::var("CONTAINER")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -204,18 +258,21 @@ impl Settings {
 
         if need_master {
             let key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-            self.master_api_key = Some(key.clone());
+            eprintln!(
+                "  [auto-generated] MASTER_API_KEY={} (full value in .env)",
+                crate::utils::api_key::mask_key(&key)
+            );
             lines.push(format!("MASTER_API_KEY={key}"));
-            eprintln!("  [auto-generated] MASTER_API_KEY={key}");
+            self.master_api_key = Some(key);
         }
 
         if need_encryption {
             let key: String = (0..32)
                 .map(|_| format!("{:02x}", rand::random::<u8>()))
                 .collect();
-            self.encryption_key = Some(key.clone());
+            eprintln!("  [auto-generated] ENCRYPTION_KEY=•••• (full value in .env)");
             lines.push(format!("ENCRYPTION_KEY={key}"));
-            eprintln!("  [auto-generated] ENCRYPTION_KEY={key}");
+            self.encryption_key = Some(key);
         }
 
         if !lines.is_empty() {
@@ -352,11 +409,23 @@ impl Settings {
 }
 
 /// Append key=value lines to the .env file, creating it if it doesn't exist.
+/// Append generated keys to `./.env`, readable by the owner only (0600 — the
+/// file holds the master and encryption keys).
 fn append_to_dotenv(lines: &[String]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(".env")?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(".env")?;
+    // `mode` only applies on creation: tighten an existing file too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
 
     // Add a blank line separator if the file is non-empty
     let metadata = file.metadata()?;
@@ -374,6 +443,23 @@ fn append_to_dotenv(lines: &[String]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_uri_redaction() {
+        assert_eq!(
+            redact_database_uri("postgres://app:s3cret@db:5432/gw"),
+            "postgres://app:****@db:5432/gw"
+        );
+        assert_eq!(
+            redact_database_uri("sqlite://./data/gateway.db"),
+            "sqlite://./data/gateway.db"
+        );
+        assert_eq!(
+            redact_database_uri("dynamodb://us-east-1"),
+            "dynamodb://us-east-1"
+        );
+        assert!(!redact_database_uri("postgres://u:p%40ss@h/d").contains("p%40ss"));
+    }
 
     #[test]
     fn default_host_is_loopback_outside_containers() {

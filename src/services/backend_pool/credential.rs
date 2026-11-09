@@ -157,7 +157,6 @@ pub trait Credential: Send + Sync {
 // ============================================================================
 
 /// Simple API key credential for services like Gemini, OpenAI, DeepSeek, Anthropic
-#[derive(Debug)]
 pub struct ApiKeyCredential {
     /// Credential name for identification
     name: String,
@@ -171,6 +170,20 @@ pub struct ApiKeyCredential {
     organization: Option<String>,
     /// Optional base URL override
     base_url: Option<String>,
+}
+
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for ApiKeyCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyCredential")
+            .field("name", &self.name)
+            .field("api_key", &"<redacted>")
+            .field("weight", &self.weight)
+            .field("health", &self.health)
+            .field("organization", &self.organization)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl ApiKeyCredential {
@@ -238,7 +251,6 @@ impl Credential for ApiKeyCredential {
 // ============================================================================
 
 /// AWS credential for Bedrock service
-#[derive(Debug)]
 pub struct AwsCredential {
     /// Credential name for identification
     name: String,
@@ -260,6 +272,33 @@ pub struct AwsCredential {
     filter: ModelFilter,
     /// Backend priority — tiebreaker between wildcard matches of equal kind
     priority: i32,
+}
+
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for AwsCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsCredential")
+            .field("name", &self.name)
+            .field("region", &self.region)
+            .field("profile", &self.profile)
+            .field(
+                "access_key_id",
+                &self.access_key_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("weight", &self.weight)
+            .field("health", &self.health)
+            .field("filter", &self.filter)
+            .field("priority", &self.priority)
+            .finish()
+    }
 }
 
 impl AwsCredential {
@@ -405,7 +444,7 @@ impl Credential for AwsCredential {
 // ============================================================================
 
 /// Configuration for API key credentials
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ApiKeyCredentialConfig {
     pub api_key: String,
     #[serde(default = "default_name")]
@@ -418,8 +457,22 @@ pub struct ApiKeyCredentialConfig {
     pub base_url: Option<String>,
 }
 
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for ApiKeyCredentialConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyCredentialConfig")
+            .field("api_key", &"<redacted>")
+            .field("name", &self.name)
+            .field("weight", &self.weight)
+            .field("enabled", &self.enabled)
+            .field("organization", &self.organization)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
 /// Configuration for AWS credentials
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AwsCredentialConfig {
     #[serde(default = "default_name")]
     pub name: String,
@@ -432,6 +485,31 @@ pub struct AwsCredentialConfig {
     pub weight: u32,
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for AwsCredentialConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsCredentialConfig")
+            .field("name", &self.name)
+            .field("region", &self.region)
+            .field("profile", &self.profile)
+            .field(
+                "access_key_id",
+                &self.access_key_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("weight", &self.weight)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
 }
 
 fn default_name() -> String {

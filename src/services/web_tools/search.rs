@@ -27,6 +27,7 @@ pub struct TavilySearchProvider {
 impl TavilySearchProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("Failed to build reqwest client");
@@ -99,6 +100,7 @@ pub struct BraveSearchProvider {
 impl BraveSearchProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("Failed to build reqwest client");

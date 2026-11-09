@@ -1009,7 +1009,9 @@ impl ErrorResponse {
             response_type: "error".to_string(),
             error: ErrorDetail {
                 error_type: error_type.into(),
-                message: message.into(),
+                // Every client-facing error passes through here: strip keys,
+                // ARNs / account ids and request URLs from relayed text.
+                message: crate::utils::redact::redact_secrets(&message.into()),
             },
         }
     }

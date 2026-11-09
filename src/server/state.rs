@@ -13,13 +13,57 @@ use crate::services::{
     BackendInstance, BedrockService, CredentialPool, GeminiService, ModelMappingService,
     PassthroughService, PtcService, UpdateService, UsageTracker,
 };
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-/// In-memory store of active admin session tokens.
-pub type SessionStore = Arc<RwLock<HashSet<String>>>;
+/// Absolute lifetime of an admin session.
+pub const ADMIN_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+/// Idle timeout of an admin session.
+pub const ADMIN_SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// One admin session. Keyed in the store by the SHA-256 of the cookie token,
+/// so the store never holds a usable token.
+#[derive(Debug, Clone, Copy)]
+pub struct AdminSession {
+    pub created_at: Instant,
+    pub last_seen: Instant,
+}
+
+impl AdminSession {
+    pub fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            created_at: now,
+            last_seen: now,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.created_at.elapsed() >= ADMIN_SESSION_TTL
+            || self.last_seen.elapsed() >= ADMIN_SESSION_IDLE
+    }
+}
+
+impl Default for AdminSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// In-memory store of active admin sessions (`sha256(token)` → session).
+/// Cleared on restart; rotating MASTER_API_KEY requires a restart, which
+/// therefore also revokes every session.
+pub type SessionStore = Arc<RwLock<std::collections::HashMap<String, AdminSession>>>;
+
+/// Store key for a session token.
+pub fn session_key(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
 
 /// Hot-reloadable configuration — wrapped in `Arc<RwLock<>>` for shared mutable access.
 pub struct DynamicConfig {

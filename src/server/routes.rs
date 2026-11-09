@@ -263,8 +263,11 @@ pub fn create_router(state: AppState) -> Router {
 
     // Combine all routes
     Router::new()
-        .nest("/v1", anthropic_routes)
-        .nest("/v1", openai_routes)
+        // CORS only on the business API (Bearer / x-api-key, no cookies). The
+        // admin API gets none, so browsers never send it cross-origin
+        // credentialed requests with custom headers.
+        .nest("/v1", anthropic_routes.layer(create_cors_layer()))
+        .nest("/v1", openai_routes.layer(create_cors_layer()))
         .merge(health_routes)
         .merge(metrics_routes)
         .nest("/admin/api", admin_session_routes) // login/logout (no auth)
@@ -273,7 +276,6 @@ pub fn create_router(state: AppState) -> Router {
         .fallback(move |request: Request<Body>| async move { fallback_handler(request) })
         .layer(body_limit)
         .layer(middleware::from_fn(track_http_metrics))
-        .layer(create_cors_layer())
         .with_state(state)
 }
 

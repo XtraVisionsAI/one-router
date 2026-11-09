@@ -33,6 +33,7 @@ mod credential;
 mod instance;
 pub mod model_filter;
 mod pool;
+pub mod secure_config;
 mod strategy;
 
 pub use config::{

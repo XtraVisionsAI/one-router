@@ -19,8 +19,9 @@ POWER="micro"        # nano (0.25 vCPU/0.5GB), micro (1 vCPU/2GB), small (2/4), 
 SCALE=1              # Number of container nodes (1–20)
 
 # Application secrets
-MASTER_API_KEY=""
-ENCRYPTION_KEY=""
+# Read from the environment (preferred); flags expose values to `ps`/history.
+MASTER_API_KEY="${MASTER_API_KEY:-}"
+ENCRYPTION_KEY="${ENCRYPTION_KEY:-}"
 
 # AWS authentication
 AWS_PROFILE=""
@@ -60,8 +61,12 @@ Service configuration:
   --power POWER             Container power: nano, micro (default), small, medium, large, xlarge
   --scale N                 Number of nodes, 1–20 (default: 1)
   --create                  Create new service (vs update existing)
-  --master-api-key KEY      MASTER_API_KEY for the gateway
-  --encryption-key KEY      ENCRYPTION_KEY for credential encryption
+  --master-api-key KEY      MASTER_API_KEY (deprecated: prefer the MASTER_API_KEY env var)
+  --encryption-key KEY      ENCRYPTION_KEY (deprecated: prefer the ENCRYPTION_KEY env var)
+
+  Note: Lightsail containers cannot reference Secrets Manager / SSM, so the
+  keys end up in the deployment's environment (readable by anyone with
+  lightsail:GetContainerServiceDeployments). Prefer App Runner for production.
 
 AWS authentication:
   --profile PROFILE         AWS CLI named profile
@@ -112,8 +117,8 @@ while [[ $# -gt 0 ]]; do
         --tag)                    TAG="$2"; shift 2 ;;
         --power)                  POWER="$2"; shift 2 ;;
         --scale)                  SCALE="$2"; shift 2 ;;
-        --master-api-key)         MASTER_API_KEY="$2"; shift 2 ;;
-        --encryption-key)         ENCRYPTION_KEY="$2"; shift 2 ;;
+        --master-api-key)         MASTER_API_KEY="$2"; FLAG_SECRETS=true; shift 2 ;;
+        --encryption-key)         ENCRYPTION_KEY="$2"; FLAG_SECRETS=true; shift 2 ;;
         --profile)                AWS_PROFILE="$2"; shift 2 ;;
         --endpoint-url)           AWS_ENDPOINT_URL="$2"; shift 2 ;;
         --access-key-id)          AWS_ACCESS_KEY_ID_OPT="$2"; shift 2 ;;
@@ -168,7 +173,7 @@ echo "  Region:    ${REGION}"
 echo "  Service:   ${SERVICE_NAME}"
 echo "  Power:     ${POWER}"
 echo "  Scale:     ${SCALE}"
-echo "  Database:  ${DATABASE}"
+echo "  Database:  $(echo "${DATABASE}" | sed -E 's#(://[^:/@]+:).*@#\1****@#')"
 [[ -n "$AWS_PROFILE" ]] && echo "  Profile:   ${AWS_PROFILE}"
 if [[ "$BUILD" == "true" ]]; then
     echo "  Source:    local build (${DOCKERFILE})"
@@ -288,25 +293,37 @@ ok "Pushed: ${LIGHTSAIL_IMAGE}"
 # ═══════════════════════════════════════════════════════════════════════════════
 info "Step 3: Creating deployment..."
 
-# Build environment map
-ENV_MAP='"DATABASE":"'"${DATABASE}"'","PORT":"8000","LOG_LEVEL":"info"'
-[[ -n "$MASTER_API_KEY" ]] && ENV_MAP+=',"MASTER_API_KEY":"'"${MASTER_API_KEY}"'"'
-[[ -n "$ENCRYPTION_KEY" ]] && ENV_MAP+=',"ENCRYPTION_KEY":"'"${ENCRYPTION_KEY}"'"'
+# Build the containers document in a private temp file (secrets never on a
+# command line). Values are passed to jq through the environment.
 
-CONTAINERS=$(cat <<JSON
-{
-  "one-router": {
-    "image": "${LIGHTSAIL_IMAGE}",
-    "ports": {
-      "8000": "HTTP"
-    },
-    "environment": {
-      ${ENV_MAP}
-    }
-  }
+# ─── Secret-safe temp files ─────────────────────────────────────────────────
+# Payloads containing secrets are passed to the AWS CLI as file:// documents
+# (never as command-line arguments, which `ps` and shell history expose), in
+# private mktemp files removed on exit.
+TMP_FILES=()
+cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}"; return 0; }
+trap cleanup_tmp EXIT
+private_tmp() {
+    local f
+    f=$(umask 077 && mktemp "${TMPDIR:-/tmp}/one-router-deploy.XXXXXX")
+    TMP_FILES+=("$f")
+    echo "$f"
 }
-JSON
-)
+# Mask the password of a DATABASE URI for display.
+mask_db() { echo "$1" | sed -E 's#(://[^:/@]+:).*@#\1****@#'; }
+
+if [[ "${FLAG_SECRETS:-false}" == "true" ]]; then
+    warn "Secrets passed as command-line flags are visible in 'ps' and shell history;"
+    warn "prefer the MASTER_API_KEY / ENCRYPTION_KEY environment variables."
+fi
+CONTAINERS_FILE=$(private_tmp)
+DB_VALUE="${DATABASE}" MK="${MASTER_API_KEY}" EK="${ENCRYPTION_KEY}" jq -n --arg image "${LIGHTSAIL_IMAGE}" '
+  {"one-router": {
+     image: $image,
+     ports: {"8000": "HTTP"},
+     environment: ({DATABASE: env.DB_VALUE, PORT: "8000", LOG_LEVEL: "info"}
+       + (if env.MK != "" then {MASTER_API_KEY: env.MK} else {} end)
+       + (if env.EK != "" then {ENCRYPTION_KEY: env.EK} else {} end))}}' > "${CONTAINERS_FILE}"
 
 PUBLIC_ENDPOINT=$(cat <<JSON
 {
@@ -325,7 +342,7 @@ JSON
 
 awscli lightsail create-container-service-deployment \
     --service-name "${SERVICE_NAME}" \
-    --containers "${CONTAINERS}" \
+    --containers "file://${CONTAINERS_FILE}" \
     --public-endpoint "${PUBLIC_ENDPOINT}" \
     --output json >/dev/null
 

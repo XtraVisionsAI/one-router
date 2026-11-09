@@ -44,7 +44,7 @@ One Router 是一个用 Rust 编写的高性能 API 网关，让你通过**一�
 - **Admin 管理界面** — 内置浏览器管理界面（`/admin`），可管理 API Key、后端配置、模型映射、系统设置和用量统计，无需额外工具
 - **AES-256-GCM 加密** — 后端凭证静态加密存储；Admin 界面支持明文输入，保存时自动加密
 - **API Key 哈希存储** — API Key 使用 HMAC-SHA256 哈希后存储；明文仅在创建时展示一次，管理界面中以中间掩码形式显示（sk-abcd....5678）
-- **自更新** — 通过 CLI（`one-router update`）或 Admin API 从 GitHub Releases 检查并应用更新
+- **自更新** — 通过 CLI（`one-router update`）或 Admin API 从 GitHub Releases 检查并应用更新；仅安装经 Ed25519 签名验证的版本（无签名即拒绝，见 `scripts/release-keygen.sh`）
 - **热重载** — 通过 Admin 界面修改后端配置和系统设置后即时生效，无需重启
 - **CLI 配置** — 通过命令行参数覆盖任意设置（`--port`、`--database`、`--log-level`）
 - **健康检查** — 内置 `/health`、`/ready`、`/liveness` 端点
@@ -358,6 +358,9 @@ One Router 使用环境变量配置基础设施。所有运行时设置存储在
 | `ENCRYPTION_KEY` | _(自动生成)_ | AES-256 密钥，用于凭证加密和 API Key HMAC — 首次运行时自动生成 |
 | `SEED_DEFAULTS` | `empty` | 启动时何时植入默认模型映射：`off`（从不）、`empty`（仅当映射表为空 — 用户删除不会被复活）或 `missing`（每次启动补齐缺失的默认项） |
 | `MAX_BODY_SIZE_MB` | `64` | HTTP 请求体大小上限（MB）。长会话的 Codex / Claude Code 会把完整对话放在单个请求里。前置反向代理的限制（如 nginx `client_max_body_size`）需与此值对齐 |
+| `BEDROCK_ALLOWED_PROFILES` | _(未设置=不限)_ | Bedrock 后端允许引用的 AWS profile（逗号分隔）。引用其它 profile 的后端写入时被拒绝、加载时被跳过 |
+| `BEDROCK_ALLOW_DEFAULT_CREDENTIALS` | `true` | 是否允许未配置密钥/profile 的 Bedrock 后端使用主机默认凭证链（环境变量 / 实例角色 / SSO 缓存）。设为 `false` 可防止通过管理 API 借用网关自身身份 |
+| `ADMIN_COOKIE_INSECURE` | _(未设置)_ | 去掉 `admin_session` cookie 的 `Secure` 标志（非 localhost 的纯 HTTP 管理访问）。有 TLS 时不要设置 |
 
 **首次运行行为：**
 - **裸机部署：** 缺失的 `MASTER_API_KEY` 或 `ENCRYPTION_KEY` 会自动生成并保存到 `.env` 文件。

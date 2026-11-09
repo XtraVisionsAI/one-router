@@ -314,15 +314,14 @@ pub(crate) async fn fetch_litellm(url: &str) -> Result<serde_json::Value, String
         return Err("pricing_sync_url must use https".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
+    // Admin-supplied URL: guarded DNS (no private / metadata addresses), no
+    // proxy, no redirects.
+    let client = crate::services::web_tools::ssrf::guarded_client(FETCH_TIMEOUT, "one-router")?;
     let resp = client
         .get(parsed)
         .send()
         .await
-        .map_err(|e| format!("pricing table fetch failed: {e}"))?;
+        .map_err(|e| format!("pricing table fetch failed: {}", e.without_url()))?;
     if !resp.status().is_success() {
         return Err(format!(
             "pricing table fetch failed: HTTP {}",

@@ -46,7 +46,7 @@ impl Default for PoolSettings {
 /// 1. `profile` — AWS named profile
 /// 2. `access_key_id` + `secret_access_key` (+ optional `session_token`)
 /// 3. Default credential chain (env / instance role)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BedrockBackendConfig {
     #[serde(default = "default_region")]
     pub region: String,
@@ -62,12 +62,35 @@ pub struct BedrockBackendConfig {
     pub weight: u32,
 }
 
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for BedrockBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BedrockBackendConfig")
+            .field("region", &self.region)
+            .field("profile", &self.profile)
+            .field(
+                "access_key_id",
+                &self.access_key_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("weight", &self.weight)
+            .finish()
+    }
+}
+
 // ============================================================================
 // Gemini backend config
 // ============================================================================
 
 /// Configuration stored in `BackendRecord.config` for `backend_type = "gemini"`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GeminiBackendConfig {
     pub api_keys: Vec<String>,
     #[serde(default)]
@@ -76,12 +99,26 @@ pub struct GeminiBackendConfig {
     pub timeout_seconds: u64,
 }
 
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for GeminiBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeminiBackendConfig")
+            .field(
+                "api_keys",
+                &format_args!("[{} redacted]", self.api_keys.len()),
+            )
+            .field("base_url", &self.base_url)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
+}
+
 // ============================================================================
 // Anthropic backend config
 // ============================================================================
 
 /// Configuration stored in `BackendRecord.config` for `backend_type = "anthropic"`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AnthropicBackendConfig {
     pub api_keys: Vec<String>,
     #[serde(default)]
@@ -90,12 +127,26 @@ pub struct AnthropicBackendConfig {
     pub timeout_seconds: u64,
 }
 
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for AnthropicBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicBackendConfig")
+            .field(
+                "api_keys",
+                &format_args!("[{} redacted]", self.api_keys.len()),
+            )
+            .field("base_url", &self.base_url)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
+}
+
 // ============================================================================
 // OpenAI backend config
 // ============================================================================
 
 /// Configuration stored in `BackendRecord.config` for `backend_type = "openai"`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OpenAIBackendConfig {
     pub api_keys: Vec<String>,
     #[serde(default)]
@@ -104,6 +155,21 @@ pub struct OpenAIBackendConfig {
     pub organization: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+}
+
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for OpenAIBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAIBackendConfig")
+            .field(
+                "api_keys",
+                &format_args!("[{} redacted]", self.api_keys.len()),
+            )
+            .field("base_url", &self.base_url)
+            .field("organization", &self.organization)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
 }
 
 // ============================================================================

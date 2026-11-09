@@ -83,7 +83,13 @@ impl OpenAIApiError {
             BedrockError::ModelNotFound(msg) => {
                 Self::bad_request(format!("Model not found: {msg}"))
             }
-            BedrockError::AccessDenied(msg) => Self::unauthorized(msg),
+            BedrockError::AccessDenied(msg) => {
+                // AWS's text names the host IAM role and account — log only.
+                tracing::warn!(error = %msg, "Bedrock access denied");
+                Self::unauthorized(
+                    "Access denied by the upstream provider. Details are in the gateway logs.",
+                )
+            }
             BedrockError::ServiceUnavailable(msg) => Self::internal_error(msg),
             BedrockError::InternalError(msg) => Self::internal_error(msg),
             BedrockError::Serialization(msg) => {
@@ -1358,7 +1364,9 @@ async fn handle_anthropic_backend(
             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
         return Err(OpenAIApiError {
             status,
-            error: OpenAIErrorResponse::server_error(&error_body),
+            error: OpenAIErrorResponse::server_error(
+                &crate::utils::redact::upstream_error_message(upstream_status, &error_body),
+            ),
         });
     }
 
@@ -1569,13 +1577,11 @@ async fn handle_openai_passthrough(
     let body_bytes = serde_json::to_vec(&body_value)
         .map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
 
-    // Forward only safe passthrough headers
-    let mut extra_headers: Vec<(String, String)> = Vec::new();
-    if let Some(val) = client_headers.get("openai-organization") {
-        if let Ok(v) = val.to_str() {
-            extra_headers.push(("openai-organization".to_string(), v.to_string()));
-        }
-    }
+    // No client headers are forwarded: `openai-organization` would let a
+    // caller choose which organization of the gateway's OpenAI key is billed
+    // (the backend's configured `organization` is applied by the service).
+    let _ = &client_headers;
+    let extra_headers: Vec<(String, String)> = Vec::new();
 
     tracing::debug!(
         request_id = %request_id,
@@ -1605,7 +1611,9 @@ async fn handle_openai_passthrough(
         let status = StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
         return Err(OpenAIApiError {
             status,
-            error: OpenAIErrorResponse::server_error(&error_body),
+            error: OpenAIErrorResponse::server_error(
+                &crate::utils::redact::upstream_error_message(upstream_status, &error_body),
+            ),
         });
     }
 

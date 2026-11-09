@@ -46,6 +46,9 @@ pub struct UpdateInfo {
     pub latest_version: Option<String>,
     pub download_url: Option<String>,
     pub checksum_url: Option<String>,
+    /// Detached Ed25519 signature over the checksum file (`<asset>.sha256.sig`).
+    #[serde(default)]
+    pub signature_url: Option<String>,
     pub release_notes: Option<String>,
     pub published_at: Option<String>,
     pub update_available: bool,
@@ -61,6 +64,7 @@ impl UpdateInfo {
             latest_version: None,
             download_url: None,
             checksum_url: None,
+            signature_url: None,
             release_notes: None,
             published_at: None,
             update_available: false,
@@ -198,11 +202,18 @@ impl UpdateService {
             .iter()
             .find(|a| a.name == checksum_name)
             .map(|a| a.browser_download_url.clone());
+        let signature_name = format!("{checksum_name}.sig");
+        let signature_url = release
+            .assets
+            .iter()
+            .find(|a| a.name == signature_name)
+            .map(|a| a.browser_download_url.clone());
 
         let mut info = self.info.write().await;
         info.latest_version = Some(latest_tag.to_string());
         info.download_url = download_url;
         info.checksum_url = checksum_url;
+        info.signature_url = signature_url;
         info.release_notes = release.body;
         info.published_at = release.published_at;
         info.update_available = update_available;
@@ -221,10 +232,17 @@ impl UpdateService {
     // Download, verify, and apply
     // ========================================================================
 
-    /// Download the latest release, verify checksum, and replace the current binary.
+    /// Download the latest release, verify its signed checksum, and replace the
+    /// current binary. Fails closed: a release without a checksum, without a
+    /// signature, or a build without an embedded release public key is never
+    /// applied.
     pub async fn download_and_apply(&self) -> Result<()> {
+        let public_key = release_public_key().context(
+            "This build has no release signing key embedded (ONE_ROUTER_RELEASE_PUBKEY), \
+             so self-update is disabled; update by deploying a new image or binary",
+        )?;
         // Ensure we have a check result
-        let (download_url, checksum_url) = {
+        let (download_url, checksum_url, signature_url) = {
             let info = self.info.read().await;
             if !info.update_available {
                 bail!("No update available");
@@ -233,8 +251,15 @@ impl UpdateService {
                 .download_url
                 .clone()
                 .context("No download URL for current architecture")?;
-            let cs = info.checksum_url.clone();
-            (dl, cs)
+            let cs = info
+                .checksum_url
+                .clone()
+                .context("Release has no checksum file; refusing to update")?;
+            let sig = info
+                .signature_url
+                .clone()
+                .context("Release has no checksum signature; refusing to update")?;
+            (dl, cs, sig)
         };
 
         // Download binary archive
@@ -256,14 +281,15 @@ impl UpdateService {
             info.status = UpdateStatus::Verifying;
         }
 
-        if let Some(ref cs_url) = checksum_url {
-            let checksum_path = temp_dir.path().join("checksum.sha256");
-            self.download_file(cs_url, &checksum_path).await?;
-            verify_checksum(&archive_path, &checksum_path)?;
-            tracing::info!("SHA256 checksum verified");
-        } else {
-            tracing::warn!("No checksum file available, skipping verification");
-        }
+        let checksum_path = temp_dir.path().join("checksum.sha256");
+        let signature_path = temp_dir.path().join("checksum.sha256.sig");
+        self.download_file(&checksum_url, &checksum_path).await?;
+        self.download_file(&signature_url, &signature_path).await?;
+        // Authenticity first (the checksum file is signed by the release key),
+        // then integrity of the archive against that checksum.
+        verify_signature(&checksum_path, &signature_path, &public_key)?;
+        verify_checksum(&archive_path, &checksum_path)?;
+        tracing::info!("Release signature and SHA256 checksum verified");
 
         // Extract and apply
         {
@@ -351,6 +377,50 @@ fn target_triple() -> String {
 }
 
 /// Verify SHA256 checksum of a file against a checksum file.
+/// Release public key compiled in at build time (`ONE_ROUTER_RELEASE_PUBKEY`:
+/// base64 of the raw 32-byte Ed25519 key or of its SPKI DER, as printed by
+/// `scripts/release-keygen.sh`).
+fn release_public_key() -> Option<Vec<u8>> {
+    parse_public_key(option_env!("ONE_ROUTER_RELEASE_PUBKEY")?)
+}
+
+fn parse_public_key(b64: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .ok()?;
+    match raw.len() {
+        32 => Some(raw),
+        // SPKI DER for Ed25519 is a fixed 12-byte prefix + the 32-byte key.
+        44 if raw.starts_with(&[0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]) => {
+            Some(raw[12..].to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// Verify the detached Ed25519 signature (raw 64 bytes, or base64 of them)
+/// over the checksum file's exact bytes.
+fn verify_signature(
+    checksum_path: &PathBuf,
+    signature_path: &PathBuf,
+    public_key: &[u8],
+) -> Result<()> {
+    use base64::Engine;
+    let message = std::fs::read(checksum_path).context("Failed to read checksum file")?;
+    let sig_raw = std::fs::read(signature_path).context("Failed to read signature file")?;
+    let signature = if sig_raw.len() == 64 {
+        sig_raw
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(String::from_utf8_lossy(&sig_raw).trim())
+            .context("Signature file is neither raw nor base64")?
+    };
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+        .verify(&message, &signature)
+        .map_err(|_| anyhow::anyhow!("Release signature verification FAILED; refusing to update"))
+}
+
 fn verify_checksum(file_path: &PathBuf, checksum_path: &PathBuf) -> Result<()> {
     let checksum_content =
         std::fs::read_to_string(checksum_path).context("Failed to read checksum file")?;
@@ -506,5 +576,70 @@ mod tests {
         std::fs::write(&checksum_path, "0000000000000000  test.bin").unwrap();
 
         assert!(verify_checksum(&file_path, &checksum_path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    #[test]
+    fn signed_checksum_verifies_and_tampering_fails() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cs = dir.path().join("a.sha256");
+        let sig = dir.path().join("a.sha256.sig");
+        std::fs::write(&cs, b"abc123  one-router.tar.gz\n").unwrap();
+        std::fs::write(&sig, kp.sign(b"abc123  one-router.tar.gz\n").as_ref()).unwrap();
+        let pk = kp.public_key().as_ref().to_vec();
+        assert!(verify_signature(&cs, &sig, &pk).is_ok());
+
+        std::fs::write(&cs, b"def456  one-router.tar.gz\n").unwrap();
+        assert!(verify_signature(&cs, &sig, &pk).is_err());
+
+        let other =
+            Ed25519KeyPair::from_pkcs8(Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref())
+                .unwrap();
+        assert!(verify_signature(&cs, &sig, other.public_key().as_ref()).is_err());
+    }
+
+    /// Interop with the CI signer: produced by `openssl pkeyutl -sign -rawin`
+    /// (OpenSSL 3) with a throwaway key; public key as printed by
+    /// `scripts/release-keygen.sh` (SPKI DER, base64).
+    #[test]
+    fn openssl_signature_verifies() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let cs = dir.path().join("x.sha256");
+        let sig = dir.path().join("x.sha256.sig");
+        std::fs::write(&cs, b"abc  x.tar.gz\n").unwrap();
+        std::fs::write(
+            &sig,
+            base64::engine::general_purpose::STANDARD
+                .decode("nGT5DtvCy/amDaKGaNRD2dxKmfddCMlUJaiiuZFfOtbRgBmMwApnr4VdRkvibHkOgdWJeDYP9wAytWinOcFmAQ==")
+                .unwrap(),
+        )
+        .unwrap();
+        let pk = parse_public_key("MCowBQYDK2VwAyEAcHbS7taSZNSjapWRqUQJkKzbzMwVwurSmit4gHYW59c=")
+            .unwrap();
+        assert!(verify_signature(&cs, &sig, &pk).is_ok());
+    }
+
+    #[test]
+    fn public_key_formats() {
+        use base64::Engine;
+        let raw = [7u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD;
+        assert_eq!(parse_public_key(&b64.encode(raw)).unwrap(), raw);
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(&raw);
+        assert_eq!(parse_public_key(&b64.encode(&spki)).unwrap(), raw);
+        assert!(parse_public_key("not base64!").is_none());
+        assert!(parse_public_key(&b64.encode([1u8; 10])).is_none());
     }
 }

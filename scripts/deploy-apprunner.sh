@@ -18,9 +18,11 @@ TAG="latest"
 DOCKERHUB_IMAGE="xtravisions/one-router"
 PTC_PREFIX="docker-hub"      # ECR Pull Through Cache prefix
 
-# Application secrets
-MASTER_API_KEY=""
-ENCRYPTION_KEY=""
+# Application secrets — read from the environment (preferred); the
+# --master-api-key / --encryption-key flags still work but expose the value to
+# `ps` and shell history.
+MASTER_API_KEY="${MASTER_API_KEY:-}"
+ENCRYPTION_KEY="${ENCRYPTION_KEY:-}"
 
 # AWS authentication
 AWS_PROFILE=""
@@ -59,8 +61,13 @@ Service configuration:
                             Examples: dynamodb://us-east-1, postgres://user:pass@host/db
   --tag TAG                 Image tag (default: latest)
   --create                  Create new service (vs update existing)
-  --master-api-key KEY      MASTER_API_KEY for the gateway
-  --encryption-key KEY      ENCRYPTION_KEY for credential encryption
+  --master-api-key KEY      MASTER_API_KEY (deprecated: prefer the MASTER_API_KEY env var)
+  --encryption-key KEY      ENCRYPTION_KEY (deprecated: prefer the ENCRYPTION_KEY env var)
+
+  Secrets are stored as SSM Parameter Store SecureStrings
+  (/<service>/MASTER_API_KEY, /<service>/ENCRYPTION_KEY, and /<service>/DATABASE
+  when it contains credentials) and injected through App Runner
+  RuntimeEnvironmentSecrets — never as plaintext environment variables.
 
 AWS authentication:
   --profile PROFILE         AWS CLI named profile (maps to aws --profile)
@@ -78,6 +85,8 @@ Environment variables (also respected):
   AWS_SECRET_ACCESS_KEY     Equivalent to --secret-access-key
   AWS_SESSION_TOKEN         Equivalent to --session-token
   AWS_REGION                Equivalent to --region
+  MASTER_API_KEY            Gateway master key (preferred over the flag)
+  ENCRYPTION_KEY            Gateway encryption key (preferred over the flag)
 
 Examples:
   # DynamoDB (default) — no --database needed
@@ -114,13 +123,13 @@ while [[ $# -gt 0 ]]; do
         --dockerfile)             DOCKERFILE="$2"; shift 2 ;;
         --platform)               BUILD_PLATFORM="$2"; shift 2 ;;
         --tag)                    TAG="$2"; shift 2 ;;
-        --master-api-key)         MASTER_API_KEY="$2"; shift 2 ;;
-        --encryption-key)         ENCRYPTION_KEY="$2"; shift 2 ;;
+        --master-api-key)         MASTER_API_KEY="$2"; FLAG_SECRETS=true; shift 2 ;;
+        --encryption-key)         ENCRYPTION_KEY="$2"; FLAG_SECRETS=true; shift 2 ;;
         --profile)                AWS_PROFILE="$2"; shift 2 ;;
         --endpoint-url)           AWS_ENDPOINT_URL="$2"; shift 2 ;;
-        --access-key-id)          AWS_ACCESS_KEY_ID_OPT="$2"; shift 2 ;;
-        --secret-access-key)      AWS_SECRET_ACCESS_KEY_OPT="$2"; shift 2 ;;
-        --session-token)          AWS_SESSION_TOKEN_OPT="$2"; shift 2 ;;
+        --access-key-id)          AWS_ACCESS_KEY_ID_OPT="$2"; FLAG_SECRETS=true; shift 2 ;;
+        --secret-access-key)      AWS_SECRET_ACCESS_KEY_OPT="$2"; FLAG_SECRETS=true; shift 2 ;;
+        --session-token)          AWS_SESSION_TOKEN_OPT="$2"; FLAG_SECRETS=true; shift 2 ;;
         -h|--help)                usage ;;
         *) err "Unknown option: $1"; usage ;;
     esac
@@ -149,6 +158,38 @@ fi
 
 # Helper: run aws cli with global args
 awscli() { aws "${AWS_ARGS[@]}" "$@"; }
+
+# ─── Secret-safe temp files ─────────────────────────────────────────────────
+# Payloads containing secrets are passed to the AWS CLI as file:// documents
+# (never as command-line arguments, which `ps` and shell history expose), in
+# private mktemp files removed on exit.
+TMP_FILES=()
+cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}"; return 0; }
+trap cleanup_tmp EXIT
+private_tmp() {
+    local f
+    f=$(umask 077 && mktemp "${TMPDIR:-/tmp}/one-router-deploy.XXXXXX")
+    TMP_FILES+=("$f")
+    echo "$f"
+}
+# Mask the password of a DATABASE URI for display.
+mask_db() { echo "$1" | sed -E 's#(://[^:/@]+:).*@#\1****@#'; }
+
+if [[ "${FLAG_SECRETS:-false}" == "true" ]]; then
+    warn "Secrets passed as command-line flags are visible in 'ps' and shell history;"
+    warn "prefer the MASTER_API_KEY / ENCRYPTION_KEY / AWS_* environment variables."
+fi
+
+# Store a secret as an SSM SecureString (value never on a command line) and
+# print its ARN.
+put_secret() {
+    local name="/${SERVICE_NAME}/$1" value="$2" f
+    f=$(private_tmp)
+    SECRET_VALUE="$value" jq -n --arg n "$name" \
+        '{Name: $n, Value: env.SECRET_VALUE, Type: "SecureString", Overwrite: true}' > "$f"
+    awscli ssm put-parameter --cli-input-json "file://$f" >/dev/null
+    echo "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter${name}"
+}
 
 # ─── Validate ───────────────────────────────────────────────────────────────
 if [[ "$BUILD" == "true" && -n "$IMAGE" ]]; then
@@ -381,9 +422,22 @@ INSTANCE_POLICY=$(cat <<POLICY
         "dynamodb:Query",
         "dynamodb:Scan",
         "dynamodb:CreateTable",
-        "dynamodb:DescribeTable"
+        "dynamodb:DescribeTable",
+        "dynamodb:UpdateTable",
+        "dynamodb:UpdateTimeToLive"
       ],
       "Resource": "arn:aws:dynamodb:*:${ACCOUNT_ID}:table/one_router_*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter/${SERVICE_NAME}/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"kms:ViaService": "ssm.${REGION}.amazonaws.com"}}
     }
   ]
 }
@@ -402,7 +456,12 @@ if ! awscli iam get-role --role-name "${INSTANCE_ROLE_NAME}" >/dev/null 2>&1; th
     warn "Waiting 10s for IAM propagation..."
     sleep 10
 else
-    ok "Instance role exists: ${INSTANCE_ROLE_NAME}"
+    # Keep the inline policy current (adds SSM secret read on upgrade).
+    awscli iam put-role-policy \
+        --role-name "${INSTANCE_ROLE_NAME}" \
+        --policy-name "${SERVICE_NAME}-permissions" \
+        --policy-document "${INSTANCE_POLICY}"
+    ok "Instance role exists: ${INSTANCE_ROLE_NAME} (policy refreshed)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -413,40 +472,33 @@ if [[ -z "$DATABASE" ]]; then
     DATABASE="dynamodb://${REGION}"
 fi
 EFFECTIVE_DB="${DATABASE}"
-info "Database: ${EFFECTIVE_DB}"
+info "Database: $(mask_db "${EFFECTIVE_DB}")"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step 4: Create / Update App Runner Service
 # ═══════════════════════════════════════════════════════════════════════════════
 info "Step 4: Configuring App Runner service..."
 
-SOURCE_CONFIG=$(cat <<JSON
-{
-  "ImageRepository": {
-    "ImageIdentifier": "${DEPLOY_IMAGE}",
-    "ImageConfiguration": {
-      "Port": "8000",
-      "RuntimeEnvironmentVariables": {
-        "DATABASE": "${EFFECTIVE_DB}",
-        "PORT": "8000",
-        "LOG_LEVEL": "info",
-        "AWS_REGION": "${REGION}"$(
-[[ -n "$MASTER_API_KEY" ]] && echo ",
-        \"MASTER_API_KEY\": \"${MASTER_API_KEY}\""
-)$(
-[[ -n "$ENCRYPTION_KEY" ]] && echo ",
-        \"ENCRYPTION_KEY\": \"${ENCRYPTION_KEY}\""
-)
-      }
-    },
-    "ImageRepositoryType": "ECR"
-  },
-  "AuthenticationConfiguration": {
-    "AccessRoleArn": "${ACCESS_ROLE_ARN}"
-  }
+# Secrets → SSM SecureStrings, referenced via RuntimeEnvironmentSecrets.
+# DATABASE is a secret too when it carries credentials (user:pass@).
+build_image_configuration() {
+    local db="$1" secrets='{}' vars
+    vars=$(jq -n --arg region "${REGION}" '{PORT: "8000", LOG_LEVEL: "info", AWS_REGION: $region}')
+    if [[ -n "$db" ]]; then
+        if [[ "$db" == *"@"* ]]; then
+            secrets=$(jq --arg a "$(put_secret DATABASE "$db")" '. + {DATABASE: $a}' <<<"$secrets")
+        else
+            vars=$(jq --arg d "$db" '. + {DATABASE: $d}' <<<"$vars")
+        fi
+    fi
+    [[ -n "$MASTER_API_KEY" ]] && secrets=$(jq --arg a "$(put_secret MASTER_API_KEY "$MASTER_API_KEY")" '. + {MASTER_API_KEY: $a}' <<<"$secrets")
+    [[ -n "$ENCRYPTION_KEY" ]] && secrets=$(jq --arg a "$(put_secret ENCRYPTION_KEY "$ENCRYPTION_KEY")" '. + {ENCRYPTION_KEY: $a}' <<<"$secrets")
+    jq -n --argjson v "$vars" --argjson s "$secrets" \
+        '{Port: "8000", RuntimeEnvironmentVariables: $v, RuntimeEnvironmentSecrets: $s}'
 }
-JSON
-)
+
+SOURCE_CONFIG_FILE=$(private_tmp)
+RESULT_FILE=$(private_tmp)
 
 INSTANCE_CONFIG=$(cat <<JSON
 {
@@ -471,15 +523,19 @@ JSON
 
 if [[ "$CREATE" == "true" ]]; then
     echo "  Creating new service: ${SERVICE_NAME}..."
+    jq -n --argjson ic "$(build_image_configuration "${EFFECTIVE_DB}")" \
+        --arg image "${DEPLOY_IMAGE}" --arg role "${ACCESS_ROLE_ARN}" \
+        '{ImageRepository: {ImageIdentifier: $image, ImageConfiguration: $ic, ImageRepositoryType: "ECR"},
+          AuthenticationConfiguration: {AccessRoleArn: $role}}' > "${SOURCE_CONFIG_FILE}"
     awscli apprunner create-service \
         --service-name "${SERVICE_NAME}" \
-        --source-configuration "${SOURCE_CONFIG}" \
+        --source-configuration "file://${SOURCE_CONFIG_FILE}" \
         --instance-configuration "${INSTANCE_CONFIG}" \
         --health-check-configuration "${HEALTH_CHECK_CONFIG}" \
-        --output json > /tmp/apprunner-result.json
+        --output json > "${RESULT_FILE}"
 
-    SERVICE_ARN=$(jq -r '.Service.ServiceArn' /tmp/apprunner-result.json)
-    SERVICE_URL=$(jq -r '.Service.ServiceUrl' /tmp/apprunner-result.json)
+    SERVICE_ARN=$(jq -r '.Service.ServiceArn' "${RESULT_FILE}")
+    SERVICE_URL=$(jq -r '.Service.ServiceUrl' "${RESULT_FILE}")
 else
     echo "  Updating service image: ${SERVICE_NAME}..."
     SERVICE_ARN=$(awscli apprunner list-services \
@@ -494,49 +550,24 @@ else
     # Update mode: always update image; only include ImageConfiguration if any
     # env var overrides are explicitly provided — otherwise preserve existing values.
     if [[ -n "$DATABASE" || -n "$MASTER_API_KEY" || -n "$ENCRYPTION_KEY" ]]; then
-        # Build env vars object with only the provided keys
-        ENV_VARS='"PORT": "8000", "LOG_LEVEL": "info", "AWS_REGION": "'"${REGION}"'"'
-        [[ -n "$DATABASE"       ]] && ENV_VARS+=', "DATABASE": "'"${DATABASE}"'"'
-        [[ -n "$MASTER_API_KEY" ]] && ENV_VARS+=', "MASTER_API_KEY": "'"${MASTER_API_KEY}"'"'
-        [[ -n "$ENCRYPTION_KEY" ]] && ENV_VARS+=', "ENCRYPTION_KEY": "'"${ENCRYPTION_KEY}"'"'
-
-        UPDATE_SOURCE_CONFIG=$(cat <<JSON
-{
-  "ImageRepository": {
-    "ImageIdentifier": "${DEPLOY_IMAGE}",
-    "ImageConfiguration": {
-      "Port": "8000",
-      "RuntimeEnvironmentVariables": { ${ENV_VARS} }
-    },
-    "ImageRepositoryType": "ECR"
-  },
-  "AuthenticationConfiguration": {
-    "AccessRoleArn": "${ACCESS_ROLE_ARN}"
-  }
-}
-JSON
-)
+        # Replaces RuntimeEnvironmentVariables wholesale — this also removes
+        # plaintext keys left by older versions of this script.
+        jq -n --argjson ic "$(build_image_configuration "${DATABASE}")" \
+            --arg image "${DEPLOY_IMAGE}" --arg role "${ACCESS_ROLE_ARN}" \
+            '{ImageRepository: {ImageIdentifier: $image, ImageConfiguration: $ic, ImageRepositoryType: "ECR"},
+              AuthenticationConfiguration: {AccessRoleArn: $role}}' > "${SOURCE_CONFIG_FILE}"
     else
-        UPDATE_SOURCE_CONFIG=$(cat <<JSON
-{
-  "ImageRepository": {
-    "ImageIdentifier": "${DEPLOY_IMAGE}",
-    "ImageRepositoryType": "ECR"
-  },
-  "AuthenticationConfiguration": {
-    "AccessRoleArn": "${ACCESS_ROLE_ARN}"
-  }
-}
-JSON
-)
+        jq -n --arg image "${DEPLOY_IMAGE}" --arg role "${ACCESS_ROLE_ARN}" \
+            '{ImageRepository: {ImageIdentifier: $image, ImageRepositoryType: "ECR"},
+              AuthenticationConfiguration: {AccessRoleArn: $role}}' > "${SOURCE_CONFIG_FILE}"
     fi
 
     awscli apprunner update-service \
         --service-arn "${SERVICE_ARN}" \
-        --source-configuration "${UPDATE_SOURCE_CONFIG}" \
-        --output json > /tmp/apprunner-result.json
+        --source-configuration "file://${SOURCE_CONFIG_FILE}" \
+        --output json > "${RESULT_FILE}"
 
-    SERVICE_URL=$(jq -r '.Service.ServiceUrl' /tmp/apprunner-result.json)
+    SERVICE_URL=$(jq -r '.Service.ServiceUrl' "${RESULT_FILE}")
 
     # update-service does not re-deploy when the image URI is unchanged (e.g. `latest` tag).
     # start-deployment forces App Runner to pull the current image from ECR regardless.
@@ -562,9 +593,9 @@ if [[ "$CREATE" == "true" ]]; then
 
     if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
         echo -e "${YELLOW}=== ACTION REQUIRED ===${NC}"
-        echo "Set these sensitive env vars in the AWS Console (or re-run with flags):"
+        echo "Re-run with these set as environment variables (stored as SSM SecureStrings):"
         for s in "${MISSING_SECRETS[@]}"; do
-            echo "  - ${s}  (--$(echo "${s}" | tr '[:upper:]_' '[:lower:]-'))"
+            echo "  - ${s}"
         done
         echo ""
         echo "Console: https://${REGION}.console.aws.amazon.com/apprunner/home?region=${REGION}"

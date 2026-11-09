@@ -44,7 +44,7 @@ One Router is a high-performance API gateway written in Rust that lets you use *
 - **Admin Web UI** — built-in browser UI at `/admin` for managing API keys, backends, model mappings, settings, and usage stats — no external tools needed
 - **AES-256-GCM Encryption** — encrypt backend credentials at rest; the Admin UI handles plaintext input and encrypts automatically on save
 - **API Key Hashing** — API keys are HMAC-SHA256 hashed before storage; plaintext shown once at creation, middle-masked in admin UI (sk-abcd....5678)
-- **Self-Update** — check and apply updates from GitHub Releases via CLI (`one-router update`) or Admin API
+- **Self-Update** — check and apply updates from GitHub Releases via CLI (`one-router update`) or Admin API; only Ed25519-signed releases are installed (fail closed — see `scripts/release-keygen.sh`)
 - **Hot-Reload** — backend and settings changes via Admin UI take effect immediately without restart
 - **CLI Configuration** — override any setting via command-line flags (`--port`, `--database`, `--log-level`)
 - **Health Endpoints** — built-in `/health`, `/ready`, `/liveness` endpoints
@@ -354,6 +354,9 @@ One Router uses environment variables for infrastructure config. All runtime set
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC — auto-generated on first run |
 | `SEED_DEFAULTS` | `empty` | When to seed default model mappings on startup: `off` (never), `empty` (only when the mappings table is empty — deletions stick), or `missing` (re-insert any missing default on every startup) |
 | `MAX_BODY_SIZE_MB` | `64` | Maximum HTTP request body size in MB (long Codex / Claude Code sessions send the whole conversation per request). Align any reverse proxy's limit (e.g. nginx `client_max_body_size`) with this value |
+| `BEDROCK_ALLOWED_PROFILES` | _(unset = any)_ | Comma-separated AWS profile names Bedrock backends may reference. A backend naming another profile is rejected on write and skipped on load |
+| `BEDROCK_ALLOW_DEFAULT_CREDENTIALS` | `true` | Allow Bedrock backends without explicit keys/profile to use the host's default AWS credential chain (env / instance role / SSO cache). Set `false` so the gateway's own identity can never be borrowed through the admin API |
+| `ADMIN_COOKIE_INSECURE` | _(unset)_ | Drop the `Secure` flag from the `admin_session` cookie (plain-HTTP admin access on a non-localhost host). Leave unset behind TLS |
 
 **First-run behavior:**
 - **Bare metal:** Missing `MASTER_API_KEY` or `ENCRYPTION_KEY` are auto-generated and saved to `.env`.

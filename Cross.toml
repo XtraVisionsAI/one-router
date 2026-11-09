@@ -5,6 +5,7 @@ passthrough = [
     "AWS_LC_SYS_CMAKE_BUILDER",
     "CC",
     "CXX",
+    "ONE_ROUTER_RELEASE_PUBKEY",
 ]
 
 [target.x86_64-unknown-linux-gnu]
@@ -15,7 +16,7 @@ pre-build = [
 ]
 
 [target.x86_64-unknown-linux-gnu.env]
-passthrough = ["AWS_LC_SYS_CMAKE_BUILDER", "CC", "CXX"]
+passthrough = ["AWS_LC_SYS_CMAKE_BUILDER", "CC", "CXX", "ONE_ROUTER_RELEASE_PUBKEY"]
 
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
@@ -25,4 +26,4 @@ pre-build = [
 ]
 
 [target.aarch64-unknown-linux-gnu.env]
-passthrough = ["AWS_LC_SYS_CMAKE_BUILDER", "CC", "CXX"]
+passthrough = ["AWS_LC_SYS_CMAKE_BUILDER", "CC", "CXX", "ONE_ROUTER_RELEASE_PUBKEY"]

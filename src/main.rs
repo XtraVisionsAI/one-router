@@ -82,12 +82,15 @@ async fn run_server(cli: Cli) -> Result<()> {
         cli.encryption_key,
         cli.seed_defaults,
     );
+    // After CLI overrides, so flag-provided keys are never auto-generated.
+    settings.ensure_required_keys()?;
     init_tracing(&settings.log_level);
+    let database_display = one_router::config::settings::redact_database_uri(&settings.database);
 
     println!("\n{}", "=".repeat(60));
     println!("  One Router v{}", settings.app_version);
     println!("{}", "=".repeat(60));
-    println!("  Database:  {}", settings.database);
+    println!("  Database:  {database_display}");
     println!("  Listen:    {}:{}", settings.host, settings.port);
     println!("  Max body:  {} MB", settings.max_body_size_mb);
 
@@ -111,7 +114,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         version = %settings.app_version,
         host = %settings.host,
         port = %settings.port,
-        database = %settings.database,
+        database = %database_display,
         "Starting One Router"
     );
 
@@ -172,8 +175,15 @@ async fn run_update(check_only: bool) -> Result<()> {
 
 /// Initialize tracing subscriber
 fn init_tracing(log_level: &str) {
+    // The level applies to this crate and generic deps, but the AWS signing /
+    // SDK internals are capped: at trace, aws-sigv4 logs the canonical request,
+    // which includes the x-amz-security-token value.
+    let directives = format!(
+        "{log_level},aws_sigv4=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn,\
+         aws_config=warn,aws_credential_types=warn,hyper=info,reqwest=info,h2=info"
+    );
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(directives));
 
     tracing_subscriber::registry()
         .with(fmt::layer().json().with_filter(filter))

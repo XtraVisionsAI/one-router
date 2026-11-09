@@ -92,7 +92,13 @@ impl ApiError {
             BedrockError::ModelNotFound(msg) => {
                 Self::bad_request(format!("Model not found: {msg}"))
             }
-            BedrockError::AccessDenied(msg) => Self::unauthorized(msg),
+            BedrockError::AccessDenied(msg) => {
+                // AWS's text names the host IAM role and account — log only.
+                tracing::warn!(error = %msg, "Bedrock access denied");
+                Self::unauthorized(
+                    "Access denied by the upstream provider. Details are in the gateway logs.",
+                )
+            }
             BedrockError::ServiceUnavailable(msg) => Self::service_unavailable(msg),
             BedrockError::InternalError(msg) => Self::internal_error(msg),
             BedrockError::Serialization(msg) => {
@@ -1072,7 +1078,7 @@ async fn handle_anthropic_passthrough(
         return Err(ApiError {
             status,
             error_type: "api_error".to_string(),
-            message: error_body,
+            message: crate::utils::redact::upstream_error_message(upstream_status, &error_body),
         });
     }
 
@@ -1301,7 +1307,7 @@ async fn handle_openai_backend(
         return Err(ApiError {
             status,
             error_type: "api_error".to_string(),
-            message: error_body,
+            message: crate::utils::redact::upstream_error_message(upstream_status, &error_body),
         });
     }
 

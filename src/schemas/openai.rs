@@ -608,7 +608,7 @@ impl OpenAIErrorResponse {
     pub fn new(error_type: &str, message: &str) -> Self {
         Self {
             error: OpenAIError {
-                message: message.to_string(),
+                message: crate::utils::redact::redact_secrets(message),
                 error_type: error_type.to_string(),
                 param: None,
                 code: None,
@@ -619,7 +619,7 @@ impl OpenAIErrorResponse {
     pub fn with_code(error_type: &str, message: &str, code: &str) -> Self {
         Self {
             error: OpenAIError {
-                message: message.to_string(),
+                message: crate::utils::redact::redact_secrets(message),
                 error_type: error_type.to_string(),
                 param: None,
                 code: Some(code.to_string()),

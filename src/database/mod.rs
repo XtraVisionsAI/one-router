@@ -36,6 +36,9 @@ pub async fn create_database(database: &str) -> Result<Arc<dyn DatabaseService>>
         let region = database.strip_prefix("dynamodb://").unwrap();
         Ok(Arc::new(dynamodb::DynamoDbBackend::new(region).await?))
     } else {
-        anyhow::bail!("Unsupported DATABASE scheme: {database}. Expected sqlite://, postgres://, or dynamodb://")
+        anyhow::bail!(
+            "Unsupported DATABASE scheme: {}. Expected sqlite://, postgres://, or dynamodb://",
+            crate::config::settings::redact_database_uri(database)
+        )
     }
 }

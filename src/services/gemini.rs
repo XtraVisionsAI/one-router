@@ -47,7 +47,7 @@ pub enum GeminiServiceError {
 // ============================================================================
 
 /// Configuration for Gemini service
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeminiConfig {
     /// API keys for authentication (supports multiple keys for load balancing)
     pub api_keys: Vec<String>,
@@ -57,6 +57,20 @@ pub struct GeminiConfig {
 
     /// Request timeout in seconds
     pub timeout_seconds: u64,
+}
+
+/// Hand-written: secret fields are redacted so a `{:?}` log line cannot leak them.
+impl std::fmt::Debug for GeminiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeminiConfig")
+            .field(
+                "api_keys",
+                &format_args!("[{} redacted]", self.api_keys.len()),
+            )
+            .field("base_url", &self.base_url)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
 }
 
 impl GeminiConfig {
@@ -129,6 +143,9 @@ impl GeminiService {
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_seconds))
+            // Never follow redirects: a 3xx to another host would carry the
+            // provider key (reqwest strips only Authorization/Cookie).
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         // Create credentials from API keys

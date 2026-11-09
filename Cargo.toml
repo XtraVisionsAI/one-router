@@ -24,6 +24,9 @@ async-trait = "0.1"
 
 # HTTP client (using rustls for cross-compilation compatibility)
 reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# hyper 0.14 (already pulled in by reqwest 0.11): only for the `Name` type of
+# reqwest's DNS `Resolve` trait (SSRF-guarded resolver).
+hyper014 = { package = "hyper", version = "0.14", default-features = false, features = ["client", "tcp"] }
 bytes = "1"
 
 # Serialization & validation
@@ -83,6 +86,8 @@ rand = "0.8"
 
 # Base64 encoding/decoding
 base64 = "0.22"
+# Ed25519 verification of release signatures (self-update); already in the tree via rustls.
+ring = "0.17"
 
 # Rate limiting
 governor = "0.6"
