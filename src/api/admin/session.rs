@@ -72,7 +72,7 @@ pub async fn login(
         .settings
         .master_api_key
         .as_deref()
-        .map(|mk| crate::utils::api_key::secret_eq(key, mk))
+        .map(|mk| crate::config::master_key::matches(key, mk))
         .unwrap_or(false);
 
     // Verify against ephemeral key

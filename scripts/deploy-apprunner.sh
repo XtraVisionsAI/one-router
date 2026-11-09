@@ -180,6 +180,20 @@ if [[ "${FLAG_SECRETS:-false}" == "true" ]]; then
     warn "prefer the MASTER_API_KEY / ENCRYPTION_KEY / AWS_* environment variables."
 fi
 
+# The gateway only compares the master key, so deploy just its SHA-256
+# (`sha256:<hex>`): the platform then never holds a usable admin credential.
+# Log in with the original key.
+if [[ -n "$MASTER_API_KEY" && "$MASTER_API_KEY" != sha256:* ]]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+        _mk_hex=$(printf '%s' "$MASTER_API_KEY" | sha256sum | cut -d' ' -f1)
+    else
+        _mk_hex=$(printf '%s' "$MASTER_API_KEY" | shasum -a 256 | cut -d' ' -f1)
+    fi
+    MASTER_API_KEY="sha256:${_mk_hex}"
+    unset _mk_hex
+    info "MASTER_API_KEY will be deployed as its SHA-256 (log in with the original key)"
+fi
+
 # Store a secret as an SSM SecureString (value never on a command line) and
 # print its ARN.
 put_secret() {

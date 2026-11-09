@@ -88,7 +88,7 @@ pub async fn require_admin_key(
 
     // Check master key
     if let Some(ref master_key) = state.settings.master_api_key {
-        if crate::utils::api_key::secret_eq(&raw_key, master_key) {
+        if crate::config::master_key::matches(&raw_key, master_key) {
             request.extensions_mut().insert(AdminActor("master".into()));
             return Ok(next.run(request).await);
         }

@@ -354,8 +354,8 @@ One Router 使用环境变量配置基础设施。所有运行时设置存储在
 | `METRICS_PUBLIC` | `false` | `/metrics` 免鉴权。默认需要 master key(`authorization: Bearer <MASTER_API_KEY>`)或管理会话 |
 | `TRUSTED_PROXY_CIDRS` | _(空)_ | 受信反向代理的 CIDR(逗号分隔),仅来自这些地址的 `X-Forwarded-For` 用于确定客户端 IP(IP 白名单、审计日志) |
 | `LOG_LEVEL` | `info` | 日志级别：`trace`、`debug`、`info`、`warn`、`error` |
-| `MASTER_API_KEY` | _(自动生成)_ | 管理专用 API Key — 用于 `/admin` 界面登录和管理 API，不能调用 `/v1/*` 业务端点。裸机首次运行时自动生成并保存到 `.env` |
-| `ENCRYPTION_KEY` | _(自动生成)_ | AES-256 密钥，用于凭证加密和 API Key HMAC — 首次运行时自动生成 |
+| `MASTER_API_KEY` | _(自动生成)_ | 管理专用 API Key — 用于 `/admin` 界面登录和管理 API，不能调用 `/v1/*` 业务端点。可填明文**或 `sha256:<hex>`**（只做比对，网关无需明文）。来自 `.env` 的强明文密钥在启动时被替换为哈希；首次生成只保存哈希并在终端显示一次。`one-router reset-master-key` / `one-router hash-key`。部署脚本只部署哈希 |
+| `ENCRYPTION_KEY` | _(自动生成)_ | AES-256 密钥，用于凭证加密和 API Key HMAC。明文（启动时告警）或在启动时解析的 provider 引用（失败即退出）：`aws-kms:<region>:<base64>`（通过实例/任务/Pod 角色调用 KMS Decrypt，加密上下文 `app=one-router,purpose=ENCRYPTION_KEY`）、`vault-transit:<key>:<vault:v1:…>`（`VAULT_ADDR` + `VAULT_TOKEN` 或 `VAULT_K8S_ROLE`）、`systemd-creds:<name>`（TPM 绑定）、`raw:<key>`。未知的 `scheme:` 前缀直接退出。用 `one-router wrap-key --provider aws-kms\|vault-transit\|systemd-creds --key …` 生成（包装的是同一个密钥，已有数据不受影响） |
 | `SEED_DEFAULTS` | `empty` | 启动时何时植入默认模型映射：`off`（从不）、`empty`（仅当映射表为空 — 用户删除不会被复活）或 `missing`（每次启动补齐缺失的默认项） |
 | `MAX_BODY_SIZE_MB` | `64` | HTTP 请求体大小上限（MB）。长会话的 Codex / Claude Code 会把完整对话放在单个请求里。前置反向代理的限制（如 nginx `client_max_body_size`）需与此值对齐 |
 | `BEDROCK_ALLOWED_PROFILES` | _(未设置=不限)_ | Bedrock 后端允许引用的 AWS profile（逗号分隔）。引用其它 profile 的后端写入时被拒绝、加载时被跳过 |

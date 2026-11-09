@@ -177,6 +177,9 @@ impl Settings {
         }
 
         let master_api_key = env::var("MASTER_API_KEY").ok().filter(|k| !k.is_empty());
+        if let Some(k) = &master_api_key {
+            super::master_key::validate(k).map_err(|e| anyhow::anyhow!(e))?;
+        }
 
         let encryption_key = env::var("ENCRYPTION_KEY").ok().filter(|k| !k.is_empty());
 
@@ -257,13 +260,28 @@ impl Settings {
         let mut lines = Vec::new();
 
         if need_master {
-            let key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-            eprintln!(
-                "  [auto-generated] MASTER_API_KEY={} (full value in .env)",
-                crate::utils::api_key::mask_key(&key)
+            // Only the hash is persisted; the plaintext is shown once, and only
+            // on an interactive terminal (never into a captured log stream).
+            let key = super::master_key::generate();
+            let hashed = super::master_key::hash(&key);
+            use std::io::IsTerminal;
+            if std::io::stderr().is_terminal() {
+                eprintln!("  [auto-generated] MASTER_API_KEY={key}");
+                eprintln!(
+                    "  Store it now — only its SHA-256 is saved to .env and it will not be shown again."
+                );
+            } else {
+                eprintln!(
+                    "  [auto-generated] MASTER_API_KEY (not displayed: no terminal). \
+                     Run `one-router reset-master-key` interactively to obtain a usable key."
+                );
+            }
+            lines.push(
+                "# Master key stored as its SHA-256; log in with the plaintext shown at generation."
+                    .to_string(),
             );
-            lines.push(format!("MASTER_API_KEY={key}"));
-            self.master_api_key = Some(key);
+            lines.push(format!("MASTER_API_KEY={hashed}"));
+            self.master_api_key = Some(hashed);
         }
 
         if need_encryption {
@@ -286,6 +304,68 @@ impl Settings {
             }
         }
 
+        Ok(())
+    }
+
+    /// Replace a plaintext `MASTER_API_KEY` in `./.env` by its SHA-256 (see
+    /// [`super::master_key::migrate_dotenv`]). Logs the outcome; never fails.
+    pub fn migrate_master_key(&mut self) {
+        use super::master_key::{migrate_dotenv, Migration};
+        let Some(current) = self.master_api_key.clone() else {
+            return;
+        };
+        let path = std::path::Path::new(super::dotenv_file::DOTENV_PATH);
+        match migrate_dotenv(path, &current) {
+            (Migration::Migrated, Some(hashed)) => {
+                tracing::warn!(
+                    "MASTER_API_KEY in .env was replaced by its SHA-256; the plaintext is no longer \
+                     stored. Log in with the original key (lost it? `one-router reset-master-key`)."
+                );
+                self.master_api_key = Some(hashed);
+            }
+            (Migration::AlreadyHashed, _) => {}
+            (Migration::NotFromDotenv, _) => tracing::warn!(
+                "MASTER_API_KEY is plaintext from the environment / CLI. Store \
+                 `sha256:<hex>` instead (`one-router hash-key`)."
+            ),
+            (Migration::Weak, _) => tracing::warn!(
+                min_len = super::master_key::MIN_STRONG_LEN,
+                "MASTER_API_KEY in .env is weak, so it was not migrated to a hash. Replace it with \
+                 `one-router reset-master-key`."
+            ),
+            (Migration::WriteFailed(e), _) => {
+                tracing::warn!(error = %e, "Could not rewrite .env to hash MASTER_API_KEY")
+            }
+            (Migration::Migrated, None) => {}
+        }
+    }
+
+    /// Resolve an `ENCRYPTION_KEY` provider reference (`aws-kms:` /
+    /// `vault-transit:` / `systemd-creds:` / `raw:`) to the key itself.
+    /// Fails closed; logs a warning for a plaintext key.
+    pub async fn resolve_encryption_key(&mut self) -> Result<()> {
+        let Some(value) = self.encryption_key.clone() else {
+            return Ok(());
+        };
+        let (key, source) = super::key_provider::resolve(&value)
+            .await
+            .map_err(|e| anyhow::anyhow!("ENCRYPTION_KEY: {e}"))?;
+        if source.is_plaintext() {
+            if is_container_env() {
+                tracing::info!(
+                    "ENCRYPTION_KEY is plaintext. Fine when injected from a secret store \
+                     (Secrets Manager / SSM / K8s Secret); otherwise wrap it with `one-router wrap-key`."
+                );
+            } else {
+                tracing::warn!(
+                    "ENCRYPTION_KEY is stored in plaintext. Wrap it with `one-router wrap-key` \
+                     (aws-kms / vault-transit) or use systemd-creds."
+                );
+            }
+        } else {
+            tracing::info!(provider = source.label(), "ENCRYPTION_KEY resolved");
+        }
+        self.encryption_key = Some(key);
         Ok(())
     }
 
@@ -351,28 +431,17 @@ impl Settings {
     /// warnings for risky configuration; never blocks startup. Callers should
     /// log each returned string at `warn` level.
     pub fn security_warnings(&self) -> Vec<String> {
-        const WEAK_KEYS: &[&str] = &[
-            "changeme",
-            "password",
-            "secret",
-            "test",
-            "admin",
-            "master",
-            "sk-master",
-            "1234",
-            "12345678",
-            "your-master-key",
-            "sk-your-master-key",
-        ];
-
         let mut warnings = Vec::new();
         let is_container = env::var("CONTAINER")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
-        if let Some(key) = &self.master_api_key {
-            let lower = key.to_ascii_lowercase();
-            if WEAK_KEYS.iter().any(|w| lower == *w || lower.contains(w)) {
+        if let Some(key) = self
+            .master_api_key
+            .as_ref()
+            .filter(|k| !super::master_key::is_hashed(k))
+        {
+            if super::master_key::is_weak(key) {
                 warnings.push(
                     "MASTER_API_KEY matches a well-known weak value; set a strong, random key."
                         .to_string(),
