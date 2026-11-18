@@ -1,3 +1,19 @@
+## v0.35.0 (2026-11-18)
+
+### Feat
+
+- **security**: hashed master key and provider-wrapped encryption key
+- **teams**: teams, concurrency caps, shared rate-limit store, budget precharge (P3)
+- **keys**: audit log, budget periods & alerts, key rotation, auth cache, IP allowlists, usage tags (P2)
+- **users**: users own API keys; user-level billing, limits, expiry, model allowlists (P1)
+- **keys**: stable key_id, hard delete, TPM enforcement, hot-reloaded rate limits (P0)
+
+### Fix
+
+- **security**: full-audit remediation (2026-11)
+- **security**: harden credential handling across SSRF, configs, errors, admin auth and releases
+- **security**: loopback default bind, authenticated /metrics, constant-time admin key checks
+
 ## v0.34.1 (2026-10-25)
 
 ### Fix
