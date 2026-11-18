@@ -8,7 +8,7 @@ use futures::stream::Stream;
 
 use crate::schemas::anthropic::{
     ContentBlock, ErrorResponse, Message, MessageContent, MessageRequest, MessageResponse,
-    ToolResultValue,
+    ToolResultValue, Usage,
 };
 use crate::services::bedrock::BedrockService;
 use crate::services::gemini::GeminiService;
@@ -21,6 +21,40 @@ use super::{
     fetch::{FetchProvider, ReqwestFetchProvider},
     search::SearchProvider,
 };
+
+/// A failed web-tool loop together with the usage of every backend call it
+/// already made (those calls were billed upstream, so they must be billed here).
+#[derive(Debug)]
+pub struct WebToolRunError {
+    pub error: WebToolError,
+    pub usage: Usage,
+}
+
+impl std::fmt::Display for WebToolRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// Running usage total of a streamed web-tool loop, updated after every
+/// backend call so the stream biller sees all iterations even when the loop
+/// errors or the client disconnects mid-loop.
+pub type UsageAccumulator = Arc<std::sync::Mutex<Usage>>;
+
+/// `total += u` (input / output / cache tokens).
+pub fn add_usage(total: &mut Usage, u: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(u.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(u.output_tokens);
+    let sum = |a: Option<i32>, b: Option<i32>| match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    };
+    total.cache_creation_input_tokens = sum(
+        total.cache_creation_input_tokens,
+        u.cache_creation_input_tokens,
+    );
+    total.cache_read_input_tokens = sum(total.cache_read_input_tokens, u.cache_read_input_tokens);
+}
 
 /// Trait abstracting the LLM backend call for the web tool agentic loop.
 /// This allows the executor to work with any backend (Bedrock, Gemini, etc.)
@@ -46,9 +80,14 @@ impl WebToolBackend for BedrockService {
     }
 }
 
-/// Client-safe text for a Bedrock failure inside the web-tool loop. AWS's
-/// AccessDenied text names the host IAM role and account: log it, return the
-/// same generic message as the main Bedrock path (`ApiError::from_bedrock_error`).
+/// Client-safe text for a Bedrock failure inside the web-tool loop.
+///
+/// Throttling / validation / model-not-found messages describe the request
+/// and are shown as on the main Bedrock path (`ApiError::from_bedrock_error`).
+/// AccessDenied names the host IAM role and account; everything else
+/// (service, internal, (de)serialization, unmodeled SDK errors) may carry
+/// endpoint, credential-provider or response details — both are logged in
+/// full under an `error_ref` and replaced by an opaque message.
 fn bedrock_backend_error(e: crate::services::bedrock::BedrockError) -> WebToolError {
     use crate::services::bedrock::BedrockError;
     match e {
@@ -59,7 +98,20 @@ fn bedrock_backend_error(e: crate::services::bedrock::BedrockError) -> WebToolEr
                     .to_string(),
             )
         }
-        other => WebToolError::BackendError(other.to_string()),
+        BedrockError::Throttled(msg) => WebToolError::BackendError(format!("Throttled: {msg}")),
+        BedrockError::ValidationError(msg) => {
+            WebToolError::BackendError(format!("Validation error: {msg}"))
+        }
+        BedrockError::ModelNotFound(msg) => {
+            WebToolError::BackendError(format!("Model not found: {msg}"))
+        }
+        other => {
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            tracing::error!(error_ref = %id, error = %other, "Bedrock request failed (web tools)");
+            WebToolError::BackendError(format!(
+                "Upstream Bedrock request failed (error ref {id}; details in gateway logs)"
+            ))
+        }
     }
 }
 
@@ -131,6 +183,7 @@ impl WebToolBackend for GeminiWebToolBackend {
     }
 }
 
+#[derive(Clone)]
 pub struct WebToolExecutor {
     pub search: Option<Arc<dyn SearchProvider>>,
     pub fetch: Arc<dyn FetchProvider>,
@@ -180,6 +233,19 @@ impl WebToolExecutor {
         self
     }
 
+    /// Per-request copy with the code executor replaced (`None` = no
+    /// Dynamic Filtering code execution: plain web-tool results). Used to
+    /// apply the model's `ptc` capability and PTC slot accounting
+    /// (`ptc::gated::for_request`).
+    pub fn with_request_code_executor(
+        self: &Arc<Self>,
+        code_executor: Option<Arc<dyn CodeExecutor>>,
+    ) -> Arc<Self> {
+        let mut e = (**self).clone();
+        e.code_executor = code_executor;
+        Arc::new(e)
+    }
+
     pub fn has_server_tools(request: &MessageRequest) -> bool {
         request
             .tools
@@ -193,6 +259,43 @@ impl WebToolExecutor {
         request: &MessageRequest,
         backend: &dyn WebToolBackend,
         target_model: &str,
+    ) -> Result<MessageResponse, WebToolError> {
+        self.run_billed(request, backend, target_model)
+            .await
+            .map_err(|e| e.error)
+    }
+
+    /// [`Self::run`] with billing: the returned response's `usage` is the sum
+    /// over all loop iterations, and an error carries the usage of the backend
+    /// calls made before it failed.
+    pub async fn run_billed(
+        &self,
+        request: &MessageRequest,
+        backend: &dyn WebToolBackend,
+        target_model: &str,
+    ) -> Result<MessageResponse, WebToolRunError> {
+        let mut total = Usage::new(0, 0);
+        match self
+            .run_inner(request, backend, target_model, &mut total)
+            .await
+        {
+            Ok(mut response) => {
+                response.usage = total;
+                Ok(response)
+            }
+            Err(error) => Err(WebToolRunError {
+                error,
+                usage: total,
+            }),
+        }
+    }
+
+    async fn run_inner(
+        &self,
+        request: &MessageRequest,
+        backend: &dyn WebToolBackend,
+        target_model: &str,
+        total: &mut Usage,
     ) -> Result<MessageResponse, WebToolError> {
         let tools = request.tools.as_deref().unwrap_or(&[]);
 
@@ -275,6 +378,7 @@ impl WebToolExecutor {
             }
 
             let response = backend.invoke(&modified, target_model).await?;
+            add_usage(total, &response.usage);
 
             let server_calls = extract_server_calls(&response.content, &server_names);
 
@@ -414,6 +518,19 @@ impl WebToolExecutor {
         backend: Arc<dyn WebToolBackend>,
         target_model: String,
     ) -> Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> {
+        self.run_stream_metered(request, backend, target_model, None)
+    }
+
+    /// [`Self::run_stream`] that keeps `usage` updated with the running total
+    /// of every backend call, so a loop that errors or is abandoned mid-way is
+    /// still billed for all completed iterations.
+    pub fn run_stream_metered(
+        self: Arc<Self>,
+        request: MessageRequest,
+        backend: Arc<dyn WebToolBackend>,
+        target_model: String,
+        usage: Option<UsageAccumulator>,
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> {
         Box::pin(async_stream::stream! {
             let tools = request.tools.as_deref().unwrap_or(&[]);
 
@@ -504,6 +621,11 @@ impl WebToolExecutor {
 
                 total_input_tokens += response.usage.input_tokens;
                 total_output_tokens += response.usage.output_tokens;
+                if let Some(acc) = &usage {
+                    if let Ok(mut t) = acc.lock() {
+                        add_usage(&mut t, &response.usage);
+                    }
+                }
 
                 let server_calls = extract_server_calls(&response.content, &server_names);
 
@@ -1192,5 +1314,102 @@ mod tests {
         let s = e.to_string();
         assert!(!s.contains("123456789012") && !s.contains("Secret"), "{s}");
         assert!(s.contains("Access denied by the upstream provider"), "{s}");
+    }
+
+    /// Always calls `web_search` — the loop never finishes.
+    struct LoopingBackend;
+
+    #[async_trait::async_trait]
+    impl WebToolBackend for LoopingBackend {
+        async fn invoke(
+            &self,
+            _request: &MessageRequest,
+            _model: &str,
+        ) -> Result<MessageResponse, WebToolError> {
+            let content = vec![ContentBlock::ToolUse {
+                id: "toolu_x".into(),
+                name: "web_search".into(),
+                input: serde_json::json!({"query": "q"}),
+                caller: None,
+            }];
+            let mut usage = Usage::new(100, 10);
+            usage.cache_read_input_tokens = Some(5);
+            Ok(MessageResponse::new("msg", "m", content, usage))
+        }
+    }
+
+    fn search_exec(max_iterations: u32) -> WebToolExecutor {
+        WebToolExecutor::with_fetch(
+            Some(Arc::new(RecordingSearch::default())),
+            Arc::new(RecordingFetch::default()),
+            64,
+            max_iterations,
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_loop_carries_usage_of_all_iterations() {
+        let exec = search_exec(3);
+        let req =
+            request_with(serde_json::json!({"type": "web_search_20250305", "name": "web_search"}));
+        let err = exec
+            .run_billed(&req, &LoopingBackend, "m")
+            .await
+            .unwrap_err();
+        assert!(matches!(err.error, WebToolError::MaxIterationsExceeded(3)));
+        assert_eq!(err.usage.input_tokens, 300);
+        assert_eq!(err.usage.output_tokens, 30);
+        assert_eq!(err.usage.cache_read_input_tokens, Some(15));
+    }
+
+    #[tokio::test]
+    async fn successful_loop_sums_usage_over_iterations() {
+        let exec = search_exec(4);
+        let req =
+            request_with(serde_json::json!({"type": "web_search_20250305", "name": "web_search"}));
+        let backend = ScriptedBackend {
+            tool: "web_search",
+            input: serde_json::json!({"query": "q"}),
+            calls: Mutex::new(Vec::new()),
+        };
+        let resp = exec.run_billed(&req, &backend, "m").await.unwrap();
+        // Two backend calls at (1, 1) each.
+        assert_eq!((resp.usage.input_tokens, resp.usage.output_tokens), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn stream_accumulator_sees_iterations_before_error() {
+        use futures::StreamExt;
+        let exec = Arc::new(search_exec(2));
+        let req =
+            request_with(serde_json::json!({"type": "web_search_20250305", "name": "web_search"}));
+        let acc: UsageAccumulator = Arc::new(std::sync::Mutex::new(Usage::new(0, 0)));
+        let _: Vec<_> = exec
+            .run_stream_metered(req, Arc::new(LoopingBackend), "m".into(), Some(acc.clone()))
+            .collect()
+            .await;
+        let u = acc.lock().unwrap().clone();
+        assert_eq!((u.input_tokens, u.output_tokens), (200, 20));
+        assert_eq!(u.cache_read_input_tokens, Some(10));
+    }
+
+    #[test]
+    fn other_bedrock_errors_are_opaque_with_error_ref() {
+        use crate::services::bedrock::BedrockError;
+        for e in [
+            BedrockError::InternalError("dispatch failure: profile 'prod-admin' via sso".into()),
+            BedrockError::Unknown("https://bedrock-runtime.us-east-1.amazonaws.com x".into()),
+            BedrockError::Deserialization("raw body {..}".into()),
+            BedrockError::ServiceUnavailable("endpoint 10.0.0.7".into()),
+        ] {
+            let s = bedrock_backend_error(e).to_string();
+            assert!(s.contains("error ref "), "{s}");
+            for leak in ["prod-admin", "amazonaws", "raw body", "10.0.0.7"] {
+                assert!(!s.contains(leak), "{s}");
+            }
+        }
+        let s = bedrock_backend_error(BedrockError::ValidationError("max_tokens too big".into()))
+            .to_string();
+        assert!(s.contains("max_tokens too big"), "{s}");
     }
 }

@@ -19,11 +19,7 @@
     "vue-router": "^5.0.4"
   },
   "pnpm": {
-    "onlyBuiltDependencies": [
-      "@swc/core",
-      "esbuild",
-      "unrs-resolver"
-    ]
+    "onlyBuiltDependencies": ["@swc/core", "esbuild", "unrs-resolver"]
   },
   "devDependencies": {
     "@iconify-json/carbon": "^1.2.0",

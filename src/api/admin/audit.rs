@@ -47,24 +47,50 @@ fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
-/// Validate a time bound: RFC 3339 (`2026-11-01T00:00:00Z`) or a plain date
-/// (`2026-11-01`). Storage compares these lexicographically against stored
-/// RFC 3339 timestamps and derives month partitions from them, so anything
-/// else is rejected with 400 rather than producing garbage (or a panic).
-fn time_bound(field: &str, v: Option<String>) -> Result<Option<String>, HandlerError> {
+/// Which side of the range a bound is (decides how a plain date expands).
+#[derive(Clone, Copy)]
+enum Bound {
+    /// `start` (inclusive): a date means the start of that UTC day.
+    Start,
+    /// `end` (inclusive): a date means the whole UTC day.
+    End,
+    /// `before` (exclusive cursor): a date means the start of that UTC day.
+    Before,
+}
+
+/// Format in which audit timestamps are stored (`services/audit.rs`).
+fn storage_format(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// Validate a time bound — RFC 3339 with any offset (`2026-11-01T08:00:00+08:00`)
+/// or a plain UTC date (`2026-11-01`) — and **normalize it to UTC in the
+/// storage format** (`2026-11-01T00:00:00.000000Z`). Every backend compares
+/// bounds lexicographically against stored timestamps (and DynamoDB derives
+/// month partitions from them), so an un-normalized offset or a bare date
+/// would compare wrong; anything unparsable is rejected with 400.
+fn time_bound(field: &str, side: Bound, v: Option<String>) -> Result<Option<String>, HandlerError> {
     let Some(v) = non_empty(v) else {
         return Ok(None);
     };
-    let v = v.trim().to_string();
-    let ok = chrono::DateTime::parse_from_rfc3339(&v).is_ok()
-        || (v.len() == 10 && chrono::NaiveDate::parse_from_str(&v, "%Y-%m-%d").is_ok());
-    if ok {
-        Ok(Some(v))
-    } else {
-        Err(bad_request(format!(
-            "'{field}' must be an RFC 3339 timestamp or YYYY-MM-DD date"
-        )))
+    let v = v.trim();
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(v) {
+        return Ok(Some(storage_format(t.with_timezone(&chrono::Utc))));
     }
+    if v.len() == 10 {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+            let t = match side {
+                Bound::Start | Bound::Before => d.and_hms_opt(0, 0, 0),
+                Bound::End => d.and_hms_micro_opt(23, 59, 59, 999_999),
+            };
+            if let Some(t) = t {
+                return Ok(Some(storage_format(t.and_utc())));
+            }
+        }
+    }
+    Err(bad_request(format!(
+        "'{field}' must be an RFC 3339 timestamp or YYYY-MM-DD date"
+    )))
 }
 
 /// GET /admin/api/audit
@@ -72,9 +98,9 @@ pub async fn list_audit(State(state): State<AppState>, Query(p): Query<AuditPara
     let limit = p.limit.unwrap_or(100).clamp(1, 500);
     let bounds = (|| {
         Ok::<_, HandlerError>((
-            time_bound("start", p.start)?,
-            time_bound("end", p.end)?,
-            time_bound("before", p.before)?,
+            time_bound("start", Bound::Start, p.start)?,
+            time_bound("end", Bound::End, p.end)?,
+            time_bound("before", Bound::Before, p.before)?,
         ))
     })();
     let (start, end, before) = match bounds {
@@ -122,21 +148,17 @@ pub async fn list_audit(State(state): State<AppState>, Query(p): Query<AuditPara
 mod tests {
     use super::*;
 
+    fn norm(side: Bound, v: &str) -> Option<String> {
+        time_bound("t", side, Some(v.into())).unwrap()
+    }
+
     #[test]
     fn time_bounds_validated() {
-        assert_eq!(time_bound("end", None).unwrap(), None);
-        assert_eq!(time_bound("end", Some("  ".into())).unwrap(), None);
-        assert!(
-            time_bound("end", Some("2026-11-18T10:00:00.123456Z".into()))
-                .unwrap()
-                .is_some()
+        assert_eq!(time_bound("end", Bound::End, None).unwrap(), None);
+        assert_eq!(
+            time_bound("end", Bound::End, Some("  ".into())).unwrap(),
+            None
         );
-        assert!(time_bound("end", Some("2026-11-18T10:00:00+08:00".into()))
-            .unwrap()
-            .is_some());
-        assert!(time_bound("start", Some("2026-11-18".into()))
-            .unwrap()
-            .is_some());
         for bad in [
             "2026",
             "x",
@@ -144,7 +166,62 @@ mod tests {
             "26-11-18",
             "2026-11-18T25:00:00Z",
         ] {
-            assert!(time_bound("before", Some(bad.into())).is_err(), "{bad}");
+            assert!(
+                time_bound("before", Bound::Before, Some(bad.into())).is_err(),
+                "{bad}"
+            );
         }
+    }
+
+    #[test]
+    fn time_bounds_normalized_to_utc_storage_format() {
+        // UTC input: re-rendered with microseconds + Z.
+        assert_eq!(
+            norm(Bound::End, "2026-11-18T10:00:00.123456Z").as_deref(),
+            Some("2026-11-18T10:00:00.123456Z")
+        );
+        assert_eq!(
+            norm(Bound::Start, "2026-11-18T10:00:00Z").as_deref(),
+            Some("2026-11-18T10:00:00.000000Z")
+        );
+        // Offsets converted to UTC (incl. across a day / month boundary).
+        assert_eq!(
+            norm(Bound::End, "2026-11-18T10:00:00+08:00").as_deref(),
+            Some("2026-11-18T02:00:00.000000Z")
+        );
+        assert_eq!(
+            norm(Bound::Start, "2026-12-01T03:00:00+08:00").as_deref(),
+            Some("2026-11-30T19:00:00.000000Z")
+        );
+        assert_eq!(
+            norm(Bound::Before, "2026-11-18T20:30:00-05:00").as_deref(),
+            Some("2026-11-19T01:30:00.000000Z")
+        );
+        // Plain dates are UTC days; `end` covers the whole day.
+        assert_eq!(
+            norm(Bound::Start, "2026-11-18").as_deref(),
+            Some("2026-11-18T00:00:00.000000Z")
+        );
+        assert_eq!(
+            norm(Bound::Before, "2026-11-18").as_deref(),
+            Some("2026-11-18T00:00:00.000000Z")
+        );
+        assert_eq!(
+            norm(Bound::End, "2026-11-18").as_deref(),
+            Some("2026-11-18T23:59:59.999999Z")
+        );
+    }
+
+    #[test]
+    fn normalized_bounds_compare_correctly_with_stored_timestamps() {
+        // A record stored at 02:30Z is after 10:00+08:00 (= 02:00Z); the raw
+        // string comparison used to say otherwise.
+        let stored = "2026-11-18T02:30:00.000000Z";
+        let start = norm(Bound::Start, "2026-11-18T10:00:00+08:00").unwrap();
+        assert!(stored >= start.as_str());
+        assert!(stored < "2026-11-18T10:00:00+08:00");
+        // An end date includes records later that day.
+        let end = norm(Bound::End, "2026-11-18").unwrap();
+        assert!("2026-11-18T23:00:00.000000Z" <= end.as_str());
     }
 }

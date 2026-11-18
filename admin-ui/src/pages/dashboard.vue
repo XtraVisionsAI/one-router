@@ -1,17 +1,17 @@
 <script setup lang="ts">
   import type { BackendSummary, StatusResponse, UsageSummaryResponse, UsageSummaryRow } from '@/api/types'
-  import { NCard, NDataTable, NSelect, NSpin, NStatistic, NTag, useMessage } from 'naive-ui'
-  import { h } from 'vue'
-  import VChart from 'vue-echarts'
-  import { use } from 'echarts/core'
   import { BarChart, LineChart, PieChart } from 'echarts/charts'
   import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
+  import { use } from 'echarts/core'
   import { CanvasRenderer } from 'echarts/renderers'
+  import { NAlert, NCard, NDataTable, NSelect, NSpin, NStatistic, NTag, useMessage } from 'naive-ui'
+  import { h } from 'vue'
+  import VChart from 'vue-echarts'
   import { useBackendsApi } from '@/api/backends'
   import { useUsageApi } from '@/api/usage'
   import { useApi } from '@/composables/useApi'
   import { useChartTheme } from '@/composables/useChartTheme'
-  import { fmtMoney, fmtTokens, fmtUptime, fmtPercent } from '@/utils/format'
+  import { fmtMoney, fmtPercent, fmtUptime } from '@/utils/format'
 
   use([BarChart, LineChart, PieChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer])
 
@@ -24,6 +24,7 @@
   // ── State ────────────────────────────────────────────────
   const loading = ref(true)
   const uptime = ref('')
+  const invalidSecrets = ref(0)
   const backends = ref<BackendSummary[]>([])
   const period = ref('7d')
 
@@ -36,7 +37,7 @@
   // Derived metrics
   const totalErrors = computed(() => dailyData.value.reduce((s, r) => s + r.error_requests, 0))
   const totalRequests = computed(() => summary.value?.total_requests ?? 0)
-  const errorRate = computed(() => totalRequests.value > 0 ? totalErrors.value / totalRequests.value : 0)
+  const errorRate = computed(() => (totalRequests.value > 0 ? totalErrors.value / totalRequests.value : 0))
   const totalCachedTokens = computed(() => dailyData.value.reduce((s, r) => s + r.cached_tokens, 0))
   const totalInputTokens = computed(() => summary.value?.total_input_tokens ?? 0)
   const cacheHitRate = computed(() => {
@@ -47,7 +48,7 @@
   const periodOptions = [
     { label: 'Last 24h', value: '1d' },
     { label: 'Last 7 days', value: '7d' },
-    { label: 'Last 30 days', value: '30d' },
+    { label: 'Last 30 days', value: '30d' }
   ]
 
   function getStartTime(p: string): string {
@@ -66,9 +67,10 @@
         usageApi.summary({ group_by: groupBy, start_time }),
         usageApi.summary({ group_by: 'provider', start_time }),
         usageApi.summary({ group_by: 'model', start_time }),
-        backendsApi.list(),
+        backendsApi.list()
       ])
       uptime.value = fmtUptime(statusRes.uptime_seconds)
+      invalidSecrets.value = statusRes.invalid_stored_secrets ?? 0
       dailyData.value = dailyRes.data.slice().reverse() // chronological order for chart
       providerData.value = providerRes.data
       modelData.value = modelRes.data
@@ -91,52 +93,67 @@
     tooltip: { ...baseOption.tooltip, trigger: 'axis' },
     legend: { show: false },
     grid: { left: 55, right: 55, top: 10, bottom: 25 },
-    xAxis: { type: 'category', data: dailyData.value.map(r => r.group_key), ...axisCommon },
+    xAxis: { type: 'category', data: dailyData.value.map((r) => r.group_key), ...axisCommon },
     yAxis: [
       { type: 'value', ...axisCommon, splitLine: axisCommon.splitLine },
-      { type: 'value', ...axisCommon, splitLine: { show: false } },
+      { type: 'value', ...axisCommon, splitLine: { show: false } }
     ],
     series: [
       {
         name: 'Requests',
         type: 'bar',
-        data: dailyData.value.map(r => r.total_requests),
+        data: dailyData.value.map((r) => r.total_requests),
         itemStyle: { color: COLORS[3], borderRadius: [3, 3, 0, 0] },
         barMaxWidth: 28,
-        yAxisIndex: 0,
+        yAxisIndex: 0
       },
       {
         name: 'Cost',
         type: 'line',
-        data: dailyData.value.map(r => r.total_cost),
+        data: dailyData.value.map((r) => r.total_cost),
         smooth: true,
         symbol: 'circle',
         symbolSize: 6,
         lineStyle: { color: COLORS[2], width: 2 },
         itemStyle: { color: COLORS[2] },
-        areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(251,191,36,0.25)' }, { offset: 1, color: 'rgba(251,191,36,0)' }] } },
-        yAxisIndex: 1,
-      },
-    ],
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(251,191,36,0.25)' },
+              { offset: 1, color: 'rgba(251,191,36,0)' }
+            ]
+          }
+        },
+        yAxisIndex: 1
+      }
+    ]
   }))
 
   const providerOption = computed(() => {
     const data = providerData.value
-      .filter(r => r.total_cost > 0)
-      .map(r => ({ name: r.group_key, value: +r.total_cost.toFixed(2) }))
+      .filter((r) => r.total_cost > 0)
+      .map((r) => ({ name: r.group_key, value: +r.total_cost.toFixed(2) }))
     return {
       ...baseOption,
+      // eslint-disable-next-line no-template-curly-in-string -- ECharts formatter template; `$` is a literal dollar sign
       tooltip: { ...baseOption.tooltip, trigger: 'item', formatter: '{b}: ${c} ({d}%)' },
       legend: { show: false },
-      series: [{
-        type: 'pie',
-        radius: ['45%', '72%'],
-        center: ['50%', '52%'],
-        avoidLabelOverlap: true,
-        itemStyle: { borderColor: '#1a2638', borderWidth: 2 },
-        label: { color: '#94a3b8', fontSize: 11 },
-        data,
-      }],
+      series: [
+        {
+          type: 'pie',
+          radius: ['45%', '72%'],
+          center: ['50%', '52%'],
+          avoidLabelOverlap: true,
+          itemStyle: { borderColor: '#1a2638', borderWidth: 2 },
+          label: { color: '#94a3b8', fontSize: 11 },
+          data
+        }
+      ]
     }
   })
 
@@ -154,16 +171,22 @@
       xAxis: { type: 'value', ...axisCommon },
       yAxis: {
         type: 'category',
-        data: top.map(r => r.group_key),
+        data: top.map((r) => r.group_key),
         ...axisCommon,
-        axisLabel: { ...axisCommon.axisLabel, width: 140, overflow: 'truncate' },
+        axisLabel: { ...axisCommon.axisLabel, width: 140, overflow: 'truncate' }
       },
-      series: [{
-        type: 'bar',
-        data: top.map((r, i) => ({ value: +r.total_cost.toFixed(2), itemStyle: { color: COLORS[i % COLORS.length], borderRadius: [0, 3, 3, 0] } })),
-        barMaxWidth: 18,
-        label: { show: true, position: 'right', color: '#94a3b8', fontSize: 11, formatter: '${c}' },
-      }],
+      series: [
+        {
+          type: 'bar',
+          data: top.map((r, i) => ({
+            value: +r.total_cost.toFixed(2),
+            itemStyle: { color: COLORS[i % COLORS.length], borderRadius: [0, 3, 3, 0] }
+          })),
+          barMaxWidth: 18,
+          // eslint-disable-next-line no-template-curly-in-string -- ECharts formatter template; `$` is a literal dollar sign
+          label: { show: true, position: 'right', color: '#94a3b8', fontSize: 11, formatter: '${c}' }
+        }
+      ]
     }
   })
 
@@ -175,10 +198,14 @@
       title: 'Health',
       key: 'health_status',
       render: (row: BackendSummary) => {
-        const t = row.health_status === 'healthy' ? 'success'
-          : row.health_status.startsWith('degraded') ? 'warning'
-          : row.health_status === 'unhealthy' ? 'error'
-          : 'default'
+        const t =
+          row.health_status === 'healthy'
+            ? 'success'
+            : row.health_status.startsWith('degraded')
+              ? 'warning'
+              : row.health_status === 'unhealthy'
+                ? 'error'
+                : 'default'
         return h(NTag, { type: t, size: 'small' }, { default: () => row.health_status })
       }
     },
@@ -186,7 +213,11 @@
       title: 'Enabled',
       key: 'enabled',
       render: (row: BackendSummary) =>
-        h(NTag, { type: row.enabled ? 'success' : 'default', size: 'small' }, { default: () => (row.enabled ? 'yes' : 'no') })
+        h(
+          NTag,
+          { type: row.enabled ? 'success' : 'default', size: 'small' },
+          { default: () => (row.enabled ? 'yes' : 'no') }
+        )
     }
   ]
 </script>
@@ -195,67 +226,78 @@
   <div>
     <div class="flex items-center justify-between mb-6">
       <h1 class="text-xl font-semibold text-slate-100">Dashboard</h1>
-      <NSelect v-model:value="period" :options="periodOptions" style="width: 150px" size="small" />
+      <n-select v-model:value="period" :options="periodOptions" style="width: 150px" size="small" />
     </div>
 
-    <NSpin :show="loading">
+    <n-spin :show="loading">
+      <n-alert v-if="invalidSecrets > 0" type="error" title="Unreadable stored secrets" class="mb-4">
+        {{ invalidSecrets }} backend config(s) / sensitive setting(s) cannot be decrypted (not in the v2 format, or
+        written with a different ENCRYPTION_KEY) and are being ignored. Re-enter their secrets here, or stop the server,
+        back up the database and run <code>one-router migrate-secrets --dry-run</code> then
+        <code>one-router migrate-secrets</code>.
+      </n-alert>
+
       <!-- Stat cards -->
       <div class="grid grid-cols-6 gap-3 mb-6">
-        <NCard size="small" style="position: relative; overflow: hidden">
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-send absolute top-3 right-3 text-[28px] text-indigo-400 opacity-80" />
-          <NStatistic label="Requests" :value="totalRequests.toLocaleString()" />
-        </NCard>
-        <NCard size="small" style="position: relative; overflow: hidden">
+          <n-statistic label="Requests" :value="totalRequests.toLocaleString()" />
+        </n-card>
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-currency-dollar absolute top-3 right-3 text-[28px] text-amber-400 opacity-80" />
-          <NStatistic label="Cost" :value="fmtMoney(summary?.total_cost)" />
-        </NCard>
-        <NCard size="small" style="position: relative; overflow: hidden">
+          <n-statistic label="Cost" :value="fmtMoney(summary?.total_cost)" />
+        </n-card>
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-warning absolute top-3 right-3 text-[28px] text-rose-400 opacity-80" />
-          <NStatistic label="Errors" :value="totalErrors.toLocaleString()" />
-        </NCard>
-        <NCard size="small" style="position: relative; overflow: hidden">
+          <n-statistic label="Errors" :value="totalErrors.toLocaleString()" />
+        </n-card>
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-warning-alt absolute top-3 right-3 text-[28px] text-rose-400 opacity-60" />
-          <NStatistic label="Error Rate" :value="fmtPercent(errorRate)" />
-        </NCard>
-        <NCard size="small" style="position: relative; overflow: hidden">
+          <n-statistic label="Error Rate" :value="fmtPercent(errorRate)" />
+        </n-card>
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-data-backup absolute top-3 right-3 text-[28px] text-blue-400 opacity-80" />
-          <NStatistic label="Cache Hit" :value="fmtPercent(cacheHitRate)" />
-        </NCard>
-        <NCard size="small" style="position: relative; overflow: hidden">
+          <n-statistic label="Cache Hit" :value="fmtPercent(cacheHitRate)" />
+        </n-card>
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-time absolute top-3 right-3 text-[28px] text-emerald-400 opacity-80" />
-          <NStatistic label="Uptime" :value="uptime" />
-        </NCard>
+          <n-statistic label="Uptime" :value="uptime" />
+        </n-card>
       </div>
 
       <!-- Trend chart -->
-      <NCard size="small" class="mb-6">
+      <n-card size="small" class="mb-6">
         <div class="flex items-center justify-between mb-2">
           <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider">Requests & Cost Trend</h2>
           <div class="flex items-center gap-4 text-xs text-slate-400">
-            <span class="flex items-center gap-1.5"><span class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#60a5fa" />&nbsp;Requests</span>
-            <span class="flex items-center gap-1.5"><span class="inline-block w-4 h-0.5 rounded" style="background:#fbbf24" />&nbsp;Cost</span>
+            <span class="flex items-center gap-1.5"
+              ><span class="inline-block w-2.5 h-2.5 rounded-sm" style="background: #60a5fa" />&nbsp;Requests</span
+            >
+            <span class="flex items-center gap-1.5"
+              ><span class="inline-block w-4 h-0.5 rounded" style="background: #fbbf24" />&nbsp;Cost</span
+            >
           </div>
         </div>
-        <VChart :option="trendOption" style="height: 260px" autoresize />
-      </NCard>
+        <v-chart :option="trendOption" style="height: 260px" autoresize />
+      </n-card>
 
       <!-- Provider + Model charts -->
       <div class="grid grid-cols-2 gap-4 mb-6">
-        <NCard size="small">
+        <n-card size="small">
           <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Cost by Provider</h2>
-          <VChart :option="providerOption" style="height: 220px" autoresize />
-        </NCard>
-        <NCard size="small">
+          <v-chart :option="providerOption" style="height: 220px" autoresize />
+        </n-card>
+        <n-card size="small">
           <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Top Models by Cost</h2>
-          <VChart :option="modelOption" style="height: 220px" autoresize />
-        </NCard>
+          <v-chart :option="modelOption" style="height: 220px" autoresize />
+        </n-card>
       </div>
 
       <!-- Backend status -->
       <div>
         <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-3">Backend Status</h2>
-        <NDataTable :columns="backendColumns" :data="backends" :pagination="false" size="small" />
+        <n-data-table :columns="backendColumns" :data="backends" :pagination="false" size="small" />
       </div>
-    </NSpin>
+    </n-spin>
   </div>
 </template>

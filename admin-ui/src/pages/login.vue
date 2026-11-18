@@ -29,7 +29,7 @@
 <template>
   <div class="bg-[#1e293b] rounded-xl shadow-2xl p-8 w-[400px] border border-slate-700">
     <div class="mb-6 flex items-center justify-center gap-3">
-      <img src="/logo.png" alt="one-router" class="w-10 h-10 rounded-lg">
+      <img src="/logo.png" alt="one-router" class="w-10 h-10 rounded-lg" />
       <span class="text-indigo-400 font-semibold text-xl">one-router</span>
       <span class="text-sm text-slate-500 bg-slate-700 px-2 py-0.5 rounded">admin</span>
     </div>

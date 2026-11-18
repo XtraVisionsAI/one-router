@@ -4,12 +4,15 @@
 //! row it belongs to (see [`backend_context`] / [`setting_context`]) bound in as
 //! AEAD associated data — a ciphertext copied into another row fails to decrypt.
 //!
-//! Still readable: legacy `encrypted:<base64>` (v1, no binding) and plaintext
-//! (rows written while no key was configured). [`Encryptor::needs_upgrade`]
-//! flags both; the startup migration (`server::app::upgrade_stored_secrets`)
-//! rewrites them in the current format.
+//! The runtime reads v2 only ([`Encryptor::decrypt`]). Legacy formats — v1
+//! `encrypted:<base64>` (no row binding) and plaintext (rows written while no
+//! key was configured) — are rejected there; only the offline
+//! `one-router migrate-secrets` command reads them
+//! ([`Encryptor::decrypt_legacy`], see `database::secret_migration`) to rewrite
+//! them as v2. The server refuses to start while any remain.
 //!
-//! When ENCRYPTION_KEY is not set, values are stored in plaintext.
+//! When ENCRYPTION_KEY is not set, `encrypt` is a no-op (the server always has
+//! a key; see `Settings::ensure_required_keys`).
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -34,9 +37,48 @@ pub fn setting_context(key: &str) -> String {
     format!("setting:{key}")
 }
 
+/// Storage format of a stored secret value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretFormat {
+    /// Empty string (e.g. a disabled sensitive setting) — nothing to protect.
+    Empty,
+    Plaintext,
+    V1,
+    V2,
+}
+
+impl SecretFormat {
+    pub fn of(value: &str) -> Self {
+        if value.is_empty() {
+            Self::Empty
+        } else if value.starts_with(V2_PREFIX) {
+            Self::V2
+        } else if value.starts_with(ENCRYPTED_PREFIX) {
+            Self::V1
+        } else {
+            Self::Plaintext
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Plaintext => "plaintext",
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    /// Legacy format the runtime rejects (needs `one-router migrate-secrets`).
+    pub fn is_legacy(self) -> bool {
+        matches!(self, Self::Plaintext | Self::V1)
+    }
+}
+
 /// Encryption helper.
 ///
-/// If `key` is `None`, encrypt/decrypt are no-ops (plaintext passthrough).
+/// If `key` is `None`, `encrypt` is a no-op and `decrypt` rejects every
+/// non-empty value.
 #[derive(Clone)]
 pub struct Encryptor {
     cipher: Option<Aes256Gcm>,
@@ -82,15 +124,37 @@ impl Encryptor {
         format!("{V2_PREFIX}{}", BASE64.encode(&combined))
     }
 
-    /// Decrypt a stored value for `context`. v2 values must have been written
-    /// for the same context; legacy v1 values and plaintext are accepted.
+    /// Decrypt a stored value for `context` — the runtime reader, **v2 only**.
+    /// An empty value is returned as is (empty = unset / disabled); legacy v1
+    /// ciphertexts and plaintext are rejected (`one-router migrate-secrets`).
     pub fn decrypt(&self, value: &str, context: &str) -> anyhow::Result<String> {
+        match SecretFormat::of(value) {
+            SecretFormat::Empty => Ok(String::new()),
+            SecretFormat::V2 => self.decrypt_inner(value, context),
+            legacy => anyhow::bail!(
+                "stored secret is in the legacy {} format; stop the server, back up the \
+                 database and run `one-router migrate-secrets`",
+                legacy.label()
+            ),
+        }
+    }
+
+    /// Decrypt any supported format (v2, legacy v1, plaintext). Only for the
+    /// offline `migrate-secrets` command — runtime readers use [`Self::decrypt`].
+    pub fn decrypt_legacy(&self, value: &str, context: &str) -> anyhow::Result<String> {
+        match SecretFormat::of(value) {
+            SecretFormat::Empty | SecretFormat::Plaintext => Ok(value.to_string()),
+            SecretFormat::V1 | SecretFormat::V2 => self.decrypt_inner(value, context),
+        }
+    }
+
+    fn decrypt_inner(&self, value: &str, context: &str) -> anyhow::Result<String> {
         let (encoded, aad) = if let Some(rest) = value.strip_prefix(V2_PREFIX) {
             (rest, Some(format!("{AAD_DOMAIN}{context}")))
         } else if let Some(rest) = value.strip_prefix(ENCRYPTED_PREFIX) {
             (rest, None)
         } else {
-            return Ok(value.to_string());
+            anyhow::bail!("value is not encrypted");
         };
 
         let Some(ref cipher) = self.cipher else {
@@ -129,15 +193,22 @@ impl Encryptor {
         String::from_utf8(plaintext).map_err(|e| anyhow::anyhow!("UTF-8 decode error: {e}"))
     }
 
-    /// True when encryption is enabled and `value` is not in the current
-    /// format (plaintext or legacy v1). Empty values are left alone.
-    pub fn needs_upgrade(&self, value: &str) -> bool {
-        self.cipher.is_some() && !value.is_empty() && !value.starts_with(V2_PREFIX)
-    }
-
     /// Returns true if encryption is enabled.
     pub fn is_enabled(&self) -> bool {
         self.cipher.is_some()
+    }
+
+    /// Legacy v1 writer (no associated data) — tests only.
+    #[cfg(test)]
+    pub(crate) fn encrypt_v1_for_tests(&self, plaintext: &str) -> String {
+        let cipher = self.cipher.as_ref().unwrap();
+        let nonce_bytes: [u8; NONCE_LEN] = rand::random();
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .unwrap();
+        let mut combined = nonce_bytes.to_vec();
+        combined.extend_from_slice(&ct);
+        format!("{ENCRYPTED_PREFIX}{}", BASE64.encode(&combined))
     }
 }
 
@@ -155,18 +226,6 @@ mod tests {
 
     const CTX: &str = "backend:test";
 
-    /// Legacy v1 writer (no associated data), kept for compatibility tests.
-    fn encrypt_v1(enc: &Encryptor, plaintext: &str) -> String {
-        let cipher = enc.cipher.as_ref().unwrap();
-        let nonce_bytes: [u8; NONCE_LEN] = rand::random();
-        let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
-            .unwrap();
-        let mut combined = nonce_bytes.to_vec();
-        combined.extend_from_slice(&ct);
-        format!("{ENCRYPTED_PREFIX}{}", BASE64.encode(&combined))
-    }
-
     #[test]
     fn test_roundtrip_with_key() {
         let enc = Encryptor::new(Some("my-secret-key"));
@@ -175,7 +234,7 @@ mod tests {
         assert!(encrypted.starts_with("encrypted:v2:"));
         assert_ne!(encrypted, plaintext);
         assert_eq!(enc.decrypt(&encrypted, CTX).unwrap(), plaintext);
-        assert!(!enc.needs_upgrade(&encrypted));
+        assert_eq!(SecretFormat::of(&encrypted), SecretFormat::V2);
     }
 
     #[test]
@@ -187,30 +246,44 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_v1_still_decrypts_and_needs_upgrade() {
+    fn test_strict_decrypt_rejects_v1() {
         let enc = Encryptor::new(Some("key"));
-        let v1 = encrypt_v1(&enc, "old-secret");
-        assert_eq!(enc.decrypt(&v1, CTX).unwrap(), "old-secret");
-        assert!(enc.needs_upgrade(&v1));
+        let v1 = enc.encrypt_v1_for_tests("old-secret");
+        assert_eq!(SecretFormat::of(&v1), SecretFormat::V1);
+        let err = enc.decrypt(&v1, CTX).unwrap_err().to_string();
+        assert!(err.contains("migrate-secrets"), "{err}");
+        // Only the migration path still reads it.
+        assert_eq!(enc.decrypt_legacy(&v1, CTX).unwrap(), "old-secret");
     }
 
     #[test]
-    fn test_no_key_passthrough() {
+    fn test_strict_decrypt_rejects_plaintext() {
+        let enc = Encryptor::new(Some("key"));
+        assert!(enc.decrypt("not-encrypted-value", CTX).is_err());
+        assert_eq!(
+            enc.decrypt_legacy("not-encrypted-value", CTX).unwrap(),
+            "not-encrypted-value"
+        );
+        assert_eq!(
+            SecretFormat::of("not-encrypted-value"),
+            SecretFormat::Plaintext
+        );
+        // Without a key plaintext is still rejected at runtime.
+        assert!(Encryptor::new(None).decrypt("plain", CTX).is_err());
+    }
+
+    #[test]
+    fn test_empty_value_allowed() {
+        let enc = Encryptor::new(Some("key"));
+        assert_eq!(enc.decrypt("", CTX).unwrap(), "");
+        assert_eq!(SecretFormat::of(""), SecretFormat::Empty);
+        assert!(!SecretFormat::Empty.is_legacy());
+    }
+
+    #[test]
+    fn test_no_key_encrypt_passthrough() {
         let enc = Encryptor::new(None);
-        let value = "plain-api-key";
-        let encrypted = enc.encrypt(value, CTX);
-        assert_eq!(encrypted, value);
-        assert_eq!(enc.decrypt(value, CTX).unwrap(), value);
-        assert!(!enc.needs_upgrade(value));
-    }
-
-    #[test]
-    fn test_decrypt_plaintext_passthrough_and_needs_upgrade() {
-        let enc = Encryptor::new(Some("key"));
-        let result = enc.decrypt("not-encrypted-value", CTX).unwrap();
-        assert_eq!(result, "not-encrypted-value");
-        assert!(enc.needs_upgrade("not-encrypted-value"));
-        assert!(!enc.needs_upgrade(""));
+        assert_eq!(enc.encrypt("plain-api-key", CTX), "plain-api-key");
     }
 
     #[test]

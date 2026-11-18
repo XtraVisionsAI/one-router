@@ -323,6 +323,10 @@ fn row_to_audit(r: &sqlx::postgres::PgRow) -> AuditLogRecord {
     }
 }
 
+/// Roll a row's spend counter from `prev_month` to `month` — only while the
+/// stored period is still `prev_month` (a stale cached period must not reset
+/// the new period again). Compare-and-set on `(period, spend)`; archives the
+/// **stored** spend, not the caller's cached `_prev_mtd`. See the SQLite twin.
 async fn reset_budget(
     pool: &PgPool,
     table: &str,
@@ -330,33 +334,53 @@ async fn reset_budget(
     id: &str,
     month: &str,
     prev_month: &str,
-    prev_mtd: f64,
+    _prev_mtd: f64,
 ) -> Result<()> {
-    let row = sqlx::query(&format!(
-        "SELECT budget_history FROM {table} WHERE {id_col} = $1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-    let mut history: std::collections::HashMap<String, f64> = row
-        .and_then(|r| r.get::<Option<String>, _>("budget_history"))
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-    if prev_mtd > 0.0 && !prev_month.is_empty() {
-        history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
+    use crate::database::budget::{archive_period, period_is, CAS_ATTEMPTS};
+    for attempt in 0..=CAS_ATTEMPTS {
+        let Some(row) = sqlx::query(&format!(
+            "SELECT budget_history, budget_used_mtd, budget_mtd_month FROM {table} WHERE {id_col} = $1"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        else {
+            return Ok(());
+        };
+        let stored: Option<String> = row.get("budget_mtd_month");
+        if !period_is(stored.as_deref(), prev_month) {
+            return Ok(()); // already rolled (by another request / instance)
+        }
+        let used: f64 = row.get::<Option<f64>, _>("budget_used_mtd").unwrap_or(0.0);
+        let history = archive_period(
+            row.get::<Option<String>, _>("budget_history").as_deref(),
+            prev_month,
+            used,
+        );
+        let cas = attempt < CAS_ATTEMPTS;
+        let spend_cond = if cas {
+            " AND COALESCE(budget_used_mtd, 0.0) = $6"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "UPDATE {table} SET budget_used_mtd = 0.0, budget_mtd_month = $1, \
+             budget_history = $2, updated_at = $3 \
+             WHERE {id_col} = $4 AND COALESCE(budget_mtd_month, '') = $5{spend_cond}"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(month)
+            .bind(&history)
+            .bind(unix_now())
+            .bind(id)
+            .bind(prev_month);
+        if cas {
+            q = q.bind(used);
+        }
+        if q.execute(pool).await?.rows_affected() == 1 {
+            return Ok(());
+        }
     }
-    let updated_history = serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string());
-    sqlx::query(&format!(
-        "UPDATE {table} SET budget_used_mtd = 0.0, budget_mtd_month = $1, \
-         budget_history = $2, updated_at = $3 WHERE {id_col} = $4"
-    ))
-    .bind(month)
-    .bind(&updated_history)
-    .bind(unix_now())
-    .bind(id)
-    .execute(pool)
-    .await?;
     Ok(())
 }
 
@@ -948,19 +972,23 @@ impl BudgetStore for PostgresBackend {
         id: &str,
         amount: f64,
         max_used_before: f64,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let (table, id_col) = layer.table();
-        let res = sqlx::query(&format!(
+        let row = sqlx::query(&format!(
             "UPDATE {table} SET budget_used = budget_used + $1, \
              budget_used_mtd = budget_used_mtd + $1 \
-             WHERE {id_col} = $2 AND budget_used_mtd <= $3"
+             WHERE {id_col} = $2 AND budget_used_mtd <= $3 \
+             RETURNING budget_mtd_month"
         ))
         .bind(amount)
         .bind(id)
         .bind(max_used_before)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(res.rows_affected() == 1)
+        Ok(row.map(|r| {
+            r.get::<Option<String>, _>("budget_mtd_month")
+                .unwrap_or_default()
+        }))
     }
 }
 
@@ -1318,42 +1346,53 @@ impl UsageStore for PostgresBackend {
 // ModelMappingStore
 // ============================================================================
 
+fn pg_mapping_row(r: &sqlx::postgres::PgRow) -> ModelMappingRecord {
+    let price = |col: &str| {
+        r.try_get::<Option<f64>, _>(col)
+            .ok()
+            .flatten()
+            .unwrap_or(0.0)
+    };
+    ModelMappingRecord {
+        source_model_id: r.get("source_model_id"),
+        target_model_id: r.get("target_model_id"),
+        provider: r.get("provider"),
+        display_name: r.get("display_name"),
+        input_price: r.get("input_price"),
+        output_price: r.get("output_price"),
+        cache_read_price: r.get("cache_read_price"),
+        cache_write_price: r.get("cache_write_price"),
+        priority: r.get("priority"),
+        status: r.get("status"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+        capabilities: r.get("capabilities"),
+        pricing_source: r
+            .try_get::<Option<String>, _>("pricing_source")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "litellm".to_string()),
+        price_per_request: price("price_per_request"),
+        price_per_image: price("price_per_image"),
+        price_per_search_unit: price("price_per_search_unit"),
+    }
+}
+
 #[async_trait]
 impl ModelMappingStore for PostgresBackend {
     async fn get_mappings(&self, source_model_id: &str) -> Result<Vec<ModelMappingRecord>> {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities, pricing_source \
+             priority, status, created_at, updated_at, capabilities, pricing_source, \
+             price_per_request, price_per_image, price_per_search_unit \
              FROM model_mappings WHERE source_model_id = $1 ORDER BY priority DESC",
         )
         .bind(source_model_id)
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows
-            .iter()
-            .map(|r| ModelMappingRecord {
-                source_model_id: r.get("source_model_id"),
-                target_model_id: r.get("target_model_id"),
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                input_price: r.get("input_price"),
-                output_price: r.get("output_price"),
-                cache_read_price: r.get("cache_read_price"),
-                cache_write_price: r.get("cache_write_price"),
-                priority: r.get("priority"),
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-                capabilities: r.get("capabilities"),
-                pricing_source: r
-                    .try_get::<Option<String>, _>("pricing_source")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "litellm".to_string()),
-            })
-            .collect();
+        let records = rows.iter().map(pg_mapping_row).collect();
 
         Ok(records)
     }
@@ -1366,7 +1405,8 @@ impl ModelMappingStore for PostgresBackend {
         let row = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities, pricing_source \
+             priority, status, created_at, updated_at, capabilities, pricing_source, \
+             price_per_request, price_per_image, price_per_search_unit \
              FROM model_mappings WHERE source_model_id = $1 AND provider = $2",
         )
         .bind(source_model_id)
@@ -1375,26 +1415,7 @@ impl ModelMappingStore for PostgresBackend {
         .await?;
 
         match row {
-            Some(r) => Ok(Some(ModelMappingRecord {
-                source_model_id: r.get("source_model_id"),
-                target_model_id: r.get("target_model_id"),
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                input_price: r.get("input_price"),
-                output_price: r.get("output_price"),
-                cache_read_price: r.get("cache_read_price"),
-                cache_write_price: r.get("cache_write_price"),
-                priority: r.get("priority"),
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-                capabilities: r.get("capabilities"),
-                pricing_source: r
-                    .try_get::<Option<String>, _>("pricing_source")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "litellm".to_string()),
-            })),
+            Some(r) => Ok(Some(pg_mapping_row(&r))),
             None => Ok(None),
         }
     }
@@ -1403,35 +1424,14 @@ impl ModelMappingStore for PostgresBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities, pricing_source \
+             priority, status, created_at, updated_at, capabilities, pricing_source, \
+             price_per_request, price_per_image, price_per_search_unit \
              FROM model_mappings ORDER BY provider, priority DESC, source_model_id",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows
-            .iter()
-            .map(|r| ModelMappingRecord {
-                source_model_id: r.get("source_model_id"),
-                target_model_id: r.get("target_model_id"),
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                input_price: r.get("input_price"),
-                output_price: r.get("output_price"),
-                cache_read_price: r.get("cache_read_price"),
-                cache_write_price: r.get("cache_write_price"),
-                priority: r.get("priority"),
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-                capabilities: r.get("capabilities"),
-                pricing_source: r
-                    .try_get::<Option<String>, _>("pricing_source")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "litellm".to_string()),
-            })
-            .collect();
+        let records = rows.iter().map(pg_mapping_row).collect();
 
         Ok(records)
     }
@@ -1442,8 +1442,9 @@ impl ModelMappingStore for PostgresBackend {
             "INSERT INTO model_mappings \
              (source_model_id, target_model_id, provider, display_name, \
               input_price, output_price, cache_read_price, cache_write_price, \
-              priority, status, created_at, updated_at, capabilities, pricing_source) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+              priority, status, created_at, updated_at, capabilities, pricing_source, \
+              price_per_request, price_per_image, price_per_search_unit) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
              ON CONFLICT(source_model_id, provider) DO UPDATE SET \
              target_model_id = EXCLUDED.target_model_id, \
              display_name = EXCLUDED.display_name, \
@@ -1455,7 +1456,10 @@ impl ModelMappingStore for PostgresBackend {
              status = EXCLUDED.status, \
              updated_at = EXCLUDED.updated_at, \
              capabilities = EXCLUDED.capabilities, \
-             pricing_source = EXCLUDED.pricing_source",
+             pricing_source = EXCLUDED.pricing_source, \
+             price_per_request = EXCLUDED.price_per_request, \
+             price_per_image = EXCLUDED.price_per_image, \
+             price_per_search_unit = EXCLUDED.price_per_search_unit",
         )
         .bind(&record.source_model_id)
         .bind(&record.target_model_id)
@@ -1471,6 +1475,9 @@ impl ModelMappingStore for PostgresBackend {
         .bind(now)
         .bind(&record.capabilities)
         .bind(&record.pricing_source)
+        .bind(record.price_per_request)
+        .bind(record.price_per_image)
+        .bind(record.price_per_search_unit)
         .execute(&self.pool)
         .await?;
 
@@ -1491,36 +1498,15 @@ impl ModelMappingStore for PostgresBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities, pricing_source \
+             priority, status, created_at, updated_at, capabilities, pricing_source, \
+             price_per_request, price_per_image, price_per_search_unit \
              FROM model_mappings WHERE source_model_id LIKE '%*%' AND status = 'active' \
              ORDER BY priority DESC",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows
-            .iter()
-            .map(|r| ModelMappingRecord {
-                source_model_id: r.get("source_model_id"),
-                target_model_id: r.get("target_model_id"),
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                input_price: r.get("input_price"),
-                output_price: r.get("output_price"),
-                cache_read_price: r.get("cache_read_price"),
-                cache_write_price: r.get("cache_write_price"),
-                priority: r.get("priority"),
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-                capabilities: r.get("capabilities"),
-                pricing_source: r
-                    .try_get::<Option<String>, _>("pricing_source")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "litellm".to_string()),
-            })
-            .collect();
+        let records = rows.iter().map(pg_mapping_row).collect();
 
         Ok(records)
     }

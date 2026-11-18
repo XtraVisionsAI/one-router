@@ -99,7 +99,13 @@
       </NFormItem>
       <div class="flex gap-4">
         <NFormItem label="Budget ($ per period)" class="flex-1">
-          <NInputNumber v-model:value="form.monthly_budget" :min="0" :precision="2" placeholder="unlimited" class="w-full" />
+          <NInputNumber
+            v-model:value="form.monthly_budget"
+            :min="0"
+            :precision="2"
+            placeholder="unlimited"
+            class="w-full"
+          />
         </NFormItem>
         <NFormItem label="Budget Period" class="flex-1">
           <NSelect v-model:value="form.budget_period" :options="periodOptions" />

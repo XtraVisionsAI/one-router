@@ -54,8 +54,9 @@ impl DynamoDbBackend {
     ///
     /// DynamoDB update expressions have no `max()`, so a negative amount (a
     /// precharge refund) is applied conditionally on `budget_used_mtd >= -amount`;
-    /// if that fails the month-to-date counter is set to 0 instead — spend never
-    /// goes negative.
+    /// if that fails, [`Self::refund_clamped`] sets both counters to
+    /// `max(0, cur - refund)` with a compare-and-set loop — spend never goes
+    /// negative and a concurrent increment is never overwritten.
     async fn add_spend(
         &self,
         table: &str,
@@ -94,24 +95,143 @@ impl DynamoDbBackend {
             Err(e) => {
                 let svc = e.into_service_error();
                 if amount < 0.0 && svc.is_conditional_check_failed_exception() {
-                    let out = self
-                        .client
-                        .update_item()
-                        .table_name(Self::table_name(table))
-                        .key(id_attr, av_s(id))
-                        .condition_expression(exists)
-                        .update_expression("SET budget_used_mtd = :zero, updated_at = :now")
-                        .expression_attribute_values(":zero", av_n_f64(0.0))
-                        .expression_attribute_values(":now", av_n(unix_now()))
-                        .return_values(ReturnValue::AllNew)
-                        .send()
-                        .await?;
-                    Ok(spend_after(out.attributes()))
+                    self.refund_clamped(table, id_attr, id, -amount).await
                 } else {
                     Err(anyhow::anyhow!("{table} spend update: {svc}"))
                 }
             }
         }
+    }
+
+    /// Refund `refund` from a row whose month-to-date spend is below it:
+    /// `budget_used_mtd` and `budget_used` both become `max(0, cur - refund)`
+    /// (the SQL backends' `MAX(0, x + amount)`). Compare-and-set against the
+    /// values just read (raw number strings — DynamoDB compares decimals
+    /// exactly), retried [`CAS_ATTEMPTS`] times so an increment landing
+    /// between read and write is never overwritten.
+    ///
+    /// [`CAS_ATTEMPTS`]: crate::database::budget::CAS_ATTEMPTS
+    async fn refund_clamped(
+        &self,
+        table: &str,
+        id_attr: &str,
+        id: &str,
+        refund: f64,
+    ) -> Result<SpendAfter> {
+        use crate::database::budget::CAS_ATTEMPTS;
+        use aws_sdk_dynamodb::types::ReturnValue;
+        for _ in 0..CAS_ATTEMPTS {
+            let item = self
+                .client
+                .get_item()
+                .table_name(Self::table_name(table))
+                .key(id_attr, av_s(id))
+                .consistent_read(true)
+                .send()
+                .await?
+                .item()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{table} row not found: {id}"))?;
+            let plan = refund_plan(&item, refund);
+            let mut req = self
+                .client
+                .update_item()
+                .table_name(Self::table_name(table))
+                .key(id_attr, av_s(id))
+                .update_expression(
+                    "SET budget_used_mtd = :mtd, budget_used = :used, updated_at = :now",
+                )
+                .condition_expression(plan.condition)
+                .expression_attribute_values(":mtd", av_n_f64(plan.mtd))
+                .expression_attribute_values(":used", av_n_f64(plan.used))
+                .expression_attribute_values(":now", av_n(unix_now()))
+                .return_values(ReturnValue::AllNew);
+            for (k, v) in plan.values {
+                req = req.expression_attribute_values(k, v);
+            }
+            match req.send().await {
+                Ok(out) => return Ok(spend_after(out.attributes())),
+                Err(e) => {
+                    let svc = e.into_service_error();
+                    if !svc.is_conditional_check_failed_exception() {
+                        return Err(anyhow::anyhow!("{table} refund: {svc}"));
+                    }
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "{table} refund for {id}: counters kept changing; refund not applied"
+        ))
+    }
+
+    /// Roll a row's spend counter from `prev` to `period`, only while the
+    /// stored `budget_mtd_month` is still `prev` (a request with a cached,
+    /// stale period must not reset the new period again). Archives the
+    /// **stored** spend into `budget_history`; compare-and-set on the stored
+    /// spend so a concurrent increment is not lost (the last attempt is
+    /// conditioned on the period alone).
+    async fn reset_period(
+        &self,
+        table: &str,
+        id_attr: &str,
+        id: &str,
+        period: &str,
+        prev: &str,
+    ) -> Result<()> {
+        use crate::database::budget::{archive_period, period_is, CAS_ATTEMPTS};
+        for attempt in 0..=CAS_ATTEMPTS {
+            let Some(item) = self
+                .client
+                .get_item()
+                .table_name(Self::table_name(table))
+                .key(id_attr, av_s(id))
+                .consistent_read(true)
+                .send()
+                .await?
+                .item()
+                .cloned()
+            else {
+                return Ok(());
+            };
+            let stored = get_opt_s(&item, "budget_mtd_month");
+            if !period_is(stored.as_deref(), prev) {
+                return Ok(()); // already rolled
+            }
+            let history = archive_period(
+                get_opt_s(&item, "budget_history").as_deref(),
+                prev,
+                get_f64(&item, "budget_used_mtd"),
+            );
+            let cas = attempt < CAS_ATTEMPTS;
+            let (condition, values) = reset_condition(&item, prev, cas);
+            let mut req = self
+                .client
+                .update_item()
+                .table_name(Self::table_name(table))
+                .key(id_attr, av_s(id))
+                .update_expression(
+                    "SET budget_used_mtd = :zero, budget_mtd_month = :month, \
+                     budget_history = :history, updated_at = :now",
+                )
+                .condition_expression(condition)
+                .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
+                .expression_attribute_values(":month", av_s(period))
+                .expression_attribute_values(":history", av_s(&history))
+                .expression_attribute_values(":now", av_n(unix_now()));
+            for (k, v) in values {
+                req = req.expression_attribute_values(k, v);
+            }
+            match req.send().await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    let svc = e.into_service_error();
+                    if !svc.is_conditional_check_failed_exception() {
+                        return Err(anyhow::anyhow!("{svc}"));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether `user_id` already owns a key named `name` (other than
@@ -683,6 +803,70 @@ fn team_to_item(t: &TeamRecord) -> HashMap<String, AttributeValue> {
     item
 }
 
+/// Condition (+ values) "this attribute still holds the value just read":
+/// the raw number when present, else `attribute_not_exists`.
+fn unchanged_number(
+    item: &HashMap<String, AttributeValue>,
+    attr: &str,
+    placeholder: &'static str,
+) -> (String, Option<(&'static str, AttributeValue)>) {
+    match item.get(attr).filter(|v| v.as_n().is_ok()) {
+        Some(v) => (
+            format!("{attr} = {placeholder}"),
+            Some((placeholder, v.clone())),
+        ),
+        None => (format!("attribute_not_exists({attr})"), None),
+    }
+}
+
+/// A clamped refund computed from a freshly read row.
+struct RefundPlan {
+    mtd: f64,
+    used: f64,
+    condition: String,
+    values: Vec<(&'static str, AttributeValue)>,
+}
+
+fn refund_plan(item: &HashMap<String, AttributeValue>, refund: f64) -> RefundPlan {
+    use crate::database::budget::clamped_after_refund;
+    let (c1, v1) = unchanged_number(item, "budget_used_mtd", ":cur_mtd");
+    let (c2, v2) = unchanged_number(item, "budget_used", ":cur_used");
+    RefundPlan {
+        mtd: clamped_after_refund(get_f64(item, "budget_used_mtd"), refund),
+        used: clamped_after_refund(get_f64(item, "budget_used"), refund),
+        condition: format!("{c1} AND {c2}"),
+        values: v1.into_iter().chain(v2).collect(),
+    }
+}
+
+/// Condition for a period reset from `prev`: stored period still `prev`
+/// (`""` ≡ absent) and — when `cas` — spend unchanged since the read.
+fn reset_condition(
+    item: &HashMap<String, AttributeValue>,
+    prev: &str,
+    cas: bool,
+) -> (String, Vec<(&'static str, AttributeValue)>) {
+    let mut values = Vec::new();
+    let mut condition = if prev.is_empty() {
+        values.push((":prev", av_s("")));
+        // `*_to_item` writes an unset period as a NULL-typed attribute
+        // (`av_opt_s`): it exists and is not `= ""`, so match it explicitly.
+        values.push((":null_t", av_s("NULL")));
+        "(attribute_not_exists(budget_mtd_month) OR attribute_type(budget_mtd_month, :null_t) \
+         OR budget_mtd_month = :prev)"
+            .to_string()
+    } else {
+        values.push((":prev", av_s(prev)));
+        "budget_mtd_month = :prev".to_string()
+    };
+    if cas {
+        let (c, v) = unchanged_number(item, "budget_used_mtd", ":cur_mtd");
+        condition = format!("{condition} AND {c}");
+        values.extend(v);
+    }
+    (condition, values)
+}
+
 fn spend_after(attrs: Option<&HashMap<String, AttributeValue>>) -> SpendAfter {
     SpendAfter {
         used: attrs.map(|a| get_f64(a, "budget_used_mtd")).unwrap_or(0.0),
@@ -892,6 +1076,9 @@ fn model_mapping_from_item(item: &HashMap<String, AttributeValue>) -> ModelMappi
         updated_at: get_opt_i64(item, "updated_at"),
         capabilities: get_opt_s(item, "capabilities"),
         pricing_source: get_opt_s(item, "pricing_source").unwrap_or_else(|| "litellm".to_string()),
+        price_per_request: get_f64(item, "price_per_request"),
+        price_per_image: get_f64(item, "price_per_image"),
+        price_per_search_unit: get_f64(item, "price_per_search_unit"),
     }
 }
 
@@ -1106,49 +1293,11 @@ impl ApiKeyStore for DynamoDbBackend {
         api_key: &str,
         month: &str,
         prev_month: &str,
-        prev_mtd: f64,
+        _prev_mtd: f64,
     ) -> Result<()> {
-        let now = unix_now();
-
-        // Get current item to read existing budget_history
-        let get_result = self
-            .client
-            .get_item()
-            .table_name(Self::table_name("api_keys"))
-            .key("api_key", av_s(api_key))
-            .send()
-            .await?;
-
-        let updated_history = if let Some(item) = get_result.item() {
-            let existing = get_opt_s(item, "budget_history");
-            let mut history: std::collections::HashMap<String, f64> = existing
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            if prev_mtd > 0.0 && !prev_month.is_empty() {
-                history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
-            }
-            serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string())
-        } else {
-            "{}".to_string()
-        };
-
-        self.client
-            .update_item()
-            .table_name(Self::table_name("api_keys"))
-            .key("api_key", av_s(api_key))
-            .update_expression(
-                "SET budget_used_mtd = :zero, budget_mtd_month = :month, \
-                 budget_history = :history, updated_at = :now",
-            )
-            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
-            .expression_attribute_values(":month", av_s(month))
-            .expression_attribute_values(":history", av_s(&updated_history))
-            .expression_attribute_values(":now", av_n(now))
-            .send()
+        self.reset_period("api_keys", "api_key", api_key, month, prev_month)
             .await
-            .map_err(|e| anyhow::anyhow!("DynamoDB reset_monthly_budget: {e}"))?;
-        Ok(())
+            .map_err(|e| anyhow::anyhow!("DynamoDB reset_monthly_budget: {e}"))
     }
 
     async fn reactivate_api_key(&self, api_key: &str) -> Result<()> {
@@ -1581,33 +1730,11 @@ impl TeamStore for DynamoDbBackend {
         team_id: &str,
         period: &str,
         prev_period: &str,
-        prev_used: f64,
+        _prev_used: f64,
     ) -> Result<()> {
-        let existing = self.get_team(team_id).await?.and_then(|t| t.budget_history);
-        let mut history: HashMap<String, f64> = existing
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        if prev_used > 0.0 && !prev_period.is_empty() {
-            history.insert(prev_period.to_string(), (prev_used * 100.0).round() / 100.0);
-        }
-        let history = serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string());
-        self.client
-            .update_item()
-            .table_name(Self::table_name("teams"))
-            .key("team_id", av_s(team_id))
-            .update_expression(
-                "SET budget_used_mtd = :zero, budget_mtd_month = :month, \
-                 budget_history = :history, updated_at = :now",
-            )
-            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
-            .expression_attribute_values(":month", av_s(period))
-            .expression_attribute_values(":history", av_s(&history))
-            .expression_attribute_values(":now", av_n(unix_now()))
-            .send()
+        self.reset_period("teams", "team_id", team_id, period, prev_period)
             .await
-            .map_err(|e| anyhow::anyhow!("DynamoDB reset_team_monthly_budget: {e}"))?;
-        Ok(())
+            .map_err(|e| anyhow::anyhow!("DynamoDB reset_team_monthly_budget: {e}"))
     }
 
     async fn claim_team_budget_alert(
@@ -1640,7 +1767,7 @@ impl BudgetStore for DynamoDbBackend {
         id: &str,
         amount: f64,
         max_used_before: f64,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let (table, id_col) = layer.table();
         let res = self
             .client
@@ -1653,14 +1780,19 @@ impl BudgetStore for DynamoDbBackend {
             .condition_expression("budget_used_mtd <= :max")
             .expression_attribute_values(":a", av_n_f64(amount))
             .expression_attribute_values(":max", av_n_f64(max_used_before))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
             .send()
             .await;
         match res {
-            Ok(_) => Ok(true),
+            Ok(out) => Ok(Some(
+                out.attributes()
+                    .and_then(|a| get_opt_s(a, "budget_mtd_month"))
+                    .unwrap_or_default(),
+            )),
             Err(e) => {
                 let svc = e.into_service_error();
                 if svc.is_conditional_check_failed_exception() {
-                    Ok(false)
+                    Ok(None)
                 } else {
                     Err(anyhow::anyhow!("reserve_budget: {svc}"))
                 }
@@ -1845,33 +1977,11 @@ impl UserStore for DynamoDbBackend {
         user_id: &str,
         month: &str,
         prev_month: &str,
-        prev_mtd: f64,
+        _prev_mtd: f64,
     ) -> Result<()> {
-        let existing = self.get_user(user_id).await?.and_then(|u| u.budget_history);
-        let mut history: HashMap<String, f64> = existing
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        if prev_mtd > 0.0 && !prev_month.is_empty() {
-            history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
-        }
-        let history = serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string());
-        self.client
-            .update_item()
-            .table_name(Self::table_name("users"))
-            .key("user_id", av_s(user_id))
-            .update_expression(
-                "SET budget_used_mtd = :zero, budget_mtd_month = :month, \
-                 budget_history = :history, updated_at = :now",
-            )
-            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
-            .expression_attribute_values(":month", av_s(month))
-            .expression_attribute_values(":history", av_s(&history))
-            .expression_attribute_values(":now", av_n(unix_now()))
-            .send()
+        self.reset_period("users", "user_id", user_id, month, prev_month)
             .await
-            .map_err(|e| anyhow::anyhow!("DynamoDB reset_user_monthly_budget: {e}"))?;
-        Ok(())
+            .map_err(|e| anyhow::anyhow!("DynamoDB reset_user_monthly_budget: {e}"))
     }
 }
 
@@ -2252,6 +2362,15 @@ impl ModelMappingStore for DynamoDbBackend {
         item.insert("updated_at".into(), av_n(now));
         item.insert("capabilities".into(), av_opt_s(&record.capabilities));
         item.insert("pricing_source".into(), av_s(&record.pricing_source));
+        item.insert(
+            "price_per_request".into(),
+            av_n_f64(record.price_per_request),
+        );
+        item.insert("price_per_image".into(), av_n_f64(record.price_per_image));
+        item.insert(
+            "price_per_search_unit".into(),
+            av_n_f64(record.price_per_search_unit),
+        );
 
         self.client
             .put_item()
@@ -2482,7 +2601,7 @@ impl SystemSettingStore for DynamoDbBackend {
 
 #[cfg(test)]
 mod audit_month_tests {
-    use super::audit_start_month;
+    use super::*;
 
     #[test]
     fn short_or_odd_bounds_do_not_panic() {
@@ -2494,5 +2613,56 @@ mod audit_month_tests {
             audit_start_month("2026-03-15T00:00:00Z"),
             chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()
         );
+    }
+
+    fn row(mtd: Option<&str>, used: Option<&str>) -> HashMap<String, AttributeValue> {
+        let mut m = HashMap::new();
+        if let Some(v) = mtd {
+            m.insert("budget_used_mtd".to_string(), AttributeValue::N(v.into()));
+        }
+        if let Some(v) = used {
+            m.insert("budget_used".to_string(), AttributeValue::N(v.into()));
+        }
+        m
+    }
+
+    #[test]
+    fn refund_plan_clamps_and_compares_raw_values() {
+        let p = refund_plan(&row(Some("1.25"), Some("7.5")), 2.0);
+        assert_eq!(p.mtd, 0.0);
+        assert_eq!(p.used, 5.5);
+        assert_eq!(
+            p.condition,
+            "budget_used_mtd = :cur_mtd AND budget_used = :cur_used"
+        );
+        // The raw stored number (exact decimal) is the compare value.
+        assert_eq!(p.values[0].1, AttributeValue::N("1.25".into()));
+        let p = refund_plan(&row(None, None), 1.0);
+        assert_eq!(
+            p.condition,
+            "attribute_not_exists(budget_used_mtd) AND attribute_not_exists(budget_used)"
+        );
+        assert!(p.values.is_empty());
+        assert_eq!((p.mtd, p.used), (0.0, 0.0));
+    }
+
+    #[test]
+    fn reset_condition_requires_old_period_and_unchanged_spend() {
+        let item = row(Some("3"), None);
+        let (c, v) = reset_condition(&item, "2026-10", true);
+        assert_eq!(c, "budget_mtd_month = :prev AND budget_used_mtd = :cur_mtd");
+        assert_eq!(v.len(), 2);
+        let (c, _) = reset_condition(&item, "2026-10", false);
+        assert_eq!(c, "budget_mtd_month = :prev");
+        let (c, v) = reset_condition(&item, "", false);
+        assert!(c.contains("attribute_not_exists(budget_mtd_month)"), "{c}");
+        // New rows store an unset period as a NULL-typed attribute.
+        assert!(
+            c.contains("attribute_type(budget_mtd_month, :null_t)"),
+            "{c}"
+        );
+        assert!(v
+            .iter()
+            .any(|(k, val)| *k == ":null_t" && val.as_s().is_ok_and(|s| s == "NULL")));
     }
 }

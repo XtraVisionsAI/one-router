@@ -106,8 +106,10 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
             }
         }
         "web_fetch_max_content_kb" => match value.parse::<u64>() {
-            Ok(n) if n > 0 => Ok(()),
-            _ => Err("web_fetch_max_content_kb must be a positive integer"),
+            Ok(n) if (1..=crate::services::web_tools::fetch::MAX_FETCH_CONTENT_KB).contains(&n) => {
+                Ok(())
+            }
+            _ => Err("web_fetch_max_content_kb must be an integer between 1 and 10240 (KB)"),
         },
         "bedrock_max_request_mb" => match value.parse::<u64>() {
             Ok(n) if (1..=64).contains(&n) => Ok(()),
@@ -239,8 +241,8 @@ pub async fn upsert_setting(
         .before(&existing.as_ref().map(|e| shown(&e.value)))
         .after(&shown(&body.value));
 
-    // Sensitive values are encrypted at rest like backend configs (readers use
-    // `Encryptor::decrypt`, which also accepts legacy plaintext).
+    // Sensitive values are encrypted at rest (v2, bound to the key) like
+    // backend configs; empty = disabled and stays empty.
     let stored_value = if sensitive && !body.value.is_empty() {
         state.encryptor.encrypt(
             &body.value,

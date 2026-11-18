@@ -45,7 +45,7 @@ impl FetchProvider for ReqwestFetchProvider {
     ) -> Result<FetchResult, WebToolError> {
         // SSRF-guarded GET that re-validates every redirect hop against the
         // domain policy and IP rules (guarded resolver at connect time).
-        let max_bytes = (max_content_kb * 1024) as usize;
+        let max_bytes = content_cap_bytes(max_content_kb);
         let result = ssrf::safe_get_bytes(
             url,
             max_bytes,
@@ -73,6 +73,17 @@ impl FetchProvider for ReqwestFetchProvider {
             status_code: 200,
         })
     }
+}
+
+/// Upper bound for `web_fetch_max_content_kb` (10 MB), enforced by the
+/// settings API and again here for values from env / older rows.
+pub const MAX_FETCH_CONTENT_KB: u64 = 10 * 1024;
+
+/// Byte cap for a fetch: `kb` clamped to `1..=MAX_FETCH_CONTENT_KB`, no
+/// overflow on any `u64`.
+pub fn content_cap_bytes(kb: u64) -> usize {
+    let bytes = kb.clamp(1, MAX_FETCH_CONTENT_KB).saturating_mul(1024);
+    usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
 /// Decode UTF-8 text that may have been truncated mid-character at the byte
@@ -183,7 +194,7 @@ impl FetchProvider for TavilyExtractProvider {
             .unwrap_or("")
             .to_string();
 
-        truncate_to_char_boundary(&mut content, (max_content_kb * 1024) as usize);
+        truncate_to_char_boundary(&mut content, content_cap_bytes(max_content_kb));
 
         Ok(FetchResult {
             url: url.to_string(),
@@ -328,6 +339,14 @@ mod tests {
         assert_eq!(decode_text(bytes).unwrap(), "页面内容");
         // Invalid bytes in the middle: not text.
         assert!(decode_text(&[b'a', 0xff, b'b']).is_none());
+    }
+
+    #[test]
+    fn content_cap_never_overflows() {
+        assert_eq!(content_cap_bytes(512), 512 * 1024);
+        assert_eq!(content_cap_bytes(0), 1024);
+        assert_eq!(content_cap_bytes(u64::MAX), 10 * 1024 * 1024);
+        assert_eq!(content_cap_bytes(u64::MAX / 512), 10 * 1024 * 1024);
     }
 
     #[test]

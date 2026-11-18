@@ -308,9 +308,16 @@ impl Drop for BillingGuard {
             output_tokens = usage.output_tokens,
             "Stream ended early (client disconnect); recording usage seen so far"
         );
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(billing.record(usage));
-        }
+        spawn_record(billing, usage);
+    }
+}
+
+/// Record on a detached task so the write survives the body being dropped.
+fn spawn_record(billing: StreamBilling, usage: Usage) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(billing.record(usage));
+    } else {
+        tracing::warn!(request_id = %billing.request_id, "No tokio runtime; streaming usage not recorded");
     }
 }
 
@@ -332,8 +339,11 @@ pub fn bill_sse_response(resp: Response, billing: StreamBilling) -> Response {
             yield chunk;
         }
         if let Some(billing) = guard.billing.take() {
+            // Spawned, not awaited: a client reset right after the last frame
+            // drops this body future, which would cancel an in-flight record.
+            // `take()` above keeps it exactly-once with the drop guard.
             let usage = billing.resolve(&guard.meter);
-            billing.record(usage).await;
+            spawn_record(billing, usage);
         }
     };
     Response::from_parts(parts, Body::from_stream(stream))
@@ -498,6 +508,32 @@ mod tests {
         drop(data);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!((f.user_spend().await - 3.0).abs() < 1e-9);
+    }
+
+    /// The end-of-stream record is spawned: the body finishes without waiting
+    /// on the store, so a client reset right after the last frame cannot
+    /// cancel the write — and it still happens exactly once.
+    #[tokio::test]
+    async fn final_record_survives_immediate_drop() {
+        use futures::StreamExt;
+        let f = crate::services::usage_tracker::test_support::fixture(100.0).await;
+        let resp = bill_sse_response(sse_response(vec![START_1M], false), billing(&f));
+        let mut data = resp.into_body().into_data_stream();
+        assert!(data.next().await.is_some());
+        // The poll that runs the end-of-body path resolves at once.
+        let end = futures::poll!(data.next());
+        assert!(matches!(end, std::task::Poll::Ready(None)), "{end:?}");
+        drop(data);
+        let mut spend = 0.0;
+        for _ in 0..100 {
+            spend = f.user_spend().await;
+            if spend > 0.0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!((f.user_spend().await - 3.0).abs() < 1e-9, "billed {spend}");
     }
 
     #[test]

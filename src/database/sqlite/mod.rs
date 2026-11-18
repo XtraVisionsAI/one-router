@@ -358,6 +358,9 @@ impl SqliteBackend {
                 updated_at INTEGER,
                 capabilities TEXT,
                 pricing_source TEXT DEFAULT 'litellm',
+                price_per_request REAL DEFAULT 0.0,
+                price_per_image REAL DEFAULT 0.0,
+                price_per_search_unit REAL DEFAULT 0.0,
                 PRIMARY KEY (source_model_id, provider)
             )",
         )
@@ -386,6 +389,21 @@ impl SqliteBackend {
             .execute(&self.pool)
             .await
             .ok();
+
+        // Migration: non-token prices (USD per call / per generated image /
+        // per rerank search unit). Idempotent: a duplicate column errors.
+        for col in [
+            "price_per_request",
+            "price_per_image",
+            "price_per_search_unit",
+        ] {
+            sqlx::query(&format!(
+                "ALTER TABLE model_mappings ADD COLUMN {col} REAL DEFAULT 0.0"
+            ))
+            .execute(&self.pool)
+            .await
+            .ok();
+        }
 
         // --- backends ---
         sqlx::query(
@@ -911,7 +929,16 @@ fn bind_usage_filter<'q>(
     q
 }
 
-/// Reset month-to-date spend and archive the previous month into budget_history.
+/// Roll a row's spend counter from period `prev_month` to `month`: archive
+/// the **stored** period spend into budget_history and zero it — only while
+/// the stored period is still `prev_month`. Requests carrying a cached,
+/// stale period (auth cache) would otherwise reset the counter again after
+/// another request already rolled it, erasing the new period's spend.
+///
+/// Compare-and-set on `(period, spend)` so a concurrent increment between the
+/// read and the write is not lost; after `CAS_ATTEMPTS` the write is
+/// conditioned on the period alone. `_prev_mtd` (the caller's cached spend) is
+/// not trusted — the stored value is archived.
 async fn reset_budget(
     pool: &SqlitePool,
     table: &str,
@@ -919,42 +946,54 @@ async fn reset_budget(
     id: &str,
     month: &str,
     prev_month: &str,
-    prev_mtd: f64,
+    _prev_mtd: f64,
 ) -> Result<()> {
-    let row = sqlx::query(&format!(
-        "SELECT budget_history FROM {table} WHERE {id_col} = ?"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-    let updated_history = archive_month(
-        row.and_then(|r| r.get::<Option<String>, _>("budget_history")),
-        prev_month,
-        prev_mtd,
-    );
-    sqlx::query(&format!(
-        "UPDATE {table} SET budget_used_mtd = 0.0, budget_mtd_month = ?, \
-         budget_history = ?, updated_at = ? WHERE {id_col} = ?"
-    ))
-    .bind(month)
-    .bind(&updated_history)
-    .bind(unix_now())
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Add `prev_mtd` (rounded to cents) under `prev_month` in a budget_history JSON.
-fn archive_month(existing: Option<String>, prev_month: &str, prev_mtd: f64) -> String {
-    let mut history: std::collections::HashMap<String, f64> = existing
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-    if prev_mtd > 0.0 && !prev_month.is_empty() {
-        history.insert(prev_month.to_string(), (prev_mtd * 100.0).round() / 100.0);
+    use crate::database::budget::{archive_period, period_is, CAS_ATTEMPTS};
+    for attempt in 0..=CAS_ATTEMPTS {
+        let Some(row) = sqlx::query(&format!(
+            "SELECT budget_history, budget_used_mtd, budget_mtd_month FROM {table} WHERE {id_col} = ?"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        else {
+            return Ok(());
+        };
+        let stored: Option<String> = row.get("budget_mtd_month");
+        if !period_is(stored.as_deref(), prev_month) {
+            return Ok(()); // already rolled (by another request / instance)
+        }
+        let used: f64 = row.get::<Option<f64>, _>("budget_used_mtd").unwrap_or(0.0);
+        let history = archive_period(
+            row.get::<Option<String>, _>("budget_history").as_deref(),
+            prev_month,
+            used,
+        );
+        let cas = attempt < CAS_ATTEMPTS;
+        let spend_cond = if cas {
+            " AND COALESCE(budget_used_mtd, 0.0) = ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "UPDATE {table} SET budget_used_mtd = 0.0, budget_mtd_month = ?, \
+             budget_history = ?, updated_at = ? \
+             WHERE {id_col} = ? AND COALESCE(budget_mtd_month, '') = ?{spend_cond}"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(month)
+            .bind(&history)
+            .bind(unix_now())
+            .bind(id)
+            .bind(prev_month);
+        if cas {
+            q = q.bind(used);
+        }
+        if q.execute(pool).await?.rows_affected() == 1 {
+            return Ok(());
+        }
     }
-    serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string())
+    Ok(())
 }
 
 fn row_to_api_key(r: &sqlx::sqlite::SqliteRow) -> ApiKeyRecord {
@@ -1576,20 +1615,24 @@ impl BudgetStore for SqliteBackend {
         id: &str,
         amount: f64,
         max_used_before: f64,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let (table, id_col) = layer.table();
-        let res = sqlx::query(&format!(
+        let row = sqlx::query(&format!(
             "UPDATE {table} SET budget_used = budget_used + ?, \
              budget_used_mtd = budget_used_mtd + ? \
-             WHERE {id_col} = ? AND budget_used_mtd <= ?"
+             WHERE {id_col} = ? AND budget_used_mtd <= ? \
+             RETURNING budget_mtd_month"
         ))
         .bind(amount)
         .bind(amount)
         .bind(id)
         .bind(max_used_before)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(res.rows_affected() == 1)
+        Ok(row.map(|r| {
+            r.get::<Option<String>, _>("budget_mtd_month")
+                .unwrap_or_default()
+        }))
     }
 }
 
@@ -1922,40 +1965,51 @@ impl UsageStore for SqliteBackend {
 // ModelMappingStore
 // ============================================================================
 
+fn sqlite_mapping_row(r: &sqlx::sqlite::SqliteRow) -> ModelMappingRecord {
+    let price = |col: &str| {
+        r.try_get::<Option<f64>, _>(col)
+            .ok()
+            .flatten()
+            .unwrap_or(0.0)
+    };
+    ModelMappingRecord {
+        source_model_id: r.get("source_model_id"),
+        target_model_id: r.get("target_model_id"),
+        provider: r.get("provider"),
+        display_name: r.get("display_name"),
+        input_price: r.get("input_price"),
+        output_price: r.get("output_price"),
+        cache_read_price: r.get("cache_read_price"),
+        cache_write_price: r.get("cache_write_price"),
+        priority: r.get("priority"),
+        status: r.get("status"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+        capabilities: r.get("capabilities"),
+        pricing_source: r
+            .get::<Option<String>, _>("pricing_source")
+            .unwrap_or_else(|| "litellm".to_string()),
+        price_per_request: price("price_per_request"),
+        price_per_image: price("price_per_image"),
+        price_per_search_unit: price("price_per_search_unit"),
+    }
+}
+
 #[async_trait]
 impl ModelMappingStore for SqliteBackend {
     async fn get_mappings(&self, source_model_id: &str) -> Result<Vec<ModelMappingRecord>> {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities, pricing_source \
+             priority, status, created_at, updated_at, capabilities, pricing_source, \
+             price_per_request, price_per_image, price_per_search_unit \
              FROM model_mappings WHERE source_model_id = ? ORDER BY priority DESC",
         )
         .bind(source_model_id)
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows
-            .iter()
-            .map(|r| ModelMappingRecord {
-                source_model_id: r.get("source_model_id"),
-                target_model_id: r.get("target_model_id"),
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                input_price: r.get("input_price"),
-                output_price: r.get("output_price"),
-                cache_read_price: r.get("cache_read_price"),
-                cache_write_price: r.get("cache_write_price"),
-                priority: r.get("priority"),
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-                capabilities: r.get("capabilities"),
-                pricing_source: r
-                    .get::<Option<String>, _>("pricing_source")
-                    .unwrap_or_else(|| "litellm".to_string()),
-            })
-            .collect();
+        let records = rows.iter().map(sqlite_mapping_row).collect();
 
         Ok(records)
     }
@@ -1968,7 +2022,8 @@ impl ModelMappingStore for SqliteBackend {
         let row = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities, pricing_source \
+             priority, status, created_at, updated_at, capabilities, pricing_source, \
+             price_per_request, price_per_image, price_per_search_unit \
              FROM model_mappings WHERE source_model_id = ? AND provider = ?",
         )
         .bind(source_model_id)
@@ -1977,24 +2032,7 @@ impl ModelMappingStore for SqliteBackend {
         .await?;
 
         match row {
-            Some(r) => Ok(Some(ModelMappingRecord {
-                source_model_id: r.get("source_model_id"),
-                target_model_id: r.get("target_model_id"),
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                input_price: r.get("input_price"),
-                output_price: r.get("output_price"),
-                cache_read_price: r.get("cache_read_price"),
-                cache_write_price: r.get("cache_write_price"),
-                priority: r.get("priority"),
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-                capabilities: r.get("capabilities"),
-                pricing_source: r
-                    .get::<Option<String>, _>("pricing_source")
-                    .unwrap_or_else(|| "litellm".to_string()),
-            })),
+            Some(r) => Ok(Some(sqlite_mapping_row(&r))),
             None => Ok(None),
         }
     }
@@ -2003,33 +2041,14 @@ impl ModelMappingStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities, pricing_source \
+             priority, status, created_at, updated_at, capabilities, pricing_source, \
+             price_per_request, price_per_image, price_per_search_unit \
              FROM model_mappings ORDER BY provider, priority DESC, source_model_id",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows
-            .iter()
-            .map(|r| ModelMappingRecord {
-                source_model_id: r.get("source_model_id"),
-                target_model_id: r.get("target_model_id"),
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                input_price: r.get("input_price"),
-                output_price: r.get("output_price"),
-                cache_read_price: r.get("cache_read_price"),
-                cache_write_price: r.get("cache_write_price"),
-                priority: r.get("priority"),
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-                capabilities: r.get("capabilities"),
-                pricing_source: r
-                    .get::<Option<String>, _>("pricing_source")
-                    .unwrap_or_else(|| "litellm".to_string()),
-            })
-            .collect();
+        let records = rows.iter().map(sqlite_mapping_row).collect();
 
         Ok(records)
     }
@@ -2040,8 +2059,9 @@ impl ModelMappingStore for SqliteBackend {
             "INSERT INTO model_mappings \
              (source_model_id, target_model_id, provider, display_name, \
               input_price, output_price, cache_read_price, cache_write_price, \
-              priority, status, created_at, updated_at, capabilities, pricing_source) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+              priority, status, created_at, updated_at, capabilities, pricing_source, \
+              price_per_request, price_per_image, price_per_search_unit) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(source_model_id, provider) DO UPDATE SET \
              target_model_id = excluded.target_model_id, \
              display_name = excluded.display_name, \
@@ -2053,7 +2073,10 @@ impl ModelMappingStore for SqliteBackend {
              status = excluded.status, \
              updated_at = excluded.updated_at, \
              capabilities = excluded.capabilities, \
-             pricing_source = excluded.pricing_source",
+             pricing_source = excluded.pricing_source, \
+             price_per_request = excluded.price_per_request, \
+             price_per_image = excluded.price_per_image, \
+             price_per_search_unit = excluded.price_per_search_unit",
         )
         .bind(&record.source_model_id)
         .bind(&record.target_model_id)
@@ -2069,6 +2092,9 @@ impl ModelMappingStore for SqliteBackend {
         .bind(now)
         .bind(&record.capabilities)
         .bind(&record.pricing_source)
+        .bind(record.price_per_request)
+        .bind(record.price_per_image)
+        .bind(record.price_per_search_unit)
         .execute(&self.pool)
         .await?;
 
@@ -2089,34 +2115,15 @@ impl ModelMappingStore for SqliteBackend {
         let rows = sqlx::query(
             "SELECT source_model_id, target_model_id, provider, display_name, \
              input_price, output_price, cache_read_price, cache_write_price, \
-             priority, status, created_at, updated_at, capabilities, pricing_source \
+             priority, status, created_at, updated_at, capabilities, pricing_source, \
+             price_per_request, price_per_image, price_per_search_unit \
              FROM model_mappings WHERE source_model_id LIKE '%*%' AND status = 'active' \
              ORDER BY priority DESC",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let records = rows
-            .iter()
-            .map(|r| ModelMappingRecord {
-                source_model_id: r.get("source_model_id"),
-                target_model_id: r.get("target_model_id"),
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                input_price: r.get("input_price"),
-                output_price: r.get("output_price"),
-                cache_read_price: r.get("cache_read_price"),
-                cache_write_price: r.get("cache_write_price"),
-                priority: r.get("priority"),
-                status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-                capabilities: r.get("capabilities"),
-                pricing_source: r
-                    .get::<Option<String>, _>("pricing_source")
-                    .unwrap_or_else(|| "litellm".to_string()),
-            })
-            .collect();
+        let records = rows.iter().map(sqlite_mapping_row).collect();
 
         Ok(records)
     }
@@ -2347,7 +2354,7 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn in_memory_db() -> SqliteBackend {
+    pub(super) async fn in_memory_db() -> SqliteBackend {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -2358,7 +2365,7 @@ mod tests {
         backend
     }
 
-    fn key_record(hash: &str, name: &str) -> ApiKeyRecord {
+    pub(super) fn key_record(hash: &str, name: &str) -> ApiKeyRecord {
         ApiKeyRecord {
             api_key: hash.into(),
             key_id: new_key_id(),
@@ -2684,6 +2691,7 @@ mod tests {
         let db = in_memory_db().await;
         let mut u = UserRecord::new("carol", 1);
         u.monthly_budget = Some(5.0);
+        u.budget_mtd_month = Some("2026-11".into());
         u.allowed_models = Some(vec!["claude-*".into()]);
         db.users().create_user(&u).await.unwrap();
         assert!(db
@@ -3032,16 +3040,19 @@ mod tests {
         assert!(b
             .reserve_budget(BudgetLayer::User, &u.user_id, 4.0, 6.0)
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         assert!(b
             .reserve_budget(BudgetLayer::User, &u.user_id, 4.0, 6.0)
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         // used 8 > 6 → refused, nothing changed.
-        assert!(!b
+        assert!(b
             .reserve_budget(BudgetLayer::User, &u.user_id, 4.0, 6.0)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         let got = db.users().get_user(&u.user_id).await.unwrap().unwrap();
         assert_eq!(got.budget_used_mtd, 8.0);
         // Settlement refunds via a negative increment.
@@ -3051,10 +3062,11 @@ mod tests {
             .unwrap();
         let got = db.users().get_user(&u.user_id).await.unwrap().unwrap();
         assert_eq!(got.budget_used_mtd, 5.0);
-        assert!(!b
+        assert!(b
             .reserve_budget(BudgetLayer::Team, "missing", 1.0, 9.0)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -3255,6 +3267,7 @@ mod tests {
 
 #[cfg(test)]
 mod seed_mode_tests {
+    use super::tests::{in_memory_db, key_record};
     use super::*;
     use crate::database::seed::{self, SeedMode};
     use sqlx::sqlite::SqlitePoolOptions;
@@ -3315,5 +3328,207 @@ mod seed_mode_tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    fn history_of(h: Option<String>) -> std::collections::HashMap<String, f64> {
+        serde_json::from_str(h.as_deref().unwrap_or("{}")).unwrap()
+    }
+
+    /// A request carrying a cached (stale) period must not reset the counter
+    /// again after the period already rolled; history keeps the stored spend.
+    #[tokio::test]
+    async fn period_reset_is_conditional_on_stored_period() {
+        let db = in_memory_db().await;
+        let mut k = key_record("hash-roll", "roll");
+        k.budget_used = 5.0;
+        k.budget_used_mtd = 5.0;
+        k.budget_mtd_month = Some("2026-10".into());
+        db.api_keys().create_api_key(&k).await.unwrap();
+        // Caller's cached spend (1.0) is stale: the stored 5.0 is archived.
+        db.api_keys()
+            .reset_monthly_budget("hash-roll", "2026-11", "2026-10", 1.0)
+            .await
+            .unwrap();
+        db.api_keys()
+            .increment_budget_used("hash-roll", 2.0)
+            .await
+            .unwrap();
+        // Second (stale) reset from 2026-10: no-op.
+        db.api_keys()
+            .reset_monthly_budget("hash-roll", "2026-11", "2026-10", 5.0)
+            .await
+            .unwrap();
+        let got = db
+            .api_keys()
+            .get_api_key("hash-roll")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.budget_used_mtd, 2.0);
+        assert_eq!(got.budget_mtd_month.as_deref(), Some("2026-11"));
+        assert_eq!(got.budget_used, 7.0);
+        assert_eq!(history_of(got.budget_history)["2026-10"], 5.0);
+
+        // Users.
+        let mut u = UserRecord::new("roll-user", 0);
+        u.budget_mtd_month = Some("2026-10".into());
+        db.users().create_user(&u).await.unwrap();
+        db.users()
+            .increment_user_budget_used(&u.user_id, 4.0)
+            .await
+            .unwrap();
+        db.users()
+            .reset_user_monthly_budget(&u.user_id, "2026-11", "2026-10", 0.5)
+            .await
+            .unwrap();
+        db.users()
+            .increment_user_budget_used(&u.user_id, 3.0)
+            .await
+            .unwrap();
+        db.users()
+            .reset_user_monthly_budget(&u.user_id, "2026-11", "2026-10", 4.0)
+            .await
+            .unwrap();
+        let got = db.users().get_user(&u.user_id).await.unwrap().unwrap();
+        assert_eq!(got.budget_used_mtd, 3.0);
+        assert_eq!(history_of(got.budget_history)["2026-10"], 4.0);
+
+        // Teams.
+        let mut t = TeamRecord::new("roll-team", 0);
+        t.budget_mtd_month = Some("2026-10".into());
+        db.teams().create_team(&t).await.unwrap();
+        db.teams()
+            .increment_team_budget_used(&t.team_id, 6.0)
+            .await
+            .unwrap();
+        db.teams()
+            .reset_team_monthly_budget(&t.team_id, "2026-11", "2026-10", 6.0)
+            .await
+            .unwrap();
+        db.teams()
+            .increment_team_budget_used(&t.team_id, 1.0)
+            .await
+            .unwrap();
+        db.teams()
+            .reset_team_monthly_budget(&t.team_id, "2026-11", "2026-10", 6.0)
+            .await
+            .unwrap();
+        let got = db.teams().get_team(&t.team_id).await.unwrap().unwrap();
+        assert_eq!(got.budget_used_mtd, 1.0);
+        assert_eq!(history_of(got.budget_history)["2026-10"], 6.0);
+    }
+
+    /// A never-rolled row (NULL period) resets from `""`.
+    #[tokio::test]
+    async fn period_reset_from_unset_period() {
+        let db = in_memory_db().await;
+        let mut k = key_record("hash-null", "null");
+        k.budget_mtd_month = None;
+        k.budget_used_mtd = 2.0;
+        db.api_keys().create_api_key(&k).await.unwrap();
+        db.api_keys()
+            .reset_monthly_budget("hash-null", "2026-11", "", 2.0)
+            .await
+            .unwrap();
+        let got = db
+            .api_keys()
+            .get_api_key("hash-null")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.budget_used_mtd, 0.0);
+        assert_eq!(got.budget_mtd_month.as_deref(), Some("2026-11"));
+    }
+
+    #[tokio::test]
+    async fn reserve_returns_stored_period() {
+        let db = in_memory_db().await;
+        let mut u = UserRecord::new("res-period", 0);
+        u.budget_mtd_month = Some("2026-10".into());
+        db.users().create_user(&u).await.unwrap();
+        let got = db
+            .budgets()
+            .reserve_budget(BudgetLayer::User, &u.user_id, 1.0, 100.0)
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("2026-10"));
+    }
+
+    /// A pre-010 model_mappings table (no non-token price columns) gains them
+    /// on startup; old rows read back as 0 and new values round-trip.
+    #[tokio::test]
+    async fn non_token_price_columns_migrate_and_round_trip() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE model_mappings (
+                source_model_id TEXT NOT NULL,
+                target_model_id TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT '',
+                display_name TEXT DEFAULT '',
+                input_price REAL DEFAULT 0.0,
+                output_price REAL DEFAULT 0.0,
+                cache_read_price REAL DEFAULT 0.0,
+                cache_write_price REAL DEFAULT 0.0,
+                priority INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER,
+                capabilities TEXT,
+                pricing_source TEXT DEFAULT 'litellm',
+                PRIMARY KEY (source_model_id, provider)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO model_mappings (source_model_id, target_model_id, provider, created_at) \
+             VALUES ('old', 'amazon.nova-canvas-v1:0', 'bedrock', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let db = SqliteBackend { pool };
+        db.initialize(None, SeedMode::Off).await.unwrap();
+        // Idempotent on a second startup.
+        db.initialize(None, SeedMode::Off).await.unwrap();
+
+        let old = db
+            .model_mapping()
+            .get_mapping("old", "bedrock")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.price_per_request, 0.0);
+        assert_eq!(old.price_per_image, 0.0);
+        assert_eq!(old.price_per_search_unit, 0.0);
+
+        let mut rec = old.clone();
+        rec.price_per_request = 0.001;
+        rec.price_per_image = 0.04;
+        rec.price_per_search_unit = 0.002;
+        db.model_mapping().upsert_mapping(&rec).await.unwrap();
+        let back = db.model_mapping().list_mappings().await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].price_per_request, 0.001);
+        assert_eq!(back[0].price_per_image, 0.04);
+        assert_eq!(back[0].price_per_search_unit, 0.002);
+    }
+
+    #[tokio::test]
+    async fn seeded_rerank_mappings_are_priced_per_search_unit() {
+        let db = bare_db(SeedMode::Empty).await;
+        let rerank = db
+            .model_mapping()
+            .get_mapping("rerank-english-v3.0", "bedrock")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rerank.price_per_search_unit, 0.002);
     }
 }

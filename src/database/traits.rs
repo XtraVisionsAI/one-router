@@ -129,14 +129,16 @@ pub trait TeamStore: Send + Sync {
 pub trait BudgetStore: Send + Sync {
     /// Atomically add `amount` to the layer's spend **only if** its current
     /// period spend is `<= max_used_before` (the caller passes
-    /// `budget - amount`). Returns `false` (nothing changed) otherwise.
+    /// `budget - amount`). Returns `None` (nothing changed) otherwise, else
+    /// `Some(period)`: the row's stored period key (`budget_mtd_month`, `""`
+    /// when unset) the reservation landed in — read atomically with the update.
     async fn reserve_budget(
         &self,
         layer: BudgetLayer,
         id: &str,
         amount: f64,
         max_used_before: f64,
-    ) -> Result<bool>;
+    ) -> Result<Option<String>>;
 }
 
 /// Shared fixed-window rate-limit counters (database rate-limit store).

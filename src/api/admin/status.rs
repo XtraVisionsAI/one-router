@@ -12,6 +12,10 @@ pub struct StatusResponse {
     pub uptime_seconds: u64,
     pub database: String,
     pub started_at: String,
+    /// Stored secrets (backend configs / sensitive settings) the runtime cannot
+    /// read — not v2, or v2 that fails to decrypt with the current key. Such
+    /// rows are skipped on config load. `null` if the scan itself failed.
+    pub invalid_stored_secrets: Option<usize>,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -22,10 +26,24 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         Err(_) => "unhealthy".to_string(),
     };
 
+    let invalid_stored_secrets = match crate::database::secret_migration::find_unreadable_secrets(
+        &state.database,
+        &state.encryptor,
+    )
+    .await
+    {
+        Ok(rows) => Some(rows.len()),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to scan stored secrets");
+            None
+        }
+    };
+
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: uptime,
         database: database_status,
         started_at: (Utc::now() - chrono::Duration::seconds(uptime as i64)).to_rfc3339(),
+        invalid_stored_secrets,
     })
 }

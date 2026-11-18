@@ -1599,6 +1599,17 @@ async fn handle_openai_passthrough(
         }
     }
 
+    // Billing needs the upstream's final usage chunk: force
+    // `stream_options.include_usage` and, if the client didn't ask for it,
+    // strip the usage frames from its stream (client-visible output unchanged).
+    let client_wants_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|o| o.include_usage);
+    if request.stream {
+        force_include_usage(&mut body_value);
+    }
+
     let body_bytes = serde_json::to_vec(&body_value)
         .map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
 
@@ -1649,6 +1660,7 @@ async fn handle_openai_passthrough(
             svc.clone(),
             credential_name,
             usage_ctx.clone(),
+            !client_wants_usage,
         )
         .await?;
         return Ok(ChatCompletionApiResponse::Stream(sse_stream));
@@ -1674,6 +1686,46 @@ async fn handle_openai_passthrough(
     Ok(ChatCompletionApiResponse::Json(Json(response)))
 }
 
+/// Set `stream_options.include_usage = true` on an upstream Chat Completions
+/// body (other `stream_options` keys are kept).
+pub(crate) fn force_include_usage(body: &mut serde_json::Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let opts = obj
+        .entry("stream_options")
+        .or_insert_with(|| serde_json::json!({}));
+    if !opts.is_object() {
+        *opts = serde_json::json!({});
+    }
+    opts["include_usage"] = serde_json::Value::Bool(true);
+}
+
+/// The client-facing form of one upstream `data:` payload when the gateway
+/// forced `include_usage` but the client did not ask for it: the usage-only
+/// final chunk (`choices: []`) is dropped (`None`) and the `usage: null` field
+/// OpenAI then adds to every other chunk is removed.
+fn strip_forced_usage(data: &str) -> Option<String> {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Some(data.to_string());
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return Some(data.to_string());
+    };
+    if !obj.contains_key("usage") {
+        return Some(data.to_string());
+    }
+    let no_choices = obj
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .is_none_or(|c| c.is_empty());
+    if no_choices {
+        return None;
+    }
+    obj.remove("usage");
+    Some(v.to_string())
+}
+
 /// Proxy OpenAI SSE stream from upstream to client
 async fn proxy_openai_sse_stream(
     upstream: reqwest::Response,
@@ -1681,6 +1733,7 @@ async fn proxy_openai_sse_stream(
     svc: Arc<crate::services::PassthroughService>,
     credential_name: String,
     usage_ctx: UsageContext,
+    strip_usage: bool,
 ) -> Result<SseStream, OpenAIApiError> {
     let req_id = request_id.to_string();
 
@@ -1731,8 +1784,18 @@ async fn proxy_openai_sse_stream(
                                 }
                             }
 
-                            // Forward [DONE] and JSON data
-                            yield Ok(Event::default().data(data));
+                            // Forward [DONE] and JSON data (upstream error frames redacted,
+                            // same shape; the forced usage chunk stripped if the client
+                            // didn't ask for it).
+                            let forwarded = if strip_usage && data != "[DONE]" {
+                                strip_forced_usage(data)
+                            } else {
+                                Some(data.to_string())
+                            };
+                            if let Some(out) = forwarded {
+                                let out = crate::utils::redact::redact_sse_error_frame(&out).unwrap_or(out);
+                                yield Ok(Event::default().data(out));
+                            }
                             if data == "[DONE]" {
                                 got_done = true;
                                 break 'outer;
@@ -1772,4 +1835,35 @@ async fn proxy_openai_sse_stream(
     };
 
     Ok(Box::pin(stream))
+}
+
+#[cfg(test)]
+mod forced_usage_tests {
+    use super::*;
+
+    #[test]
+    fn force_include_usage_adds_or_overrides() {
+        let mut b = serde_json::json!({"model": "m", "stream": true});
+        force_include_usage(&mut b);
+        assert_eq!(b["stream_options"]["include_usage"], true);
+        let mut b = serde_json::json!({"stream_options": {"include_usage": false, "x": 1}});
+        force_include_usage(&mut b);
+        assert_eq!(b["stream_options"]["include_usage"], true);
+        assert_eq!(b["stream_options"]["x"], 1);
+    }
+
+    #[test]
+    fn strip_forced_usage_drops_usage_chunk_and_null_fields() {
+        let usage_only =
+            r#"{"id":"c","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
+        assert_eq!(strip_forced_usage(usage_only), None);
+        let content = r#"{"id":"c","choices":[{"delta":{"content":"hi"}}],"usage":null}"#;
+        let out = strip_forced_usage(content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("usage").is_none());
+        assert_eq!(v["choices"][0]["delta"]["content"], "hi");
+        // Chunks without a usage key pass through byte-for-byte.
+        let plain = r#"{"choices":[{"delta":{"content":"x"}}]}"#;
+        assert_eq!(strip_forced_usage(plain).as_deref(), Some(plain));
+    }
 }

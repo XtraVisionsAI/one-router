@@ -108,7 +108,8 @@
   function fmtLastUsed(row: ApiKey) {
     if (!row.last_used_at) return h('span', { class: 'text-slate-500' }, 'never')
     const mins = Math.floor((Date.now() / 1000 - row.last_used_at) / 60)
-    const txt = mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.floor(mins / 60)}h ago` : `${Math.floor(mins / 1440)}d ago`
+    const txt =
+      mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.floor(mins / 60)}h ago` : `${Math.floor(mins / 1440)}d ago`
     return h('span', { title: new Date(row.last_used_at * 1000).toLocaleString() }, txt)
   }
 
@@ -134,7 +135,8 @@
   function statusTag(row: ApiKey) {
     if (row.is_active) return h(NTag, { type: 'success', size: 'small' }, { default: () => 'active' })
     const reason = row.deactivated_reason
-    const label = reason === 'deleted' ? 'deleted (legacy)' : reason === 'budget_exceeded' ? 'budget exceeded' : 'inactive'
+    const label =
+      reason === 'deleted' ? 'deleted (legacy)' : reason === 'budget_exceeded' ? 'budget exceeded' : 'inactive'
     const tag = h(NTag, { type: reason === 'deleted' ? 'default' : 'error', size: 'small' }, { default: () => label })
     if (reason !== 'deleted') return tag
     return h(NTooltip, null, {
@@ -221,7 +223,11 @@
             { size: 'small', disabled: !!row.rotated_to, onClick: () => confirmRotate(row) },
             { default: () => (row.rotated_to ? 'Rotated' : 'Rotate') }
           ),
-          h(NButton, { size: 'small', type: 'error', ghost: true, onClick: () => confirmDelete(row) }, { default: () => 'Delete' })
+          h(
+            NButton,
+            { size: 'small', type: 'error', ghost: true, onClick: () => confirmDelete(row) },
+            { default: () => 'Delete' }
+          )
         ])
     }
   ]
@@ -258,7 +264,7 @@
 
     <div class="flex items-center gap-3 mb-4">
       <span class="text-xs text-slate-400">User</span>
-      <NSelect
+      <n-select
         v-model:value="userFilter"
         :options="userOptions"
         filterable

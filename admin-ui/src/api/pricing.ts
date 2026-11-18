@@ -50,6 +50,9 @@ export interface ImportCandidate {
   output_price: number
   cache_read_price: number | null
   cache_write_price: number | null
+  price_per_request: number | null
+  price_per_image: number | null
+  price_per_search_unit: number | null
   supports_reasoning: boolean
   supports_function_calling: boolean
   max_input_tokens: number | null

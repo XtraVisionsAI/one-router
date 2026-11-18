@@ -125,7 +125,11 @@ pub async fn handle_ptc_request(
 
     let owner_hash = owner_key_hash(key_info);
     let session_id = ptc
-        .create_session(&tool_names, &owner_hash)
+        .create_session(
+            &tool_names,
+            &owner_hash,
+            key_info.user.as_ref().map(|u| u.user_id.as_str()),
+        )
         .await
         .map_err(ApiError::from)?;
 

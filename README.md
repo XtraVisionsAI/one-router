@@ -173,7 +173,7 @@ curl -N http://localhost:8000/v1/responses \
   -d '{"model":"gpt-4o","input":"Hello!","stream":true}'
 ```
 
-Multi-turn conversations are stateful: pass a prior response's `id` as `previous_response_id` to continue where it left off (stored responses are bound to the API key that created them). To point the Codex CLI at One Router, set its base URL to `http://localhost:8000/v1` and use your API key.
+Multi-turn conversations are stateful: pass a prior response's `id` as `previous_response_id` to continue where it left off (stored responses are bound to the API key that created them). Context is kept in memory for 1 hour, text only (images and tool definitions are not stored); a turn whose history exceeds 8 MB, or a key / user over its storage quota, is still answered normally — it is just not stored, so continuing from *that* response returns not-found (resend the conversation as `input` instead). To point the Codex CLI at One Router, set its base URL to `http://localhost:8000/v1` and use your API key.
 
 > **Bedrock GPT-5.x:** GPT-5.x models on AWS Bedrock are Responses-only (no Converse API). When a mapping targets one (`openai.gpt-5*`), `/v1/responses` passes the raw request through to the Bedrock Mantle Responses endpoint with native SSE relay, and `/v1/messages` / `/v1/chat/completions` reach the same models via built-in one-hop protocol conversion — including thinking-signature round-trips for Claude Code. Note these models are region-restricted (e.g. sol is us-east-1/us-east-2 only), so the Bedrock backend credential's region must match — pair this with a per-backend `models` filter to route only GPT models to the matching region.
 
@@ -323,7 +323,7 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
 
 ## Admin Web UI
 
-One Router includes a built-in admin UI at **`/admin`**. Open it in a browser and sign in with your master key or ephemeral key (debug builds). Authentication uses HttpOnly session cookies — no key is stored in the browser after login.
+One Router includes a built-in admin UI at **`/admin`**. Open it in a browser and sign in with your master key or ephemeral key (debug builds). Authentication uses HttpOnly session cookies — no key is stored in the browser after login. Logins are throttled to 10 failed attempts per 15 minutes per client address; once the limit is hit, attempts from that address are refused (429) without the key being checked, so behind a reverse proxy set `TRUSTED_PROXY_CIDRS` or every client shares one bucket.
 
 | Page | What you can do |
 |---|---|
@@ -348,7 +348,7 @@ One Router uses environment variables for infrastructure config. All runtime set
 | `PORT` | `8000` | HTTP listen port |
 | `HOST` | `127.0.0.1` (`0.0.0.0` when `CONTAINER=true`) | HTTP bind host. Loopback by default on bare metal; set `HOST=0.0.0.0` only behind a firewall / TLS reverse proxy |
 | `METRICS_PUBLIC` | `false` | Serve `/metrics` without authentication. Default requires the master key (`authorization: Bearer <MASTER_API_KEY>`) or an admin session |
-| `TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is trusted for the client address (IP allowlists, audit log) |
+| `TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is trusted for the client address (IP allowlists, audit log, admin login throttle). A trusted proxy sending a malformed / non-ASCII chain makes the client **unknown** (IP allowlists deny); no header at all = the proxy's own address. Set it behind a proxy — otherwise all clients share the proxy's admin-login throttle bucket (a warning is logged once) |
 | `LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `MASTER_API_KEY` | _(auto-generated)_ | Admin-only key — for `/admin` UI login and admin API. Cannot call `/v1/*` business endpoints. Plaintext **or `sha256:<hex>`** (only compared, so the gateway never needs the plaintext). A strong plaintext key read from `.env` is replaced there by its hash on startup; first-run generation stores only the hash and shows the key once (on a terminal). `one-router reset-master-key` / `one-router hash-key`. Deploy scripts deploy the hash |
 | `ENCRYPTION_KEY` | _(auto-generated)_ | AES-256 key for credential encryption and API key HMAC. Plaintext (startup warning) or a provider reference resolved at startup, fail-closed: `aws-kms:<region>:<base64>` (KMS Decrypt via the instance/task/pod role, encryption context `app=one-router,purpose=ENCRYPTION_KEY`), `vault-transit:<key>:<vault:v1:…>` (`VAULT_ADDR` + `VAULT_TOKEN` or `VAULT_K8S_ROLE`; optional `VAULT_TRANSIT_MOUNT`/`VAULT_NAMESPACE`/`VAULT_CACERT`), `systemd-creds:<name>` (`$CREDENTIALS_DIRECTORY`, TPM-bound), `raw:<key>`. Unknown `scheme:` prefixes abort startup. Create with `one-router wrap-key --provider aws-kms\|vault-transit\|systemd-creds --key …` (wraps the *same* key — existing data stays valid) |
@@ -357,12 +357,61 @@ One Router uses environment variables for infrastructure config. All runtime set
 | `BEDROCK_ALLOWED_PROFILES` | _(unset = any)_ | Comma-separated AWS profile names Bedrock backends may reference. A backend naming another profile is rejected on write and skipped on load |
 | `BEDROCK_ALLOW_DEFAULT_CREDENTIALS` | `true` | Allow Bedrock backends without explicit keys/profile to use the host's default AWS credential chain (env / instance role / SSO cache). Set `false` so the gateway's own identity can never be borrowed through the admin API |
 | `ADMIN_COOKIE_INSECURE` | _(unset)_ | Drop the `Secure` flag from the `admin_session` cookie (plain-HTTP admin access on a non-localhost host). Leave unset behind TLS |
+| `OUTBOUND_PROXY` | `off` | Proxy for SSRF-guarded fetches: `off` / `env` (use `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`) / an explicit `http://` or `https://` proxy URL (userinfo allowed, never logged; SOCKS not supported). Provider clients (Bedrock / Gemini / OpenAI / Anthropic / Tavily / Brave) always honor `HTTPS_PROXY` already |
+| `OUTBOUND_PROXY_SCOPE` | `admin` | `admin`: pricing sync, LiteLLM catalog / import, budget webhook. `all`: also web_fetch direct fetches and image URL inlining (user-supplied URLs — the proxy must deny private ranges) |
+| `PTC_MAX_SESSIONS_PER_USER` | `8` | Per-user cap (all of a user's keys) on concurrent PTC sessions and dynamic-filtering code runs; over the cap → 429 |
 
 **First-run behavior:**
 - **Bare metal:** Missing `MASTER_API_KEY` or `ENCRYPTION_KEY` are auto-generated and saved to `.env`.
 - **Docker:** These must be provided explicitly via `-e` flags. The container will refuse to start without them.
 
 CLI flags override environment variables: `one-router --port 9000 --database postgres://...`
+
+### Running behind a proxy
+
+In intranets or mainland-China deployments that reach the internet only through an
+HTTP(S) proxy, the provider clients already use `HTTPS_PROXY`. The SSRF-guarded
+fetches (pricing sync, LiteLLM import, budget webhook, web_fetch, image URLs) ignore
+it by default — a proxy resolves names itself, bypassing the gateway's connect-time
+DNS guard — and log a startup note when `HTTPS_PROXY` is set. Opt in:
+
+```bash
+OUTBOUND_PROXY=env            # or OUTBOUND_PROXY=http://user:pass@proxy.corp:3128
+OUTBOUND_PROXY_SCOPE=admin    # or all (also web_fetch + image URLs)
+```
+
+Proxied requests still get the static URL checks (scheme, IP literals, blocked
+hostnames) and a local DNS pre-check (any private / metadata address → rejected;
+local resolution failure → allowed, since only the proxy may resolve), and redirects
+are still followed manually with per-hop checks. With `OUTBOUND_PROXY_SCOPE=all` the
+**proxy is the last line of defense** for user-supplied URLs: it must refuse private
+destinations, for example:
+
+```
+# squid.conf — deny private / link-local / metadata destinations
+acl private_dst dst 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8
+acl private_dst dst 169.254.0.0/16 100.64.0.0/10 0.0.0.0/8
+acl private_dst dst fc00::/7 fe80::/10 ::1
+http_access deny private_dst
+http_access deny CONNECT private_dst
+```
+
+```yaml
+# Clash rules — reject private destinations before the proxy group
+rules:
+  - IP-CIDR,10.0.0.0/8,REJECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,REJECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,REJECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,REJECT,no-resolve
+  - IP-CIDR,169.254.0.0/16,REJECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,REJECT,no-resolve
+  - IP-CIDR6,fc00::/7,REJECT,no-resolve
+  - IP-CIDR6,::1/128,REJECT,no-resolve
+  - MATCH,PROXY
+```
+Use rules that match the **resolved** destination (Clash: without `no-resolve` on
+domain traffic the proxy resolves the name first; keep `IP-CIDR` rules before any
+`DOMAIN` / `MATCH` rule).
 
 ### Storage Backends
 
@@ -484,6 +533,20 @@ One Router ships with pre-configured mappings. All mappings are stored in the da
 
 Bedrock and Gemini return `b64_json` only. OpenAI passthrough supports both `url` and `b64_json`.
 
+### Model Pricing
+
+Each mapping carries per-1M-token prices (`input_price`, `output_price`, `cache_read_price`, `cache_write_price`) plus three non-token prices in USD (default 0):
+
+| Field | Charged | Used by |
+|---|---|---|
+| `price_per_request` | once per call | `/v1/images/generations`, `/v1/rerank` (token endpoints ignore it) |
+| `price_per_image` | per image actually returned | `/v1/images/generations` |
+| `price_per_search_unit` | per search unit = one query over up to 100 documents (101–200 docs = 2 units) | `/v1/rerank` |
+
+Cost = token cost + non-token cost, × the caller's cost rate (user × team). Images bill the prompt as input tokens, rerank bills query + documents as input tokens — both at the mapping's own input price only (no default per-token fallback). The seeded Cohere Rerank 3.5 mappings ship at `$0.002` per search unit (Bedrock: $2.00 / 1K queries); image mappings must be priced before they cost anything — a budgeted key calling an unpriced image/rerank mapping logs a one-time warning. With `budget_enforcement = precharge`, images reserve `price_per_image × n` (default 1) and rerank reserves its search units up front.
+
+LiteLLM pricing sync and import fill these from the price table: `image_generation` entries' `output_cost_per_image` → `price_per_image`, `rerank` entries' `input_cost_per_query` → `price_per_search_unit`, `input_cost_per_request` → `price_per_request`. Size/quality variants (`hd/1024-x-1024/dall-e-3`, `…/50-steps/…`, per-pixel pricing) and token-priced image models (`gpt-image-1`) are not imported — set their prices manually (and mark the mapping `manual`).
+
 Wildcard catch-alls (`claude-*`, `gpt-*`, `gemini-*`, `o1-*`) ensure unknown model variants are still routed.
 
 ### Model Capabilities
@@ -587,6 +650,38 @@ docker compose --profile dynamodb up
 ```
 
 Run `./scripts/deploy-apprunner.sh --help` for all options.
+
+## Upgrading
+
+Upgrades are **stop-the-world**: run one version at a time against a database (no rolling upgrades), and roll back by restoring the database backup.
+
+1. Stop every one-router instance.
+2. Back up the database (copy the SQLite file, `pg_dump`, or a DynamoDB on-demand backup).
+3. With the **new** binary / image and the same `DATABASE` + `ENCRYPTION_KEY` (from `.env`, the environment, or `-d` / `--encryption-key`), preview the stored-secret migration:
+   ```bash
+   one-router migrate-secrets --dry-run
+   ```
+4. Apply it:
+   ```bash
+   one-router migrate-secrets
+   ```
+   It prints one line per changed row (`backend <name>: v1 → v2`, `setting <key>: plaintext → v2`, `… decrypt failed (skipped)`) and a summary — never secret values. It is idempotent ("Nothing to migrate") and exits non-zero if any row could not be decrypted (wrong `ENCRYPTION_KEY`, or a corrupted / copied value). Opening the database runs the regular schema migrations; default model mappings are not seeded.
+5. Start the new version.
+
+Stored backend credentials and sensitive settings must be in the current `encrypted:v2:` format: the server refuses to start while any are still plaintext or legacy v1, and lists the affected backend names / setting keys. Rollback = stop, restore the backup taken in step 2, start the old version.
+
+Docker: `docker run --rm -e DATABASE=… -e ENCRYPTION_KEY=… -v one-router-data:/app/data xtravisions/one-router:<tag> one-router migrate-secrets --dry-run` (the image's command is `one-router`, so name it explicitly).
+
+**CLI commands:**
+
+| Command | Description |
+|---|---|
+| `one-router` | Run the server |
+| `one-router update [--check]` | Check for / apply a signed self-update (bare metal) |
+| `one-router migrate-secrets [--dry-run]` | Re-encrypt plaintext / v1 stored secrets as v2 (server stopped) |
+| `one-router reset-master-key [--no-write]` | New master key, shown once; only its SHA-256 is saved to `.env` |
+| `one-router hash-key` | stdin key → `sha256:<hex>` (for `MASTER_API_KEY`) |
+| `one-router wrap-key --provider aws-kms\|vault-transit\|systemd-creds` | Wrap `ENCRYPTION_KEY` with a key provider |
 
 ## Development
 

@@ -4,6 +4,7 @@
 //! in a secure Docker sandbox environment with persistent attach connections.
 
 pub mod exceptions;
+pub mod gated;
 pub mod runner;
 pub mod sandbox;
 pub mod service;

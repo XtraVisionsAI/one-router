@@ -1,18 +1,18 @@
 <script setup lang="ts">
-  import type { ApiKey, User, UsageSummaryResponse, UsageSummaryRow } from '@/api/types'
+  import type { ApiKey, UsageSummaryResponse, UsageSummaryRow, User } from '@/api/types'
   import type { GroupByDimension, UsageSummaryParams } from '@/api/usage'
+  import { BarChart, LineChart } from 'echarts/charts'
+  import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
+  import { use } from 'echarts/core'
+  import { CanvasRenderer } from 'echarts/renderers'
   import { NButton, NCard, NDataTable, NDatePicker, NInput, NSelect, NStatistic, useMessage } from 'naive-ui'
   import { h } from 'vue'
   import VChart from 'vue-echarts'
-  import { use } from 'echarts/core'
-  import { BarChart, LineChart } from 'echarts/charts'
-  import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
-  import { CanvasRenderer } from 'echarts/renderers'
   import { useKeysApi } from '@/api/keys'
-  import { useUsersApi } from '@/api/users'
   import { useUsageApi } from '@/api/usage'
+  import { useUsersApi } from '@/api/users'
   import { useChartTheme } from '@/composables/useChartTheme'
-  import { fmtMoney, fmtTokens, fmtPercent } from '@/utils/format'
+  import { fmtMoney, fmtPercent, fmtTokens } from '@/utils/format'
 
   use([BarChart, LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer])
 
@@ -61,12 +61,19 @@
 
   const splitByOptions = computed(() => [
     { label: 'None', value: null },
-    ...groupByOptions.filter(o => o.value !== groupBy.value)
+    ...groupByOptions.filter((o) => o.value !== groupBy.value)
   ])
 
   const groupByLabel: Record<string, string> = {
-    hour: 'Hour', day: 'Day', month: 'Month',
-    model: 'Model', provider: 'Provider', api_key: 'API Key', user: 'User', team: 'Team', tag: 'Tag',
+    hour: 'Hour',
+    day: 'Day',
+    month: 'Month',
+    model: 'Model',
+    provider: 'Provider',
+    api_key: 'API Key',
+    user: 'User',
+    team: 'Team',
+    tag: 'Tag'
   }
 
   const isTimeDimension = computed(() => ['hour', 'day', 'month'].includes(groupBy.value))
@@ -89,7 +96,9 @@
       const [k, u] = await Promise.all([keysApi.list(), usersApi.list()])
       keys.value = k.data
       users.value = u.data
-    } catch (e: any) { message.error(`Failed to load keys/users: ${e.message}`) }
+    } catch (e: any) {
+      message.error(`Failed to load keys/users: ${e.message}`)
+    }
   })
 
   function applyPreset(hours: number) {
@@ -120,8 +129,11 @@
         params.end_time = new Date(dateRange.value[1] + 86400000 - 1).toISOString()
       }
       result.value = await api.summary(params)
-    } catch (e: any) { message.error(e.message) }
-    finally { loading.value = false }
+    } catch (e: any) {
+      message.error(e.message)
+    } finally {
+      loading.value = false
+    }
   }
 
   // ── Chart ──────────────────────────────────────────────
@@ -137,21 +149,38 @@
         tooltip: { ...baseOption.tooltip, trigger: 'axis' },
         legend: { show: false },
         grid: { left: 55, right: 20, top: 20, bottom: 25 },
-        xAxis: { type: 'category', data: sorted.map(r => r.group_key), ...axisCommon },
+        xAxis: { type: 'category', data: sorted.map((r) => r.group_key), ...axisCommon },
         yAxis: { type: 'value', ...axisCommon },
-        series: [{
-          type: 'line', smooth: true, symbol: 'circle', symbolSize: 5,
-          data: sorted.map(r => +r.total_cost.toFixed(2)),
-          lineStyle: { color: COLORS[0], width: 2 },
-          itemStyle: { color: COLORS[0] },
-          areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(129,140,248,0.3)' }, { offset: 1, color: 'rgba(129,140,248,0)' }] } },
-        }],
+        series: [
+          {
+            type: 'line',
+            smooth: true,
+            symbol: 'circle',
+            symbolSize: 5,
+            data: sorted.map((r) => +r.total_cost.toFixed(2)),
+            lineStyle: { color: COLORS[0], width: 2 },
+            itemStyle: { color: COLORS[0] },
+            areaStyle: {
+              color: {
+                type: 'linear',
+                x: 0,
+                y: 0,
+                x2: 0,
+                y2: 1,
+                colorStops: [
+                  { offset: 0, color: 'rgba(129,140,248,0.3)' },
+                  { offset: 1, color: 'rgba(129,140,248,0)' }
+                ]
+              }
+            }
+          }
+        ]
       }
     }
 
     // Multi-series (split_by)
-    const splitKeys = [...new Set(data.map(r => r.split_key ?? 'unknown'))]
-    const groupKeys = [...new Set(data.map(r => r.group_key))].sort()
+    const splitKeys = [...new Set(data.map((r) => r.split_key ?? 'unknown'))]
+    const groupKeys = [...new Set(data.map((r) => r.group_key))].sort()
     const lookup = new Map<string, number>()
     for (const r of data) lookup.set(`${r.group_key}\0${r.split_key ?? 'unknown'}`, r.total_cost)
 
@@ -163,13 +192,17 @@
       xAxis: { type: 'category', data: groupKeys, ...axisCommon },
       yAxis: { type: 'value', ...axisCommon },
       series: splitKeys.map((sk, i) => ({
-        name: sk, type: 'line', smooth: true, symbol: 'circle', symbolSize: 4,
+        name: sk,
+        type: 'line',
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: 4,
         stack: 'total',
         areaStyle: { opacity: 0.3 },
         lineStyle: { color: COLORS[i % COLORS.length], width: 2 },
         itemStyle: { color: COLORS[i % COLORS.length] },
-        data: groupKeys.map(gk => +(lookup.get(`${gk}\0${sk}`) ?? 0).toFixed(2)),
-      })),
+        data: groupKeys.map((gk) => +(lookup.get(`${gk}\0${sk}`) ?? 0).toFixed(2))
+      }))
     }
   })
 
@@ -190,13 +223,36 @@
       })
     }
     cols.push(
-      { title: 'Requests', key: 'total_requests', render: (row: UsageSummaryRow) => row.total_requests.toLocaleString() },
-      { title: 'Errors', key: 'error_requests', render: (row: UsageSummaryRow) => h('span', { class: row.error_requests > 0 ? 'text-red-400' : '' }, String(row.error_requests)) },
-      { title: 'Error %', key: 'error_rate', render: (row: UsageSummaryRow) => { const r = row.total_requests > 0 ? row.error_requests / row.total_requests : 0; return h('span', { class: r > 0.05 ? 'text-red-400' : '' }, fmtPercent(r)) } },
+      {
+        title: 'Requests',
+        key: 'total_requests',
+        render: (row: UsageSummaryRow) => row.total_requests.toLocaleString()
+      },
+      {
+        title: 'Errors',
+        key: 'error_requests',
+        render: (row: UsageSummaryRow) =>
+          h('span', { class: row.error_requests > 0 ? 'text-red-400' : '' }, String(row.error_requests))
+      },
+      {
+        title: 'Error %',
+        key: 'error_rate',
+        render: (row: UsageSummaryRow) => {
+          const r = row.total_requests > 0 ? row.error_requests / row.total_requests : 0
+          return h('span', { class: r > 0.05 ? 'text-red-400' : '' }, fmtPercent(r))
+        }
+      },
       { title: 'Input', key: 'input_tokens', render: (row: UsageSummaryRow) => fmtTokens(row.input_tokens) },
       { title: 'Output', key: 'output_tokens', render: (row: UsageSummaryRow) => fmtTokens(row.output_tokens) },
       { title: 'Cost', key: 'total_cost', render: (row: UsageSummaryRow) => fmtMoney(row.total_cost) },
-      { title: 'Avg Cost', key: 'avg_cost', render: (row: UsageSummaryRow) => { const avg = row.total_requests > 0 ? row.total_cost / row.total_requests : 0; return fmtMoney(avg) } },
+      {
+        title: 'Avg Cost',
+        key: 'avg_cost',
+        render: (row: UsageSummaryRow) => {
+          const avg = row.total_requests > 0 ? row.total_cost / row.total_requests : 0
+          return fmtMoney(avg)
+        }
+      }
     )
     return cols
   })
@@ -210,40 +266,53 @@
     <div class="flex gap-3 mb-3 flex-wrap items-end">
       <div>
         <div class="text-xs text-slate-400 mb-1">User</div>
-        <NSelect v-model:value="selectedUser" :options="userOptions" placeholder="All users" clearable filterable style="width: 180px" />
+        <n-select
+          v-model:value="selectedUser"
+          :options="userOptions"
+          placeholder="All users"
+          clearable
+          filterable
+          style="width: 180px"
+        />
       </div>
       <div>
         <div class="text-xs text-slate-400 mb-1">Tag</div>
-        <NInput v-model:value="tagFilter" placeholder="any" clearable style="width: 140px" />
+        <n-input v-model:value="tagFilter" placeholder="any" clearable style="width: 140px" />
       </div>
       <div>
         <div class="text-xs text-slate-400 mb-1">API Key</div>
-        <NSelect v-model:value="selectedKey" :options="keyOptions" placeholder="All keys" clearable style="width: 200px" />
+        <n-select
+          v-model:value="selectedKey"
+          :options="keyOptions"
+          placeholder="All keys"
+          clearable
+          style="width: 200px"
+        />
       </div>
       <div>
         <div class="text-xs text-slate-400 mb-1">Group By</div>
-        <NSelect v-model:value="groupBy" :options="groupByOptions" style="width: 140px" />
+        <n-select v-model:value="groupBy" :options="groupByOptions" style="width: 140px" />
       </div>
       <div>
         <div class="text-xs text-slate-400 mb-1">Split By</div>
-        <NSelect v-model:value="splitBy" :options="splitByOptions" clearable style="width: 140px" />
+        <n-select v-model:value="splitBy" :options="splitByOptions" clearable style="width: 140px" />
       </div>
       <div>
         <div class="text-xs text-slate-400 mb-1">Date Range</div>
-        <NDatePicker v-model:value="dateRange" type="daterange" clearable style="width: 260px" />
+        <n-date-picker v-model:value="dateRange" type="daterange" clearable style="width: 260px" />
       </div>
-      <NButton type="primary" :loading="loading" @click="query">
+      <n-button type="primary" :loading="loading" @click="query">
         <template #icon><span class="i-carbon-search" /></template>
         Query
-      </NButton>
+      </n-button>
     </div>
 
     <!-- Time presets -->
     <div class="flex gap-2 mb-6">
-      <NButton size="tiny" quaternary @click="applyPreset(24)">24h</NButton>
-      <NButton size="tiny" quaternary @click="applyPreset(24 * 7)">7d</NButton>
-      <NButton size="tiny" quaternary @click="applyPreset(24 * 30)">30d</NButton>
-      <NButton size="tiny" quaternary @click="applyMTD()">MTD</NButton>
+      <n-button size="tiny" quaternary @click="applyPreset(24)">24h</n-button>
+      <n-button size="tiny" quaternary @click="applyPreset(24 * 7)">7d</n-button>
+      <n-button size="tiny" quaternary @click="applyPreset(24 * 30)">30d</n-button>
+      <n-button size="tiny" quaternary @click="applyMTD()">MTD</n-button>
     </div>
 
     <p v-if="!result && !loading" class="text-slate-500 text-sm">
@@ -253,34 +322,34 @@
     <template v-if="result">
       <!-- Summary cards -->
       <div class="grid grid-cols-4 gap-4 mb-6">
-        <NCard size="small" style="position: relative; overflow: hidden">
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-send absolute top-3 right-3 text-[32px] text-indigo-400 opacity-80" />
-          <NStatistic label="Requests" :value="result.summary.total_requests.toLocaleString()" />
-        </NCard>
-        <NCard size="small" style="position: relative; overflow: hidden">
+          <n-statistic label="Requests" :value="result.summary.total_requests.toLocaleString()" />
+        </n-card>
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-currency-dollar absolute top-3 right-3 text-[32px] text-amber-400 opacity-80" />
-          <NStatistic label="Total Cost" :value="fmtMoney(result.summary.total_cost)" />
-        </NCard>
-        <NCard size="small" style="position: relative; overflow: hidden">
+          <n-statistic label="Total Cost" :value="fmtMoney(result.summary.total_cost)" />
+        </n-card>
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-warning absolute top-3 right-3 text-[32px] text-rose-400 opacity-80" />
-          <NStatistic label="Error Rate" :value="fmtPercent(errorRate)" />
-        </NCard>
-        <NCard size="small" style="position: relative; overflow: hidden">
+          <n-statistic label="Error Rate" :value="fmtPercent(errorRate)" />
+        </n-card>
+        <n-card size="small" style="position: relative; overflow: hidden">
           <span class="i-carbon-data-backup absolute top-3 right-3 text-[32px] text-blue-400 opacity-80" />
-          <NStatistic label="Cache Hit" :value="fmtPercent(cacheHitRate)" />
-        </NCard>
+          <n-statistic label="Cache Hit" :value="fmtPercent(cacheHitRate)" />
+        </n-card>
       </div>
 
       <!-- Chart (when group_by is time-based) -->
-      <NCard v-if="chartOption" size="small" class="mb-6">
+      <n-card v-if="chartOption" size="small" class="mb-6">
         <h2 class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">
           Cost Trend{{ splitBy ? ` by ${groupByLabel[splitBy]}` : '' }}
         </h2>
-        <VChart :option="chartOption" style="height: 240px" autoresize />
-      </NCard>
+        <v-chart :option="chartOption" style="height: 240px" autoresize />
+      </n-card>
 
       <!-- Data table -->
-      <NDataTable :columns="columns" :data="result.data" :pagination="{ pageSize: 50 }" size="small" />
+      <n-data-table :columns="columns" :data="result.data" :pagination="{ pageSize: 50 }" size="small" />
     </template>
   </div>
 </template>

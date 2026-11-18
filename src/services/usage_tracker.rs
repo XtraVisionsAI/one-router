@@ -8,7 +8,7 @@ use crate::middleware::auth::ApiKeyInfo;
 use crate::middleware::rate_limit::{team_bucket, user_bucket, TokenRateLimiter};
 use crate::schemas::anthropic::Usage;
 use crate::services::budget_alerts::{self, BudgetAlert, BudgetAlertConfig};
-use crate::services::model_mapping::ModelMappingService;
+use crate::services::model_mapping::{MappingPrices, ModelMappingService};
 use crate::services::precharge::{PrechargeConfig, Settlement};
 use chrono::Utc;
 use std::sync::Arc;
@@ -54,7 +54,7 @@ pub struct UsageTracker {
     alerts: Arc<std::sync::RwLock<BudgetAlertConfig>>,
     /// Budget precharge mode (hot-reloaded via `set_precharge_config`).
     precharge: Arc<std::sync::RwLock<PrechargeConfig>>,
-    http: Arc<reqwest::Client>,
+    http: Option<Arc<crate::services::web_tools::ssrf::GuardedClient>>,
 }
 
 /// One budget-carrying layer of a caller, as seen by the tracker.
@@ -78,14 +78,19 @@ impl UsageTracker {
             token_limiter,
             alerts: Arc::new(std::sync::RwLock::new(BudgetAlertConfig::default())),
             precharge: Arc::new(std::sync::RwLock::new(PrechargeConfig::default())),
-            // Webhook URL is admin-supplied: guarded DNS, no proxy, no redirects.
-            http: Arc::new(
-                crate::services::web_tools::ssrf::guarded_client(
-                    std::time::Duration::from_secs(5),
-                    "one-router-budget-alerts",
-                )
-                .unwrap_or_default(),
-            ),
+            // Webhook URL is admin-supplied: guarded DNS, no redirects, proxy
+            // only via OUTBOUND_PROXY. Fail closed: without a guarded client
+            // alerts are log-only — never an unguarded default client.
+            http: crate::services::web_tools::ssrf::guarded_client(
+                crate::config::outbound_proxy::Egress::Admin,
+                std::time::Duration::from_secs(5),
+                "one-router-budget-alerts",
+            )
+            .map_err(|e| {
+                tracing::error!(error = %e, "Budget alert webhook client unavailable; alerts are log-only")
+            })
+            .ok()
+            .map(Arc::new),
         }
     }
 
@@ -241,11 +246,26 @@ impl UsageTracker {
 
     /// Estimated cost of `input` + `output` tokens on `model` (precharge).
     pub async fn estimate_cost(&self, model: &str, input: u64, output: u64, cost_rate: f64) -> f64 {
+        self.estimate_cost_with(model, input, output, cost_rate, DefaultPricing::Fallback)
+            .await
+    }
+
+    /// [`estimate_cost`](Self::estimate_cost) with an explicit pricing mode
+    /// (non-token endpoints pass their expected units).
+    pub async fn estimate_cost_with(
+        &self,
+        model: &str,
+        input: u64,
+        output: u64,
+        cost_rate: f64,
+        default_pricing: DefaultPricing,
+    ) -> f64 {
         let usage = Usage::new(
             input.min(i32::MAX as u64) as i32,
             output.min(i32::MAX as u64) as i32,
         );
-        self.calculate_cost(model, &usage, cost_rate, None).await
+        self.calculate_cost_with(model, &usage, cost_rate, None, default_pricing)
+            .await
     }
 
     /// Claim and emit alerts for thresholds this spend crossed.
@@ -483,6 +503,13 @@ impl UsageTracker {
             .calculate_cost_with(model, usage, key_info.cost_rate, cache_ttl, default_pricing)
             .await;
         record.cost = cost;
+        if cost <= 0.0
+            && default_pricing != DefaultPricing::Fallback
+            && !is_internal_key
+            && has_any_budget(key_info)
+        {
+            warn_unpriced_once(model);
+        }
 
         // Precharged: report the cost before anything else can fail. If the
         // request already settled (non-streaming handlers record from a
@@ -556,17 +583,8 @@ impl UsageTracker {
     ///   apply. The underlying foundation model resolved for routing is **not**
     ///   used to derive pricing — set prices on the ARN's mapping row for
     ///   accurate billing.
-    async fn calculate_cost(
-        &self,
-        model: &str,
-        usage: &Usage,
-        cost_rate: f64,
-        cache_ttl: Option<&str>,
-    ) -> f64 {
-        self.calculate_cost_with(model, usage, cost_rate, cache_ttl, DefaultPricing::Fallback)
-            .await
-    }
-
+    ///
+    /// The formula itself is [`compute_cost`].
     async fn calculate_cost_with(
         &self,
         model: &str,
@@ -575,47 +593,141 @@ impl UsageTracker {
         cache_ttl: Option<&str>,
         default_pricing: DefaultPricing,
     ) -> f64 {
-        let (input_price, output_price, cache_read_price, cache_write_price) =
-            match self.model_mapping.get_pricing(model).await {
-                Some(prices) if prices.0 > 0.0 || prices.1 > 0.0 => prices,
-                _ if default_pricing == DefaultPricing::None => return 0.0,
-                _ => (
-                    DEFAULT_INPUT_PRICE,
-                    DEFAULT_OUTPUT_PRICE,
-                    DEFAULT_CACHE_READ_PRICE,
-                    DEFAULT_CACHE_WRITE_PRICE,
-                ),
-            };
-
-        let input_cost = (usage.input_tokens as f64) * input_price / 1_000_000.0;
-        let output_cost = (usage.output_tokens as f64) * output_price / 1_000_000.0;
-
-        let cache_read_cost = usage
-            .cache_read_input_tokens
-            .map(|t| (t as f64) * cache_read_price / 1_000_000.0)
-            .unwrap_or(0.0);
-
-        // 1-hour cache writes are priced at 2× the base input rate; the default
-        // (5-minute) TTL uses the model's stored cache-write price (~1.25× input).
-        let effective_write_price =
-            cache_write_price_for_ttl(input_price, cache_write_price, cache_ttl);
-        let cache_write_cost = usage
-            .cache_creation_input_tokens
-            .map(|t| (t as f64) * effective_write_price / 1_000_000.0)
-            .unwrap_or(0.0);
-
-        let base_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
-        base_cost * cost_rate
+        let prices = self.model_mapping.get_pricing(model).await;
+        compute_cost(prices, usage, cost_rate, cache_ttl, default_pricing)
     }
 }
 
-/// Price fallback when a model's mapping carries no prices.
+/// Pure cost formula (see `UsageTracker::calculate_cost_with` for which mapping
+/// row prices a request).
+///
+/// `token cost + price_per_request + price_per_image × images +
+/// price_per_search_unit × search_units`, all × `cost_rate`; the unit terms
+/// only for [`DefaultPricing::Units`] (images / rerank). Token prices fall
+/// back to DEFAULT_* only for [`DefaultPricing::Fallback`] when the mapping
+/// has no input/output price; unit prices never fall back.
+pub fn compute_cost(
+    prices: Option<MappingPrices>,
+    usage: &Usage,
+    cost_rate: f64,
+    cache_ttl: Option<&str>,
+    default_pricing: DefaultPricing,
+) -> f64 {
+    let token_prices = match prices {
+        Some(p) if p.has_token_prices() => p,
+        _ if default_pricing != DefaultPricing::Fallback => MappingPrices::default(),
+        _ => MappingPrices {
+            input: DEFAULT_INPUT_PRICE,
+            output: DEFAULT_OUTPUT_PRICE,
+            cache_read: DEFAULT_CACHE_READ_PRICE,
+            cache_write: DEFAULT_CACHE_WRITE_PRICE,
+            ..Default::default()
+        },
+    };
+
+    let input_cost = (usage.input_tokens as f64) * token_prices.input / 1_000_000.0;
+    let output_cost = (usage.output_tokens as f64) * token_prices.output / 1_000_000.0;
+
+    let cache_read_cost = usage
+        .cache_read_input_tokens
+        .map(|t| (t as f64) * token_prices.cache_read / 1_000_000.0)
+        .unwrap_or(0.0);
+
+    // 1-hour cache writes are priced at 2× the base input rate; the default
+    // (5-minute) TTL uses the model's stored cache-write price (~1.25× input).
+    let effective_write_price =
+        cache_write_price_for_ttl(token_prices.input, token_prices.cache_write, cache_ttl);
+    let cache_write_cost = usage
+        .cache_creation_input_tokens
+        .map(|t| (t as f64) * effective_write_price / 1_000_000.0)
+        .unwrap_or(0.0);
+
+    // Unit prices apply to non-token endpoints only: token endpoints may
+    // record several usage rows per request (web-tool loops, streams), so a
+    // per-request price there would be charged more than once.
+    let unit_cost = match (prices, default_pricing) {
+        (Some(p), DefaultPricing::Units(units)) => {
+            p.per_request
+                + p.per_image * units.images as f64
+                + p.per_search_unit * units.search_units as f64
+        }
+        _ => 0.0,
+    };
+
+    let base_cost = input_cost + output_cost + cache_read_cost + cache_write_cost + unit_cost;
+    base_cost * cost_rate
+}
+
+/// Price fallback when a model's mapping carries no token prices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultPricing {
     /// DEFAULT_* per-token rates (chat, embeddings).
     Fallback,
-    /// Cost 0 (images, rerank — not token-priced; set mapping prices to bill).
+    /// No token fallback, no billable units.
     None,
+    /// Non-token endpoints (images, rerank): no token fallback; the mapping's
+    /// per-image / per-search-unit prices are charged for these units.
+    Units(BillableUnits),
+}
+
+/// Non-token quantities a request is billed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BillableUnits {
+    /// Images returned (`/v1/images/generations`).
+    pub images: u64,
+    /// Rerank search units (`/v1/rerank`).
+    pub search_units: u64,
+}
+
+impl BillableUnits {
+    pub fn images(n: u64) -> Self {
+        Self {
+            images: n,
+            search_units: 0,
+        }
+    }
+
+    /// One query over up to [`RERANK_DOCS_PER_SEARCH_UNIT`] documents is one
+    /// search unit (Cohere / Bedrock rerank billing); a bigger request counts
+    /// as several. At least 1.
+    pub fn rerank(documents: usize) -> Self {
+        Self {
+            images: 0,
+            search_units: (documents as u64)
+                .div_ceil(RERANK_DOCS_PER_SEARCH_UNIT)
+                .max(1),
+        }
+    }
+}
+
+/// Documents per rerank search unit.
+pub const RERANK_DOCS_PER_SEARCH_UNIT: u64 = 100;
+
+/// Whether any of the caller's layers (key, user, team) carries a budget.
+fn has_any_budget(k: &ApiKeyInfo) -> bool {
+    k.monthly_budget.is_some()
+        || k.user.as_ref().is_some_and(|u| u.monthly_budget.is_some())
+        || k.team.as_ref().is_some_and(|t| t.monthly_budget.is_some())
+}
+
+/// Warn once per model (per process) when a budgeted caller hits a
+/// non-token endpoint whose mapping has no price at all — every such call
+/// costs 0 and never moves the budget.
+fn warn_unpriced_once(model: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut set = WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if set.len() < 1024 && set.insert(model.to_string()) {
+        tracing::warn!(
+            model = %model,
+            "Budgeted key called a mapping with no price (token, per-request, per-image or \
+             per-search-unit); these requests cost 0. Set prices on the model mapping."
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -662,6 +774,91 @@ mod tests {
             cache_write_price_for_ttl(3.0, 3.75, Some("passthrough")),
             3.75
         );
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-12
+    }
+
+    #[test]
+    fn non_token_cost_formula() {
+        let image_prices = MappingPrices {
+            input: 1.0, // per 1M prompt tokens
+            per_request: 0.01,
+            per_image: 0.04,
+            ..Default::default()
+        };
+        // 1000 prompt tokens + 3 images + per-request, × cost_rate 1.5.
+        let cost = compute_cost(
+            Some(image_prices),
+            &Usage::new(1000, 0),
+            1.5,
+            None,
+            DefaultPricing::Units(BillableUnits::images(3)),
+        );
+        assert!(approx(cost, (0.001 + 0.12 + 0.01) * 1.5), "{cost}");
+
+        // Rerank: 250 docs = 3 search units; no token price → no DEFAULT_* fallback.
+        let rerank_prices = MappingPrices {
+            per_search_unit: 0.002,
+            ..Default::default()
+        };
+        let cost = compute_cost(
+            Some(rerank_prices),
+            &Usage::new(50_000, 0),
+            1.0,
+            None,
+            DefaultPricing::Units(BillableUnits::rerank(250)),
+        );
+        assert!(approx(cost, 0.006), "{cost}");
+        assert_eq!(BillableUnits::rerank(0).search_units, 1);
+        assert_eq!(BillableUnits::rerank(100).search_units, 1);
+        assert_eq!(BillableUnits::rerank(101).search_units, 2);
+
+        // Unpriced / unmapped non-token request costs 0.
+        let units = DefaultPricing::Units(BillableUnits::images(1));
+        assert_eq!(
+            compute_cost(
+                Some(MappingPrices::default()),
+                &Usage::new(9, 0),
+                1.0,
+                None,
+                units
+            ),
+            0.0
+        );
+        assert_eq!(compute_cost(None, &Usage::new(9, 0), 1.0, None, units), 0.0);
+
+        // Token endpoints never charge unit prices (they may record several
+        // rows per request).
+        let chat = MappingPrices {
+            input: 3.0,
+            output: 15.0,
+            per_request: 0.5,
+            per_image: 100.0,
+            ..Default::default()
+        };
+        let cost = compute_cost(
+            Some(chat),
+            &Usage::new(1_000_000, 0),
+            1.0,
+            None,
+            DefaultPricing::Fallback,
+        );
+        assert!(approx(cost, 3.0), "{cost}");
+        // …and a mapping with only unit prices keeps the DEFAULT_* fallback.
+        let only_request = MappingPrices {
+            per_request: 0.5,
+            ..Default::default()
+        };
+        let cost = compute_cost(
+            Some(only_request),
+            &Usage::new(1_000_000, 0),
+            1.0,
+            None,
+            DefaultPricing::Fallback,
+        );
+        assert!(approx(cost, DEFAULT_INPUT_PRICE), "{cost}");
     }
 }
 
@@ -790,7 +987,8 @@ mod settlement_tests {
             .budgets()
             .reserve_budget(BudgetLayer::User, &f.user_id, amount, 100.0)
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         Arc::new(Settlement::new(vec![Reservation {
             layer: BudgetLayer::User,
             id: f.user_id.clone(),
@@ -890,6 +1088,11 @@ mod settlement_tests {
     async fn period_rollover_does_not_refund_into_new_period() {
         let f = fixture(100.0).await;
         // Reserved in an earlier period, which has since been rolled over.
+        // The stored period must really be the old one for the conditional reset.
+        f.db.users()
+            .reset_user_monthly_budget(&f.user_id, "2000-01", &current_period(), 0.0)
+            .await
+            .unwrap();
         let s = reserve(&f, 5.0, "2000-01").await;
         f.db.users()
             .reset_user_monthly_budget(&f.user_id, &current_period(), "2000-01", 5.0)
@@ -911,6 +1114,11 @@ mod settlement_tests {
     #[tokio::test]
     async fn period_rollover_charges_excess_over_reservation() {
         let f = fixture(100.0).await;
+        // The stored period must really be the old one for the conditional reset.
+        f.db.users()
+            .reset_user_monthly_budget(&f.user_id, "2000-01", &current_period(), 0.0)
+            .await
+            .unwrap();
         let s = reserve(&f, 1.0, "2000-01").await;
         f.db.users()
             .reset_user_monthly_budget(&f.user_id, &current_period(), "2000-01", 1.0)
@@ -921,5 +1129,110 @@ mod settlement_tests {
         record(&f, &key).await; // actual 3 > reserved 1
         settle_after_report(&f.tracker, &key, &s, true, Duration::from_secs(1)).await;
         assert!(approx(f.user_spend().await, 2.0));
+    }
+}
+
+/// End-to-end non-token billing through the SQLite fixture.
+#[cfg(test)]
+mod non_token_billing_tests {
+    use super::test_support::fixture;
+    use super::*;
+    use crate::database::models::ModelMappingRecord;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn mapping(
+        source: &str,
+        per_request: f64,
+        per_image: f64,
+        per_unit: f64,
+    ) -> ModelMappingRecord {
+        ModelMappingRecord {
+            source_model_id: source.into(),
+            target_model_id: source.into(),
+            provider: "bedrock".into(),
+            display_name: source.into(),
+            input_price: 0.0,
+            output_price: 0.0,
+            cache_read_price: 0.0,
+            cache_write_price: 0.0,
+            priority: 0,
+            status: "active".into(),
+            created_at: 0,
+            updated_at: None,
+            capabilities: None,
+            pricing_source: "manual".into(),
+            price_per_request: per_request,
+            price_per_image: per_image,
+            price_per_search_unit: per_unit,
+        }
+    }
+
+    #[tokio::test]
+    async fn images_and_rerank_charge_unit_prices_with_cost_rate() {
+        let f = fixture(100.0).await;
+        f.db.model_mapping()
+            .upsert_mapping(&mapping("canvas", 0.01, 0.04, 0.0))
+            .await
+            .unwrap();
+        f.db.model_mapping()
+            .upsert_mapping(&mapping("rerank", 0.0, 0.0, 0.002))
+            .await
+            .unwrap();
+        let mut key = f.key_info.clone();
+        key.cost_rate = 2.0;
+
+        let record = |model: &'static str, units: BillableUnits| {
+            let (tracker, key) = (f.tracker.clone(), key.clone());
+            async move {
+                tracker
+                    .record_usage_priced(
+                        &key,
+                        "req",
+                        model,
+                        &Usage::new(10, 0),
+                        true,
+                        "bedrock",
+                        "openai",
+                        None,
+                        DefaultPricing::Units(units),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        record("canvas", BillableUnits::images(2)).await;
+        // (0.01 + 2 × 0.04) × 2
+        assert!(
+            approx(f.user_spend().await, 0.18),
+            "{}",
+            f.user_spend().await
+        );
+        record("rerank", BillableUnits::rerank(150)).await;
+        // + 2 search units × 0.002 × 2
+        assert!(
+            approx(f.user_spend().await, 0.188),
+            "{}",
+            f.user_spend().await
+        );
+
+        // Unpriced non-token mapping: free, no DEFAULT_* fallback.
+        record("unmapped-image-model", BillableUnits::images(1)).await;
+        assert!(approx(f.user_spend().await, 0.188));
+
+        // Precharge estimate uses the same prices.
+        let est = f
+            .tracker
+            .estimate_cost_with(
+                "canvas",
+                0,
+                0,
+                1.0,
+                DefaultPricing::Units(BillableUnits::images(4)),
+            )
+            .await;
+        assert!(approx(est, 0.17), "{est}");
     }
 }

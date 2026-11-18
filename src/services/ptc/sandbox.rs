@@ -65,6 +65,9 @@ impl CodeExecutor for OneshotExecutor {
             .sandbox
             .create_container(None, vec!["sleep".to_string(), keepalive], Vec::new())
             .await?;
+        // Removes the container even if this future is dropped mid-way
+        // (client disconnect).
+        let guard = ContainerCleanupGuard::new(Arc::clone(&self.sandbox), container.id.clone());
 
         let result = match self.sandbox.start_container(&container.id).await {
             Ok(()) => self.sandbox.exec_command(&container.id, cmd).await,
@@ -72,9 +75,54 @@ impl CodeExecutor for OneshotExecutor {
         };
 
         // Always clean up (also on start failure).
+        guard.disarm();
         let _ = self.sandbox.stop_and_remove(&container.id).await;
 
         result
+    }
+}
+
+/// Removes a created container when dropped while still armed — makes
+/// create → start → (exchange) sequences cancellation-safe: if the request
+/// future is dropped (client disconnect) between `create_container` and the
+/// point where ownership is handed over, removal is spawned on the runtime.
+pub struct ContainerCleanupGuard {
+    sandbox: Arc<SandboxExecutor>,
+    container_id: String,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl ContainerCleanupGuard {
+    pub fn new(sandbox: Arc<SandboxExecutor>, container_id: String) -> Self {
+        Self {
+            sandbox,
+            container_id,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Ownership handed over (or removal done explicitly): do nothing on drop.
+    pub fn disarm(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for ContainerCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let sandbox = Arc::clone(&self.sandbox);
+        let id = std::mem::take(&mut self.container_id);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                if let Err(e) = sandbox.stop_and_remove(&id).await {
+                    tracing::debug!(container_id = %id, error = %e, "Cancelled PTC container removal failed");
+                } else {
+                    tracing::debug!(container_id = %id, "Removed PTC container after cancellation");
+                }
+            });
+        }
     }
 }
 
@@ -82,8 +130,47 @@ impl CodeExecutor for OneshotExecutor {
 // Configuration
 // ============================================================================
 
-/// Default Docker image for sandbox execution
+/// Default Docker image for sandbox execution. A mutable tag: operators
+/// should pin a digest via `PTC_IMAGE` (`python:3.11-slim@sha256:…`); a
+/// startup warning is logged while the image is unpinned.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "python:3.11-slim";
+
+/// Whether an image reference is pinned by content digest.
+pub fn image_is_digest_pinned(image: &str) -> bool {
+    image
+        .split_once("@sha256:")
+        .is_some_and(|(_, d)| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Container name prefix of every sandbox container (used by the startup
+/// orphan sweep).
+pub const SANDBOX_NAME_PREFIX: &str = "ptc_sandbox_";
+
+/// Orphan sweep: a container that was created but never started is
+/// abandoned after this long (start follows create within milliseconds).
+const ORPHAN_CREATED_MIN_AGE_SECS: i64 = 120;
+/// Orphan sweep: a running sandbox older than this cannot belong to a live
+/// session of any instance (idle expiry 270 s; ≤ 10 iterations of ≤ 65 s).
+const ORPHAN_RUNNING_MIN_AGE_SECS: i64 = 3600;
+
+/// Whether a listed container is a leftover sandbox to remove at startup.
+/// Age thresholds keep the sweep safe when several gateway instances share
+/// one Docker daemon.
+pub fn is_orphan_sandbox(names: &[String], state: &str, created: i64, now: i64) -> bool {
+    let ours = names
+        .iter()
+        .any(|n| n.trim_start_matches('/').starts_with(SANDBOX_NAME_PREFIX));
+    if !ours {
+        return false;
+    }
+    let age = now.saturating_sub(created);
+    match state {
+        "created" => age >= ORPHAN_CREATED_MIN_AGE_SECS,
+        "running" | "paused" | "restarting" => age >= ORPHAN_RUNNING_MIN_AGE_SECS,
+        // exited / dead: nothing runs, always safe to remove.
+        _ => true,
+    }
+}
 
 /// uid:gid code runs as inside sandbox containers (`nobody`).
 const SANDBOX_USER: &str = "65534:65534";
@@ -120,6 +207,79 @@ pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 /// Max combined stdout+stderr bytes collected from a one-shot exec.
 pub const MAX_EXEC_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Max payload bytes of parsed frames queued per session between the reader
+/// task and the request awaiting them.
+pub const MAX_QUEUED_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Depth of the reader → handle channel. With one solicited frame per
+/// exchange, a handful of slots covers the frame plus a terminal error /
+/// stream-end notice.
+const READER_CHANNEL_DEPTH: usize = 4;
+
+/// State shared by a [`ContainerHandle`] and its background reader.
+///
+/// The runner answers every host message (code, tool results) — and its
+/// startup — with exactly one frame. `awaiting` is set when the host sends
+/// and consumed by the next frame; a frame arriving while nothing awaits is
+/// unsolicited (model code writing raw frames to fd 1/2) and poisons the
+/// session: the reader stops and removes the container.
+#[derive(Debug)]
+pub struct ReaderState {
+    awaiting: std::sync::atomic::AtomicBool,
+    queued_bytes: std::sync::atomic::AtomicUsize,
+    poisoned: std::sync::atomic::AtomicBool,
+    budget: usize,
+}
+
+impl ReaderState {
+    fn new(budget: usize) -> Self {
+        Self {
+            // The runner's `__READY__` is expected right after start.
+            awaiting: std::sync::atomic::AtomicBool::new(true),
+            queued_bytes: std::sync::atomic::AtomicUsize::new(0),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+            budget,
+        }
+    }
+
+    /// Admit one parsed frame of `size` payload bytes into the queue.
+    fn admit(&self, size: usize) -> Result<(), String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.awaiting.swap(false, SeqCst) {
+            self.poisoned.store(true, SeqCst);
+            return Err("Unsolicited sandbox frame; session terminated".to_string());
+        }
+        let queued = self.queued_bytes.load(SeqCst);
+        if queued.saturating_add(size) > self.budget {
+            self.poisoned.store(true, SeqCst);
+            return Err(format!(
+                "Sandbox frames exceeded the {}-byte queue budget; session terminated",
+                self.budget
+            ));
+        }
+        self.queued_bytes.fetch_add(size, SeqCst);
+        Ok(())
+    }
+
+    fn expect_reply(&self) {
+        self.awaiting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn consumed(&self, size: usize) {
+        let _ = self.queued_bytes.try_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |q| Some(q.saturating_sub(size)),
+        );
+    }
+
+    /// The reader saw an unsolicited / over-budget frame.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 // ============================================================================
 // Sandbox Configuration
@@ -260,10 +420,13 @@ pub enum ContainerMessage {
 pub struct ContainerHandle {
     /// Writer to container stdin
     stdin: Arc<TokioMutex<Pin<Box<dyn tokio::io::AsyncWrite + Send>>>>,
-    /// Receiver for parsed messages from the background reader
-    messages_rx: mpsc::Receiver<ContainerMessage>,
+    /// Receiver for parsed messages (+ their queued payload size) from the
+    /// background reader
+    messages_rx: mpsc::Receiver<(ContainerMessage, usize)>,
     /// Handle for the background reader task
     reader_task: JoinHandle<()>,
+    /// Exchange / queue-budget state shared with the reader
+    state: Arc<ReaderState>,
 }
 
 impl ContainerHandle {
@@ -275,6 +438,7 @@ impl ContainerHandle {
             b64_encode(code.as_bytes()),
             runner::IPC_CODE_END
         );
+        self.state.expect_reply();
         let mut stdin = self.stdin.lock().await;
         stdin
             .write_all(payload.as_bytes())
@@ -297,6 +461,7 @@ impl ContainerHandle {
             b64_encode(json_str.as_bytes()),
             runner::IPC_TOOL_RESULT_END
         );
+        self.state.expect_reply();
         let mut stdin = self.stdin.lock().await;
         stdin
             .write_all(payload.as_bytes())
@@ -311,9 +476,11 @@ impl ContainerHandle {
 
     /// Receive the next message from the container.
     pub async fn recv_message(&mut self) -> PtcResult<ContainerMessage> {
-        self.messages_rx.recv().await.ok_or(PtcError::IpcError(
+        let (msg, size) = self.messages_rx.recv().await.ok_or(PtcError::IpcError(
             "Container stream ended unexpectedly".into(),
-        ))
+        ))?;
+        self.state.consumed(size);
+        Ok(msg)
     }
 
     /// Receive the next message with a timeout.
@@ -335,6 +502,11 @@ impl ContainerHandle {
     /// handle (the handle may be held by an in-flight exchange).
     pub fn reader_abort_handle(&self) -> tokio::task::AbortHandle {
         self.reader_task.abort_handle()
+    }
+
+    /// Shared reader state (poison flag), readable without the handle lock.
+    pub fn reader_state(&self) -> Arc<ReaderState> {
+        Arc::clone(&self.state)
     }
 }
 
@@ -705,7 +877,11 @@ impl SandboxExecutor {
         let mut output_stream = attach_result.output;
 
         // Create channel for parsed messages
-        let (tx, rx) = mpsc::channel::<ContainerMessage>(32);
+        let (tx, rx) = mpsc::channel::<(ContainerMessage, usize)>(READER_CHANNEL_DEPTH);
+        let state = Arc::new(ReaderState::new(MAX_QUEUED_FRAME_BYTES));
+        let reader_state = Arc::clone(&state);
+        let docker = self.docker.clone();
+        let container_id = container_id.to_string();
 
         // Spawn background reader task
         let reader_task = tokio::spawn(async move {
@@ -716,30 +892,56 @@ impl SandboxExecutor {
                 let parsed = match result {
                     Ok(LogOutput::StdOut { message }) => {
                         stdout_buf.push_str(&String::from_utf8_lossy(&message));
-                        parse_stdout_messages(&mut stdout_buf, &tx).await
+                        parse_stdout_frames(&mut stdout_buf)
                     }
                     Ok(LogOutput::StdErr { message }) => {
                         stderr_buf.push_str(&String::from_utf8_lossy(&message));
-                        parse_stderr_messages(&mut stderr_buf, &tx).await
+                        parse_stderr_frames(&mut stderr_buf)
                     }
-                    Ok(_) => Ok(()), // StdIn echo, Console — ignore
+                    Ok(_) => Ok(Vec::new()), // StdIn echo, Console — ignore
                     Err(e) => Err(format!("Stream error: {e}")),
                 };
-                if let Err(e) = parsed {
-                    // Oversized frame or stream failure: report and stop
-                    // reading; the service then removes the container.
-                    let _ = tx.send(ContainerMessage::Error(e)).await;
+                let mut fatal = None;
+                match parsed {
+                    Ok(frames) => {
+                        for (msg, size) in frames {
+                            if let Err(e) = reader_state.admit(size) {
+                                fatal = Some(e);
+                                break;
+                            }
+                            if tx.send((msg, size)).await.is_err() {
+                                return; // handle dropped
+                            }
+                        }
+                    }
+                    Err(e) => fatal = Some(e),
+                }
+                if let Some(e) = fatal {
+                    // Oversized / unsolicited frame or stream failure: report
+                    // and stop reading; the service tears the session down.
+                    // A poisoned container is removed right away — nothing
+                    // may wait on the session for its expiry.
+                    if reader_state.is_poisoned() {
+                        tracing::warn!(container_id = %container_id, error = %e, "PTC sandbox poisoned; removing container");
+                        let opts = RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        };
+                        let _ = docker.remove_container(&container_id, Some(opts)).await;
+                    }
+                    let _ = tx.send((ContainerMessage::Error(e), 0)).await;
                     break;
                 }
             }
 
-            let _ = tx.send(ContainerMessage::StreamEnded).await;
+            let _ = tx.send((ContainerMessage::StreamEnded, 0)).await;
         });
 
         Ok(ContainerHandle {
             stdin: stdin_writer,
             messages_rx: rx,
             reader_task,
+            state,
         })
     }
 
@@ -755,6 +957,49 @@ impl SandboxExecutor {
             .inspect_container(container_id, None)
             .await
             .is_ok()
+    }
+
+    /// Remove leftover `ptc_sandbox_*` containers (crash / cancelled create
+    /// before the drop guards existed). Age thresholds in
+    /// [`is_orphan_sandbox`] keep live containers of other instances on the
+    /// same daemon. Returns the number removed; errors are logged.
+    pub async fn sweep_orphan_containers(&self) -> usize {
+        use bollard::container::ListContainersOptions;
+        let opts = ListContainersOptions::<String> {
+            all: true,
+            filters: std::collections::HashMap::from([(
+                "name".to_string(),
+                vec![SANDBOX_NAME_PREFIX.to_string()],
+            )]),
+            ..Default::default()
+        };
+        let list = match self.docker.list_containers(Some(opts)).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "PTC orphan sweep: listing containers failed");
+                return 0;
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+        let mut removed = 0;
+        for c in list {
+            let names = c.names.unwrap_or_default();
+            let state = c.state.unwrap_or_default();
+            let Some(id) = c.id else { continue };
+            if !is_orphan_sandbox(&names, &state, c.created.unwrap_or(now), now) {
+                continue;
+            }
+            match self.remove_container(&id).await {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    tracing::debug!(container_id = %id, error = %e, "PTC orphan removal failed")
+                }
+            }
+        }
+        if removed > 0 {
+            tracing::info!(removed, "Removed orphaned PTC sandbox containers");
+        }
+        removed
     }
 
     /// Check if a container is running
@@ -900,35 +1145,54 @@ fn parse_tool_calls(payload: &str) -> ContainerMessage {
 }
 
 /// Parse the stdout buffer for `__PTC_OUTPUT__{b64}__PTC_END_OUTPUT__` frames.
-async fn parse_stdout_messages(
-    buf: &mut String,
-    tx: &mpsc::Sender<ContainerMessage>,
-) -> Result<(), String> {
+/// Returns each message with its payload size (for the queue budget).
+fn parse_stdout_frames(buf: &mut String) -> Result<Vec<(ContainerMessage, usize)>, String> {
     const SPECS: [FrameSpec; 1] = [(
         runner::IPC_CODE_OUTPUT_START,
         Some(runner::IPC_CODE_OUTPUT_END),
     )];
-    for (_, payload) in drain_frames(buf, &SPECS, MAX_FRAME_BYTES)? {
-        let _ = tx.send(parse_code_output(&payload)).await;
-    }
-    Ok(())
+    Ok(drain_frames(buf, &SPECS, MAX_FRAME_BYTES)?
+        .into_iter()
+        .map(|(_, payload)| (parse_code_output(&payload), payload.len()))
+        .collect())
 }
 
 /// Parse the stderr buffer for `__READY__` and `__PTC_TOOL_CALL__{b64}__PTC_END_CALL__`.
-async fn parse_stderr_messages(
-    buf: &mut String,
-    tx: &mpsc::Sender<ContainerMessage>,
-) -> Result<(), String> {
+fn parse_stderr_frames(buf: &mut String) -> Result<Vec<(ContainerMessage, usize)>, String> {
     const SPECS: [FrameSpec; 2] = [
         (runner::IPC_READY, None),
         (runner::IPC_TOOL_CALL_START, Some(runner::IPC_TOOL_CALL_END)),
     ];
-    for (i, payload) in drain_frames(buf, &SPECS, MAX_FRAME_BYTES)? {
-        let msg = if i == 0 {
-            ContainerMessage::Ready
-        } else {
-            parse_tool_calls(&payload)
-        };
+    Ok(drain_frames(buf, &SPECS, MAX_FRAME_BYTES)?
+        .into_iter()
+        .map(|(i, payload)| {
+            let msg = if i == 0 {
+                ContainerMessage::Ready
+            } else {
+                parse_tool_calls(&payload)
+            };
+            (msg, payload.len())
+        })
+        .collect())
+}
+
+#[cfg(test)]
+async fn parse_stdout_messages(
+    buf: &mut String,
+    tx: &mpsc::Sender<ContainerMessage>,
+) -> Result<(), String> {
+    for (msg, _) in parse_stdout_frames(buf)? {
+        let _ = tx.send(msg).await;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn parse_stderr_messages(
+    buf: &mut String,
+    tx: &mpsc::Sender<ContainerMessage>,
+) -> Result<(), String> {
+    for (msg, _) in parse_stderr_frames(buf)? {
         let _ = tx.send(msg).await;
     }
     Ok(())
@@ -1219,6 +1483,89 @@ mod tests {
         assert_eq!(stdout, "12345");
         assert!(stderr.starts_with("67890"));
         assert!(stderr.contains("truncated"));
+    }
+
+    #[test]
+    fn reader_state_admits_one_frame_per_exchange() {
+        let s = ReaderState::new(100);
+        // Startup: the ready signal is expected.
+        assert!(s.admit(0).is_ok());
+        // A second frame with nothing awaiting is unsolicited.
+        assert!(s.admit(10).is_err());
+        assert!(s.is_poisoned());
+
+        let s = ReaderState::new(100);
+        s.admit(0).unwrap();
+        s.expect_reply();
+        s.admit(60).unwrap();
+        // Not yet consumed: the next (solicited) frame would exceed budget.
+        s.expect_reply();
+        assert!(s.admit(50).unwrap_err().contains("budget"));
+        assert!(s.is_poisoned());
+
+        let s = ReaderState::new(100);
+        s.admit(0).unwrap();
+        s.expect_reply();
+        s.admit(60).unwrap();
+        s.consumed(60);
+        s.expect_reply();
+        assert!(s.admit(90).is_ok());
+        assert!(!s.is_poisoned());
+    }
+
+    #[test]
+    fn frame_sizes_are_reported() {
+        let payload = b64_encode(br#"{"stdout":"x","stderr":"","exit_code":0}"#);
+        let mut buf = format!("__PTC_OUTPUT__{payload}__PTC_END_OUTPUT__\n");
+        let frames = parse_stdout_frames(&mut buf).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, payload.len());
+    }
+
+    #[test]
+    fn orphan_sweep_decisions() {
+        let n = |s: &str| vec![s.to_string()];
+        let now = 1_000_000;
+        assert!(is_orphan_sandbox(
+            &n("/ptc_sandbox_x"),
+            "created",
+            now - 600,
+            now
+        ));
+        assert!(!is_orphan_sandbox(
+            &n("/ptc_sandbox_x"),
+            "created",
+            now - 5,
+            now
+        ));
+        assert!(!is_orphan_sandbox(
+            &n("/ptc_sandbox_x"),
+            "running",
+            now - 600,
+            now
+        ));
+        assert!(is_orphan_sandbox(
+            &n("/ptc_sandbox_x"),
+            "running",
+            now - 7200,
+            now
+        ));
+        assert!(is_orphan_sandbox(&n("/ptc_sandbox_x"), "exited", now, now));
+        assert!(!is_orphan_sandbox(&n("/other"), "exited", now - 7200, now));
+        assert!(!is_orphan_sandbox(
+            &n("/my_ptc_sandbox_x"),
+            "exited",
+            0,
+            now
+        ));
+    }
+
+    #[test]
+    fn digest_pinning_detection() {
+        assert!(!image_is_digest_pinned(DEFAULT_SANDBOX_IMAGE));
+        assert!(!image_is_digest_pinned("python@sha256:abc"));
+        let pinned = format!("python:3.11-slim@sha256:{}", "a".repeat(64));
+        assert!(image_is_digest_pinned(&pinned));
     }
 
     #[test]

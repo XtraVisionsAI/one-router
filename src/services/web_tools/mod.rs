@@ -52,6 +52,16 @@ pub fn unsupported_server_tool_version(tool: &serde_json::Value) -> Option<&str>
     None
 }
 
+/// Validate a client tool definition's web-tool fields (domain filters).
+/// Non-server tools pass. An error is a client error (400
+/// `invalid_request_error`).
+pub fn validate_server_tool(tool: &serde_json::Value) -> Result<(), String> {
+    if !is_server_tool(tool) {
+        return Ok(());
+    }
+    domains::validate_tool_definition(tool)
+}
+
 pub fn split_tools(
     tools: &[serde_json::Value],
 ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {

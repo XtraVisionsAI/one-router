@@ -1,10 +1,10 @@
 <script setup lang="ts">
   import type { MenuOption } from 'naive-ui'
   import type { UpdateInfo } from '@/api/update'
-  import { h } from 'vue'
-  import { useAuthStore } from '@/stores/auth'
-  import { useUpdateApi } from '@/api/update'
   import { useMessage } from 'naive-ui'
+  import { h } from 'vue'
+  import { useUpdateApi } from '@/api/update'
+  import { useAuthStore } from '@/stores/auth'
 
   const auth = useAuthStore()
   const router = useRouter()
@@ -94,7 +94,7 @@
     <aside class="w-52 flex flex-col bg-slate-800 border-r border-slate-700/60 shrink-0">
       <!-- Logo -->
       <div class="px-4 py-3.5 border-b border-slate-700/60 flex items-center gap-2.5">
-        <img src="/logo.png" alt="one-router" class="w-9 h-9 rounded-lg shrink-0">
+        <img src="/logo.png" alt="one-router" class="w-9 h-9 rounded-lg shrink-0" />
         <div class="flex flex-col">
           <span class="text-indigo-400 font-semibold text-sm leading-tight tracking-wide">one-router</span>
           <span class="text-[10px] text-slate-500 mt-0.5">admin console</span>
@@ -108,12 +108,11 @@
       <div class="px-4 py-3 border-t border-slate-700/60 flex items-center justify-between">
         <NPopover trigger="click" placement="top-start" :width="240" content-class="!p-3.5">
           <template #trigger>
-            <button class="relative text-xs text-slate-500 hover:text-slate-300 transition-colors cursor-pointer bg-transparent border-0 p-0">
+            <button
+              class="relative text-xs text-slate-500 hover:text-slate-300 transition-colors cursor-pointer bg-transparent border-0 p-0"
+            >
               v{{ auth.version || '—' }}
-              <span
-                v-if="hasUpdate"
-                class="absolute -top-1 -right-2 w-2 h-2 bg-amber-400 rounded-full"
-              />
+              <span v-if="hasUpdate" class="absolute -top-1 -right-2 w-2 h-2 bg-amber-400 rounded-full" />
             </button>
           </template>
 
@@ -129,10 +128,16 @@
             </div>
 
             <!-- Status messages -->
-            <div v-if="updateInfo?.error" class="text-red-400/90 bg-red-950/40 px-2.5 py-2 rounded text-xs leading-relaxed">
+            <div
+              v-if="updateInfo?.error"
+              class="text-red-400/90 bg-red-950/40 px-2.5 py-2 rounded text-xs leading-relaxed"
+            >
               {{ updateInfo.error }}
             </div>
-            <div v-if="isComplete" class="text-emerald-400/90 bg-emerald-950/40 px-2.5 py-2 rounded text-xs leading-relaxed">
+            <div
+              v-if="isComplete"
+              class="text-emerald-400/90 bg-emerald-950/40 px-2.5 py-2 rounded text-xs leading-relaxed"
+            >
               Restart to activate new version.
             </div>
 

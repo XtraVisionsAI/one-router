@@ -12,11 +12,22 @@
 //!
 //! Matching: the host comes from a real URL parser (userinfo, ports, `?`/`#`,
 //! backslashes, case and IDNA are handled by the WHATWG rules), only http(s)
-//! URLs qualify, and a filter matches its exact host or any subdomain on a
-//! label boundary (`good.com` matches `docs.good.com`, not `notgood.com`),
-//! case-insensitively with trailing dots ignored. A filter may carry a path
-//! (`example.com/blog`), which then also has to prefix the URL path on a
-//! segment boundary.
+//! URLs qualify. Filter entries are normalized the same way ([`DomainFilter`]):
+//!
+//! - `good.com` (or `.good.com`) matches the apex and every subdomain on a
+//!   label boundary (`docs.good.com`, not `notgood.com`);
+//! - `*.good.com` matches subdomains only, **not** the apex;
+//! - internationalized names are compared in punycode (`bücher.de` ≡
+//!   `xn--bcher-kva.de`), case-insensitively, trailing dots ignored;
+//! - a port in an entry (`good.com:8443`) is ignored — filters match hosts,
+//!   never ports;
+//! - an entry may carry a path (`example.com/blog`), which then also has to
+//!   prefix the URL path on a segment boundary;
+//! - entries containing a query / fragment / userinfo / backslash /
+//!   whitespace, or a `*` anywhere but a leading `*.`, are invalid. In the
+//!   client's tool definition that is a 400 ([`validate_tool_definition`]);
+//!   invalid entries from the model's tool input are ignored (an allowlist
+//!   made only of invalid entries matches nothing — fail closed).
 
 use serde_json::Value;
 
@@ -36,107 +47,222 @@ pub fn url_host(url: &str) -> Option<String> {
     (!host.is_empty()).then_some(host)
 }
 
-/// A normalized filter entry: host part + optional path prefix.
-fn split_filter(filter: &str) -> Option<(String, Option<String>)> {
-    let f = filter.trim();
-    // Tolerate a scheme in the filter ("https://example.com").
-    let f = f
-        .strip_prefix("https://")
-        .or_else(|| f.strip_prefix("http://"))
-        .unwrap_or(f);
-    let (host, path) = match f.find('/') {
-        Some(i) => (&f[..i], Some(&f[i..])),
-        None => (f, None),
-    };
-    let host = host
-        .trim_start_matches("*.")
-        .trim_start_matches('.')
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    if host.is_empty() {
-        return None;
-    }
-    let path = path
-        .map(|p| p.trim_end_matches('/').to_string())
-        .filter(|p| !p.is_empty());
-    Some((host, path))
+/// A normalized domain filter entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainFilter {
+    /// ASCII (punycode) lowercase host, no brackets / trailing dot.
+    host: String,
+    /// `*.host`: subdomains only, not the apex.
+    subdomains_only: bool,
+    /// Path prefix (percent-encoded like `Url::path`), no trailing `/`.
+    path: Option<String>,
 }
 
-/// `host` is `domain` or a subdomain of it (label-aligned). Case- and
-/// trailing-dot-insensitive. A path in `domain` is ignored here.
-pub fn domain_matches(host: &str, domain: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    match split_filter(domain) {
-        Some((d, _)) => host == d || host.ends_with(&format!(".{d}")),
-        None => false,
+impl DomainFilter {
+    /// Parse and normalize one filter entry.
+    pub fn parse(entry: &str) -> Result<Self, String> {
+        let shown: String = entry.trim().chars().take(100).collect();
+        let invalid = |why: &str| format!("invalid domain filter '{shown}': {why}");
+        let f = entry.trim();
+        if f.is_empty() {
+            return Err(invalid("empty"));
+        }
+        if f.chars()
+            .any(|c| matches!(c, '?' | '#' | '@' | '\\') || c.is_whitespace() || c.is_control())
+        {
+            return Err(invalid(
+                "must not contain a query, fragment, userinfo, backslash or whitespace",
+            ));
+        }
+        // Tolerate a scheme in the filter ("https://example.com").
+        let lower = f.to_ascii_lowercase();
+        let f = if lower.starts_with("https://") {
+            &f[8..]
+        } else if lower.starts_with("http://") {
+            &f[7..]
+        } else {
+            f
+        };
+        let (host_part, path_part) = match f.find('/') {
+            Some(i) => (&f[..i], &f[i..]),
+            None => (f, ""),
+        };
+        let (host_part, subdomains_only) = match host_part.strip_prefix("*.") {
+            Some(rest) => (rest, true),
+            None => (host_part.strip_prefix('.').unwrap_or(host_part), false),
+        };
+        if host_part.contains('*') || path_part.contains('*') {
+            return Err(invalid("'*' is only allowed as a leading '*.'"));
+        }
+        if host_part.trim_end_matches('.').is_empty() {
+            return Err(invalid("no host"));
+        }
+        // The WHATWG parser does IDNA → punycode, lowercasing, IPv4
+        // normalization and path percent-encoding, exactly as for URLs.
+        let parsed = reqwest::Url::parse(&format!("http://{host_part}{path_part}"))
+            .map_err(|_| invalid("not a valid host"))?;
+        if parsed.port().is_some() {
+            tracing::debug!(filter = %shown, "Port in domain filter ignored (filters match hosts only)");
+        }
+        let host = parsed
+            .host_str()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if host.is_empty() {
+            return Err(invalid("no host"));
+        }
+        let path = Some(parsed.path().trim_end_matches('/').to_string()).filter(|p| !p.is_empty());
+        Ok(Self {
+            host,
+            subdomains_only,
+            path,
+        })
     }
-}
 
-/// Full URL ↔ filter match: host (label-aligned) and, when the filter has
-/// one, path prefix on a segment boundary.
-fn url_matches(url: &reqwest::Url, host: &str, filter: &str) -> bool {
-    let Some((d, path)) = split_filter(filter) else {
-        return false;
-    };
-    if !(host == d || host.ends_with(&format!(".{d}"))) {
-        return false;
+    /// Host match, label-aligned. `host` must already be normalized
+    /// ([`url_host`]).
+    fn matches_host(&self, host: &str) -> bool {
+        let sub = host.len() > self.host.len()
+            && host.ends_with(self.host.as_str())
+            && host.as_bytes()[host.len() - self.host.len() - 1] == b'.';
+        sub || (!self.subdomains_only && host == self.host)
     }
-    match path {
-        None => true,
-        Some(prefix) => {
-            let p = url.path();
-            p == prefix
-                || p.strip_prefix(prefix.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
+
+    /// Full URL ↔ filter match: host and, when the filter has one, path
+    /// prefix on a segment boundary.
+    fn matches(&self, url: &reqwest::Url, host: &str) -> bool {
+        if !self.matches_host(host) {
+            return false;
+        }
+        match &self.path {
+            None => true,
+            Some(prefix) => {
+                let p = url.path();
+                p == prefix
+                    || p.strip_prefix(prefix.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }
         }
     }
+
+    /// `self` lies entirely within `other` (every URL matching `self` also
+    /// matches `other`'s host rule).
+    fn within(&self, other: &Self) -> bool {
+        if self.subdomains_only {
+            // Every subdomain of self.host: needs self.host itself or a
+            // parent of it to be covered by `other` for subdomains.
+            self.host == other.host || other.matches_host(&self.host)
+        } else {
+            other.matches_host(&self.host)
+        }
+    }
+
+    /// Provider hint form (`host[/path]`). Wildcards are widened to the
+    /// apex (hints may be broader; the policy is enforced afterwards).
+    fn hint(&self) -> String {
+        format!("{}{}", self.host, self.path.as_deref().unwrap_or(""))
+    }
 }
 
-fn string_list(v: &Value) -> Option<Vec<String>> {
+/// `host` is `domain` or a subdomain of it (label-aligned); `*.domain` matches
+/// subdomains only. Case-, IDNA- and trailing-dot-insensitive. A path in
+/// `domain` is ignored here; an invalid `domain` matches nothing.
+pub fn domain_matches(host: &str, domain: &str) -> bool {
+    let Some(host) = url_host(&format!("http://{}/", host.trim())) else {
+        return false;
+    };
+    DomainFilter::parse(domain).is_ok_and(|d| d.matches_host(&host))
+}
+
+fn string_list(v: &Value) -> Option<Vec<&str>> {
     v.as_array().map(|a| {
         a.iter()
             .filter_map(|x| x.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(String::from)
             .collect()
     })
+}
+
+/// Parse a list; invalid entries are dropped with a warning (`strict` = error).
+fn parse_list(v: &Value, field: &str, strict: bool) -> Result<Option<Vec<DomainFilter>>, String> {
+    let Some(raw) = string_list(v) else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        match DomainFilter::parse(entry) {
+            Ok(f) => {
+                if !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+            Err(e) if strict => return Err(format!("{field}: {e}")),
+            Err(e) => tracing::warn!(field, error = %e, "Ignoring invalid domain filter"),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Validate the domain filters of a client server-tool definition. Any
+/// invalid entry is a client error (400 `invalid_request_error`).
+pub fn validate_tool_definition(tool: &Value) -> Result<(), String> {
+    DomainPolicy::try_from_tool_definition(tool).map(|_| ())
 }
 
 /// Effective domain restrictions for one web tool.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DomainPolicy {
     /// Allowlist layers; a URL must match at least one entry of **every**
-    /// layer. No layers = unrestricted.
-    allow_layers: Vec<Vec<String>>,
+    /// layer. No layers = unrestricted. An empty layer matches nothing.
+    allow_layers: Vec<Vec<DomainFilter>>,
     /// A URL matching any entry is refused (wins over allowlists).
-    blocked: Vec<String>,
+    blocked: Vec<DomainFilter>,
 }
 
 impl DomainPolicy {
     /// Policy declared by the client's server-tool definition. An empty
-    /// `allowed_domains` array means "no allowlist".
+    /// `allowed_domains` array means "no allowlist". Invalid entries are
+    /// rejected up front by [`validate_tool_definition`]; here they are
+    /// dropped (an allowlist of only invalid entries matches nothing).
     pub fn from_tool_definition(tool: &Value) -> Self {
+        Self::build(tool, false).unwrap_or_default()
+    }
+
+    /// Strict variant: any invalid entry is an error.
+    pub fn try_from_tool_definition(tool: &Value) -> Result<Self, String> {
+        Self::build(tool, true)
+    }
+
+    fn build(tool: &Value, strict: bool) -> Result<Self, String> {
         let mut policy = Self::default();
-        if let Some(allowed) = string_list(&tool["allowed_domains"]) {
-            if !allowed.is_empty() {
+        let raw_allowed = string_list(&tool["allowed_domains"]).unwrap_or_default();
+        if let Some(allowed) = parse_list(&tool["allowed_domains"], "allowed_domains", strict)? {
+            // Non-empty input keeps its layer even if every entry was
+            // invalid: fail closed rather than become unrestricted.
+            if !raw_allowed.is_empty() {
                 policy.allow_layers.push(allowed);
             }
         }
-        policy.blocked = string_list(&tool["blocked_domains"]).unwrap_or_default();
-        policy
+        policy.blocked =
+            parse_list(&tool["blocked_domains"], "blocked_domains", strict)?.unwrap_or_default();
+        Ok(policy)
     }
 
     /// Narrow with the model's tool-call input: its allowlist becomes another
     /// layer (intersection), its blocklist is unioned. Never widens.
     pub fn narrowed_by(&self, input: &Value) -> Self {
         let mut out = self.clone();
-        if let Some(allowed) = string_list(&input["allowed_domains"]) {
-            if !allowed.is_empty() {
+        let raw_allowed = string_list(&input["allowed_domains"]).unwrap_or_default();
+        if let Ok(Some(allowed)) = parse_list(&input["allowed_domains"], "allowed_domains", false) {
+            if !raw_allowed.is_empty() {
                 out.allow_layers.push(allowed);
             }
         }
-        if let Some(blocked) = string_list(&input["blocked_domains"]) {
+        if let Ok(Some(blocked)) = parse_list(&input["blocked_domains"], "blocked_domains", false) {
             for b in blocked {
                 if !out.blocked.contains(&b) {
                     out.blocked.push(b);
@@ -155,11 +281,11 @@ impl DomainPolicy {
         let parsed = reqwest::Url::parse(url.trim()).map_err(|_| "Invalid URL".to_string())?;
         let host = url_host(parsed.as_str())
             .ok_or_else(|| "URL must be an http(s) URL with a host".to_string())?;
-        if self.blocked.iter().any(|b| url_matches(&parsed, &host, b)) {
+        if self.blocked.iter().any(|b| b.matches(&parsed, &host)) {
             return Err(format!("Domain '{host}' is blocked"));
         }
         for layer in &self.allow_layers {
-            if !layer.iter().any(|a| url_matches(&parsed, &host, a)) {
+            if !layer.iter().any(|a| a.matches(&parsed, &host)) {
                 return Err(format!("Domain '{host}' is not in allowed list"));
             }
         }
@@ -178,15 +304,9 @@ impl DomainPolicy {
     pub fn allowed_hint(&self) -> Option<Vec<String>> {
         let (first, rest) = self.allow_layers.split_first()?;
         if rest.is_empty() {
-            return Some(first.clone());
+            return Some(dedup(first.iter().map(DomainFilter::hint)));
         }
-        let within = |a: &str, b: &str| -> bool {
-            match split_filter(a) {
-                Some((host, _)) => domain_matches(&host, b),
-                None => false,
-            }
-        };
-        let mut out: Vec<String> = Vec::new();
+        let mut kept: Vec<&DomainFilter> = Vec::new();
         for (i, layer) in self.allow_layers.iter().enumerate() {
             for entry in layer {
                 let ok = self
@@ -194,18 +314,36 @@ impl DomainPolicy {
                     .iter()
                     .enumerate()
                     .filter(|(j, _)| *j != i)
-                    .all(|(_, other)| other.iter().any(|o| within(entry, o)));
-                if ok && !out.contains(entry) {
-                    out.push(entry.clone());
+                    .all(|(_, other)| other.iter().any(|o| entry.within(o)));
+                if ok && !kept.contains(&entry) {
+                    kept.push(entry);
                 }
             }
         }
-        Some(out)
+        Some(dedup(kept.into_iter().map(DomainFilter::hint)))
     }
 
-    pub fn blocked(&self) -> &[String] {
-        &self.blocked
+    /// Blocklist hint for search providers. Subdomain-only entries are left
+    /// out (the provider would also drop the apex); the executor enforces
+    /// the full policy on every result.
+    pub fn blocked(&self) -> Vec<String> {
+        dedup(
+            self.blocked
+                .iter()
+                .filter(|b| !b.subdomains_only)
+                .map(DomainFilter::hint),
+        )
     }
+}
+
+fn dedup(items: impl Iterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in items {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -261,6 +399,87 @@ mod tests {
         assert!(!domain_matches("good.com.evil.net", "good.com"));
         assert!(!domain_matches("good.com", ""));
         assert!(!domain_matches("good.com", "docs.good.com"));
+    }
+
+    #[test]
+    fn wildcard_matches_subdomains_only() {
+        assert!(!domain_matches("good.com", "*.good.com"));
+        assert!(domain_matches("a.b.good.com", "*.good.com"));
+        let p = DomainPolicy::from_tool_definition(&json!({"allowed_domains": ["*.good.com"]}));
+        assert!(p.check_url("https://good.com/").is_err());
+        assert!(p.check_url("https://docs.good.com/").is_ok());
+        let p = DomainPolicy::from_tool_definition(&json!({"blocked_domains": ["*.good.com"]}));
+        assert!(p.check_url("https://good.com/").is_ok());
+        assert!(p.check_url("https://ads.good.com/").is_err());
+        assert!(
+            p.blocked().is_empty(),
+            "subdomain-only entries are not hinted"
+        );
+    }
+
+    #[test]
+    fn idna_entries_are_normalized_to_punycode() {
+        let f = DomainFilter::parse("Bücher.DE").unwrap();
+        assert_eq!(f.host, "xn--bcher-kva.de");
+        let p = DomainPolicy::from_tool_definition(&json!({"allowed_domains": ["bücher.de"]}));
+        assert!(p.check_url("https://xn--bcher-kva.de/x").is_ok());
+        assert!(p.check_url("https://www.bücher.de/x").is_ok());
+        let p =
+            DomainPolicy::from_tool_definition(&json!({"blocked_domains": ["xn--bcher-kva.de"]}));
+        assert!(p.check_url("https://bücher.de/").is_err());
+        assert!(domain_matches("shop.bücher.de", "*.xn--bcher-kva.de"));
+    }
+
+    #[test]
+    fn ports_in_entries_are_ignored() {
+        let f = DomainFilter::parse("good.com:8443/docs").unwrap();
+        assert_eq!(f.host, "good.com");
+        assert_eq!(f.path.as_deref(), Some("/docs"));
+        let p = DomainPolicy::from_tool_definition(&json!({"allowed_domains": ["good.com:8443"]}));
+        assert!(p.check_url("https://good.com/").is_ok());
+        assert!(p.check_url("https://good.com:9999/").is_ok());
+        assert!(p.check_url("https://evil.com:8443/").is_err());
+        assert_eq!(DomainFilter::parse("[::1]:80").unwrap().host, "::1");
+    }
+
+    #[test]
+    fn malformed_entries_are_rejected_at_parse_time() {
+        for bad in [
+            "good.com?x=1",
+            "good.com#frag",
+            "user@good.com",
+            "good.com\\x",
+            "good .com",
+            "*",
+            "*.",
+            "foo*.com",
+            "good.com/*",
+            "",
+            "https://",
+        ] {
+            assert!(DomainFilter::parse(bad).is_err(), "{bad} must be rejected");
+            let tool = json!({"type": "web_fetch_20250910", "allowed_domains": [bad]});
+            if !bad.is_empty() {
+                assert!(validate_tool_definition(&tool).is_err(), "{bad}");
+            }
+        }
+        assert!(validate_tool_definition(&json!({
+            "allowed_domains": ["good.com", "https://docs.example.com/blog/"],
+            "blocked_domains": ["*.ads.good.com"]
+        }))
+        .is_ok());
+        let err = validate_tool_definition(&json!({"blocked_domains": ["x.com?y"]})).unwrap_err();
+        assert!(err.starts_with("blocked_domains:"), "{err}");
+    }
+
+    #[test]
+    fn invalid_only_allowlist_fails_closed() {
+        let p = DomainPolicy::from_tool_definition(&json!({"allowed_domains": ["a.com?x"]}));
+        assert!(!p.is_unrestricted());
+        assert!(p.check_url("https://a.com/").is_err());
+        let open = DomainPolicy::default();
+        let narrowed = open.narrowed_by(&json!({"allowed_domains": ["#"]}));
+        assert!(narrowed.check_url("https://anything.example/").is_err());
     }
 
     #[test]
@@ -326,6 +545,12 @@ mod tests {
             narrowed.allowed_hint(),
             Some(vec!["docs.good.com".to_string()])
         );
+
+        // Wildcard narrowing: subdomains of good.com only.
+        let wild = client.narrowed_by(&json!({"allowed_domains": ["*.good.com"]}));
+        assert!(wild.check_url("https://good.com/").is_err());
+        assert!(wild.check_url("https://docs.good.com/").is_ok());
+        assert_eq!(wild.allowed_hint(), Some(vec!["good.com".to_string()]));
 
         // The model cannot drop the client's blocklist (empty list = no-op).
         let cleared = client.narrowed_by(&json!({"blocked_domains": [], "allowed_domains": []}));

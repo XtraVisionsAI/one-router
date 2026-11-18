@@ -84,10 +84,14 @@
       title: 'Health',
       key: 'health_status',
       render: (row: BackendSummary) => {
-        const t = row.health_status === 'healthy' ? 'success'
-          : row.health_status.startsWith('degraded') ? 'warning'
-          : row.health_status === 'unhealthy' ? 'error'
-          : 'default'
+        const t =
+          row.health_status === 'healthy'
+            ? 'success'
+            : row.health_status.startsWith('degraded')
+              ? 'warning'
+              : row.health_status === 'unhealthy'
+                ? 'error'
+                : 'default'
         return h(NTag, { type: t, size: 'small' }, { default: () => row.health_status })
       }
     },

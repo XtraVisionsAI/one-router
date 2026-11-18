@@ -84,6 +84,9 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
             updated_at BIGINT,
             capabilities TEXT,
             pricing_source TEXT DEFAULT 'litellm',
+            price_per_request DOUBLE PRECISION DEFAULT 0.0,
+            price_per_image DOUBLE PRECISION DEFAULT 0.0,
+            price_per_search_unit DOUBLE PRECISION DEFAULT 0.0,
             PRIMARY KEY (source_model_id, provider)
         )",
     )
@@ -104,6 +107,19 @@ pub async fn run_ddl(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    // Migration: non-token prices (USD per call / per image / per search unit)
+    for col in [
+        "price_per_request",
+        "price_per_image",
+        "price_per_search_unit",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE model_mappings ADD COLUMN IF NOT EXISTS {col} DOUBLE PRECISION DEFAULT 0.0"
+        ))
+        .execute(pool)
+        .await?;
+    }
 
     // Index for efficient wildcard (prefix) matching on source_model_id
     sqlx::query(

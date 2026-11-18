@@ -75,10 +75,11 @@ pub async fn create_image(
         "Image generation request completed"
     );
 
-    // Usage row + budget/TPM accounting. Images are not token-priced and
-    // model_mappings has no per-image price: the prompt is recorded as input
-    // tokens and billed only at the mapping's own input price (0 when the
-    // mapping is unpriced — no DEFAULT_* per-token fallback).
+    // Usage row + budget/TPM accounting. The prompt is recorded as input
+    // tokens (billed at the mapping's own input price, no DEFAULT_* fallback);
+    // cost adds `price_per_image` × images actually returned +
+    // `price_per_request`.
+    let images = response.data.len() as u64;
     state.usage_tracker.spawn_record_usage(
         key_info,
         request_id,
@@ -93,7 +94,9 @@ pub async fn create_image(
             provider.to_string()
         },
         "openai",
-        crate::services::usage_tracker::DefaultPricing::None,
+        crate::services::usage_tracker::DefaultPricing::Units(
+            crate::services::usage_tracker::BillableUnits::images(images),
+        ),
     );
 
     Ok((StatusCode::OK, Json(response)))

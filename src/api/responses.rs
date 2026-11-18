@@ -32,7 +32,7 @@ use crate::schemas::responses::{
     generate_response_id, ResponsesInput, ResponsesRequest, ResponsesResponse,
 };
 use crate::server::state::AppState;
-use crate::services::responses_context::ResponsesContextError;
+use crate::services::responses_context::{ContextOwner, ResponsesContextError};
 
 type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
@@ -101,32 +101,21 @@ pub async fn create_response(
 ) -> Result<ResponsesApiResponse, OpenAIApiError> {
     let request: ResponsesRequest = serde_json::from_value(raw_request.clone())
         .map_err(|e| OpenAIApiError::bad_request(format!("Invalid request: {e}")))?;
-    let owner = owner_key_hash(&key_info);
+    let owner = ContextOwner::new(
+        owner_key_hash(&key_info),
+        key_info.user.as_ref().map(|u| u.user_id.clone()),
+    );
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // Restore prior-turn history (as stored (role, text) pairs) if a
     // previous_response_id was supplied.
     let prev_stored = match &request.previous_response_id {
-        Some(prev_id) => state.responses_context.load(prev_id, &owner).await?,
+        Some(prev_id) => state.responses_context.load(prev_id, &owner.key).await?,
         None => Vec::new(),
     };
-    // Chained history grows every turn; once it plus this input cannot be
-    // stored any more, fail up front instead of answering a turn whose id
-    // would then 404 as a previous_response_id.
-    if request.previous_response_id.is_some() {
-        let prev_bytes = crate::services::responses_context::messages_bytes(&prev_stored);
-        let input_bytes = serde_json::to_vec(&raw_request)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        let cap = state.responses_context.max_entry_bytes();
-        if prev_bytes + input_bytes > cap {
-            return Err(OpenAIApiError::bad_request(format!(
-                "Conversation history for previous_response_id exceeds the stored-context limit \
-                 ({} MB); resend the conversation as input without previous_response_id",
-                cap / (1024 * 1024)
-            )));
-        }
-    }
+    // Context size never rejects a request: `ResponsesContextStore::save`
+    // measures what is actually stored and skips storing (warn log) past the
+    // per-entry cap, so only a later continuation from this turn 404s.
 
     // Hosted web_search takes the Anthropic WebToolExecutor path.
     if crate::converters::responses_chat::is_responses_web_search_request(&request) {
@@ -223,7 +212,7 @@ pub async fn create_response(
 async fn finalize(
     state: &AppState,
     request: &ResponsesRequest,
-    owner: &str,
+    owner: &ContextOwner,
     response_id: &str,
     mut stored_input: Vec<(String, String)>,
     responses: ResponsesResponse,
@@ -297,7 +286,7 @@ fn record_responses_usage(
 struct RelayContext {
     state: AppState,
     source_model: String,
-    owner: String,
+    owner: ContextOwner,
     stored_input: Vec<(String, String)>,
     store: bool,
 }
@@ -313,7 +302,7 @@ async fn handle_mantle_responses_passthrough(
     request: &ResponsesRequest,
     target_model_id: &str,
     key_info: &ApiKeyInfo,
-    owner: &str,
+    owner: &ContextOwner,
     prev_stored: Vec<(String, String)>,
     request_id: &str,
 ) -> Result<ResponsesApiResponse, OpenAIApiError> {
@@ -436,7 +425,7 @@ async fn handle_mantle_responses_passthrough(
             RelayContext {
                 state: state.clone(),
                 source_model,
-                owner: owner.to_string(),
+                owner: owner.clone(),
                 stored_input,
                 store: request.should_store(),
             },
@@ -878,7 +867,7 @@ async fn handle_web_search(
     state: &AppState,
     request: &ResponsesRequest,
     key_info: &ApiKeyInfo,
-    owner: &str,
+    owner: &ContextOwner,
     prev_stored: Vec<(String, String)>,
     request_id: &str,
 ) -> Result<ResponsesApiResponse, OpenAIApiError> {
@@ -919,6 +908,11 @@ async fn handle_web_search(
     }
 
     let message_req = responses_to_message_request(request, &prev_stored);
+    // Client-supplied `filters.allowed_domains` / `blocked_domains`.
+    for tool in message_req.tools.as_deref().unwrap_or(&[]) {
+        crate::services::web_tools::validate_server_tool(tool)
+            .map_err(OpenAIApiError::bad_request)?;
+    }
 
     let dynamic = state.dynamic.read().await;
     let executor = dynamic.web_tool_executor.clone().ok_or_else(|| {
@@ -949,15 +943,30 @@ async fn handle_web_search(
                 as std::sync::Arc<dyn crate::services::web_tools::executor::WebToolBackend>,
         };
     drop(dynamic);
+    // Hosted web_search uses web_search_20250305 (no dynamic filtering):
+    // never give this path a code executor.
+    let executor = executor.with_request_code_executor(None);
 
-    let message_resp = executor
-        .run(&message_req, backend.as_ref(), &resolved.target_model_id)
+    // Usage (summed over all loop iterations) is recorded on failure too: a
+    // loop that fails after billed backend calls is not free.
+    let (result, usage) = match executor
+        .run_billed(&message_req, backend.as_ref(), &resolved.target_model_id)
         .await
-        .map_err(|e| OpenAIApiError::internal_error(e.to_string()))?;
+    {
+        Ok(r) => {
+            let u = r.usage.clone();
+            (Ok(r), u)
+        }
+        Err(e) => (Err(OpenAIApiError::internal_error(e.to_string())), e.usage),
+    };
+    let has_usage = usage.input_tokens > 0
+        || usage.output_tokens > 0
+        || usage.cache_read_input_tokens.unwrap_or(0) > 0
+        || usage.cache_creation_input_tokens.unwrap_or(0) > 0;
 
     // Record usage (protocol = "responses").
-    let usage = message_resp.usage.clone();
-    {
+    let success = result.is_ok();
+    if success || has_usage {
         let tracker = state.usage_tracker.clone();
         let key_info = key_info.clone();
         let req_id = request_id.to_string();
@@ -970,7 +979,7 @@ async fn handle_web_search(
                     &req_id,
                     &model,
                     &usage,
-                    true,
+                    success,
                     &provider,
                     "responses",
                     None,
@@ -981,6 +990,7 @@ async fn handle_web_search(
             }
         });
     }
+    let message_resp = result?;
 
     let response_id = generate_response_id();
     let responses = message_response_to_responses(

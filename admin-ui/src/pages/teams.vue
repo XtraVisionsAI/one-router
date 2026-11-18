@@ -62,7 +62,11 @@
     if (t.monthly_budget == null) return `${fmtMoney(t.budget_used_mtd)} / —`
     const pct = t.monthly_budget > 0 ? Math.min(100, (t.budget_used_mtd / t.monthly_budget) * 100) : 100
     return h('div', { style: 'min-width: 140px' }, [
-      h('div', { class: 'text-xs mb-1' }, `${fmtMoney(t.budget_used_mtd)} / ${fmtMoney(t.monthly_budget)} (${t.budget_period})`),
+      h(
+        'div',
+        { class: 'text-xs mb-1' },
+        `${fmtMoney(t.budget_used_mtd)} / ${fmtMoney(t.monthly_budget)} (${t.budget_period})`
+      ),
       h(NProgress, {
         type: 'line',
         percentage: Math.round(pct),
@@ -94,20 +98,38 @@
       title: 'Status',
       key: 'is_active',
       render: (t: Team) =>
-        h(NTag, { type: t.is_active ? 'success' : 'error', size: 'small' }, { default: () => (t.is_active ? 'active' : 'inactive') })
+        h(
+          NTag,
+          { type: t.is_active ? 'success' : 'error', size: 'small' },
+          { default: () => (t.is_active ? 'active' : 'inactive') }
+        )
     },
     {
       title: 'Actions',
       key: 'actions',
       render: (t: Team) =>
         h('div', { class: 'flex gap-2' }, [
-          h(NButton, { size: 'small', onClick: () => ((editing.value = t), (modalShow.value = true)) }, { default: () => 'Edit' }),
+          h(
+            NButton,
+            {
+              size: 'small',
+              onClick: () => {
+                editing.value = t
+                modalShow.value = true
+              }
+            },
+            { default: () => 'Edit' }
+          ),
           h(
             NButton,
             { size: 'small', type: t.is_active ? 'warning' : 'default', onClick: () => toggleActive(t) },
             { default: () => (t.is_active ? 'Deactivate' : 'Activate') }
           ),
-          h(NButton, { size: 'small', type: 'error', ghost: true, onClick: () => confirmDelete(t) }, { default: () => 'Delete' })
+          h(
+            NButton,
+            { size: 'small', type: 'error', ghost: true, onClick: () => confirmDelete(t) },
+            { default: () => 'Delete' }
+          )
         ])
     }
   ]
@@ -119,7 +141,7 @@
   <div>
     <div class="flex items-center justify-between mb-6">
       <h1 class="text-xl font-semibold text-slate-100">Teams</h1>
-      <n-button type="primary" @click="(editing = undefined), (modalShow = true)">
+      <n-button type="primary" @click="((editing = undefined), (modalShow = true))">
         <template #icon><span class="i-carbon-add" /></template>
         Create Team
       </n-button>

@@ -40,9 +40,7 @@
       items.sort((a, b) => (a.schema.sort_order ?? 999) - (b.schema.sort_order ?? 999))
     }
 
-    return groupOrder
-      .filter((g) => groups[g]?.length)
-      .map((g) => ({ name: g, items: groups[g] }))
+    return groupOrder.filter((g) => groups[g]?.length).map((g) => ({ name: g, items: groups[g] }))
   })
 
   async function load() {
@@ -88,7 +86,7 @@
     const v = values.value[key]
     if (!v || v === '') return null
     const n = Number(v)
-    return isNaN(n) ? null : n
+    return Number.isNaN(n) ? null : n
   }
 
   function setNumberValue(key: string, val: number | null) {
@@ -141,7 +139,11 @@
                 show-password-on="click"
                 :placeholder="schema.placeholder || ''"
                 style="width: 260px"
-                @focus="() => { if (values[setting.key] === MASK) values[setting.key] = '' }"
+                @focus="
+                  () => {
+                    if (values[setting.key] === MASK) values[setting.key] = ''
+                  }
+                "
                 @blur="() => saveKey(setting.key, setting.description)"
               />
 

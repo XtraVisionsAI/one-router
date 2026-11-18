@@ -303,11 +303,16 @@ info "Step 3: Creating deployment..."
 TMP_FILES=()
 cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}"; return 0; }
 trap cleanup_tmp EXIT
+# Usage: private_tmp VAR_NAME — creates a 0600 temp file, stores its path in
+# VAR_NAME and registers it for the EXIT trap. Must NOT be called as
+# VAR=$(private_tmp): command substitution runs in a subshell, so the
+# TMP_FILES append would never reach this shell and the trap would delete
+# nothing. (printf -v, not declare -g: macOS ships bash 3.2.)
 private_tmp() {
-    local f
-    f=$(umask 077 && mktemp "${TMPDIR:-/tmp}/one-router-deploy.XXXXXX")
-    TMP_FILES+=("$f")
-    echo "$f"
+    local __pt_path
+    __pt_path=$(umask 077 && mktemp "${TMPDIR:-/tmp}/one-router-deploy.XXXXXX")
+    TMP_FILES+=("$__pt_path")
+    printf -v "$1" '%s' "$__pt_path"
 }
 # Mask the password of a DATABASE URI for display.
 mask_db() { echo "$1" | sed -E 's#(://[^:/@]+:).*@#\1****@#'; }
@@ -339,7 +344,7 @@ if [[ -n "$ENCRYPTION_KEY" && "$ENCRYPTION_KEY" != aws-kms:* && "$ENCRYPTION_KEY
     warn "  (or --provider vault-transit) and pass the resulting aws-kms:… / vault-transit:… value."
     warn "  Note: aws-kms needs AWS credentials with kms:Decrypt inside the container (Lightsail has no task role)."
 fi
-CONTAINERS_FILE=$(private_tmp)
+private_tmp CONTAINERS_FILE
 DB_VALUE="${DATABASE}" MK="${MASTER_API_KEY}" EK="${ENCRYPTION_KEY}" jq -n --arg image "${LIGHTSAIL_IMAGE}" '
   {"one-router": {
      image: $image,

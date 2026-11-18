@@ -164,6 +164,12 @@ export interface ModelMapping {
   cache_read_price: number
   cache_write_price: number
   pricing_source: string
+  /** USD per call (/v1/images/generations, /v1/rerank) */
+  price_per_request: number
+  /** USD per generated image (/v1/images/generations) */
+  price_per_image: number
+  /** USD per rerank search unit — one query over ≤ 100 documents (/v1/rerank) */
+  price_per_search_unit: number
   /** JSON-encoded ModelCapabilities as returned by the API. null = gateway defaults. */
   capabilities?: string | null
 }
@@ -180,6 +186,12 @@ export interface UpsertMappingBody {
   cache_read_price: number
   cache_write_price: number
   pricing_source: string
+  /** USD per call (/v1/images/generations, /v1/rerank) */
+  price_per_request: number
+  /** USD per generated image (/v1/images/generations) */
+  price_per_image: number
+  /** USD per rerank search unit — one query over ≤ 100 documents (/v1/rerank) */
+  price_per_search_unit: number
   capabilities?: string | null
 }
 
@@ -235,6 +247,8 @@ export interface UsageSummaryResponse {
 export interface StatusResponse {
   version: string
   uptime_seconds: number
+  /** Stored secrets the server cannot read (not v2 / wrong key); skipped on load. */
+  invalid_stored_secrets?: number | null
 }
 
 // ── Generic list wrapper ──────────────────────────────────────

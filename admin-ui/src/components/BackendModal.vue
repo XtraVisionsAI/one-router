@@ -212,7 +212,7 @@
       retry_after_secs: pool.value.retry_after_secs,
       service_tier: form.value.service_tier,
       // Always send the parsed filter: an empty box clears it (serve all).
-      models: parseModels(modelsText.value),
+      models: parseModels(modelsText.value)
     }
 
     // Only include config if we have loaded/entered it
@@ -306,12 +306,7 @@
       <NDivider title-placement="left"><span class="text-xs text-slate-500">Credentials</span></NDivider>
 
       <NFormItem label="API Keys" required>
-        <NInput
-          v-model:value="apiKeyConfig.api_keys_text"
-          type="textarea"
-          :rows="3"
-          placeholder="One key per line"
-        />
+        <NInput v-model:value="apiKeyConfig.api_keys_text" type="textarea" :rows="3" placeholder="One key per line" />
       </NFormItem>
 
       <div class="flex gap-4">
@@ -348,10 +343,7 @@
     </NFormItem>
 
     <NFormItem label="Models Filter">
-      <NInput
-        v-model:value="modelsText"
-        placeholder='(optional) e.g. *, !openai.*  — empty = all models'
-      />
+      <NInput v-model:value="modelsText" placeholder="(optional) e.g. *, !openai.*  — empty = all models" />
       <template #feedback>
         <span class="text-xs text-slate-500">
           Wildcard patterns matched against target model ids; "!" excludes. Comma/semicolon separated.

@@ -7,7 +7,7 @@ export const useAuthStore = defineStore('auth', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify({ key: key.trim() }),
+      body: JSON.stringify({ key: key.trim() })
     })
     if (!res.ok) throw new Error('Invalid API key')
     const data = await res.json()

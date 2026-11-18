@@ -11,7 +11,14 @@
 //! its `target_model_id` is matched against the table (with Bedrock region-prefix
 //! fallback).
 //!
-//! LiteLLM costs are USD per token; we store USD per 1M tokens.
+//! LiteLLM costs are USD per token; we store USD per 1M tokens. Non-token
+//! costs are stored as-is in USD: `image_generation` entries'
+//! `output_cost_per_image` → `price_per_image`, `rerank` entries'
+//! `input_cost_per_query` → `price_per_search_unit`, and (both modes)
+//! `input_cost_per_request` → `price_per_request`. Size/quality image
+//! variants (`1024-x-1024/dall-e-3`, `hd/…`, `…/50-steps/…`, per-pixel
+//! pricing) and token-only image entries (`gpt-image-1`) are not imported —
+//! price those mappings manually.
 
 use crate::database::models::ModelMappingRecord;
 use crate::database::traits::DatabaseService;
@@ -39,8 +46,14 @@ const REGION_PREFIXES: &[&str] = &[
 ];
 
 /// Modes imported from the table. Embeddings are per-token like chat (output 0);
-/// image/rerank use non-token pricing (e.g. per-query) and stay manual.
-pub(crate) const SYNCED_MODES: &[&str] = &["chat", "responses", "embedding"];
+/// image_generation / rerank carry per-image / per-query (search unit) prices.
+pub(crate) const SYNCED_MODES: &[&str] = &[
+    "chat",
+    "responses",
+    "embedding",
+    "image_generation",
+    "rerank",
+];
 
 /// Two per-1M prices are considered equal within this tolerance (float noise guard).
 const PRICE_EPSILON: f64 = 1e-6;
@@ -85,6 +98,10 @@ pub struct Prices {
     pub output: Option<f64>,
     pub cache_read: Option<f64>,
     pub cache_write: Option<f64>,
+    /// USD per call / per generated image / per rerank search unit.
+    pub per_request: Option<f64>,
+    pub per_image: Option<f64>,
+    pub per_search_unit: Option<f64>,
 }
 
 /// Index of extracted prices keyed by (namespace, normalized model id).
@@ -139,6 +156,71 @@ pub(crate) fn to_price_per_million(value: Option<&serde_json::Value>) -> Option<
     Some(cost * 1_000_000.0)
 }
 
+/// A LiteLLM USD amount as-is (per image / query / request). Rejects negatives.
+pub(crate) fn to_usd(value: Option<&serde_json::Value>) -> Option<f64> {
+    let cost = value?.as_f64()?;
+    (cost >= 0.0 && cost.is_finite()).then_some(cost)
+}
+
+/// Image entries keyed by a size / quality / steps variant
+/// (`1024-x-1024/dall-e-3`, `hd/1024-x-1792/dall-e-3`,
+/// `max-x-max/50-steps/stability.…`). They normalize onto the same model id
+/// as the base entry with a different price, so they are skipped.
+pub(crate) fn is_image_variant_key(key: &str) -> bool {
+    let mut segments: Vec<&str> = key.split('/').collect();
+    segments.pop();
+    segments.iter().any(|seg| {
+        let seg = seg.to_ascii_lowercase();
+        seg.contains("-x-")
+            || seg.ends_with("-steps")
+            || matches!(
+                seg.as_str(),
+                "standard" | "hd" | "low" | "medium" | "high" | "auto"
+            )
+    })
+}
+
+/// Extract the importable prices of one table entry, or `None` when the
+/// entry's mode is not synced / it carries no usable price for its mode.
+/// Token modes need both base per-token rates; `image_generation` needs
+/// `output_cost_per_image`; `rerank` needs `input_cost_per_query`.
+pub(crate) fn extract_prices(
+    key: &str,
+    spec: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Prices> {
+    let mode = spec.get("mode").and_then(|v| v.as_str())?;
+    if !SYNCED_MODES.contains(&mode) {
+        return None;
+    }
+    let mut prices = Prices {
+        input: to_price_per_million(spec.get("input_cost_per_token")),
+        output: to_price_per_million(spec.get("output_cost_per_token")),
+        cache_read: to_price_per_million(spec.get("cache_read_input_token_cost")),
+        cache_write: to_price_per_million(spec.get("cache_creation_input_token_cost")),
+        ..Default::default()
+    };
+    match mode {
+        "image_generation" => {
+            if is_image_variant_key(key) {
+                return None;
+            }
+            prices.per_image = Some(to_usd(spec.get("output_cost_per_image"))?);
+            prices.per_request = to_usd(spec.get("input_cost_per_request"));
+        }
+        "rerank" => {
+            prices.per_search_unit = Some(to_usd(spec.get("input_cost_per_query"))?);
+            prices.per_request = to_usd(spec.get("input_cost_per_request"));
+        }
+        _ => {
+            // Require at least the base rates to consider this a usable entry.
+            if prices.input.is_none() || prices.output.is_none() {
+                return None;
+            }
+        }
+    }
+    Some(prices)
+}
+
 /// Strip a leading Bedrock region prefix (`us.`, `eu.`, …), if present.
 pub(crate) fn strip_region_prefix(model_id: &str) -> &str {
     for prefix in REGION_PREFIXES {
@@ -179,22 +261,8 @@ pub fn build_index(data: &serde_json::Value) -> PricingIndex {
         let Some(ns) = ProviderNs::from_litellm_provider(litellm_provider) else {
             continue;
         };
-        match spec.get("mode").and_then(|v| v.as_str()) {
-            Some(mode) if SYNCED_MODES.contains(&mode) => {}
-            _ => continue,
-        }
-
-        let input = to_price_per_million(spec.get("input_cost_per_token"));
-        let output = to_price_per_million(spec.get("output_cost_per_token"));
-        // Require at least the base rates to consider this a usable pricing entry.
-        if input.is_none() || output.is_none() {
+        let Some(prices) = extract_prices(key, spec) else {
             continue;
-        }
-        let prices = Prices {
-            input,
-            output,
-            cache_read: to_price_per_million(spec.get("cache_read_input_token_cost")),
-            cache_write: to_price_per_million(spec.get("cache_creation_input_token_cost")),
         };
 
         // Index under the normalized key (drops any `provider/` prefix).
@@ -292,6 +360,24 @@ pub fn reconcile(
                 changed = true;
             }
         }
+        if let Some(v) = prices.per_request {
+            if differs(m.price_per_request, v) {
+                updated.price_per_request = v;
+                changed = true;
+            }
+        }
+        if let Some(v) = prices.per_image {
+            if differs(m.price_per_image, v) {
+                updated.price_per_image = v;
+                changed = true;
+            }
+        }
+        if let Some(v) = prices.per_search_unit {
+            if differs(m.price_per_search_unit, v) {
+                updated.price_per_search_unit = v;
+                changed = true;
+            }
+        }
 
         if !changed {
             summary.unchanged += 1;
@@ -316,10 +402,15 @@ pub(crate) async fn fetch_litellm(url: &str) -> Result<serde_json::Value, String
     }
 
     // Admin-supplied URL: guarded DNS (no private / metadata addresses), no
-    // proxy, no redirects; `send_guarded` also rejects IP-literal hosts, which
-    // never reach the guarded resolver.
+    // proxy unless OUTBOUND_PROXY is set (admin scope), no redirects;
+    // `send_guarded` also rejects IP-literal hosts (never seen by the
+    // guarded resolver) and pre-checks proxied destinations.
     use crate::services::web_tools::ssrf;
-    let client = ssrf::guarded_client(FETCH_TIMEOUT, "one-router")?;
+    let client = ssrf::guarded_client(
+        crate::config::outbound_proxy::Egress::Admin,
+        FETCH_TIMEOUT,
+        "one-router",
+    )?;
     let resp = ssrf::send_guarded(&client, client.get(parsed))
         .await
         .map_err(|e| format!("pricing table fetch failed: {e}"))?;
@@ -440,6 +531,32 @@ mod tests {
                 "output_cost_per_token": 0.0,
                 "input_cost_per_query": 0.002
             },
+            "amazon.nova-canvas-v1:0": {
+                "litellm_provider": "bedrock",
+                "mode": "image_generation",
+                "output_cost_per_image": 0.06
+            },
+            "1024-x-1024/50-steps/stability.stable-diffusion-xl-v1": {
+                "litellm_provider": "bedrock",
+                "mode": "image_generation",
+                "output_cost_per_image": 0.04
+            },
+            "stability.stable-diffusion-xl-v1": {
+                "litellm_provider": "bedrock",
+                "mode": "image_generation",
+                "output_cost_per_image": 0.02
+            },
+            "hd/1024-x-1024/dall-e-3": {
+                "litellm_provider": "openai",
+                "mode": "image_generation",
+                "input_cost_per_pixel": 7.629e-8,
+                "output_cost_per_pixel": 0.0
+            },
+            "gemini/imagen-4.0-generate-001": {
+                "litellm_provider": "gemini",
+                "mode": "image_generation",
+                "output_cost_per_image": 0.04
+            },
             "gemini/gemini-1.5-pro": {
                 "litellm_provider": "gemini",
                 "mode": "chat",
@@ -471,6 +588,9 @@ mod tests {
             updated_at: None,
             capabilities: None,
             pricing_source: pricing_source.into(),
+            price_per_request: 0.0,
+            price_per_image: 0.0,
+            price_per_search_unit: 0.0,
         }
     }
 
@@ -489,10 +609,12 @@ mod tests {
         assert!(index
             .get(ProviderNs::OpenAI, "text-embedding-3-small")
             .is_some());
-        // rerank mode is per-query priced and excluded.
-        assert!(index
+        // rerank mode is indexed with its per-query (search unit) price.
+        let rerank = index
             .get(ProviderNs::Bedrock, "cohere.rerank-v3-5:0")
-            .is_none());
+            .expect("rerank entry indexed");
+        assert_eq!(rerank.per_search_unit, Some(0.002));
+        assert_eq!(rerank.per_image, None);
         assert!(index.get(ProviderNs::OpenAI, "gpt-4o").is_some());
         assert!(index
             .get(ProviderNs::Anthropic, "claude-3-5-sonnet-20241022")
@@ -634,6 +756,75 @@ mod tests {
         assert!(summary.dry_run);
     }
 
+    #[test]
+    fn test_image_variant_keys() {
+        assert!(is_image_variant_key("1024-x-1024/dall-e-3"));
+        assert!(is_image_variant_key("hd/1024-x-1792/dall-e-3"));
+        assert!(is_image_variant_key(
+            "max-x-max/50-steps/stability.stable-diffusion-xl-v0"
+        ));
+        assert!(!is_image_variant_key("gemini/imagen-4.0-generate-001"));
+        assert!(!is_image_variant_key("amazon.nova-canvas-v1:0"));
+    }
+
+    #[test]
+    fn test_index_image_prices() {
+        let index = build_index(&sample_table());
+        let canvas = match_prices(&index, "bedrock", "amazon.nova-canvas-v1:0").unwrap();
+        assert_eq!(canvas.per_image, Some(0.06));
+        assert_eq!(canvas.input, None); // no per-token price in source
+                                        // The size/steps variant never shadows the base entry.
+        let sdxl = match_prices(&index, "bedrock", "stability.stable-diffusion-xl-v1").unwrap();
+        assert_eq!(sdxl.per_image, Some(0.02));
+        // Per-pixel-only variants are not imported.
+        assert!(match_prices(&index, "openai", "dall-e-3").is_none());
+        assert_eq!(
+            match_prices(&index, "gemini", "imagen-4.0-generate-001")
+                .unwrap()
+                .per_image,
+            Some(0.04)
+        );
+    }
+
+    #[test]
+    fn test_reconcile_non_token_prices() {
+        let index = build_index(&sample_table());
+        let mut rerank = mapping(
+            "rerank-english-v3.0",
+            "bedrock",
+            "cohere.rerank-v3-5:0",
+            (0.0, 0.0, 0.0, 0.0),
+            PRICING_SOURCE_LITELLM,
+        );
+        let mut canvas = mapping(
+            "nova-canvas",
+            "bedrock",
+            "amazon.nova-canvas-v1:0",
+            (0.0, 0.0, 0.0, 0.0),
+            PRICING_SOURCE_LITELLM,
+        );
+        canvas.price_per_request = 0.5; // source has none → kept
+        let (summary, writes) = reconcile(
+            &[rerank.clone(), canvas.clone()],
+            &index,
+            &SyncOptions::default(),
+        );
+        assert_eq!(summary.updated.len(), 2);
+        assert_eq!(writes[0].price_per_search_unit, 0.002);
+        assert_eq!(writes[1].price_per_image, 0.06);
+        assert_eq!(writes[1].price_per_request, 0.5);
+
+        // Manual rows keep their unit prices; synced rows already at the
+        // source price are unchanged.
+        rerank.pricing_source = PRICING_SOURCE_MANUAL.into();
+        rerank.price_per_search_unit = 0.01;
+        canvas.price_per_image = 0.06;
+        let (summary, writes) = reconcile(&[rerank, canvas], &index, &SyncOptions::default());
+        assert_eq!(summary.skipped_manual.len(), 1);
+        assert_eq!(summary.unchanged, 1);
+        assert!(writes.is_empty());
+    }
+
     #[tokio::test]
     async fn fetch_rejects_ip_literal_hosts() {
         for url in [
@@ -642,7 +833,7 @@ mod tests {
             "https://[::ffff:10.0.0.1]/table.json",
         ] {
             let err = fetch_litellm(url).await.unwrap_err();
-            assert!(err.contains("forbidden"), "{url}: {err}");
+            assert!(err.contains("destination not allowed"), "{url}: {err}");
         }
     }
 }

@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use crate::database::models::BudgetLayer;
 use crate::database::traits::DatabaseService;
 use crate::middleware::auth::{ApiKeyInfo, AuthError, BudgetScope};
-use crate::services::usage_tracker::UsageTracker;
+use crate::services::usage_tracker::{BillableUnits, DefaultPricing, UsageTracker};
 
 /// Input-token estimate ceiling (bytes/4 over-counts images and JSON overhead).
 const MAX_INPUT_ESTIMATE: u64 = 200_000;
@@ -273,20 +273,52 @@ struct BodyHints {
     max_tokens: Option<u64>,
     max_output_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
+    /// Images requested (`/v1/images/generations`).
+    n: Option<u64>,
+    /// Rerank documents (only counted).
+    documents: Option<Vec<serde::de::IgnoredAny>>,
 }
 
-/// Endpoints whose cost is token-priced (count_tokens / GETs never precharge).
+/// Endpoints whose cost is priced (count_tokens / GETs never precharge).
 fn is_billable(path: &str) -> bool {
     let p = path.trim_start_matches("/v1");
     matches!(
         p,
-        "/messages" | "/chat/completions" | "/responses" | "/embeddings"
+        "/messages"
+            | "/chat/completions"
+            | "/responses"
+            | "/embeddings"
+            | "/images/generations"
+            | "/rerank"
     )
+}
+
+/// Non-token endpoints: no token fallback, priced per image / search unit.
+fn non_token_pricing(path: &str, hints: &BodyHints) -> Option<DefaultPricing> {
+    match path.trim_start_matches("/v1") {
+        "/images/generations" => Some(DefaultPricing::Units(BillableUnits::images(
+            hints.n.unwrap_or(1).max(1),
+        ))),
+        "/rerank" => Some(DefaultPricing::Units(BillableUnits::rerank(
+            hints.documents.as_ref().map_or(0, Vec::len),
+        ))),
+        _ => None,
+    }
 }
 
 /// Endpoints billed on input tokens only (no output reservation).
 fn is_input_only(path: &str) -> bool {
     path.trim_start_matches("/v1") == "/embeddings"
+}
+
+/// Period tag of a reservation: the row's stored period returned by the
+/// reserve, or (row never had one) the layer's current period.
+fn reservation_period(stored: String, current: impl FnOnce() -> String) -> String {
+    if stored.is_empty() {
+        current()
+    } else {
+        stored
+    }
 }
 
 /// The current period key of one of the caller's budget layers.
@@ -393,7 +425,9 @@ pub async fn budget_precharge(
             .await;
     }
 
-    let (input, output) = if is_input_only(parts.uri.path()) {
+    let pricing = non_token_pricing(parts.uri.path(), &hints).unwrap_or(DefaultPricing::Fallback);
+    let (input, output) = if is_input_only(parts.uri.path()) || pricing != DefaultPricing::Fallback
+    {
         // Embeddings bill input tokens only.
         (estimate_tokens(bytes.len(), Some(0), 0).0, 0)
     } else {
@@ -410,7 +444,7 @@ pub async fn budget_precharge(
         Some(model) => {
             state
                 .usage_tracker
-                .estimate_cost(model, input, output, key_info.cost_rate)
+                .estimate_cost_with(model, input, output, key_info.cost_rate, pricing)
                 .await
         }
         None => 0.0,
@@ -425,13 +459,16 @@ pub async fn budget_precharge(
                 .reserve_budget(layer, &id, estimate, budget - estimate)
                 .await
             {
-                Ok(true) => reserved.push(Reservation {
+                Ok(Some(stored_period)) => reserved.push(Reservation {
                     layer,
-                    period: layer_period(&key_info, layer),
+                    // The period the reserve actually landed in (read with the
+                    // update), not `now()` afterwards — a rollover between the
+                    // two would mis-tag it.
+                    period: reservation_period(stored_period, || layer_period(&key_info, layer)),
                     id,
                     amount: estimate,
                 }),
-                Ok(false) => {
+                Ok(None) => {
                     rollback(&state, &reserved).await;
                     crate::observability::metrics::record_precharge("rejected");
                     return AuthError::BudgetExceeded(scope_of(layer)).into_response();
@@ -558,12 +595,47 @@ mod tests {
     }
 
     #[test]
+    fn reservation_period_prefers_stored_period() {
+        // The reserve landed in the stored period even if "now" rolled over.
+        assert_eq!(
+            reservation_period("2026-10".into(), || "2026-11".into()),
+            "2026-10"
+        );
+        assert_eq!(
+            reservation_period(String::new(), || "2026-11".into()),
+            "2026-11"
+        );
+    }
+
+    #[test]
     fn billable_paths() {
         assert!(is_billable("/v1/messages"));
         assert!(is_billable("/messages"));
         assert!(is_billable("/chat/completions"));
         assert!(!is_billable("/messages/count_tokens"));
         assert!(!is_billable("/models"));
+        assert!(is_billable("/v1/images/generations"));
+        assert!(is_billable("/v1/rerank"));
+    }
+
+    #[test]
+    fn non_token_precharge_units() {
+        let hints: BodyHints = serde_json::from_str(r#"{"model":"m","prompt":"p","n":3}"#).unwrap();
+        assert_eq!(
+            non_token_pricing("/v1/images/generations", &hints),
+            Some(DefaultPricing::Units(BillableUnits::images(3)))
+        );
+        let hints: BodyHints = serde_json::from_str(&format!(
+            r#"{{"model":"m","query":"q","documents":[{}]}}"#,
+            vec!["\"d\""; 150].join(",")
+        ))
+        .unwrap();
+        assert_eq!(
+            non_token_pricing("/v1/rerank", &hints),
+            Some(DefaultPricing::Units(BillableUnits::rerank(150)))
+        );
+        assert_eq!(BillableUnits::rerank(150).search_units, 2);
+        assert_eq!(non_token_pricing("/v1/messages", &hints), None);
     }
 
     fn res(layer: BudgetLayer, amount: f64, period: &str) -> Reservation {

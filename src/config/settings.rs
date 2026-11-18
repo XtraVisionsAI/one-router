@@ -65,6 +65,10 @@ pub struct Settings {
     /// "off" / "empty" (default, first run only) / "missing" (legacy backfill)
     pub seed_defaults: crate::database::seed::SeedMode,
 
+    /// `OUTBOUND_PROXY` / `OUTBOUND_PROXY_SCOPE` for SSRF-guarded fetches
+    /// (infra-level, read once at startup).
+    pub outbound_proxy: super::outbound_proxy::OutboundProxyConfig,
+
     /// Application version (from Cargo.toml)
     pub app_version: String,
 
@@ -98,6 +102,7 @@ impl std::fmt::Debug for Settings {
             )
             .field("web_fetch_max_content_kb", &self.web_fetch_max_content_kb)
             .field("seed_defaults", &self.seed_defaults)
+            .field("outbound_proxy", &self.outbound_proxy)
             .field("app_version", &self.app_version)
             .field(
                 "ephemeral_api_key",
@@ -201,6 +206,9 @@ impl Settings {
             _ => crate::database::seed::SeedMode::default(),
         };
 
+        let outbound_proxy = super::outbound_proxy::OutboundProxyConfig::from_env()
+            .map_err(|e| anyhow::anyhow!(e))?;
+
         let settings = Self {
             database,
             port,
@@ -217,6 +225,7 @@ impl Settings {
             seed_defaults,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             ephemeral_api_key: None,
+            outbound_proxy,
         };
 
         // Key generation happens in `ensure_required_keys`, called by main
@@ -554,6 +563,7 @@ mod tests {
             seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
+            outbound_proxy: Default::default(),
         };
         assert_eq!(settings.server_addr(), "127.0.0.1:9000");
     }
@@ -576,6 +586,7 @@ mod tests {
             seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
+            outbound_proxy: Default::default(),
         };
         let warnings = settings.security_warnings();
         assert!(warnings.iter().any(|w| w.contains("MASTER_API_KEY")));
@@ -599,6 +610,7 @@ mod tests {
             seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
+            outbound_proxy: Default::default(),
         };
         // No master/encryption warnings for strong keys. (An ENCRYPTION_KEY-set
         // config emits no auto-generation warning.)
@@ -626,6 +638,7 @@ mod tests {
             seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
+            outbound_proxy: Default::default(),
         };
         assert_eq!(settings.max_body_size_bytes(), 64 * 1024 * 1024);
 
@@ -656,6 +669,7 @@ mod tests {
             seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.1.0".into(),
             ephemeral_api_key: None,
+            outbound_proxy: Default::default(),
         };
         let key = settings.generate_ephemeral_key();
         assert!(key.starts_with("sk-"));

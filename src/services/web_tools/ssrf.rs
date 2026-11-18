@@ -9,8 +9,16 @@
 //!    rebinding, trailing-dot hostnames (`evil.com.`), and redirect hops cannot
 //!    reach a different address than the one checked.
 //!
-//! Guarded clients also disable system proxies (`HTTP(S)_PROXY` would resolve
-//! names on our behalf and bypass both layers).
+//! Guarded clients ignore system proxies (`HTTP(S)_PROXY` would resolve names
+//! on our behalf and bypass both layers) **unless** the operator opted in via
+//! `OUTBOUND_PROXY` (see `config::outbound_proxy`). A proxied client keeps
+//! [`check_url_static`] and adds a local DNS pre-check ([`precheck_proxied`]:
+//! a forbidden address rejects, a local resolution failure allows — the proxy
+//! may be the only resolver); the proxy must enforce its own egress ACL.
+//!
+//! Errors that would reveal *why* a destination is refused (the resolved
+//! private address) are returned to callers as the generic
+//! [`DESTINATION_NOT_ALLOWED`]; details are logged server-side.
 //!
 //! IP-literal hosts never reach a resolver, so [`check_url_static`] must run
 //! on every URL sent with a guarded client — [`send_guarded`] and
@@ -18,7 +26,26 @@
 //! [`read_body_capped`] (streamed, never buffered past the cap).
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use crate::config::outbound_proxy::{Egress, OutboundProxyConfig, ProxyScope, ResolvedProxy};
+
+/// Client-facing reason for every refused destination (forbidden address,
+/// blocked hostname). The concrete reason is logged, never returned: the
+/// resolved address would make the gateway a DNS / network-layout oracle.
+pub const DESTINATION_NOT_ALLOWED: &str = "destination not allowed";
+
+/// Upper bound on the local DNS pre-check of a proxied request.
+const PRECHECK_DNS_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn refused(reason: &str, host: &str, addr: Option<IpAddr>) -> String {
+    match addr {
+        Some(ip) => tracing::warn!(host, addr = %ip, reason, "Guarded fetch refused"),
+        None => tracing::warn!(host, reason, "Guarded fetch refused"),
+    }
+    DESTINATION_NOT_ALLOWED.to_string()
+}
 
 /// Maximum redirects followed manually by SSRF-guarded fetches.
 /// Each hop is re-validated (domain filters + IP checks).
@@ -120,11 +147,11 @@ pub fn check_url_static(url: &reqwest::Url) -> Result<(String, Option<IpAddr>), 
         return Err("URL has no host".to_string());
     }
     if BLOCKED_HOSTS.contains(&host.as_str()) {
-        return Err(format!("Host '{host}' is not allowed"));
+        return Err(refused("blocked hostname", &host, None));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_forbidden_ip(ip) {
-            return Err(format!("Address '{ip}' is in a forbidden range"));
+            return Err(refused("forbidden IP literal", &host, Some(ip)));
         }
         return Ok((host, Some(ip)));
     }
@@ -156,9 +183,10 @@ pub async fn validate_url(url: &reqwest::Url) -> Result<ValidatedTarget, String>
         return Err(format!("Host '{host}' did not resolve to any address"));
     }
     if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(a.ip())) {
-        return Err(format!(
-            "Host '{host}' resolves to forbidden address '{}'",
-            bad.ip()
+        return Err(refused(
+            "resolves to forbidden address",
+            &host,
+            Some(bad.ip()),
         ));
     }
     Ok(ValidatedTarget {
@@ -170,15 +198,30 @@ pub async fn validate_url(url: &reqwest::Url) -> Result<ValidatedTarget, String>
 /// DNS resolver that refuses to hand out forbidden addresses. Installed on every
 /// guarded client, so the check happens for the exact name the connector
 /// resolves, at connect time.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct GuardedResolver;
+///
+/// `exempt` holds the configured outbound proxy's own hostnames: the client
+/// must be able to reach its proxy, which usually lives on a private address.
+/// Proxied *targets* never reach this resolver (the proxy resolves them).
+#[derive(Debug, Default, Clone)]
+pub struct GuardedResolver {
+    exempt: Arc<[String]>,
+}
+
+impl GuardedResolver {
+    fn with_exempt(hosts: Vec<String>) -> Self {
+        Self {
+            exempt: hosts.into(),
+        }
+    }
+}
 
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: hyper014::client::connect::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
+        let exempt = self.exempt.contains(&host);
         Box::pin(async move {
-            if BLOCKED_HOSTS.contains(&host.as_str()) {
-                return Err(format!("Host '{host}' is not allowed").into());
+            if !exempt && BLOCKED_HOSTS.contains(&host.as_str()) {
+                return Err(refused("blocked hostname", &host, None).into());
             }
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
                 .await
@@ -187,46 +230,179 @@ impl reqwest::dns::Resolve for GuardedResolver {
             if addrs.is_empty() {
                 return Err(format!("Host '{host}' did not resolve to any address").into());
             }
-            if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(a.ip())) {
-                return Err(
-                    format!("Host '{host}' resolves to forbidden address '{}'", bad.ip()).into(),
-                );
+            if !exempt {
+                if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(a.ip())) {
+                    return Err(
+                        refused("resolves to forbidden address", &host, Some(bad.ip())).into(),
+                    );
+                }
             }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
 
+/// The process-wide outbound proxy (from `OUTBOUND_PROXY`), set once at startup.
+#[derive(Debug)]
+struct ActiveProxy {
+    scope: ProxyScope,
+    resolved: ResolvedProxy,
+}
+
+static ACTIVE_PROXY: OnceLock<Option<ActiveProxy>> = OnceLock::new();
+
+/// Install the outbound proxy configuration (first call wins; later calls
+/// are ignored — the setting is infra-level and not hot-reloadable) and log
+/// the startup notes. Must run before guarded clients are built.
+pub fn init_outbound_proxy(cfg: &OutboundProxyConfig) -> Result<(), String> {
+    let lookup = |k: &str| std::env::var(k).ok();
+    for (warn, msg) in cfg.startup_messages(lookup) {
+        if warn {
+            tracing::warn!(target: "config_check", "{msg}");
+        } else {
+            tracing::info!(target: "config_check", "{msg}");
+        }
+    }
+    let active = cfg.resolve(lookup)?.map(|resolved| ActiveProxy {
+        scope: cfg.scope,
+        resolved,
+    });
+    let _ = ACTIVE_PROXY.set(active);
+    Ok(())
+}
+
+fn active_proxy_for(egress: Egress) -> Option<&'static ResolvedProxy> {
+    ACTIVE_PROXY
+        .get()?
+        .as_ref()
+        .filter(|p| egress == Egress::Admin || p.scope == ProxyScope::All)
+        .map(|p| &p.resolved)
+}
+
+/// A guarded reqwest client plus whether it routes through the outbound proxy
+/// (which decides how [`send_guarded`] pre-checks the destination).
+#[derive(Debug, Clone)]
+pub struct GuardedClient {
+    client: reqwest::Client,
+    proxied: bool,
+}
+
+impl GuardedClient {
+    pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        self.client.get(url)
+    }
+
+    pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        self.client.post(url)
+    }
+
+    /// Whether requests go through the configured outbound proxy.
+    pub fn is_proxied(&self) -> bool {
+        self.proxied
+    }
+}
+
 /// A reqwest client for fetching untrusted / admin-supplied URLs: guarded DNS,
-/// no system proxy, no automatic redirects (callers that follow redirects do
-/// so manually, re-validating each hop).
+/// no automatic redirects (callers that follow redirects do so manually,
+/// re-validating each hop), and **no system proxy** unless `OUTBOUND_PROXY`
+/// covers `egress` (see [`init_outbound_proxy`]).
 ///
 /// The guarded resolver only sees **names**: an IP-literal URL connects
-/// without resolution. Send through [`send_guarded`] (or validate every URL
-/// with [`check_url_static`] beforehand, as `budget_alerts::parse_webhook_url`
-/// does at write and load time).
-pub fn guarded_client(timeout: Duration, user_agent: &str) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+/// without resolution, and a proxied target is resolved by the proxy. Send
+/// through [`send_guarded`], which runs [`check_url_static`] and, when
+/// proxied, [`precheck_proxied`].
+pub fn guarded_client(
+    egress: Egress,
+    timeout: Duration,
+    user_agent: &str,
+) -> Result<GuardedClient, String> {
+    build_guarded_client(active_proxy_for(egress), timeout, user_agent)
+}
+
+fn build_guarded_client(
+    proxy: Option<&ResolvedProxy>,
+    timeout: Duration,
+    user_agent: &str,
+) -> Result<GuardedClient, String> {
+    // Always clear the implicit env proxies; an opted-in proxy is installed
+    // explicitly below.
+    let builder = reqwest::Client::builder()
         .timeout(timeout)
         .user_agent(user_agent)
         .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .dns_resolver(std::sync::Arc::new(GuardedResolver))
+        .no_proxy();
+    let (builder, resolver) = match proxy {
+        Some(p) => (
+            p.apply(builder)?,
+            GuardedResolver::with_exempt(p.proxy_hosts()),
+        ),
+        None => (builder, GuardedResolver::default()),
+    };
+    let client = builder
+        .dns_resolver(Arc::new(resolver))
         .build()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(GuardedClient {
+        client,
+        proxied: proxy.is_some(),
+    })
+}
+
+/// Local DNS pre-check for a proxied request (the proxy resolves the name,
+/// so the connect-time guard never sees it): static checks first, then any
+/// forbidden resolved address rejects; a local resolution failure or timeout
+/// allows (in proxy-only networks the gateway often cannot resolve public
+/// names itself).
+pub async fn precheck_proxied(url: &reqwest::Url) -> Result<(), String> {
+    let (host, ip) = check_url_static(url)?;
+    if ip.is_some() {
+        return Ok(());
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let lookup = tokio::time::timeout(
+        PRECHECK_DNS_TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await;
+    match lookup {
+        Ok(Ok(addrs)) => {
+            let addrs: Vec<SocketAddr> = addrs.collect();
+            if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(a.ip())) {
+                return Err(refused(
+                    "resolves to forbidden address (proxied)",
+                    &host,
+                    Some(bad.ip()),
+                ));
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(host = %host, error = %e, "Local resolution failed; deferring to the outbound proxy");
+            Ok(())
+        }
+        Err(_) => {
+            tracing::debug!(host = %host, "Local resolution timed out; deferring to the outbound proxy");
+            Ok(())
+        }
+    }
 }
 
 /// Build `request`, run the static URL check (IP literals, scheme, blocked
-/// hosts) on its final URL, then execute it on `client` (a [`guarded_client`],
-/// whose resolver covers hostnames at connect time). Errors never include the
-/// URL (it may carry a token).
+/// hosts) on its final URL — plus [`precheck_proxied`] when the client is
+/// proxied — then execute it on `client` (whose resolver covers direct
+/// hostnames at connect time). Errors never include the URL (it may carry a
+/// token).
 pub async fn send_guarded(
-    client: &reqwest::Client,
+    client: &GuardedClient,
     request: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, String> {
     let request = request.build().map_err(|e| e.without_url().to_string())?;
     check_url_static(request.url())?;
+    if client.proxied {
+        precheck_proxied(request.url()).await?;
+    }
     client
+        .client
         .execute(request)
         .await
         .map_err(|e| e.without_url().to_string())
@@ -315,13 +491,17 @@ pub async fn safe_get_bytes(
     mut check_hop: impl FnMut(&reqwest::Url) -> Result<(), String>,
 ) -> Result<SafeGetResult, String> {
     let mut current: reqwest::Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
+    // Request-supplied URLs: proxied only under OUTBOUND_PROXY_SCOPE=all.
+    let client = guarded_client(Egress::UserContent, timeout, user_agent)?;
 
     for _ in 0..=MAX_REDIRECTS {
         check_hop(&current)?;
-        // Pre-flight (readable errors, IP literals); the guarded resolver
-        // re-checks the exact name at connect time.
-        validate_url(&current).await?;
-        let client = guarded_client(timeout, user_agent)?;
+        if !client.is_proxied() {
+            // Pre-flight (IP literals, early errors); the guarded resolver
+            // re-checks the exact name at connect time. Proxied clients run
+            // the lenient pre-check inside `send_guarded` instead.
+            validate_url(&current).await?;
+        }
 
         let response = send_guarded(&client, client.get(current.clone())).await?;
 
@@ -410,7 +590,7 @@ mod tests {
     async fn guarded_resolver_rejects_trailing_dot_and_private_names() {
         use reqwest::dns::Resolve;
         use std::str::FromStr;
-        let r = GuardedResolver;
+        let r = GuardedResolver::default();
         // "localhost." must be rejected exactly like "localhost" (the bypass
         // was a name-keyed pin that missed the trailing-dot form).
         for name in ["localhost", "localhost.", "LOCALHOST.", "metadata."] {
@@ -430,7 +610,7 @@ mod tests {
                 .await
                 .is_ok()
         });
-        let client = guarded_client(Duration::from_secs(2), "test").unwrap();
+        let client = guarded_client(Egress::UserContent, Duration::from_secs(2), "test").unwrap();
         for url in [
             format!("http://localhost.:{port}/"),
             format!("http://localhost:{port}/"),
@@ -478,13 +658,13 @@ mod tests {
                 .await
                 .is_ok()
         });
-        let client = guarded_client(Duration::from_secs(2), "test").unwrap();
+        let client = guarded_client(Egress::UserContent, Duration::from_secs(2), "test").unwrap();
         for url in [
             format!("http://127.0.0.1:{port}/"),
             format!("http://[::ffff:127.0.0.1]:{port}/"),
         ] {
             let err = send_guarded(&client, client.post(&url)).await.unwrap_err();
-            assert!(err.contains("forbidden"), "{url}: {err}");
+            assert_eq!(err, DESTINATION_NOT_ALLOWED, "{url}");
         }
         assert!(!accepted.await.unwrap(), "loopback must not be reached");
     }
@@ -552,6 +732,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.len(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn refusals_do_not_leak_the_resolved_address() {
+        // `localhost` resolves to loopback; the client-facing error must not
+        // say so (DNS / network-layout oracle).
+        for u in ["http://127.0.0.1/", "http://[::1]/", "http://localhost/"] {
+            let url: reqwest::Url = u.parse().unwrap();
+            let err = validate_url(&url).await.err().unwrap();
+            assert_eq!(err, DESTINATION_NOT_ALLOWED, "{u}");
+        }
+    }
+
+    #[tokio::test]
+    async fn proxied_precheck_rejects_private_and_allows_unresolvable() {
+        for u in [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/latest/",
+            "http://localhost/",
+        ] {
+            let url: reqwest::Url = u.parse().unwrap();
+            assert!(precheck_proxied(&url).await.is_err(), "{u}");
+        }
+        // `.invalid` never resolves (RFC 6761): only the proxy could, so the
+        // pre-check defers to it.
+        let url: reqwest::Url = "https://does-not-exist.invalid/x".parse().unwrap();
+        assert!(precheck_proxied(&url).await.is_ok());
+        let url: reqwest::Url = "ftp://example.com/".parse().unwrap();
+        assert!(precheck_proxied(&url).await.is_err());
+    }
+
+    /// Minimal forward proxy: answers every request with 200 "proxied" and
+    /// reports the request line it saw.
+    async fn fake_proxy() -> (String, tokio::sync::mpsc::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let _ = tx.send(line).await;
+                let resp =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nproxied";
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        (format!("http://localhost:{port}"), rx)
+    }
+
+    #[tokio::test]
+    async fn proxied_client_reaches_its_private_proxy_but_not_private_targets() {
+        let (proxy_url, mut seen) = fake_proxy().await;
+        let resolved = ResolvedProxy {
+            http: Some(proxy_url.parse().unwrap()),
+            https: None,
+            no_proxy: None,
+        };
+        let client = build_guarded_client(Some(&resolved), Duration::from_secs(5), "t").unwrap();
+        assert!(client.is_proxied());
+
+        // Unresolvable name: allowed and sent via the proxy (the `localhost`
+        // proxy host itself is exempt from the resolver guard).
+        let resp = send_guarded(&client, client.get("http://does-not-exist.invalid/p"))
+            .await
+            .unwrap();
+        assert_eq!(resp.text().await.unwrap(), "proxied");
+        let line = seen.recv().await.unwrap();
+        assert!(
+            line.starts_with("GET http://does-not-exist.invalid/p"),
+            "{line}"
+        );
+
+        // Private targets never reach the proxy.
+        for u in [
+            "http://127.0.0.1/",
+            "http://localhost./",
+            "http://10.1.2.3/",
+        ] {
+            let err = send_guarded(&client, client.get(u)).await.unwrap_err();
+            assert_eq!(err, DESTINATION_NOT_ALLOWED, "{u}");
+        }
+        assert!(seen.try_recv().is_err());
+    }
+
+    #[test]
+    fn unconfigured_proxy_means_direct_clients() {
+        // Tests never call init_outbound_proxy: every egress is direct.
+        assert!(!guarded_client(Egress::Admin, Duration::from_secs(1), "t")
+            .unwrap()
+            .is_proxied());
     }
 
     #[test]

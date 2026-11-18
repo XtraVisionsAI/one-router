@@ -107,7 +107,11 @@ impl BudgetAlert {
 }
 
 /// Emit a claimed alert: log + metric now, webhook in the background.
-pub fn emit(alert: BudgetAlert, webhook_url: Option<String>, http: Arc<reqwest::Client>) {
+pub fn emit(
+    alert: BudgetAlert,
+    webhook_url: Option<String>,
+    http: Option<Arc<crate::services::web_tools::ssrf::GuardedClient>>,
+) {
     tracing::warn!(
         scope = alert.scope,
         id = %alert.id,
@@ -122,16 +126,25 @@ pub fn emit(alert: BudgetAlert, webhook_url: Option<String>, http: Arc<reqwest::
         crate::observability::metrics::record_budget_alert(alert.scope, "logged");
         return;
     };
+    // Fail closed: no guarded client → no webhook (never an unguarded one).
+    let Some(http) = http else {
+        tracing::error!(
+            "Budget alert webhook configured but no guarded HTTP client; alert logged only"
+        );
+        crate::observability::metrics::record_budget_alert(alert.scope, "failed");
+        return;
+    };
     tokio::spawn(async move {
+        use crate::services::web_tools::ssrf;
         let body = serde_json::json!({ "text": alert.text(), "alert": &alert });
         let mut result = "failed";
         for attempt in 0..3u32 {
-            let resp = http
-                .post(&url)
-                .timeout(Duration::from_secs(5))
-                .json(&body)
-                .send()
-                .await;
+            // send_guarded: static URL check + proxied pre-check per attempt.
+            let resp = ssrf::send_guarded(
+                &http,
+                http.post(&url).timeout(Duration::from_secs(5)).json(&body),
+            )
+            .await;
             match resp {
                 Ok(r) if r.status().is_success() => {
                     result = "sent";
@@ -140,9 +153,9 @@ pub fn emit(alert: BudgetAlert, webhook_url: Option<String>, http: Arc<reqwest::
                 Ok(r) => {
                     tracing::warn!(status = %r.status(), attempt, "Budget alert webhook rejected")
                 }
-                // without_url(): the webhook URL is itself a secret (Slack token).
+                // send_guarded strips the URL (it is itself a secret: Slack token).
                 Err(e) => {
-                    tracing::warn!(error = %e.without_url(), attempt, "Budget alert webhook failed")
+                    tracing::warn!(error = %e, attempt, "Budget alert webhook failed")
                 }
             }
             tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;

@@ -54,6 +54,7 @@ import traceback
 import asyncio
 import uuid
 import base64
+import secrets
 from typing import Any, Dict, List, Optional
 
 # ── IPC markers ──────────────────────────────────────────────────────
@@ -189,8 +190,10 @@ class ToolCallHandler:
         self._results_cache: Dict[str, Any] = {}
 
     def _generate_id(self) -> str:
+        # Random per call (not a per-session counter): ids never repeat
+        # across sessions, so a stale or foreign tool_result cannot match.
         self.call_counter += 1
-        return f"toolu_{self.call_counter:012d}"
+        return "toolu_" + secrets.token_hex(12)
 
     def request_tool_call(self, name: str, **kwargs) -> Any:
         """Issue a tool call. Batches with other calls within the batch window."""
@@ -413,6 +416,15 @@ mod tests {
         assert!(RUNNER_SCRIPT.contains("_b64e(json.dumps({\"calls\": calls}))"));
         assert!(RUNNER_SCRIPT.contains("json.loads(_b64d(line[start:end]))"));
         assert!(RUNNER_SCRIPT.contains("MAX_CAPTURE_CHARS"));
+    }
+
+    #[test]
+    fn test_runner_tool_ids_are_random() {
+        // 24 hex chars after `toolu_` — within the host-side validation
+        // (`toolu_[A-Za-z0-9_-]{1,64}`), and never a per-session counter.
+        assert!(RUNNER_SCRIPT.contains("import secrets"));
+        assert!(RUNNER_SCRIPT.contains(r#"return "toolu_" + secrets.token_hex(12)"#));
+        assert!(!RUNNER_SCRIPT.contains("call_counter:012d"));
     }
 
     #[test]

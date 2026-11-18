@@ -108,12 +108,20 @@
       title: 'Price in/out (1M)',
       key: 'price',
       width: 140,
-      render: (row) =>
-        h(
+      render: (row) => {
+        // image_generation / rerank entries are priced per image / search unit.
+        const unit =
+          row.price_per_image !== null
+            ? `${fmtPrice(row.price_per_image)}/img`
+            : row.price_per_search_unit !== null
+              ? `${fmtPrice(row.price_per_search_unit)}/unit`
+              : null
+        return h(
           'span',
           { class: 'font-mono text-[11px] text-slate-400 whitespace-nowrap' },
-          `${fmtPrice(row.input_price)} / ${fmtPrice(row.output_price)}`
+          unit ?? `${fmtPrice(row.input_price)} / ${fmtPrice(row.output_price)}`
         )
+      }
     },
     {
       title: 'Capabilities',
@@ -124,9 +132,7 @@
           ...(row.supports_function_calling
             ? [h(NTag, { size: 'tiny', type: 'info' }, { default: () => 'tools' })]
             : []),
-          ...(row.supports_reasoning
-            ? [h(NTag, { size: 'tiny', type: 'warning' }, { default: () => 'thinking' })]
-            : [])
+          ...(row.supports_reasoning ? [h(NTag, { size: 'tiny', type: 'warning' }, { default: () => 'thinking' })] : [])
         ])
     }
   ])
@@ -155,16 +161,16 @@
     </div>
 
     <p class="text-xs text-slate-500 mb-2">
-      Source model id defaults to a friendly alias (vendor prefix and version suffix stripped); prices and
-      capabilities are prefilled from the table and stay auto-synced. Edit the mapping after import to adjust.
+      Source model id defaults to a friendly alias (vendor prefix and version suffix stripped); prices and capabilities
+      are prefilled from the table and stay auto-synced. Edit the mapping after import to adjust.
     </p>
 
     <NDataTable
+      v-model:checked-row-keys="checkedKeys"
       :columns="columns"
       :data="candidates"
       :loading="loading"
       :row-key="(row: ImportCandidate) => row.key"
-      v-model:checked-row-keys="checkedKeys"
       :pagination="{ pageSize: 10 }"
       size="small"
       max-height="380"

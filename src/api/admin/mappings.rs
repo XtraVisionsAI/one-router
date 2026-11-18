@@ -58,6 +58,15 @@ pub struct UpsertMappingRequest {
     /// Pricing origin: "litellm" (auto-synced) or "manual" (pinned). Defaults to "litellm".
     #[serde(default = "default_pricing_source")]
     pub pricing_source: String,
+    /// Non-token prices (USD). Omitted on create = 0; omitted on update =
+    /// keep the stored value (older clients that do not know the fields
+    /// must not wipe them).
+    #[serde(default)]
+    pub price_per_request: Option<f64>,
+    #[serde(default)]
+    pub price_per_image: Option<f64>,
+    #[serde(default)]
+    pub price_per_search_unit: Option<f64>,
 }
 
 fn default_priority() -> i32 {
@@ -138,6 +147,28 @@ fn validate_mapping_fields(
             )),
         ));
     }
+    let prices = [
+        ("input_price", Some(body.input_price)),
+        ("output_price", Some(body.output_price)),
+        ("cache_read_price", Some(body.cache_read_price)),
+        ("cache_write_price", Some(body.cache_write_price)),
+        ("price_per_request", body.price_per_request),
+        ("price_per_image", body.price_per_image),
+        ("price_per_search_unit", body.price_per_search_unit),
+    ];
+    for (name, value) in prices {
+        if let Some(v) = value {
+            if !v.is_finite() || v < 0.0 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "invalid_request_error",
+                        format!("{name} must be a finite number >= 0"),
+                    )),
+                ));
+            }
+        }
+    }
     if body.status != "active" && body.status != "inactive" {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -175,6 +206,9 @@ pub async fn create_mapping(
         updated_at: None,
         capabilities: body.capabilities,
         pricing_source: body.pricing_source,
+        price_per_request: body.price_per_request.unwrap_or(0.0),
+        price_per_image: body.price_per_image.unwrap_or(0.0),
+        price_per_search_unit: body.price_per_search_unit.unwrap_or(0.0),
     };
 
     match state.database.model_mapping().upsert_mapping(&record).await {
@@ -253,6 +287,11 @@ pub async fn update_mapping(
         updated_at: Some(now),
         capabilities: body.capabilities,
         pricing_source: body.pricing_source,
+        price_per_request: body.price_per_request.unwrap_or(existing.price_per_request),
+        price_per_image: body.price_per_image.unwrap_or(existing.price_per_image),
+        price_per_search_unit: body
+            .price_per_search_unit
+            .unwrap_or(existing.price_per_search_unit),
     };
 
     match state.database.model_mapping().upsert_mapping(&record).await {
@@ -337,5 +376,40 @@ mod tests {
         assert_eq!(req.display_name, "GPT-4o via Gemini");
         assert_eq!(req.input_price, 0.005);
         assert_eq!(req.status, "inactive");
+        assert_eq!(req.price_per_image, None);
+    }
+
+    fn req(extra: &str) -> UpsertMappingRequest {
+        serde_json::from_str(&format!(
+            r#"{{"source_model_id":"img","target_model_id":"amazon.nova-canvas-v1:0","provider":"bedrock"{extra}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn non_token_prices_parse_and_validate() {
+        let ok = req(
+            r#","price_per_request":0.001,"price_per_image":0.04,"price_per_search_unit":0.002"#,
+        );
+        assert_eq!(ok.price_per_image, Some(0.04));
+        assert_eq!(ok.price_per_search_unit, Some(0.002));
+        assert!(validate_mapping_fields(&ok).is_ok());
+        assert!(validate_mapping_fields(&req(r#","price_per_image":0"#)).is_ok());
+
+        for bad in [
+            r#","price_per_image":-0.01"#,
+            r#","price_per_request":-1"#,
+            r#","price_per_search_unit":-0.5"#,
+            r#","input_price":-3"#,
+        ] {
+            let (status, _) = validate_mapping_fields(&req(bad)).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let mut inf = req("");
+        inf.price_per_image = Some(f64::INFINITY);
+        assert!(validate_mapping_fields(&inf).is_err());
+        let mut nan = req("");
+        nan.price_per_request = Some(f64::NAN);
+        assert!(validate_mapping_fields(&nan).is_err());
     }
 }

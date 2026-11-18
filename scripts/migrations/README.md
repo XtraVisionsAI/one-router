@@ -24,7 +24,8 @@ scripts/migrations/
 │   ├── 006_api_key_id.sql                      # api_keys/usage key_id
 │   ├── 007_users.sql                           # users table, per-user key names
 │   ├── 008_p2_audit_periods_tags.sql           # audit log, budget periods, tags, CIDRs
-│   └── 009_p3_teams_rate_counters.sql          # teams, concurrency, shared rate counters
+│   ├── 009_p3_teams_rate_counters.sql          # teams, concurrency, shared rate counters
+│   └── 010_non_token_pricing.sql               # per-request / per-image / per-search-unit prices
 ├── postgres/
 │   ├── 001_model_mapping_pattern_index.sql     # text_pattern_ops index
 │   ├── 002_api_key_display.sql                 # key_display column
@@ -34,7 +35,8 @@ scripts/migrations/
 │   ├── 006_api_key_id.sql                      # api_keys/usage key_id
 │   ├── 007_users.sql                           # users table, per-user key names
 │   ├── 008_p2_audit_periods_tags.sql           # audit log, budget periods, tags, CIDRs
-│   └── 009_p3_teams_rate_counters.sql          # teams, concurrency, shared rate counters
+│   ├── 009_p3_teams_rate_counters.sql          # teams, concurrency, shared rate counters
+│   └── 010_non_token_pricing.sql               # per-request / per-image / per-search-unit prices
 └── dynamodb/
     ├── 001_apikeys_name_gsi.sh                 # name-index GSI
     ├── 002_model_pricing.sh                    # model pricing backfill
@@ -173,6 +175,13 @@ DynamoDB attributes need no schema change; only the `audit_logs` table
 `api_keys.max_concurrency`, `usage.team_id`; `rate_counters`
 (`subject`, `window_start`) for `rate_limit_store = database`. DynamoDB:
 `teams` and `rate_counters` tables, TTL on `rate_counters.expires_at`.
+Additive — no data migration.
+
+### SQLite/PostgreSQL 010: Non-token pricing
+
+`model_mappings.price_per_request`, `price_per_image`, `price_per_search_unit`
+(USD, default 0) for `/v1/images/generations` and `/v1/rerank`. DynamoDB stores
+them as optional `N` attributes on the mapping item (absent = 0) — no script.
 Additive — no data migration.
 
 ## Adding new migrations

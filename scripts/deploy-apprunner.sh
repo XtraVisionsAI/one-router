@@ -166,11 +166,16 @@ awscli() { aws "${AWS_ARGS[@]}" "$@"; }
 TMP_FILES=()
 cleanup_tmp() { [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}"; return 0; }
 trap cleanup_tmp EXIT
+# Usage: private_tmp VAR_NAME — creates a 0600 temp file, stores its path in
+# VAR_NAME and registers it for the EXIT trap. Must NOT be called as
+# VAR=$(private_tmp): command substitution runs in a subshell, so the
+# TMP_FILES append would never reach this shell and the trap would delete
+# nothing. (printf -v, not declare -g: macOS ships bash 3.2.)
 private_tmp() {
-    local f
-    f=$(umask 077 && mktemp "${TMPDIR:-/tmp}/one-router-deploy.XXXXXX")
-    TMP_FILES+=("$f")
-    echo "$f"
+    local __pt_path
+    __pt_path=$(umask 077 && mktemp "${TMPDIR:-/tmp}/one-router-deploy.XXXXXX")
+    TMP_FILES+=("$__pt_path")
+    printf -v "$1" '%s' "$__pt_path"
 }
 # Mask the password of a DATABASE URI for display.
 mask_db() { echo "$1" | sed -E 's#(://[^:/@]+:).*@#\1****@#'; }
@@ -197,11 +202,16 @@ fi
 # Store a secret as an SSM SecureString (value never on a command line) and
 # print its ARN.
 put_secret() {
-    local name="/${SERVICE_NAME}/$1" value="$2" f
-    f=$(private_tmp)
-    SECRET_VALUE="$value" jq -n --arg n "$name" \
-        '{Name: $n, Value: env.SECRET_VALUE, Type: "SecureString", Overwrite: true}' > "$f"
-    awscli ssm put-parameter --cli-input-json "file://$f" >/dev/null
+    local name="/${SERVICE_NAME}/$1" value="$2" f rc=0
+    private_tmp f
+    # put_secret runs inside $(...) (via build_image_configuration), whose
+    # subshell neither shares TMP_FILES with this shell nor runs its EXIT trap:
+    # remove the file here, on success and on failure alike.
+    { SECRET_VALUE="$value" jq -n --arg n "$name" \
+        '{Name: $n, Value: env.SECRET_VALUE, Type: "SecureString", Overwrite: true}' > "$f" \
+      && awscli ssm put-parameter --cli-input-json "file://$f" >/dev/null; } || rc=$?
+    rm -f "$f"
+    [[ $rc -eq 0 ]] || return "$rc"
     echo "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter${name}"
 }
 
@@ -324,7 +334,7 @@ case "$MODE" in
                         err "Username and access token are required."; exit 1
                     fi
                     # Token goes through a private file:// document, never argv.
-                    DH_SECRET_FILE=$(private_tmp)
+                    private_tmp DH_SECRET_FILE
                     DH_USER="$DH_USER" DH_TOKEN="$DH_TOKEN" jq -n \
                         '{username: env.DH_USER, accessToken: env.DH_TOKEN}' > "$DH_SECRET_FILE"
                     unset DH_TOKEN
@@ -516,8 +526,8 @@ build_image_configuration() {
         '{Port: "8000", RuntimeEnvironmentVariables: $v, RuntimeEnvironmentSecrets: $s}'
 }
 
-SOURCE_CONFIG_FILE=$(private_tmp)
-RESULT_FILE=$(private_tmp)
+private_tmp SOURCE_CONFIG_FILE
+private_tmp RESULT_FILE
 
 INSTANCE_CONFIG=$(cat <<JSON
 {

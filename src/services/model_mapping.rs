@@ -168,7 +168,7 @@ impl ModelMappingService {
     }
 
     /// Get the pricing info for a model (for cost calculation).
-    pub async fn get_pricing(&self, source_model_id: &str) -> Option<(f64, f64, f64, f64)> {
+    pub async fn get_pricing(&self, source_model_id: &str) -> Option<MappingPrices> {
         match self
             .storage
             .model_mapping()
@@ -178,16 +178,41 @@ impl ModelMappingService {
             Ok(mappings) => mappings
                 .into_iter()
                 .find(|m| m.status == "active")
-                .map(|mapping| {
-                    (
-                        mapping.input_price,
-                        mapping.output_price,
-                        mapping.cache_read_price,
-                        mapping.cache_write_price,
-                    )
+                .map(|m| MappingPrices {
+                    input: m.input_price,
+                    output: m.output_price,
+                    cache_read: m.cache_read_price,
+                    cache_write: m.cache_write_price,
+                    per_request: m.price_per_request,
+                    per_image: m.price_per_image,
+                    per_search_unit: m.price_per_search_unit,
                 }),
             _ => None,
         }
+    }
+}
+
+/// A mapping's prices: per-1M-token rates plus non-token USD unit prices.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MappingPrices {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub per_request: f64,
+    pub per_image: f64,
+    pub per_search_unit: f64,
+}
+
+impl MappingPrices {
+    /// Any per-token input/output price set.
+    pub fn has_token_prices(&self) -> bool {
+        self.input > 0.0 || self.output > 0.0
+    }
+
+    /// Any non-token unit price set.
+    pub fn has_unit_prices(&self) -> bool {
+        self.per_request > 0.0 || self.per_image > 0.0 || self.per_search_unit > 0.0
     }
 }
 

@@ -6,6 +6,7 @@ pub mod aws;
 pub mod dotenv_file;
 pub mod key_provider;
 pub mod master_key;
+pub mod outbound_proxy;
 pub mod settings;
 
 pub use aws::{

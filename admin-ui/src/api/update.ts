@@ -25,6 +25,6 @@ export function useUpdateApi() {
     check: () => request<UpdateInfo>('POST', '/update/check'),
 
     /** Download, verify, and apply the latest update */
-    apply: () => request<{ message: string; previous_version: string; new_version: string }>('POST', '/update'),
+    apply: () => request<{ message: string; previous_version: string; new_version: string }>('POST', '/update')
   }
 }

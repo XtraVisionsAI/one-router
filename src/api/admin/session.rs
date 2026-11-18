@@ -62,22 +62,56 @@ fn throttle_key(client: Option<&str>) -> String {
     }
 }
 
-/// Atomically count one login attempt for `key` **before** verification and
-/// return the attempt number in the current window. Concurrent attempts each
-/// get a distinct number, so at most `MAX_LOGIN_FAILURES` verifications run
-/// per window (no read-then-insert race).
-fn register_attempt(cache: &ThrottleCache, key: String) -> u32 {
+/// Login throttle design (per client address, per instance):
+///
+/// - Only **failed** verifications consume the budget: an attempt atomically
+///   reserves a slot before verification ([`reserve_attempt`]); a success
+///   clears the bucket, a failure keeps its slot. Concurrent attempts each get
+///   a distinct slot, so at most `MAX_LOGIN_FAILURES` verifications run per
+///   window (no read-then-insert race).
+/// - The bucket is checked **before** verification: once it is full, further
+///   attempts are answered 429 without the key being compared, so a locked-out
+///   brute-forcer learns nothing (no correct-key oracle), at the cost that a
+///   correct key from the same bucket also waits out the window.
+/// - Buckets are keyed by the resolved client address. Behind a reverse proxy
+///   without `TRUSTED_PROXY_CIDRS`, every client shares the proxy's bucket and
+///   anyone can lock admins out for `LOGIN_LOCKOUT`; [`warn_untrusted_proxy`]
+///   logs a one-time warning when that configuration is detected.
+///
+/// Returns `None` when the bucket is full (attempt refused, not counted).
+fn reserve_attempt(cache: &ThrottleCache, key: String) -> Option<u32> {
     let now = std::time::Instant::now();
-    cache
+    let entry = cache
         .entry(key)
         .and_upsert_with(|existing| match existing.map(|e| e.into_value()) {
             Some((n, start)) if now.duration_since(start) < LOGIN_LOCKOUT => {
-                (n.saturating_add(1), start)
+                // Full buckets stay at the cap: refused attempts are not
+                // counted (they were never verified).
+                (n.saturating_add(1).min(MAX_LOGIN_FAILURES + 1), start)
             }
             _ => (1, now),
         })
-        .into_value()
-        .0
+        .into_value();
+    (entry.0 <= MAX_LOGIN_FAILURES).then_some(entry.0)
+}
+
+/// One-time warning: an admin login carried `X-Forwarded-For` but no trusted
+/// proxies are configured, so the header is ignored and every client behind
+/// the proxy shares one throttle bucket (and one audit address).
+fn warn_untrusted_proxy(headers: &HeaderMap, settings: &crate::config::settings::Settings) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if settings.trusted_proxy_cidrs.is_empty()
+        && headers.contains_key("x-forwarded-for")
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            "Admin login received X-Forwarded-For but TRUSTED_PROXY_CIDRS is empty: the header \
+             is ignored, so all clients behind this proxy share one login-throttle bucket \
+             (anyone can trigger a {}-minute admin lockout) and one audit address. Set \
+             TRUSTED_PROXY_CIDRS to the proxy's address range.",
+            LOGIN_LOCKOUT.as_secs() / 60
+        );
+    }
 }
 
 /// `ADMIN_COOKIE_INSECURE=true` drops the cookie's `Secure` flag — only for
@@ -95,10 +129,11 @@ pub async fn login(
 ) -> impl IntoResponse {
     let key = body.key.trim();
     let client = crate::services::audit::meta(connect.map(|c| c.0), &headers, &state.settings).0;
+    warn_untrusted_proxy(&headers, &state.settings);
     let throttle_key = throttle_key(client.as_deref());
-    // Counted before verification; a success clears the bucket, so N failures
-    // allow attempt N+1 only while N < MAX_LOGIN_FAILURES.
-    if register_attempt(login_throttle(), throttle_key.clone()) > MAX_LOGIN_FAILURES {
+    // Slot reserved before verification (see `reserve_attempt`); a success
+    // clears the bucket, so only failures accumulate.
+    if reserve_attempt(login_throttle(), throttle_key.clone()).is_none() {
         // Throttled attempts are not audited individually (flood protection).
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -231,26 +266,42 @@ mod tests {
     }
 
     #[test]
-    fn attempts_counted_atomically_before_verification() {
+    fn attempts_reserved_atomically_before_verification() {
         let cache = std::sync::Arc::new(new_throttle_cache());
-        // 32 concurrent attempts from one client: each gets a distinct number,
-        // so exactly MAX_LOGIN_FAILURES of them are allowed to verify.
+        // 32 concurrent attempts from one client: each reserves a distinct
+        // slot, so exactly MAX_LOGIN_FAILURES of them are allowed to verify.
         let handles: Vec<_> = (0..32)
             .map(|_| {
                 let c = cache.clone();
-                std::thread::spawn(move || register_attempt(&c, "1.2.3.4".into()))
+                std::thread::spawn(move || reserve_attempt(&c, "1.2.3.4".into()))
             })
             .collect();
-        let mut nums: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        nums.sort();
-        assert_eq!(nums, (1..=32).collect::<Vec<_>>());
-        assert_eq!(
-            nums.iter().filter(|n| **n <= MAX_LOGIN_FAILURES).count(),
-            MAX_LOGIN_FAILURES as usize
-        );
-        // Another client is independent; a success clears the bucket.
-        assert_eq!(register_attempt(&cache, "5.6.7.8".into()), 1);
-        cache.invalidate("1.2.3.4");
-        assert_eq!(register_attempt(&cache, "1.2.3.4".into()), 1);
+        let mut slots: Vec<u32> = handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+        slots.sort();
+        assert_eq!(slots, (1..=MAX_LOGIN_FAILURES).collect::<Vec<_>>());
+        // Refused attempts are not counted: the bucket stays at the cap.
+        assert_eq!(cache.get("1.2.3.4").unwrap().0, MAX_LOGIN_FAILURES + 1);
+        // Another client is independent.
+        assert_eq!(reserve_attempt(&cache, "5.6.7.8".into()), Some(1));
+    }
+
+    #[test]
+    fn successes_do_not_consume_the_budget() {
+        let cache = new_throttle_cache();
+        // Many successful logins (each reserve followed by the success-path
+        // invalidate) never lock the client out.
+        for _ in 0..(MAX_LOGIN_FAILURES * 3) {
+            assert!(reserve_attempt(&cache, "9.9.9.9".into()).is_some());
+            cache.invalidate("9.9.9.9");
+        }
+        // Failures accumulate up to the cap, then attempts are refused
+        // before verification.
+        for n in 1..=MAX_LOGIN_FAILURES {
+            assert_eq!(reserve_attempt(&cache, "9.9.9.9".into()), Some(n));
+        }
+        assert_eq!(reserve_attempt(&cache, "9.9.9.9".into()), None);
     }
 }

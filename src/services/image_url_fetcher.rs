@@ -281,6 +281,6 @@ mod tests {
         let err = fetch_image("http://169.254.169.254/latest/meta-data/")
             .await
             .unwrap_err();
-        assert!(err.contains("169.254.169.254") || err.to_lowercase().contains("forbidden"));
+        assert!(err.ends_with("destination not allowed"), "{err}");
     }
 }

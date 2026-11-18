@@ -23,6 +23,18 @@ const USER_AGENT: &str = "one-router-updater/1.0";
 /// Download caps: release archive, and checksum / signature files.
 const MAX_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SMALL_FILE_BYTES: u64 = 64 * 1024;
+/// Cap on a GitHub API response (release JSON) / error body.
+const MAX_API_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_API_ERROR_BYTES: usize = 4096;
+/// TCP + TLS connect timeout for every updater request.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Total timeout of a GitHub API call.
+const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Max silence between two body chunks of a download (a stalled transfer
+/// fails; a slow-but-moving 200 MB download does not).
+const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Hard ceiling on one download.
+const DOWNLOAD_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Domain-separation header of the signed release manifest.
 const MANIFEST_HEADER: &str = "one-router-release-v1";
@@ -126,8 +138,11 @@ impl Default for UpdateService {
 
 impl UpdateService {
     pub fn new() -> Self {
+        // No client-wide total timeout: it would also cap the 200 MB archive
+        // download. API calls set API_TIMEOUT per request; downloads use an
+        // idle (per-chunk) timeout plus DOWNLOAD_TOTAL_TIMEOUT.
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(USER_AGENT)
             .build()
             .expect("Failed to build HTTP client for update service");
@@ -185,20 +200,28 @@ impl UpdateService {
             .client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
+            .timeout(API_TIMEOUT)
             .send()
             .await
             .context("Failed to query GitHub Releases API")?;
 
+        use crate::services::web_tools::ssrf::{read_body_capped, OversizePolicy};
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("GitHub API returned {status}: {body}");
+            let body = read_body_capped(resp, MAX_API_ERROR_BYTES, OversizePolicy::Truncate)
+                .await
+                .unwrap_or_default();
+            bail!(
+                "GitHub API returned {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
         }
 
-        let release: GitHubRelease = resp
-            .json()
+        let body = read_body_capped(resp, MAX_API_BODY_BYTES, OversizePolicy::Reject)
             .await
-            .context("Failed to parse GitHub release JSON")?;
+            .map_err(|e| anyhow::anyhow!("GitHub release response: {e}"))?;
+        let release: GitHubRelease =
+            serde_json::from_slice(&body).context("Failed to parse GitHub release JSON")?;
 
         let latest_tag = release.tag_name.trim_start_matches('v');
         let current = env!("CARGO_PKG_VERSION");
@@ -357,14 +380,38 @@ impl UpdateService {
     /// Download a file to a local path, streaming to disk and aborting once
     /// more than `max_bytes` arrive (declared or actual).
     async fn download_file(&self, url: &str, dest: &PathBuf, max_bytes: u64) -> Result<()> {
+        tokio::time::timeout(
+            DOWNLOAD_TOTAL_TIMEOUT,
+            self.download_file_inner(url, dest, max_bytes, DOWNLOAD_IDLE_TIMEOUT),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Download exceeded {}s: {url}",
+                DOWNLOAD_TOTAL_TIMEOUT.as_secs()
+            )
+        })?
+    }
+
+    async fn download_file_inner(
+        &self,
+        url: &str,
+        dest: &PathBuf,
+        max_bytes: u64,
+        idle: std::time::Duration,
+    ) -> Result<()> {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
 
-        let resp = self
-            .client
-            .get(url)
-            .send()
+        // Headers must arrive within the idle window too.
+        let resp = tokio::time::timeout(idle, self.client.get(url).send())
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Download stalled (no response in {}s): {url}",
+                    idle.as_secs()
+                )
+            })?
             .with_context(|| format!("Failed to download {url}"))?;
 
         if !resp.status().is_success() {
@@ -381,7 +428,13 @@ impl UpdateService {
             .with_context(|| format!("Failed to create {}", dest.display()))?;
         let mut written: u64 = 0;
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = tokio::time::timeout(idle, stream.next())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("Download stalled (no data for {}s): {url}", idle.as_secs())
+                })?;
+            let Some(chunk) = next else { break };
             let chunk =
                 chunk.with_context(|| format!("Failed to read response body from {url}"))?;
             written += chunk.len() as u64;
@@ -755,6 +808,35 @@ mod tests {
         let url = serve_once(5_000).await;
         svc.download_file(&url, &dest, 10_000).await.unwrap();
         assert_eq!(std::fs::metadata(&dest).unwrap().len(), 5_000);
+    }
+
+    #[tokio::test]
+    async fn stalled_download_hits_the_idle_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial")
+                .await;
+            // Then nothing: the transfer stalls.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        let svc = UpdateService::new();
+        let dir = tempfile::tempdir().unwrap();
+        let err = svc
+            .download_file_inner(
+                &format!("http://127.0.0.1:{port}/a"),
+                &dir.path().join("f"),
+                10_000,
+                std::time::Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
     }
 }
 

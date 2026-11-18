@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::database::models::ModelMappingRecord;
 use crate::database::traits::DatabaseService;
-use crate::services::pricing_sync::{self, ProviderNs, PRICING_SOURCE_LITELLM, SYNCED_MODES};
+use crate::services::pricing_sync::{self, ProviderNs, PRICING_SOURCE_LITELLM};
 use crate::services::ModelMappingService;
 
 /// How long a fetched table is served from memory before re-downloading.
@@ -66,6 +66,11 @@ pub struct ImportCandidate {
     pub output_price: f64,
     pub cache_read_price: Option<f64>,
     pub cache_write_price: Option<f64>,
+    /// USD per call / per generated image / per rerank search unit
+    /// (`image_generation` / `rerank` entries).
+    pub price_per_request: Option<f64>,
+    pub price_per_image: Option<f64>,
+    pub price_per_search_unit: Option<f64>,
     pub supports_reasoning: bool,
     pub supports_function_calling: bool,
     pub max_input_tokens: Option<i64>,
@@ -117,7 +122,7 @@ pub(crate) fn friendly_source_id(ns: ProviderNs, target_model_id: &str) -> Strin
 /// Infer a capabilities JSON from a LiteLLM spec + model id heuristics.
 fn infer_capabilities(spec: &serde_json::Map<String, serde_json::Value>, target: &str) -> String {
     let mode = spec.get("mode").and_then(|v| v.as_str()).unwrap_or("chat");
-    if mode == "embedding" {
+    if matches!(mode, "embedding" | "image_generation" | "rerank") {
         return r#"{"thinking":{"enabled":false,"style":"claude"},"document":{"enabled":false},"tool_use":{"enabled":false},"ptc":{"enabled":false}}"#.to_string();
     }
     let tool_use = spec
@@ -144,7 +149,8 @@ fn infer_capabilities(spec: &serde_json::Map<String, serde_json::Value>, target:
 }
 
 /// Build an import candidate from one LiteLLM table entry, or `None` when the
-/// entry does not belong to `ns` / is not an importable token-priced mode.
+/// entry does not belong to `ns` / is not an importable mode with a usable
+/// price (see [`pricing_sync::extract_prices`]).
 fn candidate_from_entry(
     key: &str,
     spec: &serde_json::Value,
@@ -164,11 +170,7 @@ fn candidate_from_entry(
         return None;
     }
     let mode = spec.get("mode").and_then(|v| v.as_str())?;
-    if !SYNCED_MODES.contains(&mode) {
-        return None;
-    }
-    let input = pricing_sync::to_price_per_million(spec.get("input_cost_per_token"))?;
-    let output = pricing_sync::to_price_per_million(spec.get("output_cost_per_token"))?;
+    let prices = pricing_sync::extract_prices(key, spec)?;
 
     let target = strip_table_prefix(key).to_string();
     let suggested = friendly_source_id(ns, &target);
@@ -181,14 +183,13 @@ fn candidate_from_entry(
         suggested_source_id: suggested,
         target_model_id: target,
         mode: mode.to_string(),
-        input_price: input,
-        output_price: output,
-        cache_read_price: pricing_sync::to_price_per_million(
-            spec.get("cache_read_input_token_cost"),
-        ),
-        cache_write_price: pricing_sync::to_price_per_million(
-            spec.get("cache_creation_input_token_cost"),
-        ),
+        input_price: prices.input.unwrap_or(0.0),
+        output_price: prices.output.unwrap_or(0.0),
+        cache_read_price: prices.cache_read,
+        cache_write_price: prices.cache_write,
+        price_per_request: prices.per_request,
+        price_per_image: prices.per_image,
+        price_per_search_unit: prices.per_search_unit,
         supports_reasoning: spec
             .get("supports_reasoning")
             .and_then(|v| v.as_bool())
@@ -334,6 +335,9 @@ pub async fn import_models(
             updated_at: None,
             capabilities: Some(cand.capabilities.clone()),
             pricing_source: PRICING_SOURCE_LITELLM.to_string(),
+            price_per_request: cand.price_per_request.unwrap_or(0.0),
+            price_per_image: cand.price_per_image.unwrap_or(0.0),
+            price_per_search_unit: cand.price_per_search_unit.unwrap_or(0.0),
         };
         database
             .model_mapping()
@@ -478,9 +482,46 @@ mod tests {
             updated_at: None,
             capabilities: None,
             pricing_source: "litellm".into(),
+            price_per_request: 0.0,
+            price_per_image: 0.0,
+            price_per_search_unit: 0.0,
         }];
         let gpt = list_candidates(&data, "bedrock", "gpt-5.5", &existing).unwrap();
         assert!(gpt[0].exists);
+    }
+
+    #[test]
+    fn non_token_candidates_carry_unit_prices() {
+        let data = json!({
+            "cohere.rerank-v3-5:0": {
+                "litellm_provider": "bedrock",
+                "mode": "rerank",
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+                "input_cost_per_query": 0.002
+            },
+            "amazon.nova-canvas-v1:0": {
+                "litellm_provider": "bedrock",
+                "mode": "image_generation",
+                "output_cost_per_image": 0.06
+            },
+            "1024-x-1024/50-steps/stability.stable-diffusion-xl-v1": {
+                "litellm_provider": "bedrock",
+                "mode": "image_generation",
+                "output_cost_per_image": 0.04
+            }
+        });
+        let all = list_candidates(&data, "bedrock", "", &[]).unwrap();
+        assert_eq!(all.len(), 2, "size variants are not importable");
+        let rerank = all.iter().find(|c| c.mode == "rerank").unwrap();
+        assert_eq!(rerank.price_per_search_unit, Some(0.002));
+        assert_eq!(rerank.input_price, 0.0);
+        let canvas = all.iter().find(|c| c.mode == "image_generation").unwrap();
+        assert_eq!(canvas.price_per_image, Some(0.06));
+        assert_eq!(canvas.suggested_source_id, "nova-canvas");
+        assert!(canvas
+            .capabilities
+            .contains(r#""tool_use":{"enabled":false}"#));
     }
 
     /// Regression: the Bedrock namespace in the real table exceeds

@@ -362,6 +362,8 @@ pub async fn create_message(
                         "{version} is not supported by this proxy"
                     )));
                 }
+                crate::services::web_tools::validate_server_tool(tool)
+                    .map_err(ApiError::bad_request)?;
             }
         }
 
@@ -411,16 +413,36 @@ pub async fn create_message(
             };
         drop(dynamic);
 
+        // Dynamic-filtering code execution only with the model's effective
+        // `ptc` capability, counted against the PTC session caps.
+        let executor =
+            executor.with_request_code_executor(crate::services::ptc::gated::for_request(
+                executor.code_executor.clone(),
+                state.ptc_service.as_ref(),
+                &key_info,
+                effective_caps.ptc.enabled,
+            ));
+
         // Streaming: use run_stream for per-iteration SSE output
         if filtered_request.stream {
-            let stream = executor.run_stream(
+            // The loop's running usage total (all iterations) is the exact
+            // usage, so an error or disconnect mid-loop still bills every
+            // backend call already made.
+            let acc: crate::services::web_tools::executor::UsageAccumulator = Arc::new(
+                std::sync::Mutex::new(crate::schemas::anthropic::Usage::new(0, 0)),
+            );
+            let stream = executor.run_stream_metered(
                 filtered_request.clone(),
                 backend,
                 resolved.target_model_id.clone(),
+                Some(acc.clone()),
             );
-            return Ok(wrap_stream_with_usage_recording(
+            drop(stream_usage);
+            let exact: crate::services::stream_billing::ExactUsage =
+                Arc::new(move || acc.lock().ok().map(|u| u.clone()));
+            return Ok(billed_stream(
                 stream,
-                stream_usage,
+                exact,
                 state.usage_tracker.clone(),
                 key_info.clone(),
                 request.model.clone(),
@@ -432,39 +454,52 @@ pub async fn create_message(
             ));
         }
 
-        // Non-streaming: use run() and return JSON
-        let response = executor
-            .run(
+        // Non-streaming: use run() and return JSON. Usage (summed over all
+        // iterations) is recorded on success *and* on failure — a loop that
+        // fails after billed backend calls is not free.
+        let (result, usage) = match executor
+            .run_billed(
                 &filtered_request,
                 backend.as_ref(),
                 &resolved.target_model_id,
             )
             .await
-            .map_err(|e| ApiError::internal_error(e.to_string()))?;
-
-        // Record usage for non-streaming
-        let usage = response.usage.clone();
-        let ctx = usage_ctx;
-        tokio::spawn(async move {
-            if let Err(e) = ctx
-                .tracker
-                .record_usage(
-                    &ctx.key_info,
-                    &ctx.request_id,
-                    &ctx.model,
-                    &usage,
-                    true,
-                    &ctx.provider,
-                    "anthropic",
-                    ctx.cache_ttl.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to record web tools usage");
+        {
+            Ok(r) => {
+                let u = r.usage.clone();
+                (Ok(r), u)
             }
-        });
+            Err(e) => (Err(ApiError::internal_error(e.to_string())), e.usage),
+        };
 
-        return Ok(MessageApiResponse::Json(Json(response)));
+        let ctx = usage_ctx;
+        let has_usage = usage.input_tokens > 0
+            || usage.output_tokens > 0
+            || usage.cache_read_input_tokens.unwrap_or(0) > 0
+            || usage.cache_creation_input_tokens.unwrap_or(0) > 0;
+        let success = result.is_ok();
+        if success || has_usage {
+            tokio::spawn(async move {
+                if let Err(e) = ctx
+                    .tracker
+                    .record_usage(
+                        &ctx.key_info,
+                        &ctx.request_id,
+                        &ctx.model,
+                        &usage,
+                        success,
+                        &ctx.provider,
+                        "anthropic",
+                        ctx.cache_ttl.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "Failed to record web tools usage");
+                }
+            });
+        }
+
+        return Ok(MessageApiResponse::Json(Json(result?)));
     }
 
     let result = match resolved.provider.as_str() {
@@ -689,6 +724,35 @@ fn wrap_stream_with_usage_recording(
             cache_read_input_tokens: u.cache_read_input_tokens,
         })
     });
+    billed_stream(
+        inner,
+        exact,
+        tracker,
+        key_info,
+        model,
+        request_id,
+        provider,
+        protocol,
+        cache_ttl,
+        input_estimate,
+    )
+}
+
+/// Bill `inner` through [`crate::services::stream_billing`] with `exact` as
+/// the handler-reported usage.
+#[allow(clippy::too_many_arguments)]
+fn billed_stream(
+    inner: SseStream,
+    exact: crate::services::stream_billing::ExactUsage,
+    tracker: Arc<crate::services::UsageTracker>,
+    key_info: ApiKeyInfo,
+    model: String,
+    request_id: String,
+    provider: String,
+    protocol: &'static str,
+    cache_ttl: Option<String>,
+    input_estimate: i32,
+) -> MessageApiResponse {
     MessageApiResponse::Billed(
         inner,
         Box::new(crate::services::stream_billing::StreamBilling {
@@ -1242,7 +1306,10 @@ async fn proxy_anthropic_sse_stream(
                                 }
                             }
 
-                            let mut sse_event = Event::default().data(data.clone());
+                            // Upstream error frames are redacted (same shape).
+                            let out = crate::utils::redact::redact_sse_error_frame(data)
+                                .unwrap_or_else(|| data.clone());
+                            let mut sse_event = Event::default().data(out);
                             if let Some(evt) = event_type {
                                 sse_event = sse_event.event(evt);
                             }
@@ -1327,6 +1394,14 @@ async fn handle_openai_backend(
         "openai",
     );
 
+    // Billing needs the final usage chunk (the client sees converted
+    // Anthropic events, never the raw chunk).
+    if request.stream {
+        openai_request.stream_options = Some(crate::schemas::openai::StreamOptions {
+            include_usage: true,
+        });
+    }
+
     let body_bytes =
         serde_json::to_vec(&openai_request).map_err(|e| ApiError::internal_error(e.to_string()))?;
 
@@ -1383,7 +1458,11 @@ async fn handle_openai_backend(
             // We don't have usage info at stream start for OpenAI→Anthropic path
             let _ = original_model;
 
-            loop {
+            // Exact usage from the upstream's final usage chunk (forced via
+            // `stream_options.include_usage`; the converter ignores it).
+            let mut upstream_usage: Option<crate::schemas::openai::CompletionUsage> = None;
+
+            'outer: loop {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
                         if let Ok(text) = std::str::from_utf8(&chunk) {
@@ -1397,10 +1476,13 @@ async fn handle_openai_backend(
                             if let Some(data) = line.strip_prefix("data: ") {
                                 let data = data.trim();
                                 if data == "[DONE]" {
-                                    return;
+                                    break 'outer;
                                 }
                                 // Parse the OpenAI chunk and convert to Anthropic events
                                 if let Ok(oai_chunk) = serde_json::from_str::<crate::schemas::openai::ChatCompletionChunk>(data) {
+                                    if let Some(u) = &oai_chunk.usage {
+                                        upstream_usage = Some(u.clone());
+                                    }
                                     let events = response_converter.convert_stream_chunk_to_anthropic(&oai_chunk, &mut conv_state);
                                     for (evt_type, evt_data) in &events {
                                         // Extract usage from converted Anthropic events
@@ -1451,6 +1533,14 @@ async fn handle_openai_backend(
                 svc_clone.record_success(&cred_name);
             }
 
+            if let Some(u) = upstream_usage {
+                input_tokens = u.uncached_prompt_tokens();
+                output_tokens = u.completion_tokens;
+                let cached = u.cached_tokens();
+                if cached > 0 {
+                    cache_read = Some(cached);
+                }
+            }
             {
                 let mut u = stream_usage.lock().await;
                 u.input_tokens = input_tokens;

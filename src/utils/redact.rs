@@ -9,7 +9,15 @@
 //!   which name the host's IAM role) and 12-digit account ids,
 //! - request URLs embedded in reqwest errors (`… for url (https://…)`) and any
 //!   other bare `http(s)://` URL, which can include a backend `base_url` or a
-//!   webhook token.
+//!   webhook token,
+//! - scheme-less **internal** endpoints: hostnames under internal-only
+//!   suffixes (`*.internal`, `*.local`, `*.corp`, `*.lan`, `*.intranet`,
+//!   `*.localdomain`, with or without `:port`) and `localhost` / private,
+//!   loopback or link-local IPv4 **with a port** (`10.0.0.5:8443`).
+//!
+//! Known limit: other scheme-less hostnames (`relay.example.com:443`) and bare
+//! private IPs without a port are left alone — they cannot be told apart from
+//! ordinary text (versions, file names) without false positives.
 
 /// Characters that can be part of a secret-looking token.
 fn is_token_char(c: char) -> bool {
@@ -37,7 +45,53 @@ fn redact_token(tok: &str) -> Option<String> {
     redact_segment(t).map(|r| format!("{r}{suffix}"))
 }
 
+/// Suffixes that only name non-public hosts.
+const INTERNAL_HOST_SUFFIXES: &[&str] = &[
+    "internal",
+    "local",
+    "corp",
+    "lan",
+    "intranet",
+    "localdomain",
+];
+
+/// `relay.corp`, `ip-10-0-0-5.ec2.internal:443`, `10.0.0.5:8443`,
+/// `localhost:8080` → `<internal-host>`.
+fn redact_internal_host(t: &str) -> Option<String> {
+    let (host, port) = match t.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()) => {
+            (h, Some(p))
+        }
+        _ => (t, None),
+    };
+    if host.contains(':') {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        let internal = ip.is_private() || ip.is_loopback() || ip.is_link_local();
+        return (internal && port.is_some()).then(|| "<internal-host>".to_string());
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" {
+        return port.map(|_| "<internal-host>".to_string());
+    }
+    let labels: Vec<&str> = lower.split('.').collect();
+    let well_formed = labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !l.starts_with('-')
+        });
+    let internal = labels
+        .last()
+        .is_some_and(|tld| INTERNAL_HOST_SUFFIXES.contains(tld));
+    (well_formed && internal).then(|| "<internal-host>".to_string())
+}
+
 fn redact_segment(t: &str) -> Option<String> {
+    if let Some(r) = redact_internal_host(t) {
+        return Some(r);
+    }
     let suffix = "";
     let lower = t.to_ascii_lowercase();
     if t.len() >= 12 && (lower.starts_with("sk-") || lower.starts_with("sk_")) {
@@ -164,9 +218,123 @@ pub fn redact_error_payload(payload: &mut serde_json::Value) {
     }
 }
 
+/// Redact a relayed passthrough SSE `data:` payload **if it is an error
+/// frame** — Anthropic `{"type":"error","error":{...}}` or OpenAI
+/// `{"error":{...}}` / `{"error":"..."}`. Returns the re-serialized payload
+/// (same JSON shape, only message strings rewritten), or `None` for every
+/// other frame so ordinary chunks are forwarded byte-for-byte.
+pub fn redact_sse_error_frame(data: &str) -> Option<String> {
+    // Cheap pre-filter: content chunks are the hot path.
+    if !data.contains("\"error\"") {
+        return None;
+    }
+    let mut v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let obj = v.as_object()?;
+    let is_error =
+        obj.get("type").and_then(|t| t.as_str()) == Some("error") || obj.contains_key("error");
+    if !is_error {
+        return None;
+    }
+    redact_error_payload(&mut v);
+    if let Some(e) = v.get_mut("error") {
+        if let Some(s) = e.as_str() {
+            *e = serde_json::Value::String(redact_secrets(s));
+        }
+    }
+    Some(v.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_scheme_less_internal_hosts() {
+        for (input, want) in [
+            (
+                "dial tcp ip-10-0-1-5.ec2.internal:443: i/o timeout",
+                "dial tcp <internal-host>: i/o timeout",
+            ),
+            (
+                "lookup relay.corp: no such host",
+                "lookup <internal-host>: no such host",
+            ),
+            (
+                "upstream llm-proxy.svc.cluster.local:8080 refused",
+                "upstream <internal-host> refused",
+            ),
+            (
+                "connect 10.0.0.5:8443 failed",
+                "connect <internal-host> failed",
+            ),
+            (
+                "connect 192.168.1.20:80, 172.16.4.4:9000 and 127.0.0.1:11434",
+                "connect <internal-host>, <internal-host> and <internal-host>",
+            ),
+            ("localhost:8080 down", "<internal-host> down"),
+            (
+                "proxy at gw.LAN/v1 failed",
+                "proxy at <internal-host>/v1 failed",
+            ),
+        ] {
+            assert_eq!(redact_secrets(input), want, "{input}");
+        }
+    }
+
+    #[test]
+    fn internal_host_redaction_has_no_false_positives() {
+        for t in [
+            "version 10.0.0.5 released",
+            "public 8.8.8.8:53 resolver",
+            "relay.example.com:443 timed out",
+            "use localhost for testing",
+            "the internal error was local to the corp",
+            "file config.local.json missing",
+            "time 10:30:00 UTC",
+            "model gpt-4.1 at 0.5 temperature",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ] {
+            assert_eq!(redact_secrets(t), t);
+        }
+    }
+
+    #[test]
+    fn redacts_passthrough_sse_error_frames_only() {
+        // Anthropic error event payload.
+        let out = redact_sse_error_frame(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"relay https://10.1.2.3:8443/v1 key sk-proj-abcdefghijkl"}}"#,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "overloaded_error");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !msg.contains("10.1.2.3") && !msg.contains("abcdefghijkl"),
+            "{msg}"
+        );
+        // OpenAI error frame (object and string forms).
+        let out = redact_sse_error_frame(
+            r#"{"error":{"message":"arn:aws:iam::123456789012:role/R","type":"server_error","code":null}}"#,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("123456789012") && out.contains("server_error"),
+            "{out}"
+        );
+        let out = redact_sse_error_frame(r#"{"error":"bad sk-proj-abcdefghijkl"}"#).unwrap();
+        assert!(!out.contains("abcdefghijkl"), "{out}");
+        // Ordinary frames untouched (None = forward verbatim).
+        assert_eq!(
+            redact_sse_error_frame(r#"{"choices":[{"delta":{"content":"the \"error\" word"}}]}"#),
+            None
+        );
+        assert_eq!(redact_sse_error_frame("[DONE]"), None);
+        assert_eq!(
+            redact_sse_error_frame(r#"{"type":"content_block_delta","delta":{"text":"hi"}}"#),
+            None
+        );
+    }
 
     #[test]
     fn redacts_credentials_and_identities() {

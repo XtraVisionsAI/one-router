@@ -7,8 +7,10 @@
 //!
 //! Backend is selected automatically via the `DATABASE` scheme.
 
+pub mod budget;
 pub mod encryption;
 pub mod models;
+pub mod secret_migration;
 pub mod seed;
 pub mod traits;
 

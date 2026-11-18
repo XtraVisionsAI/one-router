@@ -9,8 +9,10 @@
 //! Mirrors the PTC session pattern (`services/ptc/service.rs`): an
 //! `Arc<RwLock<..>>` with TTL expiry and a periodic sweeper driven from
 //! `server/app.rs`. Bounded by entry count, a per-entry byte cap (oversized
-//! turns are not stored), a total byte budget, and per-owner byte / entry
-//! quotas (an owner over quota evicts its own oldest entries first).
+//! turns are answered but not stored — the request itself is never rejected
+//! for context size), a total byte budget, and per-owner (API key) **and**
+//! per-user byte / entry quotas (an owner or user over quota evicts its own
+//! oldest entries first, so one user with many keys cannot flush others).
 //! Eviction is O(log n) via `seq`-ordered `BTreeMap` indexes. In-memory only —
 //! entries do not survive a restart and are not shared across instances.
 
@@ -38,6 +40,11 @@ pub const DEFAULT_MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 pub const DEFAULT_MAX_OWNER_BYTES: usize = 64 * 1024 * 1024;
 /// Per-owner entry quota (same rationale as the byte quota).
 pub const DEFAULT_MAX_OWNER_ENTRIES: usize = 1_000;
+/// Per-user byte quota, summed over all of the user's keys (a user cannot
+/// multiply its share of the store by minting keys).
+pub const DEFAULT_MAX_USER_BYTES: usize = 128 * 1024 * 1024;
+/// Per-user entry quota, summed over all of the user's keys.
+pub const DEFAULT_MAX_USER_ENTRIES: usize = 2_000;
 
 /// Store limits.
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +54,8 @@ pub struct ContextLimits {
     pub max_total_bytes: usize,
     pub max_owner_bytes: usize,
     pub max_owner_entries: usize,
+    pub max_user_bytes: usize,
+    pub max_user_entries: usize,
 }
 
 impl Default for ContextLimits {
@@ -57,6 +66,25 @@ impl Default for ContextLimits {
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_owner_bytes: DEFAULT_MAX_OWNER_BYTES,
             max_owner_entries: DEFAULT_MAX_OWNER_ENTRIES,
+            max_user_bytes: DEFAULT_MAX_USER_BYTES,
+            max_user_entries: DEFAULT_MAX_USER_ENTRIES,
+        }
+    }
+}
+
+/// Who stores an entry: the API key owner (ownership checks) and, for
+/// database keys, the owning user (quota only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextOwner {
+    pub key: String,
+    pub user: Option<String>,
+}
+
+impl ContextOwner {
+    pub fn new(key: impl Into<String>, user: Option<String>) -> Self {
+        Self {
+            key: key.into(),
+            user,
         }
     }
 }
@@ -66,6 +94,8 @@ impl Default for ContextLimits {
 #[derive(Debug, Clone)]
 pub struct StoredResponse {
     pub owner_key_hash: String,
+    /// Owning user (quota accounting only; ownership is `owner_key_hash`).
+    pub user_id: Option<String>,
     pub created_at: u64,
     pub expires_at: u64,
     /// Monotonic insertion sequence — used for deterministic oldest-eviction
@@ -112,6 +142,7 @@ struct Inner {
     /// seq → response id across all owners, oldest first.
     order: BTreeMap<u64, String>,
     owners: HashMap<String, OwnerUsage>,
+    users: HashMap<String, OwnerUsage>,
     total_bytes: usize,
 }
 
@@ -120,12 +151,9 @@ impl Inner {
         let entry = self.entries.remove(id)?;
         self.order.remove(&entry.seq);
         self.total_bytes -= entry.bytes;
-        if let Some(o) = self.owners.get_mut(&entry.owner_key_hash) {
-            o.bytes -= entry.bytes;
-            o.order.remove(&entry.seq);
-            if o.order.is_empty() {
-                self.owners.remove(&entry.owner_key_hash);
-            }
+        unaccount(&mut self.owners, &entry.owner_key_hash, &entry);
+        if let Some(user) = &entry.user_id {
+            unaccount(&mut self.users, user, &entry);
         }
         Some(entry)
     }
@@ -137,10 +165,12 @@ impl Inner {
         }
     }
 
-    fn evict_oldest_of(&mut self, owner: &str) -> bool {
-        let id = self
-            .owners
-            .get(owner)
+    /// Evict the oldest entry of `name` in the `owners` (`users == false`) or
+    /// `users` index.
+    fn evict_oldest_in(&mut self, users: bool, name: &str) -> bool {
+        let index = if users { &self.users } else { &self.owners };
+        let id = index
+            .get(name)
             .and_then(|o| o.order.first_key_value().map(|(_, id)| id.clone()));
         match id {
             Some(id) => self.remove(&id).is_some(),
@@ -148,9 +178,10 @@ impl Inner {
         }
     }
 
-    fn owner_usage(&self, owner: &str) -> (usize, usize) {
-        self.owners
-            .get(owner)
+    fn usage_in(&self, users: bool, name: &str) -> (usize, usize) {
+        let index = if users { &self.users } else { &self.owners };
+        index
+            .get(name)
             .map(|o| (o.bytes, o.order.len()))
             .unwrap_or((0, 0))
     }
@@ -161,7 +192,22 @@ impl Inner {
         let o = self.owners.entry(entry.owner_key_hash.clone()).or_default();
         o.bytes += entry.bytes;
         o.order.insert(entry.seq, id.clone());
+        if let Some(user) = &entry.user_id {
+            let u = self.users.entry(user.clone()).or_default();
+            u.bytes += entry.bytes;
+            u.order.insert(entry.seq, id.clone());
+        }
         self.entries.insert(id, entry);
+    }
+}
+
+fn unaccount(index: &mut HashMap<String, OwnerUsage>, name: &str, entry: &StoredResponse) {
+    if let Some(o) = index.get_mut(name) {
+        o.bytes -= entry.bytes;
+        o.order.remove(&entry.seq);
+        if o.order.is_empty() {
+            index.remove(name);
+        }
     }
 }
 
@@ -197,28 +243,31 @@ impl ResponsesContextStore {
         }
     }
 
-    /// Largest storable entry, in accounted bytes.
-    pub fn max_entry_bytes(&self) -> usize {
-        self.limits.max_entry_bytes
-    }
-
-    /// Store a response's context. Returns `false` (and logs a warning) when
-    /// the entry exceeds the per-entry cap — the turn behaves as `store: false`.
-    /// Otherwise evicts, oldest first: the owner's own entries while it is over
-    /// its quota, then global entries while the store is over capacity / bytes.
+    /// Store a response's context. The size is measured on what is actually
+    /// stored (history text + response JSON), not on the request. Returns
+    /// `false` (and logs a warning) when the entry exceeds the per-entry cap
+    /// or a quota — the turn behaves as `store: false` and a later
+    /// `previous_response_id` naming it gets the normal not-found error.
+    /// Otherwise evicts, oldest first: the key owner's own entries while it is
+    /// over its quota, then the user's own entries while the user is over its
+    /// quota, then global entries while the store is over capacity / bytes.
     pub async fn save(
         &self,
         response_id: &str,
-        owner_key_hash: &str,
+        owner: &ContextOwner,
         messages: Vec<(String, String)>,
         response_json: serde_json::Value,
     ) -> bool {
+        let owner_key_hash = owner.key.as_str();
         let json_bytes = serde_json::to_vec(&response_json)
             .map(|v| v.len())
             .unwrap_or(0);
         let bytes = messages_bytes(&messages) + json_bytes + response_id.len();
         let limits = self.limits;
-        if bytes > limits.max_entry_bytes || bytes > limits.max_owner_bytes {
+        if bytes > limits.max_entry_bytes
+            || bytes > limits.max_owner_bytes
+            || (owner.user.is_some() && bytes > limits.max_user_bytes)
+        {
             tracing::warn!(
                 response_id,
                 bytes,
@@ -230,6 +279,7 @@ impl ResponsesContextStore {
         let now = now_secs();
         let entry = StoredResponse {
             owner_key_hash: owner_key_hash.to_string(),
+            user_id: owner.user.clone(),
             created_at: now,
             expires_at: now + self.ttl_secs,
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
@@ -240,13 +290,24 @@ impl ResponsesContextStore {
 
         let mut inner = self.inner.write().await;
         inner.remove(response_id);
-        // Per-owner quota: evict the owner's own oldest entries.
+        // Per-owner (key) quota: evict the key's own oldest entries.
         loop {
-            let (owner_bytes, owner_count) = inner.owner_usage(owner_key_hash);
+            let (owner_bytes, owner_count) = inner.usage_in(false, owner_key_hash);
             let fits = owner_bytes + bytes <= limits.max_owner_bytes
                 && owner_count < limits.max_owner_entries;
-            if fits || !inner.evict_oldest_of(owner_key_hash) {
+            if fits || !inner.evict_oldest_in(false, owner_key_hash) {
                 break;
+            }
+        }
+        // Per-user quota (all of the user's keys): evict the user's oldest.
+        if let Some(user) = owner.user.as_deref() {
+            loop {
+                let (user_bytes, user_count) = inner.usage_in(true, user);
+                let fits = user_bytes + bytes <= limits.max_user_bytes
+                    && user_count < limits.max_user_entries;
+                if fits || !inner.evict_oldest_in(true, user) {
+                    break;
+                }
             }
         }
         // Global capacity / byte budget.
@@ -347,6 +408,10 @@ impl Default for ResponsesContextStore {
 mod tests {
     use super::*;
 
+    fn key(k: &str) -> ContextOwner {
+        ContextOwner::new(k, None)
+    }
+
     fn msgs() -> Vec<(String, String)> {
         vec![
             ("user".to_string(), "q".to_string()),
@@ -360,7 +425,7 @@ mod tests {
         store
             .save(
                 "resp_1",
-                "owner_a",
+                &key("owner_a"),
                 msgs(),
                 serde_json::json!({"id": "resp_1"}),
             )
@@ -373,7 +438,7 @@ mod tests {
     async fn test_load_wrong_owner_is_not_found() {
         let store = ResponsesContextStore::new();
         store
-            .save("resp_1", "owner_a", msgs(), serde_json::json!({}))
+            .save("resp_1", &key("owner_a"), msgs(), serde_json::json!({}))
             .await;
         assert!(matches!(
             store.load("resp_1", "owner_b").await,
@@ -385,7 +450,7 @@ mod tests {
     async fn test_expired_entry_not_loadable_and_swept() {
         let store = ResponsesContextStore::with_config(0, 100); // ttl 0 → immediately expired
         store
-            .save("resp_1", "owner_a", msgs(), serde_json::json!({}))
+            .save("resp_1", &key("owner_a"), msgs(), serde_json::json!({}))
             .await;
         assert!(matches!(
             store.load("resp_1", "owner_a").await,
@@ -401,7 +466,7 @@ mod tests {
     async fn test_delete_owner_validated() {
         let store = ResponsesContextStore::new();
         store
-            .save("resp_1", "owner_a", msgs(), serde_json::json!({}))
+            .save("resp_1", &key("owner_a"), msgs(), serde_json::json!({}))
             .await;
         assert!(store.delete("resp_1", "owner_b").await.is_err());
         assert!(store.delete("resp_1", "owner_a").await.is_ok());
@@ -411,9 +476,15 @@ mod tests {
     #[tokio::test]
     async fn test_capacity_evicts_oldest() {
         let store = ResponsesContextStore::with_config(3600, 2);
-        store.save("r1", "o", msgs(), serde_json::json!({})).await;
-        store.save("r2", "o", msgs(), serde_json::json!({})).await;
-        store.save("r3", "o", msgs(), serde_json::json!({})).await;
+        store
+            .save("r1", &key("o"), msgs(), serde_json::json!({}))
+            .await;
+        store
+            .save("r2", &key("o"), msgs(), serde_json::json!({}))
+            .await;
+        store
+            .save("r3", &key("o"), msgs(), serde_json::json!({}))
+            .await;
         assert_eq!(store.len().await, 2);
         // r1 (oldest) evicted
         assert!(store.load("r1", "o").await.is_err());
@@ -426,7 +497,7 @@ mod tests {
         store
             .save(
                 "resp_1",
-                "o",
+                &key("o"),
                 msgs(),
                 serde_json::json!({"id": "resp_1", "object": "response"}),
             )
@@ -446,6 +517,8 @@ mod tests {
             max_total_bytes: 3_000,
             max_owner_bytes: 2_000,
             max_owner_entries: 10,
+            max_user_bytes: 2_500,
+            max_user_entries: 20,
         }
     }
 
@@ -454,7 +527,7 @@ mod tests {
         let store = ResponsesContextStore::with_limits(3600, small_limits());
         assert!(
             !store
-                .save("r1", "o", big(5_000), serde_json::json!({}))
+                .save("r1", &key("o"), big(5_000), serde_json::json!({}))
                 .await
         );
         assert!(store.load("r1", "o").await.is_err());
@@ -462,18 +535,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_oversized_continuation_skips_store_but_keeps_parent() {
+        // A long session: the parent turn is stored; the next turn's history
+        // outgrows the cap. The turn itself is answered (no error here), only
+        // its own context is not stored — continuing from it is a normal
+        // not-found, while the parent stays usable.
+        let store = ResponsesContextStore::with_limits(3600, small_limits());
+        assert!(
+            store
+                .save("parent", &key("o"), big(600), serde_json::json!({}))
+                .await
+        );
+        let mut history = store.load("parent", "o").await.unwrap();
+        history.push(("user".into(), "y".repeat(600)));
+        assert!(
+            !store
+                .save("child", &key("o"), history, serde_json::json!({}))
+                .await
+        );
+        assert!(matches!(
+            store.load("child", "o").await,
+            Err(ResponsesContextError::NotFound)
+        ));
+        assert!(store.load("parent", "o").await.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_owner_quota_evicts_only_own_entries() {
         let store = ResponsesContextStore::with_limits(3600, small_limits());
         assert!(
             store
-                .save("victim", "b", big(500), serde_json::json!({}))
+                .save("victim", &key("b"), big(500), serde_json::json!({}))
                 .await
         );
         // Owner "a" writes far past its 2000-byte quota.
         for i in 0..10 {
             assert!(
                 store
-                    .save(&format!("a{i}"), "a", big(800), serde_json::json!({}))
+                    .save(&format!("a{i}"), &key("a"), big(800), serde_json::json!({}))
                     .await
             );
         }
@@ -491,10 +590,12 @@ mod tests {
             ..small_limits()
         };
         let store = ResponsesContextStore::with_limits(3600, limits);
-        store.save("b1", "b", msgs(), serde_json::json!({})).await;
+        store
+            .save("b1", &key("b"), msgs(), serde_json::json!({}))
+            .await;
         for i in 0..5 {
             store
-                .save(&format!("a{i}"), "a", msgs(), serde_json::json!({}))
+                .save(&format!("a{i}"), &key("a"), msgs(), serde_json::json!({}))
                 .await;
         }
         assert_eq!(store.len().await, 3);
@@ -508,7 +609,12 @@ mod tests {
         let store = ResponsesContextStore::with_limits(3600, small_limits());
         for (i, owner) in ["a", "b", "c", "d", "e"].iter().enumerate() {
             store
-                .save(&format!("r{i}"), owner, big(900), serde_json::json!({}))
+                .save(
+                    &format!("r{i}"),
+                    &key(owner),
+                    big(900),
+                    serde_json::json!({}),
+                )
                 .await;
         }
         assert!(store.total_bytes().await <= 3_000);
@@ -516,10 +622,72 @@ mod tests {
         assert!(store.load("r4", "e").await.is_ok());
         // Delete / overwrite keep the byte counters exact.
         store.delete("r4", "e").await.unwrap();
-        store.save("r3", "d", msgs(), serde_json::json!({})).await;
+        store
+            .save("r3", &key("d"), msgs(), serde_json::json!({}))
+            .await;
         let inner = store.inner.read().await;
         let sum: usize = inner.entries.values().map(|e| e.bytes).sum();
         assert_eq!(inner.total_bytes, sum);
         assert_eq!(inner.order.len(), inner.entries.len());
+    }
+
+    #[tokio::test]
+    async fn test_user_quota_spans_keys_and_spares_other_users() {
+        let store = ResponsesContextStore::with_limits(3600, small_limits());
+        let victim = ContextOwner::new("kb", Some("user_b".into()));
+        assert!(
+            store
+                .save("victim", &victim, big(500), serde_json::json!({}))
+                .await
+        );
+        // user_a rotates through many keys, each under its own key quota, but
+        // together far past the 2500-byte user quota.
+        for i in 0..10 {
+            let k = ContextOwner::new(format!("ka{i}"), Some("user_a".into()));
+            assert!(
+                store
+                    .save(&format!("a{i}"), &k, big(700), serde_json::json!({}))
+                    .await
+            );
+        }
+        assert!(store.load("victim", "kb").await.is_ok());
+        assert!(store.load("a9", "ka9").await.is_ok());
+        assert!(store.load("a0", "ka0").await.is_err());
+        let inner = store.inner.read().await;
+        let user_a: usize = inner
+            .entries
+            .values()
+            .filter(|e| e.user_id.as_deref() == Some("user_a"))
+            .map(|e| e.bytes)
+            .sum();
+        assert!(user_a <= 2_500);
+        assert_eq!(inner.users["user_a"].bytes, user_a);
+    }
+
+    #[tokio::test]
+    async fn test_user_entry_quota_and_index_cleanup() {
+        let limits = ContextLimits {
+            max_user_entries: 3,
+            ..small_limits()
+        };
+        let store = ResponsesContextStore::with_limits(3600, limits);
+        for i in 0..6 {
+            let k = ContextOwner::new(format!("k{i}"), Some("u".into()));
+            store
+                .save(&format!("r{i}"), &k, msgs(), serde_json::json!({}))
+                .await;
+        }
+        assert_eq!(store.len().await, 3);
+        assert!(store.load("r5", "k5").await.is_ok());
+        assert!(store.load("r2", "k2").await.is_err());
+        for i in 3..6 {
+            store
+                .delete(&format!("r{i}"), &format!("k{i}"))
+                .await
+                .unwrap();
+        }
+        let inner = store.inner.read().await;
+        assert!(inner.users.is_empty());
+        assert!(inner.owners.is_empty());
     }
 }

@@ -4,7 +4,8 @@
 //! (`TRUSTED_PROXY_CIDRS`); then `X-Forwarded-For` is walked right-to-left and
 //! the first hop that is not itself a trusted proxy is the client. Without
 //! trusted proxies configured, `X-Forwarded-For` is ignored entirely — any
-//! client can forge it.
+//! client can forge it. A trusted proxy sending a malformed chain yields an
+//! **unknown** client (`None`), never the proxy's own address.
 
 use axum::http::HeaderMap;
 use std::net::{IpAddr, SocketAddr};
@@ -103,14 +104,26 @@ fn is_port(s: &str) -> bool {
     !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Resolve the client address (see module docs). `None` when the peer address
-/// is unknown (no `ConnectInfo`, e.g. in unit tests).
+/// Resolve the client address (see module docs). `None` when the address is
+/// unknown: no peer (`ConnectInfo` missing, e.g. in unit tests) **or** a
+/// trusted proxy forwarded an `X-Forwarded-For` chain that cannot be trusted.
 ///
 /// The walk runs over the **raw** comma-separated hops, right to left: trusted
-/// proxies are skipped, the first untrusted address is the client. An
-/// unparsable hop (garbage, `unknown`, empty) stops the walk fail-closed: the
-/// answer is the nearest trusted hop already passed (or the peer) — never an
-/// entry further left, which the client could have written itself.
+/// proxies are skipped, the first untrusted address is the client. Fail-closed
+/// rules when the peer is a trusted proxy:
+///
+/// - An unparsable hop (garbage, `unknown`, empty) reached before the client,
+///   or a header line that is not visible ASCII, yields `None`, never the
+///   nearest trusted hop (that is a proxy, which an IP allowlist covering the
+///   proxy network would then admit) and never an entry further left (the
+///   client could have written it). `None` = unknown client: IP allowlists
+///   deny and the audit log records no address.
+/// - Header **absent**: the peer address. A trusted proxy that forwards no
+///   header is either the caller itself (health checks, internal jobs) or a
+///   proxy not configured to set it; in both cases the proxy's address is the
+///   honest answer.
+/// - Every hop trusted: the leftmost one (the client is inside the trusted
+///   network).
 pub fn client_ip(
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
@@ -120,22 +133,23 @@ pub fn client_ip(
     if trusted.is_empty() || !in_any(trusted, peer) {
         return Some(peer);
     }
-    let hops: Vec<&str> = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .map(|v| v.to_str().unwrap_or(""))
-        .flat_map(|v| v.split(','))
-        .collect();
+    let mut hops: Vec<&str> = Vec::new();
+    for v in headers.get_all("x-forwarded-for") {
+        // A non-ASCII line is unparsable. It must not be read as "" (which
+        // used to end the walk at the proxy's own address).
+        hops.extend(v.to_str().ok()?.split(','));
+    }
     // Nearest trusted hop seen so far; starts at the (trusted) peer.
     let mut nearest = peer;
     for token in hops.iter().rev() {
         match parse_hop(token) {
-            None => return Some(nearest),
+            None => return None,
             Some(ip) if in_any(trusted, ip) => nearest = ip,
             Some(ip) => return Some(ip),
         }
     }
-    // Every hop is a trusted proxy: the leftmost one is the best we have.
+    // No header, or every hop is a trusted proxy: the leftmost one (or the
+    // peer) is the best we have.
     Some(nearest)
 }
 
@@ -195,15 +209,21 @@ mod tests {
     fn unparsable_hop_stops_walk_fail_closed() {
         let peer: SocketAddr = "10.0.0.2:5555".parse().unwrap();
         let trusted = parse_cidr_list("10.0.0.0/8").unwrap();
-        // Attacker-written "1.1.1.1" left of a garbage hop must not win.
+        // Attacker-written "1.1.1.1" left of a garbage hop must not win, and
+        // neither must the trusted proxy 10.0.0.7: the client is unknown.
         let h = xff("1.1.1.1, garbage, 10.0.0.7");
-        assert_eq!(client_ip(Some(peer), &h, &trusted), Some(ip("10.0.0.7")));
-        // Garbage as the rightmost hop -> the peer itself.
+        assert_eq!(client_ip(Some(peer), &h, &trusted), None);
+        // Garbage as the rightmost hop -> unknown, not the peer.
         let h = xff("1.1.1.1, unknown");
-        assert_eq!(client_ip(Some(peer), &h, &trusted), Some(ip("10.0.0.2")));
-        // An empty hop is malformed too.
+        assert_eq!(client_ip(Some(peer), &h, &trusted), None);
+        // An empty hop is malformed too, as is an empty header.
         let h = xff("1.1.1.1, ");
-        assert_eq!(client_ip(Some(peer), &h, &trusted), Some(ip("10.0.0.2")));
+        assert_eq!(client_ip(Some(peer), &h, &trusted), None);
+        let h = xff("");
+        assert_eq!(client_ip(Some(peer), &h, &trusted), None);
+        // Garbage left of the real client is never reached.
+        let h = xff("unknown, 1.2.3.4, 10.0.0.7");
+        assert_eq!(client_ip(Some(peer), &h, &trusted), Some(ip("1.2.3.4")));
         // All trusted -> leftmost.
         let h = xff("10.0.0.9, 10.0.0.7");
         assert_eq!(client_ip(Some(peer), &h, &trusted), Some(ip("10.0.0.9")));
@@ -212,6 +232,29 @@ mod tests {
             client_ip(Some(peer), &HeaderMap::new(), &trusted),
             Some(ip("10.0.0.2"))
         );
+    }
+
+    #[test]
+    fn non_ascii_header_line_is_unknown_client() {
+        let peer: SocketAddr = "10.0.0.2:5555".parse().unwrap();
+        let trusted = parse_cidr_list("10.0.0.0/8").unwrap();
+        let mut h = HeaderMap::new();
+        h.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"1.1.1.1, \xff\xfe").unwrap(),
+        );
+        assert_eq!(client_ip(Some(peer), &h, &trusted), None);
+        // Also when a later, valid line follows the bad one.
+        h.append("x-forwarded-for", HeaderValue::from_static("10.0.0.7"));
+        assert_eq!(client_ip(Some(peer), &h, &trusted), None);
+        // Untrusted peer: header ignored entirely, peer wins.
+        let outsider: SocketAddr = "8.8.8.8:1".parse().unwrap();
+        assert_eq!(client_ip(Some(outsider), &h, &trusted), Some(ip("8.8.8.8")));
+        // Multiple valid lines are joined in order.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        h.append("x-forwarded-for", HeaderValue::from_static("10.0.0.7"));
+        assert_eq!(client_ip(Some(peer), &h, &trusted), Some(ip("1.2.3.4")));
     }
 
     #[test]

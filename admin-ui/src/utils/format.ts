@@ -22,6 +22,6 @@ export function healthType(status: string): 'success' | 'error' | 'default' {
 }
 
 export function fmtPercent(n: number | null | undefined): string {
-  if (n == null || isNaN(n)) return '—'
+  if (n == null || Number.isNaN(n)) return '—'
   return `${(n * 100).toFixed(1)}%`
 }

@@ -178,8 +178,26 @@
             })
           ]
         : []
-    if (input_price === 0 && output_price === 0 && cache_read_price === 0 && cache_write_price === 0) {
+    const units = [
+      row.price_per_request > 0 ? `$${fmtPrice(row.price_per_request)}/req` : null,
+      row.price_per_image > 0 ? `$${fmtPrice(row.price_per_image)}/img` : null,
+      row.price_per_search_unit > 0 ? `$${fmtPrice(row.price_per_search_unit)}/unit` : null
+    ].filter((u): u is string => u !== null)
+    const hasTokens = input_price > 0 || output_price > 0 || cache_read_price > 0 || cache_write_price > 0
+    if (!hasTokens && units.length === 0) {
       return h('span', { class: 'text-slate-600' }, [...manualMark, '—'])
+    }
+    const unitNodes = units.length
+      ? [
+          ...(hasTokens ? [h('span', { class: 'text-slate-700 mx-1' }, '·')] : []),
+          h('span', { class: 'text-slate-300', title: 'Non-token prices (USD)' }, units.join(' '))
+        ]
+      : []
+    if (!hasTokens) {
+      return h('span', { class: 'font-mono text-[11px] text-slate-400 whitespace-nowrap' }, [
+        ...manualMark,
+        ...unitNodes
+      ])
     }
     return h('span', { class: 'font-mono text-[11px] text-slate-400 whitespace-nowrap' }, [
       ...manualMark,
@@ -193,7 +211,8 @@
             h('span', { class: 'text-slate-700 mx-0.5' }, '/'),
             h('span', { class: 'text-slate-500' }, `$${fmtPrice(cache_write_price)}`)
           ]
-        : [])
+        : []),
+      ...unitNodes
     ])
   }
 

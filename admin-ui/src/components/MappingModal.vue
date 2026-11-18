@@ -34,7 +34,10 @@
     output_price: 0,
     cache_read_price: 0,
     cache_write_price: 0,
-    pricing_source: 'litellm'
+    pricing_source: 'litellm',
+    price_per_request: 0,
+    price_per_image: 0,
+    price_per_search_unit: 0
   })
   const saving = ref(false)
 
@@ -53,7 +56,10 @@
           output_price: props.existing?.output_price ?? 0,
           cache_read_price: props.existing?.cache_read_price ?? 0,
           cache_write_price: props.existing?.cache_write_price ?? 0,
-          pricing_source: props.existing?.pricing_source ?? 'litellm'
+          pricing_source: props.existing?.pricing_source ?? 'litellm',
+          price_per_request: props.existing?.price_per_request ?? 0,
+          price_per_image: props.existing?.price_per_image ?? 0,
+          price_per_search_unit: props.existing?.price_per_search_unit ?? 0
         }
         caps.value = parseCapabilities(props.existing?.capabilities)
       }
@@ -169,6 +175,23 @@
           <NInputNumber v-model:value="form.cache_write_price" :precision="4" :min="0" class="w-full" />
         </NFormItem>
       </div>
+
+      <div class="flex gap-4">
+        <NFormItem label="Per Request (USD)" class="flex-1">
+          <NInputNumber v-model:value="form.price_per_request" :precision="6" :min="0" class="w-full" />
+        </NFormItem>
+        <NFormItem label="Per Image (USD)" class="flex-1">
+          <NInputNumber v-model:value="form.price_per_image" :precision="6" :min="0" class="w-full" />
+        </NFormItem>
+        <NFormItem label="Per Search Unit (USD)" class="flex-1">
+          <NInputNumber v-model:value="form.price_per_search_unit" :precision="6" :min="0" class="w-full" />
+        </NFormItem>
+      </div>
+      <p class="text-xs text-slate-500 -mt-3 mb-3">
+        Non-token prices for images and rerank, added to any token cost: per request = every call; per image = each
+        image returned by /v1/images/generations; per search unit = each rerank query over up to 100 documents
+        (/v1/rerank).
+      </p>
 
       <NFormItem label="Pricing Source">
         <div class="w-full">

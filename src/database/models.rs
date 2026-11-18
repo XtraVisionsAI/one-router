@@ -479,6 +479,18 @@ pub struct ModelMappingRecord {
     /// overwritten on each sync) or `"manual"` (pinned — never touched by sync).
     /// Defaults to `"litellm"`.
     pub pricing_source: String,
+    /// Non-token prices (USD, not per-1M), charged on top of any token cost
+    /// by the non-token endpoints (/v1/images/generations, /v1/rerank):
+    /// once per call (`price_per_request`), per image returned
+    /// (`price_per_image`), per rerank search unit (`price_per_search_unit` —
+    /// one query over up to 100 documents). Token endpoints ignore them.
+    /// 0 = not priced.
+    #[serde(default)]
+    pub price_per_request: f64,
+    #[serde(default)]
+    pub price_per_image: f64,
+    #[serde(default)]
+    pub price_per_search_unit: f64,
 }
 
 // ============================================================================

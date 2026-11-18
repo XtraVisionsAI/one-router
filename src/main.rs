@@ -11,7 +11,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Lay
 #[command(name = "one-router", version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     /// Database connection string (overrides DATABASE env var)
-    #[arg(long, short = 'd')]
+    #[arg(long, short = 'd', global = true)]
     database: Option<String>,
 
     /// HTTP listen port (overrides PORT env var)
@@ -23,7 +23,7 @@ struct Cli {
     host: Option<String>,
 
     /// Log level (overrides LOG_LEVEL env var)
-    #[arg(long, short = 'l')]
+    #[arg(long, short = 'l', global = true)]
     log_level: Option<String>,
 
     /// Maximum HTTP request body size in MB (overrides MAX_BODY_SIZE_MB env var,
@@ -36,7 +36,7 @@ struct Cli {
     master_api_key: Option<String>,
 
     /// Encryption key for credential storage (overrides ENCRYPTION_KEY env var)
-    #[arg(long)]
+    #[arg(long, global = true)]
     encryption_key: Option<String>,
 
     /// When to seed default model mappings on startup: off, empty (default,
@@ -84,6 +84,13 @@ enum Command {
         #[arg(long)]
         no_write: bool,
     },
+    /// Re-encrypt stored secrets (plaintext / legacy v1) in the v2 format.
+    /// Run with the server stopped, after backing up the database.
+    MigrateSecrets {
+        /// Report what would change; write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -108,8 +115,73 @@ async fn main() -> Result<()> {
             output,
             no_write,
         }) => run_wrap_key(cli.encryption_key, provider, key, region, output, no_write).await,
+        Some(Command::MigrateSecrets { dry_run }) => {
+            run_migrate_secrets(cli.database, cli.encryption_key, cli.log_level, dry_run).await
+        }
         None => run_server(cli).await,
     }
+}
+
+/// `migrate-secrets`: offline plaintext / v1 → v2 re-encryption.
+///
+/// DATABASE / ENCRYPTION_KEY resolve exactly like server startup (.env < env
+/// < `-d` / `--encryption-key`; provider-wrapped keys are unwrapped). Opening
+/// the database runs the same `initialize` as startup (schema migrations, API
+/// key hash backfill, key → user migration, settings backfill); model-mapping
+/// seeding is forced off. Exits non-zero if any row failed.
+async fn run_migrate_secrets(
+    database: Option<String>,
+    encryption_key: Option<String>,
+    log_level: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    use one_router::database::{encryption::Encryptor, secret_migration};
+    // stdout is the report: JSON logs at warn+ unless `-l` asks for more.
+    init_tracing(log_level.as_deref().unwrap_or("warn"));
+    let mut settings = Settings::load()?;
+    settings.apply_overrides(
+        database,
+        None,
+        None,
+        None,
+        None,
+        None,
+        encryption_key,
+        Some(one_router::database::seed::SeedMode::Off),
+    );
+    if settings.encryption_key.is_none() {
+        anyhow::bail!(
+            "ENCRYPTION_KEY is not configured (.env, environment or --encryption-key); \
+             refusing to migrate"
+        );
+    }
+    settings.resolve_encryption_key().await?;
+
+    println!(
+        "Database: {}",
+        one_router::config::settings::redact_database_uri(&settings.database)
+    );
+    let db = one_router::database::create_database(&settings.database).await?;
+    db.initialize(settings.encryption_key.as_deref(), settings.seed_defaults)
+        .await?;
+    let encryptor = Encryptor::new(settings.encryption_key.as_deref());
+
+    let report = secret_migration::migrate_secrets(&db, &encryptor, dry_run).await?;
+    for line in report.lines(dry_run) {
+        println!("{line}");
+    }
+    println!("{}", report.summary(dry_run));
+    if report.failed() > 0 {
+        anyhow::bail!(
+            "{} row(s) could not be migrated (wrong ENCRYPTION_KEY, or a corrupted / \
+             copied value); fix or re-create them, then re-run",
+            report.failed()
+        );
+    }
+    if dry_run && report.migrated() > 0 {
+        println!("Dry run: nothing was written. Re-run without --dry-run to apply.");
+    }
+    Ok(())
 }
 
 /// Run the main HTTP server (default behavior).

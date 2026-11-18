@@ -183,6 +183,7 @@ mod tests {
             seed_defaults: crate::database::seed::SeedMode::default(),
             app_version: "0.0.0".to_string(),
             ephemeral_api_key: ephemeral.map(|s| s.to_string()),
+            outbound_proxy: Default::default(),
         }
     }
 

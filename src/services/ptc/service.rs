@@ -37,6 +37,11 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 10;
 /// Tool call batch window in milliseconds
 pub const TOOL_CALL_BATCH_WINDOW_MS: u64 = 100;
 
+/// Absolute session lifetime (activity does not extend it). Bounds how long
+/// any sandbox container can legitimately live, which the orphan sweep
+/// relies on.
+pub const MAX_SESSION_LIFETIME_SECS: u64 = 30 * 60;
+
 // ============================================================================
 // Session
 // ============================================================================
@@ -50,6 +55,8 @@ pub struct PtcSession {
     pub container: ContainerInfo,
     /// HMAC hash of the API key that owns this session
     pub owner_key_hash: String,
+    /// Owning user (per-user session cap); `None` for master / ownerless keys
+    pub owner_user_id: Option<String>,
     /// Tool names callable from sandbox code (validated at creation)
     pub allowed_tools: Vec<String>,
     /// Session creation time
@@ -93,11 +100,13 @@ pub struct PendingToolCall {
 }
 
 impl PtcSession {
-    /// Check if session has expired
+    /// Check if session has expired: idle longer than `timeout_secs`, or
+    /// alive longer than [`MAX_SESSION_LIFETIME_SECS`] regardless of activity.
     pub fn is_expired(&self, timeout_secs: u64) -> bool {
         let now = chrono::Utc::now();
-        let elapsed = now.signed_duration_since(self.last_activity);
-        elapsed.num_seconds() as u64 > timeout_secs
+        let idle = now.signed_duration_since(self.last_activity).num_seconds();
+        let age = now.signed_duration_since(self.created_at).num_seconds();
+        idle.max(0) as u64 > timeout_secs || age.max(0) as u64 > MAX_SESSION_LIFETIME_SECS
     }
 
     /// Update last activity time
@@ -211,9 +220,12 @@ pub const PTC_ENABLED_ENV: &str = "PTC_ENABLED";
 pub const PTC_MAX_SESSIONS_ENV: &str = "PTC_MAX_SESSIONS";
 /// Per-API-key cap on concurrent PTC sessions.
 pub const PTC_MAX_SESSIONS_PER_KEY_ENV: &str = "PTC_MAX_SESSIONS_PER_KEY";
+/// Per-user cap (all of a user's keys together) on concurrent PTC sessions.
+pub const PTC_MAX_SESSIONS_PER_USER_ENV: &str = "PTC_MAX_SESSIONS_PER_USER";
 
 pub const DEFAULT_MAX_SESSIONS: usize = 32;
 pub const DEFAULT_MAX_SESSIONS_PER_KEY: usize = 4;
+pub const DEFAULT_MAX_SESSIONS_PER_USER: usize = 8;
 
 /// Max tool calls in one sandbox frame.
 pub const MAX_TOOL_CALLS_PER_FRAME: usize = 32;
@@ -242,6 +254,8 @@ fn parse_bool_env(v: Option<&str>) -> bool {
 pub struct PtcLimits {
     pub max_sessions: usize,
     pub max_sessions_per_owner: usize,
+    /// Across all keys of one user (fairness of the global pool).
+    pub max_sessions_per_user: usize,
 }
 
 impl Default for PtcLimits {
@@ -249,21 +263,24 @@ impl Default for PtcLimits {
         Self {
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_sessions_per_owner: DEFAULT_MAX_SESSIONS_PER_KEY,
+            max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
         }
     }
 }
 
 impl PtcLimits {
     /// Defaults overridden by `PTC_MAX_SESSIONS` / `PTC_MAX_SESSIONS_PER_KEY`
-    /// (positive integers; anything else keeps the default).
+    /// / `PTC_MAX_SESSIONS_PER_USER` (positive integers; anything else keeps
+    /// the default).
     pub fn from_env() -> Self {
         Self::from_values(
             std::env::var(PTC_MAX_SESSIONS_ENV).ok().as_deref(),
             std::env::var(PTC_MAX_SESSIONS_PER_KEY_ENV).ok().as_deref(),
+            std::env::var(PTC_MAX_SESSIONS_PER_USER_ENV).ok().as_deref(),
         )
     }
 
-    fn from_values(total: Option<&str>, per_owner: Option<&str>) -> Self {
+    fn from_values(total: Option<&str>, per_owner: Option<&str>, per_user: Option<&str>) -> Self {
         let parse = |v: Option<&str>, default: usize| {
             v.and_then(|s| s.trim().parse::<usize>().ok())
                 .filter(|n| *n > 0)
@@ -272,17 +289,30 @@ impl PtcLimits {
         Self {
             max_sessions: parse(total, DEFAULT_MAX_SESSIONS),
             max_sessions_per_owner: parse(per_owner, DEFAULT_MAX_SESSIONS_PER_KEY),
+            max_sessions_per_user: parse(per_user, DEFAULT_MAX_SESSIONS_PER_USER),
         }
     }
 }
 
 /// Check whether one more session may be created given the current counts
-/// (live sessions + in-flight reservations).
-pub fn check_session_caps(total: usize, owner: usize, limits: &PtcLimits) -> PtcResult<()> {
+/// (live sessions + in-flight reservations). `user` is `None` for callers
+/// without an owning user (master / ownerless keys).
+pub fn check_session_caps(
+    total: usize,
+    owner: usize,
+    user: Option<usize>,
+    limits: &PtcLimits,
+) -> PtcResult<()> {
     if owner >= limits.max_sessions_per_owner {
         return Err(PtcError::SessionLimitExceeded(format!(
             "at most {} concurrent PTC sessions per API key",
             limits.max_sessions_per_owner
+        )));
+    }
+    if user.is_some_and(|n| n >= limits.max_sessions_per_user) {
+        return Err(PtcError::SessionLimitExceeded(format!(
+            "at most {} concurrent PTC sessions per user",
+            limits.max_sessions_per_user
         )));
     }
     if total >= limits.max_sessions {
@@ -388,24 +418,60 @@ pub fn validate_sandbox_tool_calls(calls: &[ToolCallData], allowed: &[String]) -
 struct SessionHandle {
     handle: Arc<TokioMutex<ContainerHandle>>,
     abort: tokio::task::AbortHandle,
+    /// Reader state (poisoned by unsolicited / over-budget frames).
+    reader: Arc<super::sandbox::ReaderState>,
 }
 
-/// Session-slot reservation held while a container is being created, so
-/// concurrent `create_session` calls cannot overshoot the caps.
-struct SlotReservation {
-    reservations: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+/// In-flight slot counts (session creations + one-shot code executions).
+#[derive(Debug, Default)]
+struct ReservationCounts {
+    by_key: HashMap<String, usize>,
+    by_user: HashMap<String, usize>,
+}
+
+impl ReservationCounts {
+    fn total(&self) -> usize {
+        self.by_key.values().sum()
+    }
+
+    fn add(&mut self, owner: &str, user: Option<&str>) {
+        *self.by_key.entry(owner.to_string()).or_default() += 1;
+        if let Some(u) = user {
+            *self.by_user.entry(u.to_string()).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, owner: &str, user: Option<&str>) {
+        fn dec(map: &mut HashMap<String, usize>, k: &str) {
+            if let Some(n) = map.get_mut(k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    map.remove(k);
+                }
+            }
+        }
+        dec(&mut self.by_key, owner);
+        if let Some(u) = user {
+            dec(&mut self.by_user, u);
+        }
+    }
+}
+
+/// Slot reservation counted against the global / per-key / per-user caps:
+/// held while a session container is being created, and for the whole run of
+/// a one-shot code execution (web-tool dynamic filtering). Released on drop.
+pub struct SlotReservation {
+    reservations: Arc<std::sync::Mutex<ReservationCounts>>,
     owner: String,
+    user: Option<String>,
 }
 
 impl Drop for SlotReservation {
     fn drop(&mut self) {
-        let mut res = self.reservations.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = res.get_mut(&self.owner) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                res.remove(&self.owner);
-            }
-        }
+        self.reservations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.owner, self.user.as_deref());
     }
 }
 
@@ -419,8 +485,8 @@ pub struct PtcService {
     container_handles: Arc<RwLock<HashMap<String, SessionHandle>>>,
     /// Execution states for continuation (preserved across turns)
     execution_states: Arc<RwLock<HashMap<String, PtcExecutionState>>>,
-    /// In-flight session creations per owner
-    reservations: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// In-flight session creations / one-shot runs per owner and user
+    reservations: Arc<std::sync::Mutex<ReservationCounts>>,
     /// Session caps
     limits: PtcLimits,
     /// Session timeout in seconds
@@ -447,13 +513,21 @@ impl PtcService {
         session_timeout: u64,
         max_iterations: u32,
     ) -> PtcResult<Self> {
+        if !super::sandbox::image_is_digest_pinned(&sandbox_config.image) {
+            tracing::warn!(
+                image = %sandbox_config.image,
+                "PTC sandbox image is not pinned by digest (mutable tag); set PTC_IMAGE=<image>@sha256:<digest>"
+            );
+        }
         let sandbox = Arc::new(SandboxExecutor::with_config(sandbox_config).await?);
+        // Leftovers of a crashed / killed previous run.
+        sandbox.sweep_orphan_containers().await;
         Ok(Self {
             sandbox,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             container_handles: Arc::new(RwLock::new(HashMap::new())),
             execution_states: Arc::new(RwLock::new(HashMap::new())),
-            reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reservations: Arc::new(std::sync::Mutex::new(ReservationCounts::default())),
             limits: PtcLimits::from_env(),
             session_timeout,
             max_iterations,
@@ -526,22 +600,42 @@ impl PtcService {
     // Session Management
     // ========================================================================
 
-    /// Reserve a session slot under the per-owner and global caps.
-    async fn reserve_slot(&self, owner: &str) -> PtcResult<SlotReservation> {
+    /// Reserve a slot under the global, per-key and per-user caps.
+    async fn reserve_slot(&self, owner: &str, user: Option<&str>) -> PtcResult<SlotReservation> {
         let sessions = self.sessions.read().await;
         let mut res = self.reservations.lock().unwrap_or_else(|e| e.into_inner());
-        let total = sessions.len() + res.values().sum::<usize>();
+        let total = sessions.len() + res.total();
         let owner_count = sessions
             .values()
             .filter(|s| s.owner_key_hash == owner)
             .count()
-            + res.get(owner).copied().unwrap_or(0);
-        check_session_caps(total, owner_count, &self.limits)?;
-        *res.entry(owner.to_string()).or_default() += 1;
+            + res.by_key.get(owner).copied().unwrap_or(0);
+        let user_count = user.map(|u| {
+            sessions
+                .values()
+                .filter(|s| s.owner_user_id.as_deref() == Some(u))
+                .count()
+                + res.by_user.get(u).copied().unwrap_or(0)
+        });
+        check_session_caps(total, owner_count, user_count, &self.limits)?;
+        res.add(owner, user);
         Ok(SlotReservation {
             reservations: Arc::clone(&self.reservations),
             owner: owner.to_string(),
+            user: user.map(str::to_string),
         })
+    }
+
+    /// Reserve a slot for a one-shot code execution (web-tool dynamic
+    /// filtering): same global / per-key / per-user caps as sessions; hold
+    /// the returned guard for the duration of the run.
+    pub async fn reserve_oneshot(
+        &self,
+        owner_key_hash: &str,
+        owner_user_id: Option<&str>,
+    ) -> PtcResult<SlotReservation> {
+        self.cleanup_expired_sessions().await;
+        self.reserve_slot(owner_key_hash, owner_user_id).await
     }
 
     /// Create a new PTC session with tool support.
@@ -553,22 +647,30 @@ impl PtcService {
         &self,
         tool_names: &[String],
         owner_key_hash: &str,
+        owner_user_id: Option<&str>,
     ) -> PtcResult<String> {
         validate_tool_names(tool_names)?;
 
         // Free slots held by expired sessions before checking the caps.
         self.cleanup_expired_sessions().await;
-        let _slot = self.reserve_slot(owner_key_hash).await?;
+        let _slot = self.reserve_slot(owner_key_hash, owner_user_id).await?;
 
         let session_id = format!("ptc_sess_{}", uuid::Uuid::new_v4());
 
         // 1. Create container (not started yet)
         let container = self.sandbox.create_runner_container(tool_names).await?;
+        // Cancellation-safe: if this future is dropped (client disconnect)
+        // before the session is stored, the guard spawns the removal.
+        let guard = super::sandbox::ContainerCleanupGuard::new(
+            Arc::clone(&self.sandbox),
+            container.id.clone(),
+        );
 
         // 2. Attach, start, wait for ready — remove the container on failure.
         let handle = match self.start_runner(&container.id).await {
             Ok(h) => h,
             Err(e) => {
+                guard.disarm();
                 let _ = self.sandbox.stop_and_remove(&container.id).await;
                 return Err(e);
             }
@@ -579,6 +681,7 @@ impl PtcService {
             id: session_id.clone(),
             container,
             owner_key_hash: owner_key_hash.to_string(),
+            owner_user_id: owner_user_id.map(str::to_string),
             allowed_tools: tool_names.to_vec(),
             created_at: chrono::Utc::now(),
             last_activity: chrono::Utc::now(),
@@ -588,17 +691,23 @@ impl PtcService {
         };
 
         let abort = handle.reader_abort_handle();
-        self.container_handles.write().await.insert(
+        let reader = handle.reader_state();
+        // Both maps are locked before either insert, and the guard is
+        // disarmed only once the session is visible to sweeps / teardown.
+        let mut handles = self.container_handles.write().await;
+        let mut sessions = self.sessions.write().await;
+        handles.insert(
             session_id.clone(),
             SessionHandle {
                 handle: Arc::new(TokioMutex::new(handle)),
                 abort,
+                reader,
             },
         );
-        self.sessions
-            .write()
-            .await
-            .insert(session_id.clone(), session);
+        sessions.insert(session_id.clone(), session);
+        guard.disarm();
+        drop(sessions);
+        drop(handles);
 
         tracing::info!(session_id, "PTC session created with attach");
         Ok(session_id)
@@ -683,11 +792,19 @@ impl PtcService {
     /// Clean up expired sessions. Called by the background sweep task and
     /// before every session creation.
     pub async fn cleanup_expired_sessions(&self) -> usize {
+        let poisoned: std::collections::HashSet<String> = self
+            .container_handles
+            .read()
+            .await
+            .iter()
+            .filter(|(_, h)| h.reader.is_poisoned())
+            .map(|(id, _)| id.clone())
+            .collect();
         let expired: Vec<(String, String)> = {
             let mut sessions = self.sessions.write().await;
             let ids: Vec<String> = sessions
                 .iter()
-                .filter(|(_, s)| s.is_expired(self.session_timeout))
+                .filter(|(id, s)| s.is_expired(self.session_timeout) || poisoned.contains(*id))
                 .map(|(id, _)| id.clone())
                 .collect();
             ids.into_iter()
@@ -756,6 +873,7 @@ impl PtcService {
         session_id: &str,
         code: &str,
     ) -> PtcResult<ContainerMessage> {
+        let guard = self.exchange_guard(session_id);
         let result = async {
             self.with_session(session_id, |session| {
                 session.state = SessionState::Executing;
@@ -773,7 +891,9 @@ impl PtcService {
             h.recv_message_timeout(self.exchange_timeout()).await
         }
         .await;
-        self.after_exchange(session_id, result).await
+        let out = self.after_exchange(session_id, result).await;
+        guard.disarm();
+        out
     }
 
     /// Send tool results to the container and wait for the next message.
@@ -782,6 +902,7 @@ impl PtcService {
         session_id: &str,
         results: &serde_json::Value,
     ) -> PtcResult<ContainerMessage> {
+        let guard = self.exchange_guard(session_id);
         let result = async {
             self.with_session(session_id, |session| {
                 session.state = SessionState::Executing;
@@ -795,7 +916,24 @@ impl PtcService {
             h.recv_message_timeout(self.exchange_timeout()).await
         }
         .await;
-        self.after_exchange(session_id, result).await
+        let out = self.after_exchange(session_id, result).await;
+        guard.disarm();
+        out
+    }
+
+    /// Drop guard for one exchange: if the request future is dropped while
+    /// the exchange is in flight (client disconnect), the session — whose
+    /// code is still running and whose next frame nobody will read — is
+    /// removed in the background instead of holding a slot until expiry.
+    fn exchange_guard(&self, session_id: &str) -> ExchangeGuard {
+        ExchangeGuard {
+            armed: true,
+            session_id: session_id.to_string(),
+            sessions: Arc::clone(&self.sessions),
+            handles: Arc::clone(&self.container_handles),
+            states: Arc::clone(&self.execution_states),
+            sandbox: Arc::clone(&self.sandbox),
+        }
     }
 
     /// Validate the exchange outcome and update session state; tear the
@@ -922,6 +1060,49 @@ impl PtcService {
             docker_version,
             active_sessions,
         }
+    }
+}
+
+/// See [`PtcService::exchange_guard`].
+struct ExchangeGuard {
+    armed: bool,
+    session_id: String,
+    sessions: Arc<RwLock<HashMap<String, PtcSession>>>,
+    handles: Arc<RwLock<HashMap<String, SessionHandle>>>,
+    states: Arc<RwLock<HashMap<String, PtcExecutionState>>>,
+    sandbox: Arc<SandboxExecutor>,
+}
+
+impl ExchangeGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExchangeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let id = std::mem::take(&mut self.session_id);
+        let sessions = Arc::clone(&self.sessions);
+        let handles = Arc::clone(&self.handles);
+        let states = Arc::clone(&self.states);
+        let sandbox = Arc::clone(&self.sandbox);
+        rt.spawn(async move {
+            let session = sessions.write().await.remove(&id);
+            if let Some(h) = handles.write().await.remove(&id) {
+                h.abort.abort();
+            }
+            states.write().await.remove(&id);
+            if let Some(s) = session {
+                tracing::info!(session_id = %id, "PTC exchange cancelled; session removed");
+                let _ = sandbox.stop_and_remove(&s.container.id).await;
+            }
+        });
     }
 }
 
@@ -1072,12 +1253,17 @@ mod tests {
 
     #[test]
     fn test_limits_from_values() {
-        assert_eq!(PtcLimits::from_values(None, None), PtcLimits::default());
-        let l = PtcLimits::from_values(Some("10"), Some("2"));
+        assert_eq!(
+            PtcLimits::from_values(None, None, None),
+            PtcLimits::default()
+        );
+        let l = PtcLimits::from_values(Some("10"), Some("2"), Some("5"));
         assert_eq!(l.max_sessions, 10);
         assert_eq!(l.max_sessions_per_owner, 2);
+        assert_eq!(l.max_sessions_per_user, 5);
+        assert_eq!(PtcLimits::default().max_sessions_per_user, 8);
         // Zero / garbage fall back to defaults.
-        let l = PtcLimits::from_values(Some("0"), Some("abc"));
+        let l = PtcLimits::from_values(Some("0"), Some("abc"), Some("-1"));
         assert_eq!(l, PtcLimits::default());
     }
 
@@ -1086,16 +1272,20 @@ mod tests {
         let limits = PtcLimits {
             max_sessions: 3,
             max_sessions_per_owner: 2,
+            max_sessions_per_user: 2,
         };
-        assert!(check_session_caps(0, 0, &limits).is_ok());
-        assert!(check_session_caps(2, 1, &limits).is_ok());
-        let e = check_session_caps(2, 2, &limits).unwrap_err();
+        assert!(check_session_caps(0, 0, None, &limits).is_ok());
+        assert!(check_session_caps(2, 1, Some(1), &limits).is_ok());
+        let e = check_session_caps(2, 2, None, &limits).unwrap_err();
         assert!(matches!(e, PtcError::SessionLimitExceeded(_)));
         assert_eq!(e.status_code(), 429);
         assert!(matches!(
-            check_session_caps(3, 0, &limits),
+            check_session_caps(3, 0, None, &limits),
             Err(PtcError::SessionLimitExceeded(_))
         ));
+        // Per-user cap: one user's many keys cannot fill the global pool.
+        let e = check_session_caps(2, 0, Some(2), &limits).unwrap_err();
+        assert!(e.to_string().contains("per user"), "{e}");
     }
 
     #[test]
@@ -1169,20 +1359,51 @@ mod tests {
 
     #[test]
     fn test_slot_reservation_released_on_drop() {
-        let map = Arc::new(std::sync::Mutex::new(HashMap::from([("k".to_string(), 2)])));
-        {
-            let _a = SlotReservation {
-                reservations: Arc::clone(&map),
+        let counts = Arc::new(std::sync::Mutex::new(ReservationCounts::default()));
+        let reserve = |user: Option<&str>| {
+            counts.lock().unwrap().add("k", user);
+            SlotReservation {
+                reservations: Arc::clone(&counts),
                 owner: "k".into(),
-            };
-        }
-        assert_eq!(map.lock().unwrap().get("k"), Some(&1));
-        {
-            let _b = SlotReservation {
-                reservations: Arc::clone(&map),
-                owner: "k".into(),
-            };
-        }
-        assert!(map.lock().unwrap().get("k").is_none());
+                user: user.map(str::to_string),
+            }
+        };
+        let a = reserve(Some("u"));
+        let b = reserve(None);
+        assert_eq!(counts.lock().unwrap().total(), 2);
+        assert_eq!(counts.lock().unwrap().by_user.get("u"), Some(&1));
+        drop(a);
+        assert_eq!(counts.lock().unwrap().by_key.get("k"), Some(&1));
+        assert!(!counts.lock().unwrap().by_user.contains_key("u"));
+        drop(b);
+        assert!(counts.lock().unwrap().by_key.is_empty());
+    }
+
+    #[test]
+    fn test_session_absolute_lifetime() {
+        let now = chrono::Utc::now();
+        let mut s = PtcSession {
+            id: "s".into(),
+            container: ContainerInfo {
+                id: "c".into(),
+                name: "n".into(),
+                created_at: now,
+                running: true,
+            },
+            owner_key_hash: "k".into(),
+            owner_user_id: None,
+            allowed_tools: vec![],
+            created_at: now,
+            last_activity: now,
+            pending_tool_calls: vec![],
+            iteration_count: 0,
+            state: SessionState::Active,
+        };
+        assert!(!s.is_expired(270));
+        s.created_at = now - chrono::Duration::seconds(MAX_SESSION_LIFETIME_SECS as i64 + 5);
+        assert!(
+            s.is_expired(270),
+            "activity must not extend past the lifetime"
+        );
     }
 }

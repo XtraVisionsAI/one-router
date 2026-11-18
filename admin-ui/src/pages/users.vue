@@ -16,7 +16,8 @@
   const users = ref<User[]>([])
   const teams = ref<Team[]>([])
   const teamsApi = useTeamsApi()
-  const teamName = (id: string | null) => (id ? (teams.value.find((t) => t.team_id === id)?.name ?? id.slice(0, 8)) : '—')
+  const teamName = (id: string | null) =>
+    id ? (teams.value.find((t) => t.team_id === id)?.name ?? id.slice(0, 8)) : '—'
   const loading = ref(true)
   const modalShow = ref(false)
   const editing = ref<User | undefined>()
@@ -115,21 +116,33 @@
       title: 'Status',
       key: 'is_active',
       render: (u: User) =>
-        h(NTag, { type: u.is_active ? 'success' : 'error', size: 'small' }, { default: () => (u.is_active ? 'active' : 'inactive') })
+        h(
+          NTag,
+          { type: u.is_active ? 'success' : 'error', size: 'small' },
+          { default: () => (u.is_active ? 'active' : 'inactive') }
+        )
     },
     {
       title: 'Actions',
       key: 'actions',
       render: (u: User) =>
         h('div', { class: 'flex gap-2' }, [
-          h(NButton, { size: 'small', onClick: () => router.push({ path: '/keys', query: { user: u.user_id } }) }, { default: () => 'Keys' }),
+          h(
+            NButton,
+            { size: 'small', onClick: () => router.push({ path: '/keys', query: { user: u.user_id } }) },
+            { default: () => 'Keys' }
+          ),
           h(NButton, { size: 'small', onClick: () => openEdit(u) }, { default: () => 'Edit' }),
           h(
             NButton,
             { size: 'small', type: u.is_active ? 'warning' : 'default', onClick: () => toggleActive(u) },
             { default: () => (u.is_active ? 'Deactivate' : 'Activate') }
           ),
-          h(NButton, { size: 'small', type: 'error', ghost: true, onClick: () => confirmDelete(u) }, { default: () => 'Delete' })
+          h(
+            NButton,
+            { size: 'small', type: 'error', ghost: true, onClick: () => confirmDelete(u) },
+            { default: () => 'Delete' }
+          )
         ])
     }
   ]

@@ -56,8 +56,14 @@
       expandable: (r: AuditEntry) => r.before_json != null || r.after_json != null,
       renderExpand: (r: AuditEntry) =>
         h('div', { class: 'grid grid-cols-2 gap-4' }, [
-          h('div', [h('div', { class: 'text-xs text-slate-400 mb-1' }, 'Before'), h(NCode, { code: JSON.stringify(r.before_json, null, 2) ?? '—', language: 'json' })]),
-          h('div', [h('div', { class: 'text-xs text-slate-400 mb-1' }, 'After'), h(NCode, { code: JSON.stringify(r.after_json, null, 2) ?? '—', language: 'json' })])
+          h('div', [
+            h('div', { class: 'text-xs text-slate-400 mb-1' }, 'Before'),
+            h(NCode, { code: JSON.stringify(r.before_json, null, 2) ?? '—', language: 'json' })
+          ]),
+          h('div', [
+            h('div', { class: 'text-xs text-slate-400 mb-1' }, 'After'),
+            h(NCode, { code: JSON.stringify(r.after_json, null, 2) ?? '—', language: 'json' })
+          ])
         ])
     },
     {
@@ -78,7 +84,8 @@
       title: 'Status',
       key: 'status',
       width: 80,
-      render: (r: AuditEntry) => h(NTag, { size: 'small', type: statusType(r.status) }, { default: () => String(r.status) })
+      render: (r: AuditEntry) =>
+        h(NTag, { size: 'small', type: statusType(r.status) }, { default: () => String(r.status) })
     },
     { title: 'Client', key: 'source_ip', width: 130, render: (r: AuditEntry) => r.source_ip ?? '—' }
   ]
@@ -95,15 +102,15 @@
     </p>
 
     <div class="flex gap-3 mb-4 flex-wrap items-end">
-      <NSelect v-model:value="action" :options="actionOptions" style="width: 180px" />
-      <NSelect v-model:value="targetType" :options="targetOptions" style="width: 160px" />
-      <NInput v-model:value="targetId" placeholder="Target id" clearable style="width: 260px" @keyup.enter="load()" />
-      <NButton @click="load()">Search</NButton>
+      <n-select v-model:value="action" :options="actionOptions" style="width: 180px" />
+      <n-select v-model:value="targetType" :options="targetOptions" style="width: 160px" />
+      <n-input v-model:value="targetId" placeholder="Target id" clearable style="width: 260px" @keyup.enter="load()" />
+      <n-button @click="load()">Search</n-button>
     </div>
 
-    <NDataTable :columns="columns" :data="rows" :loading="loading" :row-key="(r: AuditEntry) => r.id" size="small" />
+    <n-data-table :columns="columns" :data="rows" :loading="loading" :row-key="(r: AuditEntry) => r.id" size="small" />
     <div v-if="hasMore" class="mt-4 text-center">
-      <NButton :loading="loading" @click="load(true)">Load more</NButton>
+      <n-button :loading="loading" @click="load(true)">Load more</n-button>
     </div>
   </div>
 </template>
