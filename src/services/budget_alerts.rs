@@ -58,6 +58,10 @@ pub fn parse_webhook_url(raw: &str) -> Result<Option<String>, String> {
     if url.scheme() != "https" {
         return Err("webhook URL must use https".into());
     }
+    // IP-literal hosts never reach the guarded DNS resolver of the webhook
+    // client, so private / metadata literals are refused here (write and load
+    // time); hostnames are checked by the resolver at connect time.
+    crate::services::web_tools::ssrf::check_url_static(&url)?;
     Ok(Some(raw.to_string()))
 }
 
@@ -168,6 +172,19 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(parse_webhook_url("not a url").is_err());
+        // IP literals bypass the guarded resolver: refused at parse time.
+        for bad in [
+            "https://169.254.169.254/hook",
+            "https://127.0.0.1:8443/hook",
+            "https://[::1]/hook",
+            "https://2130706433/hook",
+            "https://localhost./hook",
+        ] {
+            assert!(parse_webhook_url(bad).is_err(), "{bad}");
+        }
+        assert!(parse_webhook_url("https://93.184.216.34/hook")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

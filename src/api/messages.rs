@@ -132,6 +132,12 @@ type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> 
 pub enum MessageApiResponse {
     Json(Json<MessageResponse>),
     Stream(SseStream),
+    /// SSE stream whose usage is recorded at body end **or** on client
+    /// disconnect (see `services::stream_billing`).
+    Billed(
+        SseStream,
+        Box<crate::services::stream_billing::StreamBilling>,
+    ),
 }
 
 impl IntoResponse for MessageApiResponse {
@@ -141,6 +147,14 @@ impl IntoResponse for MessageApiResponse {
             MessageApiResponse::Stream(stream) => Sse::new(stream)
                 .keep_alive(crate::api::sse_keep_alive())
                 .into_response(),
+            MessageApiResponse::Billed(stream, billing) => {
+                crate::services::stream_billing::bill_sse_response(
+                    Sse::new(stream)
+                        .keep_alive(crate::api::sse_keep_alive())
+                        .into_response(),
+                    *billing,
+                )
+            }
         }
     }
 }
@@ -169,14 +183,37 @@ pub async fn create_message(
 
     // PTC requests are Bedrock/Docker-specific and must NOT be failed over to a
     // different provider; detect PTC up front so failover can skip it.
-    let is_ptc = state
+    // `ptc_requested` is only the request shape (beta header + code_execution
+    // tool) with the sandbox configured (`PTC_ENABLED=true` + Docker).
+    let ptc_requested = state
         .ptc_service
         .as_ref()
         .map(|svc| svc.is_ptc_request(&request, beta_header.as_deref()))
         .unwrap_or(false);
 
     // Resolve model via data-driven routing + credential-exhaustion failover.
-    let resolved = resolve_request_route(&state, &request.model, &request_id, is_ptc).await?;
+    let mut resolved =
+        resolve_request_route(&state, &request.model, &request_id, ptc_requested).await?;
+
+    // The proxy-side PTC branch additionally requires the model's effective
+    // `ptc` capability (per-model, else the `enable_ptc` default — off) and a
+    // Bedrock route. Otherwise the request takes the normal provider path
+    // unchanged (Anthropic passthrough serves PTC natively; other backends
+    // answer the unsupported tool with their own error).
+    let is_ptc = ptc_requested
+        && crate::api::ptc_handler::ptc_route_enabled(
+            &resolved.provider,
+            &effective_capabilities(&state, &resolved).await,
+        );
+    if ptc_requested && !is_ptc {
+        tracing::debug!(
+            request_id = %request_id,
+            provider = %resolved.provider,
+            "PTC requested but not enabled for this model/provider; using normal path"
+        );
+        // Failover was skipped for the PTC candidate — resolve again with it.
+        resolved = resolve_request_route(&state, &request.model, &request_id, false).await?;
+    }
 
     // Bedrock/Gemini image blocks require inline base64; the Anthropic/OpenAI
     // passthroughs accept url image sources natively. Download and inline any
@@ -207,10 +244,12 @@ pub async fn create_message(
     }
 
     // PTC detection: check before normal routing (see `is_ptc` above).
-    // `is_ptc` is only true when ptc_service is configured.
     if is_ptc {
         tracing::info!(request_id, "Detected PTC request");
 
+        // Usage of every Bedrock call in the PTC flow, accumulated by the
+        // handler — recorded even when the flow fails after a billed call.
+        let mut ptc_usage = crate::schemas::anthropic::Usage::new(0, 0);
         let ptc_result = if let Some(ref container_id) = request.container {
             crate::api::ptc_handler::handle_ptc_continuation(
                 &state,
@@ -219,6 +258,7 @@ pub async fn create_message(
                 &request_id,
                 container_id,
                 &key_info,
+                &mut ptc_usage,
             )
             .await
         } else {
@@ -228,27 +268,32 @@ pub async fn create_message(
                 &resolved.target_model_id,
                 &request_id,
                 &key_info,
+                &mut ptc_usage,
             )
             .await
         };
 
-        let response = ptc_result?;
-
         // Record usage
-        let usage = response.usage.clone();
+        let usage = ptc_usage.clone();
+        let success = ptc_result.is_ok();
         let tracker = state.usage_tracker.clone();
         let key = key_info.clone();
         let model = request.model.clone();
         let rid = request_id.clone();
         let provider = resolved.provider.clone();
+        let billed = usage.input_tokens > 0 || usage.output_tokens > 0;
         tokio::spawn(async move {
+            // A failure before any Bedrock call has nothing to bill.
+            if !success && !billed {
+                return;
+            }
             if let Err(e) = tracker
                 .record_usage(
                     &key,
                     &rid,
                     &model,
                     &usage,
-                    true,
+                    success,
                     &provider,
                     "anthropic",
                     key.cache_ttl.as_deref(),
@@ -258,6 +303,9 @@ pub async fn create_message(
                 tracing::warn!(error = %e, "Failed to record PTC usage");
             }
         });
+
+        let mut response = ptc_result?;
+        response.usage = ptc_usage;
 
         if request.stream {
             return Ok(MessageApiResponse::Stream(response_to_sse_stream(response)));
@@ -370,7 +418,7 @@ pub async fn create_message(
                 backend,
                 resolved.target_model_id.clone(),
             );
-            let wrapped = wrap_stream_with_usage_recording(
+            return Ok(wrap_stream_with_usage_recording(
                 stream,
                 stream_usage,
                 state.usage_tracker.clone(),
@@ -380,8 +428,8 @@ pub async fn create_message(
                 resolved.provider.clone(),
                 "anthropic",
                 effective_cache_ttl.clone(),
-            );
-            return Ok(MessageApiResponse::Stream(wrapped));
+                crate::utils::tokens::estimate_message_request_tokens(&filtered_request),
+            ));
         }
 
         // Non-streaming: use run() and return JSON
@@ -496,20 +544,19 @@ pub async fn create_message(
             });
             result
         }
-        Ok(MessageApiResponse::Stream(stream)) => {
-            let wrapped = wrap_stream_with_usage_recording(
-                stream,
-                stream_usage,
-                state.usage_tracker.clone(),
-                key_info.clone(),
-                request.model.clone(),
-                request_id,
-                resolved.provider.clone(),
-                "anthropic",
-                effective_cache_ttl.clone(),
-            );
-            Ok(MessageApiResponse::Stream(wrapped))
-        }
+        Ok(MessageApiResponse::Stream(stream)) => Ok(wrap_stream_with_usage_recording(
+            stream,
+            stream_usage,
+            state.usage_tracker.clone(),
+            key_info.clone(),
+            request.model.clone(),
+            request_id,
+            resolved.provider.clone(),
+            "anthropic",
+            effective_cache_ttl.clone(),
+            crate::utils::tokens::estimate_message_request_tokens(&filtered_request),
+        )),
+        Ok(MessageApiResponse::Billed(..)) => result,
         Err(_) => {
             // Backend/routing failure after provider is known. record_usage
             // only runs on success, so record the error outcome here to keep
@@ -615,8 +662,11 @@ struct UsageContext {
     cache_ttl: Option<String>,
 }
 
-/// Wrap an SSE stream so that after the inner stream completes, usage is
-/// read from the shared `StreamUsage` state and recorded via the tracker.
+/// Attach usage billing to an SSE stream: usage is recorded once, when the
+/// encoded body ends (the inner stream's exact `StreamUsage`, or what the
+/// body showed if the inner stream never wrote it) **or** when the client
+/// disconnects mid-stream (usage seen so far + estimates). See
+/// `services::stream_billing`.
 #[allow(clippy::too_many_arguments)]
 fn wrap_stream_with_usage_recording(
     inner: SseStream,
@@ -628,29 +678,31 @@ fn wrap_stream_with_usage_recording(
     provider: String,
     protocol: &'static str,
     cache_ttl: Option<String>,
-) -> SseStream {
-    use futures::StreamExt;
-    let stream = async_stream::stream! {
-        let mut inner = inner;
-        while let Some(item) = inner.next().await {
-            yield item;
-        }
-        let u = usage.lock().await;
-        let anthropic_usage = crate::schemas::anthropic::Usage {
+    input_estimate: i32,
+) -> MessageApiResponse {
+    let exact: crate::services::stream_billing::ExactUsage = Arc::new(move || {
+        let u = usage.try_lock().ok()?;
+        Some(crate::schemas::anthropic::Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cache_creation_input_tokens: u.cache_creation_input_tokens,
             cache_read_input_tokens: u.cache_read_input_tokens,
-        };
-        drop(u);
-        if let Err(e) = tracker
-            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true, &provider, protocol, cache_ttl.as_deref())
-            .await
-        {
-            tracing::warn!(error = %e, "Failed to record streaming usage");
-        }
-    };
-    Box::pin(stream)
+        })
+    });
+    MessageApiResponse::Billed(
+        inner,
+        Box::new(crate::services::stream_billing::StreamBilling {
+            tracker,
+            key_info,
+            request_id,
+            model,
+            provider,
+            protocol,
+            cache_ttl,
+            input_estimate,
+            exact: Some(exact),
+        }),
+    )
 }
 
 /// Handle request using Bedrock backend
@@ -1641,16 +1693,11 @@ async fn create_gemini_streaming_response(
                 Err(e) => {
                     stream_error = true;
                     tracing::error!(request_id = %req_id, error = %e, "Gemini stream error");
-                    let error_data = serde_json::json!({
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": e.to_string()
-                        }
-                    });
+                    // Redacting constructor: reqwest errors carry the request URL.
+                    let error_data = ErrorResponse::new("api_error", e.to_string());
                     yield Ok(Event::default()
                         .event("error")
-                        .data(error_data.to_string()));
+                        .data(error_data.to_json_string()));
                     break;
                 }
             }

@@ -11,6 +11,11 @@
 //!
 //! Guarded clients also disable system proxies (`HTTP(S)_PROXY` would resolve
 //! names on our behalf and bypass both layers).
+//!
+//! IP-literal hosts never reach a resolver, so [`check_url_static`] must run
+//! on every URL sent with a guarded client — [`send_guarded`] and
+//! [`safe_get_bytes`] do it for you. Bodies are read with
+//! [`read_body_capped`] (streamed, never buffered past the cap).
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -84,11 +89,17 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Validate a URL for proxy-side fetching. Rejects non-HTTP(S) schemes,
-/// blocked hostnames, and any target address in a forbidden range. For
-/// hostnames, resolves DNS and returns the addresses so the caller can pin
-/// the connection to them.
-pub async fn validate_url(url: &reqwest::Url) -> Result<ValidatedTarget, String> {
+/// Static (no DNS) URL check: length, http(s) scheme, a host, blocked
+/// hostnames, and — crucially — **IP-literal hosts**. reqwest/hyper never call
+/// the DNS resolver for an IP literal (`https://169.254.169.254/`,
+/// `http://[::ffff:127.0.0.1]/`, `http://2130706433/` which the URL parser
+/// normalizes to `127.0.0.1`), so [`GuardedResolver`] cannot see them; every
+/// request made with a [`guarded_client`] must pass this check first (use
+/// [`send_guarded`], [`safe_get_bytes`] or [`validate_url`]).
+///
+/// Returns the normalized host (lowercase, no brackets / trailing dot) and the
+/// IP when the host is a literal.
+pub fn check_url_static(url: &reqwest::Url) -> Result<(String, Option<IpAddr>), String> {
     if url.as_str().len() > MAX_URL_LEN {
         return Err(format!("URL exceeds maximum length of {MAX_URL_LEN}"));
     }
@@ -96,24 +107,39 @@ pub async fn validate_url(url: &reqwest::Url) -> Result<ValidatedTarget, String>
         "http" | "https" => {}
         s => return Err(format!("URL scheme '{s}' is not allowed")),
     }
+    // The WHATWG parser already normalized IPv4 shorthands (decimal / octal /
+    // hex) to dotted form; IPv6 literals come bracketed.
     let host = url
         .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?;
-    let host = host
+        .unwrap_or_default()
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim_end_matches('.')
         .to_ascii_lowercase();
-
+    if host.is_empty() {
+        return Err("URL has no host".to_string());
+    }
     if BLOCKED_HOSTS.contains(&host.as_str()) {
         return Err(format!("Host '{host}' is not allowed"));
     }
-
-    // IP literal: check directly, nothing to pin.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_forbidden_ip(ip) {
             return Err(format!("Address '{ip}' is in a forbidden range"));
         }
+        return Ok((host, Some(ip)));
+    }
+    Ok((host, None))
+}
+
+/// Validate a URL for proxy-side fetching. Rejects non-HTTP(S) schemes,
+/// blocked hostnames, and any target address in a forbidden range. For
+/// hostnames, resolves DNS and returns the addresses so the caller can pin
+/// the connection to them.
+pub async fn validate_url(url: &reqwest::Url) -> Result<ValidatedTarget, String> {
+    let (host, ip) = check_url_static(url)?;
+
+    // IP literal: already checked, nothing to pin.
+    if ip.is_some() {
         return Ok(ValidatedTarget {
             host,
             pinned_addrs: Vec::new(),
@@ -174,6 +200,11 @@ impl reqwest::dns::Resolve for GuardedResolver {
 /// A reqwest client for fetching untrusted / admin-supplied URLs: guarded DNS,
 /// no system proxy, no automatic redirects (callers that follow redirects do
 /// so manually, re-validating each hop).
+///
+/// The guarded resolver only sees **names**: an IP-literal URL connects
+/// without resolution. Send through [`send_guarded`] (or validate every URL
+/// with [`check_url_static`] beforehand, as `budget_alerts::parse_webhook_url`
+/// does at write and load time).
 pub fn guarded_client(timeout: Duration, user_agent: &str) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(timeout)
@@ -183,6 +214,66 @@ pub fn guarded_client(timeout: Duration, user_agent: &str) -> Result<reqwest::Cl
         .dns_resolver(std::sync::Arc::new(GuardedResolver))
         .build()
         .map_err(|e| e.to_string())
+}
+
+/// Build `request`, run the static URL check (IP literals, scheme, blocked
+/// hosts) on its final URL, then execute it on `client` (a [`guarded_client`],
+/// whose resolver covers hostnames at connect time). Errors never include the
+/// URL (it may carry a token).
+pub async fn send_guarded(
+    client: &reqwest::Client,
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    let request = request.build().map_err(|e| e.without_url().to_string())?;
+    check_url_static(request.url())?;
+    client
+        .execute(request)
+        .await
+        .map_err(|e| e.without_url().to_string())
+}
+
+/// Read a response body, never buffering more than `max_bytes` (plus one
+/// network chunk): `Truncate` stops reading at the cap and keeps the prefix,
+/// `Reject` errors as soon as the cap is exceeded. A declared `Content-Length`
+/// over the cap is rejected up front under `Reject`.
+pub async fn read_body_capped(
+    response: reqwest::Response,
+    max_bytes: usize,
+    oversize: OversizePolicy,
+) -> Result<Vec<u8>, String> {
+    use futures::StreamExt;
+    let declared = response.content_length();
+    if oversize == OversizePolicy::Reject {
+        if let Some(len) = declared {
+            if len > max_bytes as u64 {
+                return Err(format!(
+                    "response body exceeds maximum size ({len} > {max_bytes} bytes)"
+                ));
+            }
+        }
+    }
+    let initial = declared.map_or(0, |l| l.min(max_bytes as u64) as usize);
+    let mut buf: Vec<u8> = Vec::with_capacity(initial.min(1024 * 1024));
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.without_url().to_string())?;
+        let room = max_bytes - buf.len();
+        if chunk.len() > room {
+            match oversize {
+                OversizePolicy::Truncate => {
+                    buf.extend_from_slice(&chunk[..room]);
+                    break;
+                }
+                OversizePolicy::Reject => {
+                    return Err(format!(
+                        "response body exceeds maximum size (> {max_bytes} bytes)"
+                    ));
+                }
+            }
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Bytes fetched by an SSRF-guarded GET, plus the response content type.
@@ -232,11 +323,7 @@ pub async fn safe_get_bytes(
         validate_url(&current).await?;
         let client = guarded_client(timeout, user_agent)?;
 
-        let response = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(|e| e.without_url().to_string())?;
+        let response = send_guarded(&client, client.get(current.clone())).await?;
 
         let status = response.status();
         if status.is_redirection() {
@@ -263,32 +350,8 @@ pub async fn safe_get_bytes(
             .to_string();
         let final_url = current.to_string();
 
-        // When rejecting oversize, short-circuit on a declared Content-Length
-        // over the cap so an oversized body is never buffered.
-        if oversize == OversizePolicy::Reject {
-            if let Some(len) = response.content_length() {
-                if len as usize > max_bytes {
-                    return Err(format!(
-                        "response body exceeds maximum size ({len} > {max_bytes} bytes)"
-                    ));
-                }
-            }
-        }
-
-        let full = response.bytes().await.map_err(|e| e.to_string())?;
-        let bytes = if full.len() > max_bytes {
-            match oversize {
-                OversizePolicy::Truncate => full[..max_bytes].to_vec(),
-                OversizePolicy::Reject => {
-                    return Err(format!(
-                        "response body exceeds maximum size ({} > {max_bytes} bytes)",
-                        full.len()
-                    ));
-                }
-            }
-        } else {
-            full.to_vec()
-        };
+        // Streamed: an oversized body is never buffered past the cap.
+        let bytes = read_body_capped(response, max_bytes, oversize).await?;
         return Ok(SafeGetResult {
             bytes,
             content_type,
@@ -378,6 +441,117 @@ mod tests {
             !accepted.await.unwrap(),
             "loopback listener must not be reached"
         );
+    }
+
+    #[test]
+    fn static_check_blocks_ip_literals_in_every_form() {
+        for u in [
+            "https://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/",
+            "http://2130706433/",         // decimal 127.0.0.1
+            "http://0x7f.1/",             // hex shorthand
+            "http://[::ffff:127.0.0.1]/", // IPv4-mapped
+            "http://[::1]/",
+            "http://[fd00:ec2::254]/", // EC2 IPv6 IMDS
+            "http://10.0.0.1./",
+            "http://localhost./",
+            "http://LOCALHOST/",
+            "ftp://example.com/",
+        ] {
+            let url: reqwest::Url = u.parse().unwrap();
+            assert!(check_url_static(&url).is_err(), "{u} must be rejected");
+        }
+        let ok: reqwest::Url = "https://93.184.216.34/x".parse().unwrap();
+        assert!(check_url_static(&ok).is_ok());
+        let ok: reqwest::Url = "https://example.com/x".parse().unwrap();
+        assert_eq!(check_url_static(&ok).unwrap(), ("example.com".into(), None));
+    }
+
+    #[tokio::test]
+    async fn send_guarded_never_connects_to_ip_literal_loopback() {
+        // The resolver is bypassed for IP literals; send_guarded must still
+        // refuse before any connection is attempted.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_ok()
+        });
+        let client = guarded_client(Duration::from_secs(2), "test").unwrap();
+        for url in [
+            format!("http://127.0.0.1:{port}/"),
+            format!("http://[::ffff:127.0.0.1]:{port}/"),
+        ] {
+            let err = send_guarded(&client, client.post(&url)).await.unwrap_err();
+            assert!(err.contains("forbidden"), "{url}: {err}");
+        }
+        assert!(!accepted.await.unwrap(), "loopback must not be reached");
+    }
+
+    /// Serve `body` once (no Content-Length when `declare` is false, so the
+    /// body is read until EOF) and return the URL.
+    async fn serve_once(body: Vec<u8>, declare: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            let head = if declare {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
+            };
+            let _ = sock.write_all(head.as_bytes()).await;
+            for chunk in body.chunks(4096) {
+                if sock.write_all(chunk).await.is_err() {
+                    return;
+                }
+            }
+            let _ = sock.shutdown().await;
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    #[tokio::test]
+    async fn body_cap_truncates_and_rejects_without_content_length() {
+        // Plain client: the capped reader is what is under test (a guarded
+        // client would refuse the loopback test server).
+        let client = reqwest::Client::new();
+        let big = vec![b'a'; 200_000];
+
+        let url = serve_once(big.clone(), false).await;
+        let resp = client.get(&url).send().await.unwrap();
+        let got = read_body_capped(resp, 10_000, OversizePolicy::Truncate)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 10_000);
+
+        let url = serve_once(big.clone(), false).await;
+        let resp = client.get(&url).send().await.unwrap();
+        assert!(read_body_capped(resp, 10_000, OversizePolicy::Reject)
+            .await
+            .is_err());
+
+        // Declared Content-Length over the cap: rejected up front.
+        let url = serve_once(big.clone(), true).await;
+        let resp = client.get(&url).send().await.unwrap();
+        assert!(read_body_capped(resp, 10_000, OversizePolicy::Reject)
+            .await
+            .is_err());
+
+        // Exactly at the cap / under it: returned whole.
+        let url = serve_once(vec![b'b'; 10_000], false).await;
+        let resp = client.get(&url).send().await.unwrap();
+        let got = read_body_capped(resp, 10_000, OversizePolicy::Reject)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 10_000);
     }
 
     #[test]

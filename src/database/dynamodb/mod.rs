@@ -16,6 +16,19 @@ use crate::database::traits::*;
 
 const TABLE_PREFIX: &str = "one_router_";
 
+/// api_keys attributes `update_api_key` never writes: spend counters, alert
+/// claims and the last-used stamp change only through their own atomic paths
+/// (increment / reserve / period reset / claim / touch).
+const KEY_UPDATE_PRESERVED_ATTRS: &[&str] = &[
+    "budget_used",
+    "budget_used_mtd",
+    "budget_mtd_month",
+    "budget_history",
+    "budget_alerts_sent",
+    "last_used_at",
+    "created_at",
+];
+
 /// DynamoDB-backed storage.
 pub struct DynamoDbBackend {
     client: Client,
@@ -35,6 +48,70 @@ impl DynamoDbBackend {
 
     pub fn table_name(name: &str) -> String {
         format!("{TABLE_PREFIX}{name}")
+    }
+
+    /// Add `amount` to a row's spend counters and return the new spend.
+    ///
+    /// DynamoDB update expressions have no `max()`, so a negative amount (a
+    /// precharge refund) is applied conditionally on `budget_used_mtd >= -amount`;
+    /// if that fails the month-to-date counter is set to 0 instead — spend never
+    /// goes negative.
+    async fn add_spend(
+        &self,
+        table: &str,
+        id_attr: &str,
+        id: &str,
+        amount: f64,
+        require_exists: bool,
+    ) -> Result<SpendAfter> {
+        use aws_sdk_dynamodb::types::ReturnValue;
+        let exists = format!("attribute_exists({id_attr})");
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(Self::table_name(table))
+            .key(id_attr, av_s(id))
+            .update_expression(
+                "SET budget_used = budget_used + :amount, \
+                 budget_used_mtd = budget_used_mtd + :amount, updated_at = :now",
+            )
+            .expression_attribute_values(":amount", av_n_f64(amount))
+            .expression_attribute_values(":now", av_n(unix_now()))
+            .return_values(ReturnValue::AllNew);
+        let mut condition = Vec::new();
+        if require_exists {
+            condition.push(exists.clone());
+        }
+        if amount < 0.0 {
+            condition.push("budget_used_mtd >= :refund".to_string());
+            req = req.expression_attribute_values(":refund", av_n_f64(-amount));
+        }
+        if !condition.is_empty() {
+            req = req.condition_expression(condition.join(" AND "));
+        }
+        match req.send().await {
+            Ok(out) => Ok(spend_after(out.attributes())),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if amount < 0.0 && svc.is_conditional_check_failed_exception() {
+                    let out = self
+                        .client
+                        .update_item()
+                        .table_name(Self::table_name(table))
+                        .key(id_attr, av_s(id))
+                        .condition_expression(exists)
+                        .update_expression("SET budget_used_mtd = :zero, updated_at = :now")
+                        .expression_attribute_values(":zero", av_n_f64(0.0))
+                        .expression_attribute_values(":now", av_n(unix_now()))
+                        .return_values(ReturnValue::AllNew)
+                        .send()
+                        .await?;
+                    Ok(spend_after(out.attributes()))
+                } else {
+                    Err(anyhow::anyhow!("{table} spend update: {svc}"))
+                }
+            }
+        }
     }
 
     /// Whether `user_id` already owns a key named `name` (other than
@@ -621,6 +698,17 @@ fn tag_matches(r: &UsageRecord, tag: Option<&str>) -> bool {
     })
 }
 
+/// Newest month partition to scan for an audit upper bound (`end` / `before`).
+/// `get(..7)`: never slice-panic on a short / non-ASCII bound (the admin
+/// handler validates, but storage must not trust its caller); unparsable →
+/// the current month.
+fn audit_start_month(upper: &str) -> chrono::NaiveDate {
+    upper
+        .get(..7)
+        .and_then(|ym| chrono::NaiveDate::parse_from_str(&format!("{ym}-01"), "%Y-%m-%d").ok())
+        .unwrap_or_else(|| chrono::Utc::now().date_naive())
+}
+
 fn audit_from_item(item: &HashMap<String, AttributeValue>) -> AuditLogRecord {
     AuditLogRecord {
         id: get_s(item, "id"),
@@ -956,12 +1044,36 @@ impl ApiKeyStore for DynamoDbBackend {
         {
             return Err(anyhow::anyhow!("UNIQUE constraint failed: api_keys.name"));
         }
+        // Field-wise UPDATE (not a full-item put): live spend counters, alert
+        // claims and last-used stamps change only through their own atomic
+        // paths, and an admin's read-modify-write must not overwrite them.
         let mut item = api_key_to_item(record);
         item.insert("updated_at".into(), av_n(unix_now()));
+        item.remove("api_key");
+        for attr in KEY_UPDATE_PRESERVED_ATTRS {
+            item.remove(*attr);
+        }
+        let mut names = HashMap::new();
+        let mut values = HashMap::new();
+        let mut sets = Vec::new();
+        for (i, (attr, value)) in item.into_iter().enumerate() {
+            names.insert(format!("#a{i}"), attr);
+            values.insert(format!(":v{i}"), value);
+            sets.push(format!("#a{i} = :v{i}"));
+        }
+        let mut expr = format!("SET {}", sets.join(", "));
+        if record.user_id.is_empty() {
+            names.insert("#ruid".to_string(), "user_id".to_string());
+            expr.push_str(" REMOVE #ruid");
+        }
         self.client
-            .put_item()
+            .update_item()
             .table_name(Self::table_name("api_keys"))
-            .set_item(Some(item))
+            .key("api_key", av_s(&record.api_key))
+            .condition_expression("attribute_exists(api_key)")
+            .update_expression(expr)
+            .set_expression_attribute_names(Some(names))
+            .set_expression_attribute_values(Some(values))
             .send()
             .await?;
         Ok(())
@@ -985,24 +1097,8 @@ impl ApiKeyStore for DynamoDbBackend {
     }
 
     async fn increment_budget_used(&self, api_key: &str, amount: f64) -> Result<SpendAfter> {
-        let now = unix_now();
-        let result = self
-            .client
-            .update_item()
-            .table_name(Self::table_name("api_keys"))
-            .key("api_key", av_s(api_key))
-            .update_expression(
-                "SET budget_used = budget_used + :amount, \
-                 budget_used_mtd = budget_used_mtd + :amount, \
-                 updated_at = :now",
-            )
-            .expression_attribute_values(":amount", av_n_f64(amount))
-            .expression_attribute_values(":now", av_n(now))
-            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
-            .send()
-            .await?;
-
-        Ok(spend_after(result.attributes()))
+        self.add_spend("api_keys", "api_key", api_key, amount, false)
+            .await
     }
 
     async fn reset_monthly_budget(
@@ -1310,9 +1406,7 @@ impl AuditStore for DynamoDbBackend {
             .min()
             .map(String::from)
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        let mut month =
-            chrono::NaiveDate::parse_from_str(&format!("{}-01", &upper[..7]), "%Y-%m-%d")
-                .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+        let mut month = audit_start_month(&upper);
         let lower_month = q
             .start
             .as_deref()
@@ -1478,22 +1572,8 @@ impl TeamStore for DynamoDbBackend {
     }
 
     async fn increment_team_budget_used(&self, team_id: &str, amount: f64) -> Result<SpendAfter> {
-        let result = self
-            .client
-            .update_item()
-            .table_name(Self::table_name("teams"))
-            .key("team_id", av_s(team_id))
-            .condition_expression("attribute_exists(team_id)")
-            .update_expression(
-                "SET budget_used = budget_used + :amount, \
-                 budget_used_mtd = budget_used_mtd + :amount, updated_at = :now",
-            )
-            .expression_attribute_values(":amount", av_n_f64(amount))
-            .expression_attribute_values(":now", av_n(unix_now()))
-            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
-            .send()
-            .await?;
-        Ok(spend_after(result.attributes()))
+        self.add_spend("teams", "team_id", team_id, amount, true)
+            .await
     }
 
     async fn reset_team_monthly_budget(
@@ -1746,22 +1826,8 @@ impl UserStore for DynamoDbBackend {
     }
 
     async fn increment_user_budget_used(&self, user_id: &str, amount: f64) -> Result<SpendAfter> {
-        let result = self
-            .client
-            .update_item()
-            .table_name(Self::table_name("users"))
-            .key("user_id", av_s(user_id))
-            .condition_expression("attribute_exists(user_id)")
-            .update_expression(
-                "SET budget_used = budget_used + :amount, \
-                 budget_used_mtd = budget_used_mtd + :amount, updated_at = :now",
-            )
-            .expression_attribute_values(":amount", av_n_f64(amount))
-            .expression_attribute_values(":now", av_n(unix_now()))
-            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
-            .send()
-            .await?;
-        Ok(spend_after(result.attributes()))
+        self.add_spend("users", "user_id", user_id, amount, true)
+            .await
     }
 
     async fn claim_user_budget_alert(
@@ -2411,5 +2477,22 @@ impl SystemSettingStore for DynamoDbBackend {
 
         records.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod audit_month_tests {
+    use super::audit_start_month;
+
+    #[test]
+    fn short_or_odd_bounds_do_not_panic() {
+        let now = chrono::Utc::now().date_naive();
+        for s in ["", "2026", "é", "ééééé", "2026-1"] {
+            assert_eq!(audit_start_month(s), now, "{s}");
+        }
+        assert_eq!(
+            audit_start_month("2026-03-15T00:00:00Z"),
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()
+        );
     }
 }

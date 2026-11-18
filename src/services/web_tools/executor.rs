@@ -7,11 +7,13 @@ use axum::response::sse::Event;
 use futures::stream::Stream;
 
 use crate::schemas::anthropic::{
-    ContentBlock, Message, MessageContent, MessageRequest, MessageResponse, ToolResultValue,
+    ContentBlock, ErrorResponse, Message, MessageContent, MessageRequest, MessageResponse,
+    ToolResultValue,
 };
 use crate::services::bedrock::BedrockService;
 use crate::services::gemini::GeminiService;
 use crate::services::ptc::sandbox::CodeExecutor;
+use crate::services::web_tools::domains::DomainPolicy;
 use crate::services::web_tools::search::SearchResult;
 
 use super::{extract_server_calls, split_tools, ServerToolCall, WebToolError, WebToolKind};
@@ -40,9 +42,61 @@ impl WebToolBackend for BedrockService {
     ) -> Result<MessageResponse, WebToolError> {
         self.invoke_model_messages(request, model, None)
             .await
-            .map_err(|e| WebToolError::BackendError(e.to_string()))
+            .map_err(bedrock_backend_error)
     }
 }
+
+/// Client-safe text for a Bedrock failure inside the web-tool loop. AWS's
+/// AccessDenied text names the host IAM role and account: log it, return the
+/// same generic message as the main Bedrock path (`ApiError::from_bedrock_error`).
+fn bedrock_backend_error(e: crate::services::bedrock::BedrockError) -> WebToolError {
+    use crate::services::bedrock::BedrockError;
+    match e {
+        BedrockError::AccessDenied(msg) => {
+            tracing::warn!(error = %msg, "Bedrock access denied (web tools)");
+            WebToolError::BackendError(
+                "Access denied by the upstream provider. Details are in the gateway logs."
+                    .to_string(),
+            )
+        }
+        other => WebToolError::BackendError(other.to_string()),
+    }
+}
+
+/// SSE `error` event built through the redacting [`ErrorResponse`]
+/// constructor (keys, ARNs, account ids and URLs are stripped).
+fn sse_error_event(error_type: &str, message: &str) -> Event {
+    Event::default()
+        .event("error")
+        .data(ErrorResponse::new(error_type, message).to_json_string())
+}
+
+/// Effective domain policies for the two web tools, from the client's
+/// server-tool definitions.
+#[derive(Debug, Clone, Default)]
+struct ToolPolicies {
+    search: DomainPolicy,
+    fetch: DomainPolicy,
+}
+
+impl ToolPolicies {
+    fn from_server_tools(server_tools: &[serde_json::Value]) -> Self {
+        let mut out = Self::default();
+        for tool in server_tools {
+            let name = tool["name"].as_str().unwrap_or("");
+            let ty = tool["type"].as_str().unwrap_or("");
+            if name == "web_search" || ty.starts_with("web_search_") {
+                out.search = DomainPolicy::from_tool_definition(tool);
+            } else if name == "web_fetch" || ty.starts_with("web_fetch_") {
+                out.fetch = DomainPolicy::from_tool_definition(tool);
+            }
+        }
+        out
+    }
+}
+
+/// Upper bound on the model-supplied `max_results`.
+const MAX_SEARCH_RESULTS: usize = 20;
 
 /// Wrapper that allows GeminiService to be used as a WebToolBackend.
 /// Performs Anthropic→Gemini→Anthropic conversion internally.
@@ -150,6 +204,7 @@ impl WebToolExecutor {
         }
 
         let (server_tools, client_tools) = split_tools(tools);
+        let policies = ToolPolicies::from_server_tools(&server_tools);
 
         // W7: warn if both web_search and web_fetch are present simultaneously
         let has_search = server_tools
@@ -276,7 +331,8 @@ impl WebToolExecutor {
                     caller: None,
                 });
 
-                let (result_text, search_results) = self.execute_call_with_results(call).await?;
+                let (result_text, search_results) =
+                    self.execute_call_with_results(call, &policies).await?;
                 all_search_results.extend(search_results);
 
                 server_blocks.push(ContentBlock::ToolResult {
@@ -364,20 +420,16 @@ impl WebToolExecutor {
             // Reject unsupported versions
             for tool in tools {
                 if let Some(version) = super::unsupported_server_tool_version(tool) {
-                    yield Ok(Event::default().event("error").data(
-                        serde_json::json!({
-                            "type": "error",
-                            "error": {
-                                "type": "invalid_request_error",
-                                "message": format!("{version} is not supported by this proxy")
-                            }
-                        }).to_string()
+                    yield Ok(sse_error_event(
+                        "invalid_request_error",
+                        &format!("{version} is not supported by this proxy"),
                     ));
                     return;
                 }
             }
 
             let (server_tools, client_tools) = split_tools(tools);
+            let policies = ToolPolicies::from_server_tools(&server_tools);
 
             let server_names: HashSet<String> = server_tools
                 .iter()
@@ -445,12 +497,7 @@ impl WebToolExecutor {
                 let response = match backend.invoke(&modified, &target_model).await {
                     Ok(r) => r,
                     Err(e) => {
-                        yield Ok(Event::default().event("error").data(
-                            serde_json::json!({
-                                "type": "error",
-                                "error": {"type": "api_error", "message": e.to_string()}
-                            }).to_string()
-                        ));
+                        yield Ok(sse_error_event("api_error", &e.to_string()));
                         return;
                     }
                 };
@@ -488,15 +535,10 @@ impl WebToolExecutor {
                     }
                     block_index += 1;
 
-                    let result_text = match self.execute_call(call).await {
+                    let result_text = match self.execute_call(call, &policies).await {
                         Ok(text) => text,
                         Err(e) => {
-                            yield Ok(Event::default().event("error").data(
-                                serde_json::json!({
-                                    "type": "error",
-                                    "error": {"type": "api_error", "message": e.to_string()}
-                                }).to_string()
-                            ));
+                            yield Ok(sse_error_event("api_error", &e.to_string()));
                             return;
                         }
                     };
@@ -535,38 +577,57 @@ impl WebToolExecutor {
         })
     }
 
-    async fn execute_call(&self, call: &ServerToolCall) -> Result<String, WebToolError> {
-        let (text, _) = self.execute_call_with_results(call).await?;
+    async fn execute_call(
+        &self,
+        call: &ServerToolCall,
+        policies: &ToolPolicies,
+    ) -> Result<String, WebToolError> {
+        let (text, _) = self.execute_call_with_results(call, policies).await?;
         Ok(text)
     }
 
     /// Execute a server tool call, returning the result text and any search results.
+    ///
+    /// Domain restrictions come from the client's tool definition
+    /// (`policies`); the model's `allowed_domains` / `blocked_domains` input
+    /// can only narrow them. They are enforced here on every search result
+    /// and fetch URL, independent of what the provider does with the hints.
     async fn execute_call_with_results(
         &self,
         call: &ServerToolCall,
+        policies: &ToolPolicies,
     ) -> Result<(String, Vec<SearchResult>), WebToolError> {
-        let allowed: Option<Vec<String>> = call.input["allowed_domains"].as_array().map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        });
-        let blocked: Option<Vec<String>> = call.input["blocked_domains"].as_array().map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        });
-
         match call.kind {
             WebToolKind::Search => {
                 let searcher = self
                     .search
                     .as_ref()
                     .ok_or(WebToolError::SearchNotConfigured)?;
+                let policy = policies.search.narrowed_by(&call.input);
+                let allowed = policy.allowed_hint();
+                if allowed.as_ref().is_some_and(|a| a.is_empty()) {
+                    // The model's allowlist is disjoint from the client's.
+                    return Ok((
+                        "No results: the requested domains are outside the allowed domains."
+                            .to_string(),
+                        Vec::new(),
+                    ));
+                }
+                let blocked = policy.blocked().to_vec();
                 let query = call.input["query"].as_str().unwrap_or("");
-                let max_results = call.input["max_results"].as_u64().unwrap_or(5) as usize;
-                let results = searcher
-                    .search(query, allowed.as_deref(), blocked.as_deref(), max_results)
+                let max_results = (call.input["max_results"].as_u64().unwrap_or(5) as usize)
+                    .clamp(1, MAX_SEARCH_RESULTS);
+                let mut results = searcher
+                    .search(
+                        query,
+                        allowed.as_deref(),
+                        (!blocked.is_empty()).then_some(blocked.as_slice()),
+                        max_results,
+                    )
                     .await?;
+                if !policy.is_unrestricted() {
+                    results.retain(|r| policy.permits(&r.url));
+                }
                 let text = results
                     .iter()
                     .enumerate()
@@ -577,15 +638,14 @@ impl WebToolExecutor {
             }
             WebToolKind::Fetch => {
                 let url = call.input["url"].as_str().unwrap_or("");
-                let result = self
-                    .fetch
-                    .fetch(
-                        url,
-                        allowed.as_deref(),
-                        blocked.as_deref(),
-                        self.max_fetch_kb,
-                    )
-                    .await?;
+                let policy = policies.fetch.narrowed_by(&call.input);
+                // Refused URLs are reported to the model as a tool error
+                // (like Anthropic's `url_not_allowed`) instead of failing the
+                // whole request. Redirect hops are re-checked by the provider.
+                if let Err(reason) = policy.check_url(url) {
+                    return Ok((format!("Error: URL not allowed ({reason})"), Vec::new()));
+                }
+                let result = self.fetch.fetch(url, &policy, self.max_fetch_kb).await?;
                 Ok((result.content, Vec::new()))
             }
         }
@@ -619,12 +679,12 @@ fn server_tools_to_model_definitions(server_tools: &[serde_json::Value]) -> Vec<
                             "allowed_domains": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "Only include results from these domains"
+                                "description": "Only include results from these domains (can only narrow the domains the caller allows)"
                             },
                             "blocked_domains": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "Exclude results from these domains"
+                                "description": "Additionally exclude results from these domains"
                             }
                         },
                         "required": ["query"]
@@ -644,12 +704,12 @@ fn server_tools_to_model_definitions(server_tools: &[serde_json::Value]) -> Vec<
                             "allowed_domains": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "Only allow fetching from these domains"
+                                "description": "Only allow fetching from these domains (can only narrow the domains the caller allows)"
                             },
                             "blocked_domains": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "Block fetching from these domains"
+                                "description": "Additionally block fetching from these domains"
                             }
                         },
                         "required": ["url"]
@@ -897,5 +957,240 @@ mod tests {
         }];
         post_process_citations(&mut content, &results);
         assert_eq!(content.len(), 1); // No citation block added
+    }
+
+    // ---- domain enforcement / error redaction ---------------------------
+
+    use crate::schemas::anthropic::Usage;
+    use crate::services::web_tools::fetch::FetchResult;
+    use std::sync::Mutex;
+
+    /// Returns a tool_use for `tool` with `input` on the first call, then text.
+    struct ScriptedBackend {
+        tool: &'static str,
+        input: serde_json::Value,
+        calls: Mutex<Vec<MessageRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WebToolBackend for ScriptedBackend {
+        async fn invoke(
+            &self,
+            request: &MessageRequest,
+            _model: &str,
+        ) -> Result<MessageResponse, WebToolError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(request.clone());
+            let content = if calls.len() == 1 {
+                vec![ContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: self.tool.into(),
+                    input: self.input.clone(),
+                    caller: None,
+                }]
+            } else {
+                vec![ContentBlock::Text {
+                    text: "done".into(),
+                    cache_control: None,
+                }]
+            };
+            Ok(MessageResponse::new("msg", "m", content, Usage::new(1, 1)))
+        }
+    }
+
+    struct FailingBackend;
+
+    #[async_trait::async_trait]
+    impl WebToolBackend for FailingBackend {
+        async fn invoke(
+            &self,
+            _request: &MessageRequest,
+            _model: &str,
+        ) -> Result<MessageResponse, WebToolError> {
+            Err(WebToolError::BackendError(
+                "User: arn:aws:sts::123456789012:assumed-role/GatewayRole/i-0abc is not authorized"
+                    .into(),
+            ))
+        }
+    }
+
+    type HintPair = (Option<Vec<String>>, Option<Vec<String>>);
+
+    #[derive(Default)]
+    struct RecordingSearch {
+        hints: Mutex<Vec<HintPair>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SearchProvider for RecordingSearch {
+        async fn search(
+            &self,
+            _query: &str,
+            allowed: Option<&[String]>,
+            blocked: Option<&[String]>,
+            _max_results: usize,
+        ) -> Result<Vec<SearchResult>, WebToolError> {
+            self.hints
+                .lock()
+                .unwrap()
+                .push((allowed.map(<[_]>::to_vec), blocked.map(<[_]>::to_vec)));
+            // A provider that ignores the hints entirely.
+            Ok([
+                "https://good.com/a",
+                "https://evil.com?.good.com",
+                "https://docs.good.com/b",
+            ]
+            .iter()
+            .map(|u| SearchResult {
+                title: "t".into(),
+                url: u.to_string(),
+                snippet: "s".into(),
+            })
+            .collect())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingFetch {
+        urls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FetchProvider for RecordingFetch {
+        async fn fetch(
+            &self,
+            url: &str,
+            _policy: &DomainPolicy,
+            _max_content_kb: u64,
+        ) -> Result<FetchResult, WebToolError> {
+            self.urls.lock().unwrap().push(url.to_string());
+            Ok(FetchResult {
+                url: url.into(),
+                content: "page body".into(),
+                content_type: "text/plain".into(),
+                status_code: 200,
+            })
+        }
+    }
+
+    fn tool_result_text(resp: &MessageResponse) -> String {
+        resp.content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    content: ToolResultValue::Text(t),
+                    ..
+                } => Some(t.clone()),
+                _ => None,
+            })
+            .expect("tool result")
+    }
+
+    fn request_with(tool: serde_json::Value) -> MessageRequest {
+        let mut req = MessageRequest::new("m", vec![], 100);
+        req.tools = Some(vec![tool]);
+        req
+    }
+
+    #[tokio::test]
+    async fn client_search_domains_are_enforced_and_model_cannot_widen() {
+        let search = Arc::new(RecordingSearch::default());
+        let exec = WebToolExecutor::with_fetch(
+            Some(search.clone()),
+            Arc::new(RecordingFetch::default()),
+            64,
+            4,
+        );
+        let backend = ScriptedBackend {
+            tool: "web_search",
+            // The model tries to widen to evil.com and drop the blocklist.
+            input: serde_json::json!({"query": "q", "allowed_domains": ["good.com", "evil.com"], "blocked_domains": []}),
+            calls: Mutex::new(Vec::new()),
+        };
+        let req = request_with(serde_json::json!({
+            "type": "web_search_20250305", "name": "web_search",
+            "allowed_domains": ["good.com"], "blocked_domains": ["docs.good.com"]
+        }));
+        let resp = exec.run(&req, &backend, "m").await.unwrap();
+        let text = tool_result_text(&resp);
+        assert!(text.contains("https://good.com/a"), "{text}");
+        assert!(!text.contains("evil.com"), "{text}");
+        assert!(!text.contains("docs.good.com"), "{text}");
+        let hints = search.hints.lock().unwrap();
+        assert_eq!(hints[0].0, Some(vec!["good.com".to_string()]));
+        assert_eq!(hints[0].1, Some(vec!["docs.good.com".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn client_fetch_domains_are_enforced() {
+        let fetch = Arc::new(RecordingFetch::default());
+        let exec = WebToolExecutor::with_fetch(None, fetch.clone(), 64, 4);
+        let tool = serde_json::json!({
+            "type": "web_fetch_20250910", "name": "web_fetch",
+            "allowed_domains": ["good.com"]
+        });
+        for (url, model_allowed) in [
+            ("https://evil.com/x", serde_json::json!(["evil.com"])),
+            ("https://evil.com?.good.com", serde_json::json!(null)),
+            ("https://good.com@evil.com/", serde_json::json!(null)),
+        ] {
+            let backend = ScriptedBackend {
+                tool: "web_fetch",
+                input: serde_json::json!({"url": url, "allowed_domains": model_allowed}),
+                calls: Mutex::new(Vec::new()),
+            };
+            let resp = exec
+                .run(&request_with(tool.clone()), &backend, "m")
+                .await
+                .unwrap();
+            assert!(tool_result_text(&resp).contains("URL not allowed"), "{url}");
+        }
+        assert!(fetch.urls.lock().unwrap().is_empty(), "nothing fetched");
+
+        let backend = ScriptedBackend {
+            tool: "web_fetch",
+            input: serde_json::json!({"url": "https://docs.good.com/page"}),
+            calls: Mutex::new(Vec::new()),
+        };
+        let resp = exec.run(&request_with(tool), &backend, "m").await.unwrap();
+        assert_eq!(tool_result_text(&resp), "page body");
+        assert_eq!(
+            *fetch.urls.lock().unwrap(),
+            vec!["https://docs.good.com/page"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_error_frames_are_redacted() {
+        use futures::StreamExt;
+        let exec = Arc::new(WebToolExecutor::with_fetch(
+            None,
+            Arc::new(RecordingFetch::default()),
+            64,
+            2,
+        ));
+        let req =
+            request_with(serde_json::json!({"type": "web_search_20250305", "name": "web_search"}));
+        let events: Vec<String> = exec
+            .run_stream(req, Arc::new(FailingBackend), "m".into())
+            .map(|e| format!("{:?}", e.unwrap()))
+            .collect()
+            .await;
+        let err = events
+            .iter()
+            .find(|e| e.contains("api_error"))
+            .expect("error frame");
+        assert!(!err.contains("123456789012"), "{err}");
+        assert!(!err.contains("GatewayRole"), "{err}");
+    }
+
+    #[test]
+    fn bedrock_access_denied_is_generic() {
+        let e = bedrock_backend_error(crate::services::bedrock::BedrockError::AccessDenied(
+            "arn:aws:iam::123456789012:role/Secret is not authorized".into(),
+        ));
+        let s = e.to_string();
+        assert!(!s.contains("123456789012") && !s.contains("Secret"), "{s}");
+        assert!(s.contains("Access denied by the upstream provider"), "{s}");
     }
 }

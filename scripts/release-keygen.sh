@@ -4,7 +4,9 @@ set -euo pipefail
 # Generate the Ed25519 key pair used to sign release checksums.
 #
 # Self-update (and docker/Dockerfile.release) only install releases whose
-# `<asset>.sha256` carries a valid `<asset>.sha256.sig` from this key.
+# `<asset>.sha256` carries a valid `<asset>.sha256.sig` from this key; self-update
+# additionally requires `<asset>.manifest.sig` (tag + asset + sha256, signed by
+# the same key in release.yml).
 #
 # Usage:
 #   ./scripts/release-keygen.sh [OUTPUT_DIR]     (default: ./release-signing)

@@ -31,41 +31,58 @@ impl PostgresBackend {
     }
 
     /// Full-row update of an api_keys row; `extra_where` narrows the match.
-    async fn write_api_key(&self, record: &ApiKeyRecord, extra_where: &str) -> Result<u64> {
-        let res = sqlx::query(&format!(
+    ///
+    /// Spend counters (`budget_used`, `budget_used_mtd`, `budget_mtd_month`,
+    /// `budget_history`) are written only when `with_counters` is set (the
+    /// one-time user migration); admin edits must not overwrite live spend.
+    async fn write_api_key(
+        &self,
+        record: &ApiKeyRecord,
+        extra_where: &str,
+        with_counters: bool,
+    ) -> Result<u64> {
+        let counters = if with_counters {
+            ", budget_used = $20, budget_used_mtd = $21, budget_mtd_month = $22, \
+             budget_history = $23"
+        } else {
+            ""
+        };
+        let sql = format!(
             "UPDATE api_keys SET \
              user_id = $1, name = $2, is_active = $3, rate_limit = $4, cost_rate = $5, \
-             monthly_budget = $6, budget_used = $7, budget_used_mtd = $8, budget_mtd_month = $9, \
-             deactivated_reason = $10, budget_history = $11, tpm_limit = $12, cache_ttl = $13, \
-             metadata = $14, expires_at = $15, allowed_models = $16, allowed_cidrs = $17, \
-             budget_period = $18, default_tags = $19, rotated_to = $20, max_concurrency = $21, \
-             updated_at = $22 WHERE api_key = $23{extra_where}"
-        ))
-        .bind(&record.user_id)
-        .bind(&record.name)
-        .bind(record.is_active)
-        .bind(record.rate_limit)
-        .bind(record.cost_rate)
-        .bind(record.monthly_budget)
-        .bind(record.budget_used)
-        .bind(record.budget_used_mtd)
-        .bind(&record.budget_mtd_month)
-        .bind(&record.deactivated_reason)
-        .bind(&record.budget_history)
-        .bind(record.tpm_limit)
-        .bind(&record.cache_ttl)
-        .bind(&record.metadata)
-        .bind(record.expires_at)
-        .bind(patterns_to_json(&record.allowed_models))
-        .bind(patterns_to_json(&record.allowed_cidrs))
-        .bind(record.budget_period.as_str())
-        .bind(patterns_to_json(&record.default_tags))
-        .bind(&record.rotated_to)
-        .bind(record.max_concurrency)
-        .bind(unix_now())
-        .bind(&record.api_key)
-        .execute(&self.pool)
-        .await?;
+             monthly_budget = $6, deactivated_reason = $7, tpm_limit = $8, cache_ttl = $9, \
+             metadata = $10, expires_at = $11, allowed_models = $12, allowed_cidrs = $13, \
+             budget_period = $14, default_tags = $15, rotated_to = $16, max_concurrency = $17, \
+             updated_at = $18{counters} WHERE api_key = $19{extra_where}"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(&record.user_id)
+            .bind(&record.name)
+            .bind(record.is_active)
+            .bind(record.rate_limit)
+            .bind(record.cost_rate)
+            .bind(record.monthly_budget)
+            .bind(&record.deactivated_reason)
+            .bind(record.tpm_limit)
+            .bind(&record.cache_ttl)
+            .bind(&record.metadata)
+            .bind(record.expires_at)
+            .bind(patterns_to_json(&record.allowed_models))
+            .bind(patterns_to_json(&record.allowed_cidrs))
+            .bind(record.budget_period.as_str())
+            .bind(patterns_to_json(&record.default_tags))
+            .bind(&record.rotated_to)
+            .bind(record.max_concurrency)
+            .bind(unix_now())
+            .bind(&record.api_key);
+        if with_counters {
+            q = q
+                .bind(record.budget_used)
+                .bind(record.budget_used_mtd)
+                .bind(&record.budget_mtd_month)
+                .bind(&record.budget_history);
+        }
+        let res = q.execute(&self.pool).await?;
         Ok(res.rows_affected())
     }
 
@@ -179,7 +196,8 @@ fn row_to_user(r: &sqlx::postgres::PgRow) -> UserRecord {
 }
 
 /// Atomically add `amount` to a row's spend counters (single statement) and
-/// report whether month-to-date spend reached the monthly budget.
+/// report whether month-to-date spend reached the monthly budget. Counters are
+/// clamped at 0 (a refund can never drive spend negative).
 async fn increment_budget(
     pool: &PgPool,
     table: &str,
@@ -188,8 +206,8 @@ async fn increment_budget(
     amount: f64,
 ) -> Result<SpendAfter> {
     let row = sqlx::query(&format!(
-        "UPDATE {table} SET budget_used = budget_used + $1, \
-         budget_used_mtd = budget_used_mtd + $1, updated_at = $2 WHERE {id_col} = $3 \
+        "UPDATE {table} SET budget_used = GREATEST(0, budget_used + $1), \
+         budget_used_mtd = GREATEST(0, budget_used_mtd + $1), updated_at = $2 WHERE {id_col} = $3 \
          RETURNING monthly_budget, budget_used_mtd"
     ))
     .bind(amount)
@@ -512,7 +530,7 @@ impl ApiKeyStore for PostgresBackend {
     }
 
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
-        self.write_api_key(record, "").await.map(|_| ())
+        self.write_api_key(record, "", false).await.map(|_| ())
     }
 
     async fn deactivate_api_key(&self, api_key: &str, reason: &str) -> Result<()> {
@@ -629,7 +647,7 @@ impl ApiKeyStore for PostgresBackend {
     }
 
     async fn assign_unowned_key(&self, record: &ApiKeyRecord) -> Result<bool> {
-        self.write_api_key(record, " AND (user_id IS NULL OR user_id = '')")
+        self.write_api_key(record, " AND (user_id IS NULL OR user_id = '')", true)
             .await
             .map(|n| n > 0)
     }

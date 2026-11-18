@@ -115,8 +115,13 @@ jobs:
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
           RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+          # Untrusted text: passed via env and validated, never inlined.
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if ! printf '%s' "$REF_NAME" | grep -Eq '^v[0-9][0-9A-Za-z._-]*$'; then
+            echo "::error::unexpected tag name"; exit 1
+          fi
           if [ -z "$RELEASE_SIGNING_KEY" ]; then
             echo "::error::Secret RELEASE_SIGNING_KEY is not set (see scripts/release-keygen.sh)"
             exit 1
@@ -132,8 +137,26 @@ jobs:
             exit 1
           fi
           for f in artifacts/*/*.sha256; do
+            # Legacy signature over the checksum file (older updaters,
+            # docker/Dockerfile.release).
             openssl pkeyutl -sign -inkey "$KEY" -rawin -in "$f" -out "$f.sig"
             openssl pkeyutl -verify -pubin -inkey <(openssl pkey -in "$KEY" -pubout) -rawin -in "$f" -sigfile "$f.sig"
+
+            # Version-bound manifest: binds tag + asset name + sha256 so a
+            # signed checksum cannot be replayed under another release/asset.
+            # Format must match `release_manifest` in src/services/update.rs.
+            ASSET="$(basename "$f" .sha256)"
+            read -r SHA NAME EXTRA < "$f"
+            NAME="${NAME#\*}"
+            if [ "$NAME" != "$ASSET" ] || [ -n "${EXTRA:-}" ] || ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::malformed checksum file $f"; exit 1
+            fi
+            MANIFEST="$(mktemp)"
+            printf 'one-router-release-v1\n%s\n%s\n%s\n' "$REF_NAME" "$ASSET" "$SHA" > "$MANIFEST"
+            SIG="$(dirname "$f")/$ASSET.manifest.sig"
+            openssl pkeyutl -sign -inkey "$KEY" -rawin -in "$MANIFEST" -out "$SIG"
+            openssl pkeyutl -verify -pubin -inkey <(openssl pkey -in "$KEY" -pubout) -rawin -in "$MANIFEST" -sigfile "$SIG"
+            rm -f "$MANIFEST"
           done
 
       - name: Upload signatures

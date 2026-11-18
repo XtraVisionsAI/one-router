@@ -7,8 +7,9 @@
 //!   `sk-proj-ab****wxyz`), Google keys (`AIza…`),
 //! - AWS access key ids (`AKIA…` / `ASIA…`), ARNs (`arn:aws:sts::<account>:…`,
 //!   which name the host's IAM role) and 12-digit account ids,
-//! - request URLs embedded in reqwest errors (`… for url (https://…)`), which
-//!   can include a backend `base_url` or a webhook token.
+//! - request URLs embedded in reqwest errors (`… for url (https://…)`) and any
+//!   other bare `http(s)://` URL, which can include a backend `base_url` or a
+//!   webhook token.
 
 /// Characters that can be part of a secret-looking token.
 fn is_token_char(c: char) -> bool {
@@ -59,7 +60,7 @@ fn redact_segment(t: &str) -> Option<String> {
 }
 
 /// Remove `for url (…)` fragments produced by reqwest error Display.
-fn strip_urls(text: &str) -> String {
+fn strip_reqwest_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find("for url (") {
@@ -76,9 +77,43 @@ fn strip_urls(text: &str) -> String {
     out
 }
 
+/// Characters that end a bare URL (whitespace, quotes, closing brackets).
+fn ends_url(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '`' | ',')
+}
+
+/// Replace bare `http://…` / `https://…` URLs (any case) with `<redacted-url>`
+/// — they can carry a backend `base_url`, userinfo or a token in the query.
+/// Trailing sentence punctuation is kept outside the redaction.
+fn strip_bare_urls(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(rel) = ["http://", "https://"]
+        .iter()
+        .filter_map(|p| lower[pos..].find(p))
+        .min()
+    {
+        let start = pos + rel;
+        out.push_str(&text[pos..start]);
+        let end = text[start..]
+            .char_indices()
+            .find(|(_, c)| ends_url(*c))
+            .map(|(i, _)| start + i)
+            .unwrap_or(text.len());
+        let url = &text[start..end];
+        let kept = url.trim_end_matches(['.', ':', ';', '!', '?']);
+        out.push_str("<redacted-url>");
+        out.push_str(&url[kept.len()..]);
+        pos = end;
+    }
+    out.push_str(&text[pos..]);
+    out
+}
+
 /// Redact secrets and infrastructure identifiers from `text`.
 pub fn redact_secrets(text: &str) -> String {
-    let text = strip_urls(text);
+    let text = strip_bare_urls(&strip_reqwest_urls(text));
     let mut out = String::with_capacity(text.len());
     let mut token = String::new();
     let flush = |token: &mut String, out: &mut String| {
@@ -113,6 +148,19 @@ pub fn upstream_error_message(status: u16, body: &str) -> String {
         )
     } else {
         redact_secrets(body)
+    }
+}
+
+/// Redact the message fields of an upstream SSE error payload in place
+/// (`error.message`, `response.error.message`, top-level `message`) — used for
+/// relayed Responses `error` / `response.failed` frames.
+pub fn redact_error_payload(payload: &mut serde_json::Value) {
+    for ptr in ["/error/message", "/response/error/message", "/message"] {
+        if let Some(v) = payload.pointer_mut(ptr) {
+            if let Some(s) = v.as_str() {
+                *v = serde_json::Value::String(redact_secrets(s));
+            }
+        }
     }
 }
 
@@ -165,5 +213,46 @@ mod tests {
             !upstream_error_message(401, "Incorrect API key provided: sk-proj-xx").contains("sk-")
         );
         assert!(upstream_error_message(400, "bad field").contains("bad field"));
+    }
+
+    #[test]
+    fn strips_bare_urls() {
+        assert_eq!(
+            redact_secrets("connect to https://user:pw@relay.internal:8443/v1?token=abc failed."),
+            "connect to <redacted-url> failed."
+        );
+        assert_eq!(
+            redact_secrets("see (HTTP://10.0.0.5/x), then retry"),
+            "see (<redacted-url>), then retry"
+        );
+        assert_eq!(
+            redact_secrets("\"url\":\"https://a.example/b\""),
+            "\"url\":\"<redacted-url>\""
+        );
+        // reqwest form still collapses to its own marker.
+        assert_eq!(
+            redact_secrets("error for url (https://x.example/y): boom"),
+            "error for url (redacted): boom"
+        );
+        assert_eq!(
+            redact_secrets("no urls: httpx is fine"),
+            "no urls: httpx is fine"
+        );
+    }
+
+    #[test]
+    fn redacts_error_payload_fields() {
+        let mut v = serde_json::json!({
+            "type": "error",
+            "error": {"message": "bad key sk-proj-abcdefghijkl at https://h.example/x"},
+            "response": {"error": {"message": "arn:aws:iam::123456789012:role/R"}},
+        });
+        redact_error_payload(&mut v);
+        let s = v.to_string();
+        assert!(
+            !s.contains("abcdefghijkl") && !s.contains("h.example"),
+            "{s}"
+        );
+        assert!(!s.contains("123456789012"), "{s}");
     }
 }

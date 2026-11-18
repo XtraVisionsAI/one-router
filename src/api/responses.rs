@@ -43,6 +43,12 @@ pub enum ResponsesApiResponse {
     /// fields we don't model are preserved.
     Raw(Box<serde_json::Value>),
     Stream(SseStream),
+    /// Natively relayed SSE stream whose usage is recorded at body end **or**
+    /// on client disconnect (see `services::stream_billing`).
+    Billed(
+        SseStream,
+        Box<crate::services::stream_billing::StreamBilling>,
+    ),
 }
 
 impl IntoResponse for ResponsesApiResponse {
@@ -53,6 +59,14 @@ impl IntoResponse for ResponsesApiResponse {
             ResponsesApiResponse::Stream(stream) => Sse::new(stream)
                 .keep_alive(crate::api::sse_keep_alive())
                 .into_response(),
+            ResponsesApiResponse::Billed(stream, billing) => {
+                crate::services::stream_billing::bill_sse_response(
+                    Sse::new(stream)
+                        .keep_alive(crate::api::sse_keep_alive())
+                        .into_response(),
+                    *billing,
+                )
+            }
         }
     }
 }
@@ -96,6 +110,23 @@ pub async fn create_response(
         Some(prev_id) => state.responses_context.load(prev_id, &owner).await?,
         None => Vec::new(),
     };
+    // Chained history grows every turn; once it plus this input cannot be
+    // stored any more, fail up front instead of answering a turn whose id
+    // would then 404 as a previous_response_id.
+    if request.previous_response_id.is_some() {
+        let prev_bytes = crate::services::responses_context::messages_bytes(&prev_stored);
+        let input_bytes = serde_json::to_vec(&raw_request)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let cap = state.responses_context.max_entry_bytes();
+        if prev_bytes + input_bytes > cap {
+            return Err(OpenAIApiError::bad_request(format!(
+                "Conversation history for previous_response_id exceeds the stored-context limit \
+                 ({} MB); resend the conversation as input without previous_response_id",
+                cap / (1024 * 1024)
+            )));
+        }
+    }
 
     // Hosted web_search takes the Anthropic WebToolExecutor path.
     if crate::converters::responses_chat::is_responses_web_search_request(&request) {
@@ -151,7 +182,7 @@ pub async fn create_response(
 
     let chat_resp = match dispatch.response {
         ChatCompletionApiResponse::Json(json) => json.0,
-        ChatCompletionApiResponse::Stream(_) => {
+        ChatCompletionApiResponse::Stream(_) | ChatCompletionApiResponse::Billed(..) => {
             return Err(OpenAIApiError::internal_error(
                 "internal dispatch returned a stream unexpectedly",
             ))
@@ -261,12 +292,10 @@ fn record_responses_usage(
     });
 }
 
-/// Context needed by the SSE relay to record usage and store conversation
-/// state once the upstream `response.completed` frame arrives.
+/// Context needed by the SSE relay to store conversation state once the
+/// upstream `response.completed` frame arrives.
 struct RelayContext {
     state: AppState,
-    key_info: ApiKeyInfo,
-    request_id: String,
     source_model: String,
     owner: String,
     stored_input: Vec<(String, String)>,
@@ -387,23 +416,39 @@ async fn handle_mantle_responses_passthrough(
         .await
         .map_err(|e| OpenAIApiError::from_bedrock_error(&e))?;
 
-    Ok(ResponsesApiResponse::Stream(relay_mantle_responses_sse(
-        byte_stream,
-        RelayContext {
-            state: state.clone(),
-            key_info: key_info.clone(),
-            request_id: request_id.to_string(),
-            source_model,
-            owner: owner.to_string(),
-            stored_input,
-            store: request.should_store(),
-        },
-    )))
+    let billing = crate::services::stream_billing::StreamBilling {
+        tracker: state.usage_tracker.clone(),
+        key_info: key_info.clone(),
+        request_id: request_id.to_string(),
+        model: source_model.clone(),
+        provider: "bedrock".to_string(),
+        protocol: "responses",
+        cache_ttl: None,
+        input_estimate: upstream
+            .get("input")
+            .map(crate::services::stream_billing::estimate_json_tokens)
+            .unwrap_or(0),
+        exact: None,
+    };
+    Ok(ResponsesApiResponse::Billed(
+        relay_mantle_responses_sse(
+            byte_stream,
+            RelayContext {
+                state: state.clone(),
+                source_model,
+                owner: owner.to_string(),
+                stored_input,
+                store: request.should_store(),
+            },
+        ),
+        Box::new(billing),
+    ))
 }
 
 /// Relay an upstream Responses SSE byte stream frame by frame, rewriting the
-/// target model id back to the source name. Usage recording and context
-/// storage happen when the `response.completed` frame passes through.
+/// target model id back to the source name. Context storage happens when the
+/// `response.completed` frame passes through; usage is recorded by the
+/// `StreamBilling` wrapper the caller attaches.
 fn relay_mantle_responses_sse(
     byte_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     ctx: RelayContext,
@@ -429,22 +474,19 @@ fn relay_mantle_responses_sse(
                     rewrite_model_fields(&mut payload, &ctx.source_model);
                     if event_type == "response.completed" {
                         completed = payload.get("response").cloned();
+                    } else if event_type == "error" || event_type == "response.failed" {
+                        // Relayed upstream text: strip ARNs / keys / URLs.
+                        crate::utils::redact::redact_error_payload(&mut payload);
                     }
                     yield Ok(Event::default().event(event_type).data(payload.to_string()));
                 }
             }
         }
 
+        // Usage is recorded by the `StreamBilling` wrapper around this stream
+        // (from the relayed `response.completed` frame, or from what was seen
+        // so far if the client disconnects).
         if let Some(response_json) = completed {
-            if let Some(usage) = response_json.get("usage") {
-                record_mantle_responses_usage(
-                    &ctx.state,
-                    &ctx.key_info,
-                    &ctx.request_id,
-                    &ctx.source_model,
-                    usage,
-                );
-            }
             if ctx.store {
                 let response_id = response_json
                     .get("id")

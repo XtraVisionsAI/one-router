@@ -87,6 +87,18 @@ pub enum PtcError {
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
 
+    /// Too many concurrent sessions (per API key or gateway-wide)
+    #[error("PTC session limit reached: {0}")]
+    SessionLimitExceeded(String),
+
+    /// The request is not acceptable for PTC (e.g. invalid tool names)
+    #[error("Invalid PTC request: {0}")]
+    InvalidRequest(String),
+
+    /// The sandbox emitted a tool call that is not allowed / malformed
+    #[error("Invalid tool call from sandbox: {0}")]
+    InvalidToolCall(String),
+
     /// Internal error
     #[error("Internal PTC error: {0}")]
     Internal(String),
@@ -113,6 +125,8 @@ impl PtcError {
             PtcError::ExecutionTimeout(_) => 504,
             PtcError::MaxIterationsExceeded(_) => 429,
             PtcError::PermissionDenied(_) => 403,
+            PtcError::SessionLimitExceeded(_) => 429,
+            PtcError::InvalidRequest(_) | PtcError::InvalidToolCall(_) => 400,
             PtcError::AttachFailed(_) | PtcError::RunnerNotReady(_) => 503,
             PtcError::UnexpectedMessage(_) => 500,
             _ => 500,

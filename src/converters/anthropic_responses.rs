@@ -719,13 +719,11 @@ impl ResponsesToAnthropicStreamState {
                     .or_else(|| payload.get("message"))
                     .and_then(|m| m.as_str())
                     .unwrap_or("upstream response failed");
+                // Redacting constructor: upstream text may carry ARNs / URLs.
                 events.push((
                     "error".to_string(),
-                    serde_json::json!({
-                        "type": "error",
-                        "error": {"type": "api_error", "message": message},
-                    })
-                    .to_string(),
+                    crate::schemas::anthropic::ErrorResponse::new("api_error", message)
+                        .to_json_string(),
                 ));
             }
             // in_progress, content_part.*, *.done text/summary events, etc. —

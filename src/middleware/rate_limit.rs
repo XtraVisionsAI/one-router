@@ -423,6 +423,22 @@ fn buckets(key_info: &ApiKeyInfo, default_rpm: u32) -> (Vec<Bucket>, Vec<Bucket>
     (tpm, rpm, conc)
 }
 
+/// Buckets enforced for this request. `rate_limit = disable` (`default_rpm =
+/// None`) turns off RPM and TPM (key/user/team included) but **not** the
+/// `max_concurrency` caps — those are a resource guard, not a rate limit.
+fn active_buckets(
+    key_info: &ApiKeyInfo,
+    default_rpm: Option<u32>,
+) -> (Vec<Bucket>, Vec<Bucket>, Vec<Bucket>) {
+    match default_rpm {
+        Some(rpm) => buckets(key_info, rpm),
+        None => {
+            let (_, _, conc) = buckets(key_info, 0);
+            (Vec::new(), Vec::new(), conc)
+        }
+    }
+}
+
 /// Per-instance in-flight counters.
 pub struct ConcurrencyLimiter {
     counters: moka::sync::Cache<String, Arc<AtomicUsize>>,
@@ -487,11 +503,6 @@ pub async fn rate_limit(
 ) -> Result<Response, RateLimitError> {
     let default_rpm = rate_state.dynamic.read().await.rate_limit_rpm;
 
-    // Globally disabled — bypass completely, including per-key limits
-    let Some(default_rpm) = default_rpm else {
-        return Ok(next.run(request).await);
-    };
-
     let Some(key_info) = request.extensions().get::<ApiKeyInfo>().cloned() else {
         return Ok(next.run(request).await);
     };
@@ -500,7 +511,7 @@ pub async fn rate_limit(
         return Ok(next.run(request).await);
     }
 
-    let (tpm_buckets, rpm_buckets, conc_buckets) = buckets(&key_info, default_rpm);
+    let (tpm_buckets, rpm_buckets, conc_buckets) = active_buckets(&key_info, default_rpm);
 
     // TPM checks don't consume anything — run them all first.
     for (bucket, limit, scope) in &tpm_buckets {
@@ -683,6 +694,23 @@ mod tests {
         assert_eq!(limiter.acquire(&conc).err(), Some("key"));
         drop(g1);
         let _g2 = limiter.acquire(&conc).unwrap();
+    }
+
+    #[test]
+    fn global_disable_keeps_concurrency_caps() {
+        let mut info = principal(Some(30), Some(5));
+        info.max_concurrency = Some(1);
+        let (tpm, rpm, conc) = active_buckets(&info, None);
+        assert!(tpm.is_empty() && rpm.is_empty());
+        assert_eq!(
+            conc,
+            vec![
+                ("user:u1".to_string(), 2, "user"),
+                ("k1".to_string(), 1, "key"),
+            ]
+        );
+        let (tpm, rpm, _) = active_buckets(&info, Some(100));
+        assert!(!tpm.is_empty() && !rpm.is_empty());
     }
 
     #[test]

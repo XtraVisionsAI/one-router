@@ -20,12 +20,17 @@ pub const IPC_READY: &str = "__READY__";
 
 /// The Python runner script injected into sandbox containers.
 ///
-/// Protocol:
+/// Protocol (every payload is **base64** of UTF-8 text, so user data that
+/// happens to contain a boundary marker can never truncate a frame):
 ///   stderr → host:  `__READY__\n`  (runner is waiting for code)
-///   stdin  → runner: `__CODE_START__\n{code}\n__CODE_END__\n`
-///   stderr → host:  `__PTC_TOOL_CALL__{json}__PTC_END_CALL__\n`
-///   stdin  → runner: `__PTC_TOOL_RESULT__{json}__PTC_END_RESULT__\n`
-///   stdout → host:  `__PTC_OUTPUT__{json}__PTC_END_OUTPUT__\n`
+///   stdin  → runner: `__CODE_START__\n{b64(code)}\n__CODE_END__\n`
+///   stderr → host:  `__PTC_TOOL_CALL__{b64(json)}__PTC_END_CALL__\n`
+///   stdin  → runner: `__PTC_TOOL_RESULT__{b64(json)}__PTC_END_RESULT__\n`
+///   stdout → host:  `__PTC_OUTPUT__{b64(json)}__PTC_END_OUTPUT__\n`
+///
+/// The script is passed to the container as `python -u -B -c <script>` (no
+/// file upload, so the root filesystem can stay read-only). Callable tool
+/// names arrive in the `PTC_TOOLS` environment variable.
 pub const RUNNER_SCRIPT: &str = r#"#!/usr/bin/env python3
 """
 PTC Runner Script — loop-mode, boundary-marker IPC.
@@ -48,6 +53,7 @@ import select
 import traceback
 import asyncio
 import uuid
+import base64
 from typing import Any, Dict, List, Optional
 
 # ── IPC markers ──────────────────────────────────────────────────────
@@ -61,6 +67,15 @@ IPC_CODE_OUTPUT_START = "__PTC_OUTPUT__"
 IPC_CODE_OUTPUT_END = "__PTC_END_OUTPUT__"
 IPC_READY = "__READY__"
 EXIT_SIGNAL = "__EXIT_SESSION__"
+# Captured stdout/stderr are truncated to this many characters each before
+# being reported (the host also caps every frame).
+MAX_CAPTURE_CHARS = 256_000
+
+def _b64e(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+def _b64d(data: str) -> str:
+    return base64.b64decode(data.encode("ascii"), validate=True).decode("utf-8")
 
 # ── Unbuffered I/O ───────────────────────────────────────────────────
 _stdin_fd = 0
@@ -132,7 +147,10 @@ def read_code_block() -> Optional[str]:
             break
         code_lines.append(line)
 
-    return "\n".join(code_lines)
+    try:
+        return _b64d("".join(code_lines))
+    except Exception:
+        return "raise RuntimeError('PTC runner: malformed code frame')"
 
 # ── Tool result reading ──────────────────────────────────────────────
 
@@ -153,8 +171,8 @@ def _read_tool_result(timeout: float = 300.0) -> Optional[Dict]:
             start = line.find(IPC_TOOL_RESULT_START) + len(IPC_TOOL_RESULT_START)
             end = line.find(IPC_TOOL_RESULT_END)
             try:
-                return json.loads(line[start:end])
-            except json.JSONDecodeError:
+                return json.loads(_b64d(line[start:end]))
+            except Exception:
                 return None
 
 # ── Tool calling ─────────────────────────────────────────────────────
@@ -200,7 +218,7 @@ class ToolCallHandler:
 
     def _flush_calls(self, calls: List[Dict]) -> None:
         """Write tool calls to stderr and wait for results on stdin."""
-        request = json.dumps({"calls": calls})
+        request = _b64e(json.dumps({"calls": calls}))
         _write_stderr(f"{IPC_TOOL_CALL_START}{request}{IPC_TOOL_CALL_END}\n")
 
         # Wait for results
@@ -275,9 +293,14 @@ def execute_code(code: str, tools: List[str]) -> Dict:
         exit_code = 1
         stderr_capture.write(traceback.format_exc())
 
+    def _cap(text: str) -> str:
+        if len(text) > MAX_CAPTURE_CHARS:
+            return text[:MAX_CAPTURE_CHARS] + "\n[output truncated]"
+        return text
+
     return {
-        "stdout": stdout_capture.getvalue(),
-        "stderr": stderr_capture.getvalue(),
+        "stdout": _cap(stdout_capture.getvalue()),
+        "stderr": _cap(stderr_capture.getvalue()),
         "exit_code": exit_code,
     }
 
@@ -307,7 +330,7 @@ def main():
         result = execute_code(code, tools)
 
         # Send result to host via stdout
-        result_json = json.dumps(result)
+        result_json = _b64e(json.dumps(result))
         _write_stdout(f"{IPC_CODE_OUTPUT_START}{result_json}{IPC_CODE_OUTPUT_END}\n")
 
 
@@ -315,9 +338,21 @@ if __name__ == "__main__":
     main()
 "#;
 
-/// Get the runner script as bytes for copying to container.
+/// Get the runner script as bytes.
 pub fn get_runner_script_bytes() -> Vec<u8> {
     RUNNER_SCRIPT.as_bytes().to_vec()
+}
+
+/// Container command that runs the runner script inline (`python -c`), so no
+/// file has to be uploaded into the (read-only) container filesystem.
+pub fn runner_command() -> Vec<String> {
+    vec![
+        "python".to_string(),
+        "-u".to_string(),
+        "-B".to_string(),
+        "-c".to_string(),
+        RUNNER_SCRIPT.to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -369,6 +404,22 @@ mod tests {
         assert!(RUNNER_SCRIPT.contains("os.write("));
         assert!(RUNNER_SCRIPT.contains("os.read("));
         assert!(RUNNER_SCRIPT.contains("select.select"));
+    }
+
+    #[test]
+    fn test_runner_uses_base64_framing() {
+        assert!(RUNNER_SCRIPT.contains("import base64"));
+        assert!(RUNNER_SCRIPT.contains("_b64e(json.dumps(result))"));
+        assert!(RUNNER_SCRIPT.contains("_b64e(json.dumps({\"calls\": calls}))"));
+        assert!(RUNNER_SCRIPT.contains("json.loads(_b64d(line[start:end]))"));
+        assert!(RUNNER_SCRIPT.contains("MAX_CAPTURE_CHARS"));
+    }
+
+    #[test]
+    fn test_runner_command_inline() {
+        let cmd = runner_command();
+        assert_eq!(&cmd[..4], &["python", "-u", "-B", "-c"]);
+        assert_eq!(cmd[4], RUNNER_SCRIPT);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod pricing_sync;
 pub mod ptc;
 pub mod responses_context;
 pub mod service_tier;
+pub mod stream_billing;
 pub mod update;
 pub mod usage_tracker;
 

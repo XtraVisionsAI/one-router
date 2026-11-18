@@ -7,11 +7,14 @@
 //! never leaks the existence of another key's response.
 //!
 //! Mirrors the PTC session pattern (`services/ptc/service.rs`): an
-//! `Arc<RwLock<HashMap>>` with TTL expiry, a capacity bound (oldest-evicted),
-//! and a periodic sweeper driven from `server/app.rs`. In-memory only — entries
-//! do not survive a restart and are not shared across instances.
+//! `Arc<RwLock<..>>` with TTL expiry and a periodic sweeper driven from
+//! `server/app.rs`. Bounded by entry count, a per-entry byte cap (oversized
+//! turns are not stored), a total byte budget, and per-owner byte / entry
+//! quotas (an owner over quota evicts its own oldest entries first).
+//! Eviction is O(log n) via `seq`-ordered `BTreeMap` indexes. In-memory only —
+//! entries do not survive a restart and are not shared across instances.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +27,40 @@ pub const DEFAULT_TTL_SECS: u64 = 3600;
 /// Default maximum number of stored responses before oldest-eviction kicks in.
 pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
 
+/// Largest single entry (history text + response JSON). Chained
+/// `previous_response_id` history grows with every turn; past this the turn is
+/// answered but not stored.
+pub const DEFAULT_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+/// Byte budget for the whole store (oldest entries are evicted to fit).
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+/// Per-owner (API key) byte quota: an owner over quota evicts its **own**
+/// oldest entries, so one tenant cannot flush everyone else's context.
+pub const DEFAULT_MAX_OWNER_BYTES: usize = 64 * 1024 * 1024;
+/// Per-owner entry quota (same rationale as the byte quota).
+pub const DEFAULT_MAX_OWNER_ENTRIES: usize = 1_000;
+
+/// Store limits.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextLimits {
+    pub max_entries: usize,
+    pub max_entry_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_owner_bytes: usize,
+    pub max_owner_entries: usize,
+}
+
+impl Default for ContextLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: DEFAULT_MAX_ENTRIES,
+            max_entry_bytes: DEFAULT_MAX_ENTRY_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            max_owner_bytes: DEFAULT_MAX_OWNER_BYTES,
+            max_owner_entries: DEFAULT_MAX_OWNER_ENTRIES,
+        }
+    }
+}
+
 /// A single stored turn: the conversation as (role, text) pairs plus the full
 /// response JSON.
 #[derive(Debug, Clone)]
@@ -34,6 +71,8 @@ pub struct StoredResponse {
     /// Monotonic insertion sequence — used for deterministic oldest-eviction
     /// (wall-clock `created_at` has only second granularity and ties).
     seq: u64,
+    /// Accounted size (history text + serialized response JSON).
+    bytes: usize,
     /// Conversation messages (role, text) used to reconstruct history on the
     /// next turn. Only text is retained — rich parts (images/tools) are dropped.
     pub messages: Vec<(String, String)>,
@@ -54,12 +93,84 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Accounted size of stored history messages.
+pub fn messages_bytes(messages: &[(String, String)]) -> usize {
+    messages.iter().map(|(r, t)| r.len() + t.len() + 16).sum()
+}
+
+#[derive(Default)]
+struct OwnerUsage {
+    bytes: usize,
+    /// seq → response id, oldest first.
+    order: BTreeMap<u64, String>,
+}
+
+/// Entries plus the indexes that make eviction O(log n).
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<String, StoredResponse>,
+    /// seq → response id across all owners, oldest first.
+    order: BTreeMap<u64, String>,
+    owners: HashMap<String, OwnerUsage>,
+    total_bytes: usize,
+}
+
+impl Inner {
+    fn remove(&mut self, id: &str) -> Option<StoredResponse> {
+        let entry = self.entries.remove(id)?;
+        self.order.remove(&entry.seq);
+        self.total_bytes -= entry.bytes;
+        if let Some(o) = self.owners.get_mut(&entry.owner_key_hash) {
+            o.bytes -= entry.bytes;
+            o.order.remove(&entry.seq);
+            if o.order.is_empty() {
+                self.owners.remove(&entry.owner_key_hash);
+            }
+        }
+        Some(entry)
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        match self.order.first_key_value().map(|(_, id)| id.clone()) {
+            Some(id) => self.remove(&id).is_some(),
+            None => false,
+        }
+    }
+
+    fn evict_oldest_of(&mut self, owner: &str) -> bool {
+        let id = self
+            .owners
+            .get(owner)
+            .and_then(|o| o.order.first_key_value().map(|(_, id)| id.clone()));
+        match id {
+            Some(id) => self.remove(&id).is_some(),
+            None => false,
+        }
+    }
+
+    fn owner_usage(&self, owner: &str) -> (usize, usize) {
+        self.owners
+            .get(owner)
+            .map(|o| (o.bytes, o.order.len()))
+            .unwrap_or((0, 0))
+    }
+
+    fn insert(&mut self, id: String, entry: StoredResponse) {
+        self.total_bytes += entry.bytes;
+        self.order.insert(entry.seq, id.clone());
+        let o = self.owners.entry(entry.owner_key_hash.clone()).or_default();
+        o.bytes += entry.bytes;
+        o.order.insert(entry.seq, id.clone());
+        self.entries.insert(id, entry);
+    }
+}
+
 /// In-memory, ownership-bound store for Responses continuation context.
 pub struct ResponsesContextStore {
-    inner: Arc<RwLock<HashMap<String, StoredResponse>>>,
+    inner: Arc<RwLock<Inner>>,
     seq: AtomicU64,
     ttl_secs: u64,
-    max_entries: usize,
+    limits: ContextLimits,
 }
 
 impl ResponsesContextStore {
@@ -68,44 +179,83 @@ impl ResponsesContextStore {
     }
 
     pub fn with_config(ttl_secs: u64, max_entries: usize) -> Self {
+        Self::with_limits(
+            ttl_secs,
+            ContextLimits {
+                max_entries,
+                ..ContextLimits::default()
+            },
+        )
+    }
+
+    pub fn with_limits(ttl_secs: u64, limits: ContextLimits) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(Inner::default())),
             seq: AtomicU64::new(0),
             ttl_secs,
-            max_entries,
+            limits,
         }
     }
 
-    /// Store a response's context. Evicts the oldest entry if at capacity.
+    /// Largest storable entry, in accounted bytes.
+    pub fn max_entry_bytes(&self) -> usize {
+        self.limits.max_entry_bytes
+    }
+
+    /// Store a response's context. Returns `false` (and logs a warning) when
+    /// the entry exceeds the per-entry cap — the turn behaves as `store: false`.
+    /// Otherwise evicts, oldest first: the owner's own entries while it is over
+    /// its quota, then global entries while the store is over capacity / bytes.
     pub async fn save(
         &self,
         response_id: &str,
         owner_key_hash: &str,
         messages: Vec<(String, String)>,
         response_json: serde_json::Value,
-    ) {
+    ) -> bool {
+        let json_bytes = serde_json::to_vec(&response_json)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let bytes = messages_bytes(&messages) + json_bytes + response_id.len();
+        let limits = self.limits;
+        if bytes > limits.max_entry_bytes || bytes > limits.max_owner_bytes {
+            tracing::warn!(
+                response_id,
+                bytes,
+                max_entry_bytes = limits.max_entry_bytes,
+                "Responses context too large to store; previous_response_id continuation from this response will not be available"
+            );
+            return false;
+        }
         let now = now_secs();
         let entry = StoredResponse {
             owner_key_hash: owner_key_hash.to_string(),
             created_at: now,
             expires_at: now + self.ttl_secs,
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            bytes,
             messages,
             response_json,
         };
 
-        let mut map = self.inner.write().await;
-        if map.len() >= self.max_entries && !map.contains_key(response_id) {
-            // Evict the oldest entry (lowest insertion sequence) to make room.
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, v)| v.seq)
-                .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
+        let mut inner = self.inner.write().await;
+        inner.remove(response_id);
+        // Per-owner quota: evict the owner's own oldest entries.
+        loop {
+            let (owner_bytes, owner_count) = inner.owner_usage(owner_key_hash);
+            let fits = owner_bytes + bytes <= limits.max_owner_bytes
+                && owner_count < limits.max_owner_entries;
+            if fits || !inner.evict_oldest_of(owner_key_hash) {
+                break;
             }
         }
-        map.insert(response_id.to_string(), entry);
+        // Global capacity / byte budget.
+        while (inner.entries.len() >= limits.max_entries
+            || inner.total_bytes + bytes > limits.max_total_bytes)
+            && inner.evict_oldest()
+        {}
+        inner.insert(response_id.to_string(), entry);
+        true
     }
 
     /// Load the stored conversation messages for `response_id`, validating owner.
@@ -115,8 +265,8 @@ impl ResponsesContextStore {
         response_id: &str,
         owner_key_hash: &str,
     ) -> Result<Vec<(String, String)>, ResponsesContextError> {
-        let map = self.inner.read().await;
-        match map.get(response_id) {
+        let inner = self.inner.read().await;
+        match inner.entries.get(response_id) {
             Some(entry)
                 if entry.owner_key_hash == owner_key_hash && entry.expires_at > now_secs() =>
             {
@@ -132,8 +282,8 @@ impl ResponsesContextStore {
         response_id: &str,
         owner_key_hash: &str,
     ) -> Result<serde_json::Value, ResponsesContextError> {
-        let map = self.inner.read().await;
-        match map.get(response_id) {
+        let inner = self.inner.read().await;
+        match inner.entries.get(response_id) {
             Some(entry)
                 if entry.owner_key_hash == owner_key_hash && entry.expires_at > now_secs() =>
             {
@@ -150,10 +300,10 @@ impl ResponsesContextStore {
         response_id: &str,
         owner_key_hash: &str,
     ) -> Result<(), ResponsesContextError> {
-        let mut map = self.inner.write().await;
-        match map.get(response_id) {
+        let mut inner = self.inner.write().await;
+        match inner.entries.get(response_id) {
             Some(entry) if entry.owner_key_hash == owner_key_hash => {
-                map.remove(response_id);
+                inner.remove(response_id);
                 Ok(())
             }
             _ => Err(ResponsesContextError::NotFound),
@@ -163,15 +313,27 @@ impl ResponsesContextStore {
     /// Remove all expired entries. Returns the number removed.
     pub async fn sweep_expired(&self) -> usize {
         let now = now_secs();
-        let mut map = self.inner.write().await;
-        let before = map.len();
-        map.retain(|_, v| v.expires_at > now);
-        before - map.len()
+        let mut inner = self.inner.write().await;
+        let expired: Vec<String> = inner
+            .entries
+            .iter()
+            .filter(|(_, v)| v.expires_at <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in &expired {
+            inner.remove(id);
+        }
+        expired.len()
     }
 
     #[cfg(test)]
     async fn len(&self) -> usize {
-        self.inner.read().await.len()
+        self.inner.read().await.entries.len()
+    }
+
+    #[cfg(test)]
+    async fn total_bytes(&self) -> usize {
+        self.inner.read().await.total_bytes
     }
 }
 
@@ -232,6 +394,7 @@ mod tests {
         let removed = store.sweep_expired().await;
         assert_eq!(removed, 1);
         assert_eq!(store.len().await, 0);
+        assert_eq!(store.total_bytes().await, 0);
     }
 
     #[tokio::test]
@@ -270,5 +433,93 @@ mod tests {
             .await;
         let json = store.get_response_json("resp_1", "o").await.unwrap();
         assert_eq!(json["object"], "response");
+    }
+
+    fn big(n: usize) -> Vec<(String, String)> {
+        vec![("user".to_string(), "x".repeat(n))]
+    }
+
+    fn small_limits() -> ContextLimits {
+        ContextLimits {
+            max_entries: 100,
+            max_entry_bytes: 1_000,
+            max_total_bytes: 3_000,
+            max_owner_bytes: 2_000,
+            max_owner_entries: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oversized_entry_not_stored() {
+        let store = ResponsesContextStore::with_limits(3600, small_limits());
+        assert!(
+            !store
+                .save("r1", "o", big(5_000), serde_json::json!({}))
+                .await
+        );
+        assert!(store.load("r1", "o").await.is_err());
+        assert_eq!(store.total_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_owner_quota_evicts_only_own_entries() {
+        let store = ResponsesContextStore::with_limits(3600, small_limits());
+        assert!(
+            store
+                .save("victim", "b", big(500), serde_json::json!({}))
+                .await
+        );
+        // Owner "a" writes far past its 2000-byte quota.
+        for i in 0..10 {
+            assert!(
+                store
+                    .save(&format!("a{i}"), "a", big(800), serde_json::json!({}))
+                    .await
+            );
+        }
+        // The other tenant's entry survives; "a" keeps only its newest ones.
+        assert!(store.load("victim", "b").await.is_ok());
+        assert!(store.load("a9", "a").await.is_ok());
+        assert!(store.load("a0", "a").await.is_err());
+        assert!(store.total_bytes().await <= 3_000);
+    }
+
+    #[tokio::test]
+    async fn test_owner_entry_quota() {
+        let limits = ContextLimits {
+            max_owner_entries: 2,
+            ..small_limits()
+        };
+        let store = ResponsesContextStore::with_limits(3600, limits);
+        store.save("b1", "b", msgs(), serde_json::json!({})).await;
+        for i in 0..5 {
+            store
+                .save(&format!("a{i}"), "a", msgs(), serde_json::json!({}))
+                .await;
+        }
+        assert_eq!(store.len().await, 3);
+        assert!(store.load("b1", "b").await.is_ok());
+        assert!(store.load("a4", "a").await.is_ok());
+        assert!(store.load("a2", "a").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_total_byte_budget_and_accounting() {
+        let store = ResponsesContextStore::with_limits(3600, small_limits());
+        for (i, owner) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            store
+                .save(&format!("r{i}"), owner, big(900), serde_json::json!({}))
+                .await;
+        }
+        assert!(store.total_bytes().await <= 3_000);
+        assert!(store.load("r0", "a").await.is_err()); // globally oldest evicted
+        assert!(store.load("r4", "e").await.is_ok());
+        // Delete / overwrite keep the byte counters exact.
+        store.delete("r4", "e").await.unwrap();
+        store.save("r3", "d", msgs(), serde_json::json!({})).await;
+        let inner = store.inner.read().await;
+        let sum: usize = inner.entries.values().map(|e| e.bytes).sum();
+        assert_eq!(inner.total_bytes, sum);
+        assert_eq!(inner.order.len(), inner.entries.len());
     }
 }

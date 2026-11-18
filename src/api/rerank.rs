@@ -19,6 +19,9 @@ use super::chat_completions::OpenAIApiError;
 /// POST /v1/rerank
 pub async fn create_rerank(
     State(state): State<AppState>,
+    axum::extract::Extension(key_info): axum::extract::Extension<
+        crate::middleware::auth::ApiKeyInfo,
+    >,
     Json(request): Json<RerankRequest>,
 ) -> Result<impl IntoResponse, OpenAIApiError> {
     let start_time = Instant::now();
@@ -127,6 +130,25 @@ pub async fn create_rerank(
         result_count = results.len(),
         duration_ms = duration_ms,
         "Rerank request completed"
+    );
+
+    // Usage row + budget/TPM accounting. Rerank is not token-priced upstream
+    // (search units); query + documents are recorded as input tokens and
+    // billed only at the mapping's own input price (0 when unpriced).
+    let input_tokens: u64 = crate::utils::tokens::estimate_text_tokens(&request.query)
+        + request
+            .documents
+            .iter()
+            .map(|d| crate::utils::tokens::estimate_text_tokens(d))
+            .sum::<u64>();
+    state.usage_tracker.spawn_record_usage(
+        key_info,
+        request_id.clone(),
+        request.model.clone(),
+        crate::schemas::anthropic::Usage::new(input_tokens.min(i32::MAX as u64) as i32, 0),
+        "bedrock".to_string(),
+        "openai",
+        crate::services::usage_tracker::DefaultPricing::None,
     );
 
     let response = RerankResponse {

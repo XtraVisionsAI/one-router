@@ -270,9 +270,20 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/v1", openai_routes.layer(create_cors_layer()))
         .merge(health_routes)
         .merge(metrics_routes)
-        .nest("/admin/api", admin_session_routes) // login/logout (no auth)
-        .nest("/admin/api", admin_api_routes) // protected admin endpoints
-        .nest("/admin", admin_static_routes) // broader wildcard second
+        // Admin responses (UI, API, login) carry CSP / anti-framing headers;
+        // outermost on each so auth rejections get them too.
+        .nest(
+            "/admin/api",
+            admin_session_routes.layer(middleware::from_fn(admin::admin_security_headers)),
+        ) // login/logout (no auth)
+        .nest(
+            "/admin/api",
+            admin_api_routes.layer(middleware::from_fn(admin::admin_security_headers)),
+        ) // protected admin endpoints
+        .nest(
+            "/admin",
+            admin_static_routes.layer(middleware::from_fn(admin::admin_security_headers)),
+        ) // broader wildcard second
         .fallback(move |request: Request<Body>| async move { fallback_handler(request) })
         .layer(body_limit)
         .layer(middleware::from_fn(track_http_metrics))

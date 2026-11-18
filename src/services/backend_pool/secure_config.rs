@@ -209,9 +209,32 @@ pub fn mask_backend_config(config: &Value) -> Value {
 /// `stored`. A masked list entry is matched to the stored entry with the same
 /// mask; a placeholder with no matching stored secret is left in place (and
 /// then rejected by [`validate_backend_config`]).
-pub fn merge_masked(mut incoming: Value, stored: &Value) -> Value {
+///
+/// Masked placeholders are only honoured while the secrets keep going where
+/// they went before: if the update changes a destination-determining field —
+/// `base_url` (added, removed or changed) or the backend type
+/// (`type_changed`) — any placeholder is refused, so an admin session cannot
+/// point a stored key at a new host without knowing (and resending) it. AWS
+/// `region` / `profile` are not destinations in this sense: region is
+/// restricted to AWS region codes by [`validate_backend_config`], so every
+/// host built from it is AWS's own.
+pub fn merge_masked(
+    mut incoming: Value,
+    stored: &Value,
+    type_changed: bool,
+) -> Result<Value, String> {
+    if !contains_mask(&incoming) {
+        return Ok(incoming);
+    }
+    if type_changed || normalized_base_url(&incoming) != normalized_base_url(stored) {
+        return Err(
+            "the backend's destination (base_url / type) changed: masked secrets (••••) \
+             cannot be carried over, send the real secrets"
+                .into(),
+        );
+    }
     let Some(obj) = incoming.as_object_mut() else {
-        return incoming;
+        return Ok(incoming);
     };
     for f in SECRET_FIELDS {
         if let Some(Value::String(s)) = obj.get_mut(*f) {
@@ -252,7 +275,12 @@ pub fn merge_masked(mut incoming: Value, stored: &Value) -> Value {
             }
         }
     }
-    incoming
+    Ok(incoming)
+}
+
+/// Normalized `base_url` (None = provider default endpoint).
+fn normalized_base_url(v: &Value) -> Option<String> {
+    str_field(v, "base_url").map(|s| s.trim().trim_end_matches('/').to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -354,7 +382,7 @@ mod tests {
         let mut edited = masked.clone();
         edited["region"] = json!("us-west-2");
         edited["api_keys"] = json!(["••••2222", "sk-newkey00003333"]);
-        let merged = merge_masked(edited, &stored);
+        let merged = merge_masked(edited, &stored, false).unwrap();
         assert_eq!(merged["secret_access_key"], "supersecretvalue9999");
         assert_eq!(merged["access_key_id"], "AKIAABCDEFGH1234");
         assert_eq!(
@@ -367,9 +395,46 @@ mod tests {
         );
 
         // A placeholder that matches nothing stays masked → rejected.
-        let unknown = merge_masked(json!({"api_keys": ["••••zzzz"]}), &stored);
+        let unknown = merge_masked(json!({"api_keys": ["••••zzzz"]}), &stored, false).unwrap();
         assert!(
             validate_backend_config("openai", &unknown, &CredentialPolicy::permissive()).is_err()
         );
+    }
+
+    #[test]
+    fn masked_secrets_refused_when_destination_changes() {
+        let stored =
+            json!({"api_keys": ["sk-aaaaaaaa1111"], "base_url": "https://api.openai.com/v1"});
+        let masked = mask_backend_config(&stored);
+
+        // Same destination (trailing slash / case are not a change): merged.
+        let mut same = masked.clone();
+        same["base_url"] = json!("https://API.openai.com/v1/");
+        same["timeout_seconds"] = json!(60);
+        let merged = merge_masked(same, &stored, false).unwrap();
+        assert_eq!(merged["api_keys"], json!(["sk-aaaaaaaa1111"]));
+
+        // base_url changed → refused.
+        let mut moved = masked.clone();
+        moved["base_url"] = json!("https://attacker.example/v1");
+        assert!(merge_masked(moved, &stored, false).is_err());
+
+        // base_url added where there was none → refused.
+        let stored_default = json!({"api_keys": ["sk-aaaaaaaa1111"]});
+        let mut added = mask_backend_config(&stored_default);
+        added["base_url"] = json!("https://attacker.example");
+        assert!(merge_masked(added, &stored_default, false).is_err());
+
+        // base_url removed → refused.
+        let mut removed = masked.clone();
+        removed.as_object_mut().unwrap().remove("base_url");
+        assert!(merge_masked(removed, &stored, false).is_err());
+
+        // Backend type changed → refused.
+        assert!(merge_masked(masked.clone(), &stored, true).is_err());
+
+        // Resending real secrets with a new destination is fine.
+        let fresh = json!({"api_keys": ["sk-newkey00003333"], "base_url": "https://relay.example"});
+        assert_eq!(merge_masked(fresh.clone(), &stored, true).unwrap(), fresh);
     }
 }

@@ -28,8 +28,9 @@ pub const PRICING_SOURCE_MANUAL: &str = "manual";
 pub const DEFAULT_PRICING_SYNC_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
-/// Safety cap on the downloaded body (the real table is ~2 MiB).
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Safety cap on the downloaded body (the real table is a few MiB; the body is
+/// streamed, so the cap bounds memory, not just the accepted size).
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bedrock region prefixes stripped when matching a target model ID.
@@ -315,33 +316,23 @@ pub(crate) async fn fetch_litellm(url: &str) -> Result<serde_json::Value, String
     }
 
     // Admin-supplied URL: guarded DNS (no private / metadata addresses), no
-    // proxy, no redirects.
-    let client = crate::services::web_tools::ssrf::guarded_client(FETCH_TIMEOUT, "one-router")?;
-    let resp = client
-        .get(parsed)
-        .send()
+    // proxy, no redirects; `send_guarded` also rejects IP-literal hosts, which
+    // never reach the guarded resolver.
+    use crate::services::web_tools::ssrf;
+    let client = ssrf::guarded_client(FETCH_TIMEOUT, "one-router")?;
+    let resp = ssrf::send_guarded(&client, client.get(parsed))
         .await
-        .map_err(|e| format!("pricing table fetch failed: {}", e.without_url()))?;
+        .map_err(|e| format!("pricing table fetch failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!(
             "pricing table fetch failed: HTTP {}",
             resp.status().as_u16()
         ));
     }
-    if let Some(len) = resp.content_length() {
-        if len as usize > MAX_BODY_BYTES {
-            return Err(format!(
-                "pricing table too large ({len} > {MAX_BODY_BYTES} bytes)"
-            ));
-        }
-    }
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_BODY_BYTES {
-        return Err(format!(
-            "pricing table too large ({} > {MAX_BODY_BYTES} bytes)",
-            bytes.len()
-        ));
-    }
+    // Streamed with a hard cap: an oversized body is never buffered whole.
+    let bytes = ssrf::read_body_capped(resp, MAX_BODY_BYTES, ssrf::OversizePolicy::Reject)
+        .await
+        .map_err(|e| format!("pricing table: {e}"))?;
     let data: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid pricing JSON: {e}"))?;
     if !data.is_object() {
@@ -641,5 +632,17 @@ mod tests {
         // dry_run: nothing to write even though an update was detected.
         assert!(writes.is_empty());
         assert!(summary.dry_run);
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_ip_literal_hosts() {
+        for url in [
+            "https://169.254.169.254/latest/meta-data/",
+            "https://127.0.0.1/table.json",
+            "https://[::ffff:10.0.0.1]/table.json",
+        ] {
+            let err = fetch_litellm(url).await.unwrap_err();
+            assert!(err.contains("forbidden"), "{url}: {err}");
+        }
     }
 }

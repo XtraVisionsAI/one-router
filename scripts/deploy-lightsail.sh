@@ -330,6 +330,15 @@ if [[ -n "$MASTER_API_KEY" && "$MASTER_API_KEY" != sha256:* ]]; then
     unset _mk_hex
     info "MASTER_API_KEY will be deployed as its SHA-256 (log in with the original key)"
 fi
+# Lightsail container environment variables are plain configuration (readable
+# by anyone with lightsail:GetContainerServices). Recommend a wrapped key.
+if [[ -n "$ENCRYPTION_KEY" && "$ENCRYPTION_KEY" != aws-kms:* && "$ENCRYPTION_KEY" != vault-transit:* ]]; then
+    warn "ENCRYPTION_KEY is deployed as plaintext in the container environment."
+    warn "Recommended: wrap it first and deploy the reference instead, e.g."
+    warn "  ENCRYPTION_KEY=... one-router wrap-key --provider aws-kms --key <kms-key-arn> --no-write"
+    warn "  (or --provider vault-transit) and pass the resulting aws-kms:… / vault-transit:… value."
+    warn "  Note: aws-kms needs AWS credentials with kms:Decrypt inside the container (Lightsail has no task role)."
+fi
 CONTAINERS_FILE=$(private_tmp)
 DB_VALUE="${DATABASE}" MK="${MASTER_API_KEY}" EK="${ENCRYPTION_KEY}" jq -n --arg image "${LIGHTSAIL_IMAGE}" '
   {"one-router": {

@@ -517,41 +517,60 @@ impl SqliteBackend {
 
     /// Full-row update of an api_keys row; `extra_where` narrows the match.
     /// Returns rows affected.
-    async fn write_api_key(&self, record: &ApiKeyRecord, extra_where: &str) -> Result<u64> {
-        let res = sqlx::query(&format!(
+    ///
+    /// The live spend counters (`budget_used`, `budget_used_mtd`,
+    /// `budget_mtd_month`, `budget_history`) are written only when
+    /// `with_counters` is set (the one-time user migration, which deliberately
+    /// moves the month-to-date spend to the new user). Admin edits read the row,
+    /// modify it and write it back; including the counters there would
+    /// overwrite spend that concurrent requests added in between.
+    async fn write_api_key(
+        &self,
+        record: &ApiKeyRecord,
+        extra_where: &str,
+        with_counters: bool,
+    ) -> Result<u64> {
+        let counters = if with_counters {
+            ", budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, budget_history = ?"
+        } else {
+            ""
+        };
+        let sql = format!(
             "UPDATE api_keys SET \
              user_id = ?, name = ?, is_active = ?, rate_limit = ?, cost_rate = ?, \
-             monthly_budget = ?, budget_used = ?, budget_used_mtd = ?, budget_mtd_month = ?, \
-             deactivated_reason = ?, budget_history = ?, tpm_limit = ?, cache_ttl = ?, metadata = ?, \
+             monthly_budget = ?, \
+             deactivated_reason = ?, tpm_limit = ?, cache_ttl = ?, metadata = ?, \
              expires_at = ?, allowed_models = ?, allowed_cidrs = ?, budget_period = ?, \
-             default_tags = ?, rotated_to = ?, max_concurrency = ?, updated_at = ? \
+             default_tags = ?, rotated_to = ?, max_concurrency = ?, updated_at = ?{counters} \
              WHERE api_key = ?{extra_where}"
-        ))
-        .bind(&record.user_id)
-        .bind(&record.name)
-        .bind(record.is_active as i32)
-        .bind(record.rate_limit)
-        .bind(record.cost_rate)
-        .bind(record.monthly_budget)
-        .bind(record.budget_used)
-        .bind(record.budget_used_mtd)
-        .bind(&record.budget_mtd_month)
-        .bind(&record.deactivated_reason)
-        .bind(&record.budget_history)
-        .bind(record.tpm_limit)
-        .bind(&record.cache_ttl)
-        .bind(&record.metadata)
-        .bind(record.expires_at)
-        .bind(patterns_to_json(&record.allowed_models))
-        .bind(patterns_to_json(&record.allowed_cidrs))
-        .bind(record.budget_period.as_str())
-        .bind(patterns_to_json(&record.default_tags))
-        .bind(&record.rotated_to)
-        .bind(record.max_concurrency)
-        .bind(unix_now())
-        .bind(&record.api_key)
-        .execute(&self.pool)
-        .await?;
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(&record.user_id)
+            .bind(&record.name)
+            .bind(record.is_active as i32)
+            .bind(record.rate_limit)
+            .bind(record.cost_rate)
+            .bind(record.monthly_budget)
+            .bind(&record.deactivated_reason)
+            .bind(record.tpm_limit)
+            .bind(&record.cache_ttl)
+            .bind(&record.metadata)
+            .bind(record.expires_at)
+            .bind(patterns_to_json(&record.allowed_models))
+            .bind(patterns_to_json(&record.allowed_cidrs))
+            .bind(record.budget_period.as_str())
+            .bind(patterns_to_json(&record.default_tags))
+            .bind(&record.rotated_to)
+            .bind(record.max_concurrency)
+            .bind(unix_now());
+        if with_counters {
+            q = q
+                .bind(record.budget_used)
+                .bind(record.budget_used_mtd)
+                .bind(&record.budget_mtd_month)
+                .bind(&record.budget_history);
+        }
+        let res = q.bind(&record.api_key).execute(&self.pool).await?;
         Ok(res.rows_affected())
     }
 
@@ -774,7 +793,8 @@ fn row_to_user(r: &sqlx::sqlite::SqliteRow) -> UserRecord {
 }
 
 /// `UPDATE <table> SET budget_used += amount, budget_used_mtd += amount`, then
-/// report whether month-to-date spend reached the monthly budget.
+/// report whether month-to-date spend reached the monthly budget. Counters are
+/// clamped at 0 (a refund can never drive spend negative).
 async fn increment_budget(
     pool: &SqlitePool,
     table: &str,
@@ -784,8 +804,8 @@ async fn increment_budget(
 ) -> Result<SpendAfter> {
     let mut tx = pool.begin().await?;
     let result = sqlx::query(&format!(
-        "UPDATE {table} SET budget_used = budget_used + ?, \
-         budget_used_mtd = budget_used_mtd + ?, updated_at = ? WHERE {id_col} = ?"
+        "UPDATE {table} SET budget_used = MAX(0.0, budget_used + ?), \
+         budget_used_mtd = MAX(0.0, budget_used_mtd + ?), updated_at = ? WHERE {id_col} = ?"
     ))
     .bind(amount)
     .bind(amount)
@@ -1138,7 +1158,7 @@ impl ApiKeyStore for SqliteBackend {
     }
 
     async fn update_api_key(&self, record: &ApiKeyRecord) -> Result<()> {
-        self.write_api_key(record, "").await.map(|_| ())
+        self.write_api_key(record, "", false).await.map(|_| ())
     }
 
     async fn deactivate_api_key(&self, api_key: &str, reason: &str) -> Result<()> {
@@ -1255,7 +1275,7 @@ impl ApiKeyStore for SqliteBackend {
     }
 
     async fn assign_unowned_key(&self, record: &ApiKeyRecord) -> Result<bool> {
-        self.write_api_key(record, " AND (user_id IS NULL OR user_id = '')")
+        self.write_api_key(record, " AND (user_id IS NULL OR user_id = '')", true)
             .await
             .map(|n| n > 0)
     }
@@ -2775,6 +2795,59 @@ mod tests {
         let got = db.api_keys().get_api_key("hash-p2").await.unwrap().unwrap();
         assert_eq!(got.rotated_to.as_deref(), Some("next"));
         assert_eq!(got.last_used_at, Some(1234)); // update keeps last_used_at
+    }
+
+    #[tokio::test]
+    async fn key_update_preserves_live_spend_counters() {
+        let db = in_memory_db().await;
+        let rec = key_record("hash-ctr", "ctr");
+        db.api_keys().create_api_key(&rec).await.unwrap();
+        // Admin reads the row...
+        let mut edit = db
+            .api_keys()
+            .get_api_key("hash-ctr")
+            .await
+            .unwrap()
+            .unwrap();
+        // ...requests are charged meanwhile...
+        db.api_keys()
+            .increment_budget_used("hash-ctr", 2.5)
+            .await
+            .unwrap();
+        // ...and the admin writes back a stale (zero) copy of the counters.
+        edit.monthly_budget = Some(50.0);
+        edit.budget_used = 0.0;
+        edit.budget_used_mtd = 0.0;
+        db.api_keys().update_api_key(&edit).await.unwrap();
+        let got = db
+            .api_keys()
+            .get_api_key("hash-ctr")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.monthly_budget, Some(50.0));
+        assert_eq!(got.budget_used, 2.5);
+        assert_eq!(got.budget_used_mtd, 2.5);
+    }
+
+    #[tokio::test]
+    async fn spend_counters_clamp_at_zero() {
+        let db = in_memory_db().await;
+        let u = UserRecord::new("clamp", 0);
+        db.users().create_user(&u).await.unwrap();
+        db.users()
+            .increment_user_budget_used(&u.user_id, 1.0)
+            .await
+            .unwrap();
+        let after = db
+            .users()
+            .increment_user_budget_used(&u.user_id, -5.0)
+            .await
+            .unwrap();
+        assert_eq!(after.used, 0.0);
+        let got = db.users().get_user(&u.user_id).await.unwrap().unwrap();
+        assert_eq!(got.budget_used_mtd, 0.0);
+        assert_eq!(got.budget_used, 0.0);
     }
 
     #[tokio::test]

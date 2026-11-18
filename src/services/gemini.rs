@@ -299,7 +299,13 @@ impl GeminiService {
                 let response_text = resp.text().await?;
 
                 serde_json::from_str(&response_text).map_err(|e| {
-                    tracing::error!(error = %e, body = %response_text, "Failed to parse Gemini response");
+                    tracing::error!(
+                        kind = ?e.classify(),
+                        line = e.line(),
+                        column = e.column(),
+                        body_bytes = response_text.len(),
+                        "Failed to parse Gemini response"
+                    );
                     GeminiServiceError::ParseError(e.to_string())
                 })
             }
@@ -455,7 +461,13 @@ impl GeminiService {
 
                 let response_text = resp.text().await?;
                 serde_json::from_str(&response_text).map_err(|e| {
-                    tracing::error!(error = %e, body = %response_text, "Failed to parse Gemini raw response");
+                    tracing::error!(
+                        kind = ?e.classify(),
+                        line = e.line(),
+                        column = e.column(),
+                        body_bytes = response_text.len(),
+                        "Failed to parse Gemini raw response"
+                    );
                     GeminiServiceError::ParseError(e.to_string())
                 })
             }

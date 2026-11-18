@@ -139,6 +139,12 @@ type SseStream = std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> 
 pub enum ChatCompletionApiResponse {
     Json(Json<ChatCompletionResponse>),
     Stream(SseStream),
+    /// SSE stream whose usage is recorded at body end **or** on client
+    /// disconnect (see `services::stream_billing`).
+    Billed(
+        SseStream,
+        Box<crate::services::stream_billing::StreamBilling>,
+    ),
 }
 
 impl IntoResponse for ChatCompletionApiResponse {
@@ -148,6 +154,14 @@ impl IntoResponse for ChatCompletionApiResponse {
             ChatCompletionApiResponse::Stream(stream) => Sse::new(stream)
                 .keep_alive(crate::api::sse_keep_alive())
                 .into_response(),
+            ChatCompletionApiResponse::Billed(stream, billing) => {
+                crate::services::stream_billing::bill_sse_response(
+                    Sse::new(stream)
+                        .keep_alive(crate::api::sse_keep_alive())
+                        .into_response(),
+                    *billing,
+                )
+            }
         }
     }
 }
@@ -185,8 +199,11 @@ struct UsageContext {
     stream_usage: Arc<tokio::sync::Mutex<StreamUsage>>,
 }
 
-/// Wrap an SSE stream so that after the inner stream completes, usage is
-/// read from the shared `StreamUsage` state and recorded via the tracker.
+/// Attach usage billing to an SSE stream: usage is recorded once, when the
+/// encoded body ends (the inner stream's exact `StreamUsage`, or what the
+/// body showed if the inner stream never wrote it) **or** when the client
+/// disconnects mid-stream (usage seen so far + estimates). See
+/// `services::stream_billing`.
 #[allow(clippy::too_many_arguments)]
 fn wrap_stream_with_usage_recording(
     inner: SseStream,
@@ -198,29 +215,31 @@ fn wrap_stream_with_usage_recording(
     provider: String,
     protocol: &'static str,
     cache_ttl: Option<String>,
-) -> SseStream {
-    use futures::StreamExt;
-    let stream = async_stream::stream! {
-        let mut inner = inner;
-        while let Some(item) = inner.next().await {
-            yield item;
-        }
-        let u = usage.lock().await;
-        let anthropic_usage = crate::schemas::anthropic::Usage {
+    input_estimate: i32,
+) -> ChatCompletionApiResponse {
+    let exact: crate::services::stream_billing::ExactUsage = Arc::new(move || {
+        let u = usage.try_lock().ok()?;
+        Some(crate::schemas::anthropic::Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cache_creation_input_tokens: u.cache_creation_input_tokens,
             cache_read_input_tokens: u.cache_read_input_tokens,
-        };
-        drop(u);
-        if let Err(e) = tracker
-            .record_usage(&key_info, &request_id, &model, &anthropic_usage, true, &provider, protocol, cache_ttl.as_deref())
-            .await
-        {
-            tracing::warn!(error = %e, "Failed to record streaming usage");
-        }
-    };
-    Box::pin(stream)
+        })
+    });
+    ChatCompletionApiResponse::Billed(
+        inner,
+        Box::new(crate::services::stream_billing::StreamBilling {
+            tracker,
+            key_info,
+            request_id,
+            model,
+            provider,
+            protocol,
+            cache_ttl,
+            input_estimate,
+            exact: Some(exact),
+        }),
+    )
 }
 
 // ============================================================================
@@ -244,6 +263,13 @@ pub async fn chat_completions(
     let start_time = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let model = request.model.clone();
+    let input_estimate = if request.stream {
+        serde_json::to_value(&request.messages)
+            .map(|v| crate::services::stream_billing::estimate_json_tokens(&v))
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     let dispatch = dispatch_chat(
         &state,
@@ -299,20 +325,19 @@ pub async fn chat_completions(
             });
             Ok(ChatCompletionApiResponse::Json(json_resp))
         }
-        ChatCompletionApiResponse::Stream(stream) => {
-            let wrapped = wrap_stream_with_usage_recording(
-                stream,
-                stream_usage,
-                state.usage_tracker.clone(),
-                key_info.clone(),
-                model,
-                request_id,
-                provider,
-                "openai",
-                cache_ttl,
-            );
-            Ok(ChatCompletionApiResponse::Stream(wrapped))
-        }
+        ChatCompletionApiResponse::Stream(stream) => Ok(wrap_stream_with_usage_recording(
+            stream,
+            stream_usage,
+            state.usage_tracker.clone(),
+            key_info.clone(),
+            model,
+            request_id,
+            provider,
+            "openai",
+            cache_ttl,
+            input_estimate,
+        )),
+        billed @ ChatCompletionApiResponse::Billed(..) => Ok(billed),
     }
 }
 

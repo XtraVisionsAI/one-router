@@ -64,15 +64,33 @@ impl App {
         let encryptor = Encryptor::new(settings.encryption_key.as_deref());
         if encryptor.is_enabled() {
             tracing::info!("Credential encryption enabled (AES-256-GCM)");
+            // Plaintext / legacy-format secrets → current format, before the
+            // dynamic config reads them. Best-effort: failures are logged.
+            upgrade_stored_secrets(&database, &encryptor).await;
         }
 
         // 3. Initialize PTC service (before dynamic config, for code executor sharing)
-        let ptc_service = match PtcService::new().await {
-            Ok(service) => Some(Arc::new(service)),
-            Err(e) => {
-                tracing::debug!("PTC service not available: {}", e);
-                None
+        // Infra opt-in: the Docker sandbox runs model-written code, so it is
+        // only constructed with `PTC_ENABLED=true` (even if Docker is reachable).
+        let ptc_service = if crate::services::ptc::service::ptc_enabled_from_env() {
+            match PtcService::new().await {
+                Ok(service) => {
+                    tracing::info!(
+                        image = %service.sandbox().config().image,
+                        max_sessions = service.limits().max_sessions,
+                        max_sessions_per_key = service.limits().max_sessions_per_owner,
+                        "PTC sandbox enabled"
+                    );
+                    Some(Arc::new(service))
+                }
+                Err(e) => {
+                    tracing::warn!("PTC_ENABLED is set but the sandbox is unavailable: {}", e);
+                    None
+                }
             }
+        } else {
+            tracing::debug!("PTC sandbox disabled (set PTC_ENABLED=true to enable)");
+            None
         };
 
         // 4-5. Build dynamic config (backends + settings + web tools)
@@ -186,6 +204,21 @@ impl App {
                 }
             }
         });
+        // Sweep expired PTC sessions (and their containers).
+        if let Some(ptc) = self.state.ptc_service.clone() {
+            tokio::spawn(async move {
+                let every = std::time::Duration::from_secs(
+                    crate::services::ptc::service::SESSION_SWEEP_INTERVAL_SECS,
+                );
+                loop {
+                    tokio::time::sleep(every).await;
+                    let removed = ptc.cleanup_expired_sessions().await;
+                    if removed > 0 {
+                        tracing::info!(removed, "Swept expired PTC sessions");
+                    }
+                }
+            });
+        }
         // Expired shared rate-limit windows (`rate_limit_store = database`).
         let rc_db = self.state.database.clone();
         let rc_limiter = self.state.usage_tracker.token_limiter();
@@ -268,9 +301,14 @@ async fn init_bedrock_from_backends(
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in bedrock_backends.iter().enumerate() {
-        let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
-            anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
-        })?;
+        let decrypted_config = encryptor
+            .decrypt(
+                &backend.config,
+                &crate::database::encryption::backend_context(&backend.name),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
+            })?;
         if let Err(msg) = crate::services::backend_pool::secure_config::check_stored(
             &backend.backend_type,
             &decrypted_config,
@@ -370,9 +408,14 @@ async fn init_gemini_from_backends(
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in gemini_backends.iter().enumerate() {
-        let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
-            anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
-        })?;
+        let decrypted_config = encryptor
+            .decrypt(
+                &backend.config,
+                &crate::database::encryption::backend_context(&backend.name),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
+            })?;
         if let Err(msg) = crate::services::backend_pool::secure_config::check_stored(
             &backend.backend_type,
             &decrypted_config,
@@ -462,9 +505,14 @@ async fn init_passthrough_from_backends(
     let mut pool_config = PoolConfig::default();
 
     for (i, backend) in matching_backends.iter().enumerate() {
-        let decrypted_config = encryptor.decrypt(&backend.config).map_err(|e| {
-            anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
-        })?;
+        let decrypted_config = encryptor
+            .decrypt(
+                &backend.config,
+                &crate::database::encryption::backend_context(&backend.name),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to decrypt config for '{}': {}", backend.name, e)
+            })?;
         if let Err(msg) = crate::services::backend_pool::secure_config::check_stored(
             &backend.backend_type,
             &decrypted_config,
@@ -597,6 +645,106 @@ async fn init_passthrough_from_backends(
 
 /// Build a fresh DynamicConfig by reading backends and settings from the database.
 /// Used at startup and for hot-reload.
+/// Re-encrypt stored secrets that are not in the current format: plaintext
+/// (written while no `ENCRYPTION_KEY` was configured, or sensitive settings
+/// saved before they were encrypted) and legacy v1 ciphertexts (no row
+/// binding). Covers `backends.config` and the sensitive `system_settings`.
+///
+/// Each row is re-read right before the write and only rewritten if it is
+/// unchanged, so a concurrent admin edit (or another instance doing the same
+/// upgrade) is not overwritten. A row that cannot be decrypted is left as is.
+pub(crate) async fn upgrade_stored_secrets(
+    database: &Arc<dyn crate::database::traits::DatabaseService>,
+    encryptor: &Encryptor,
+) -> usize {
+    use crate::database::encryption::{backend_context, setting_context};
+
+    let mut upgraded = 0usize;
+
+    match database.backends().list_all_backends().await {
+        Ok(backends) => {
+            for b in backends
+                .into_iter()
+                .filter(|b| encryptor.needs_upgrade(&b.config))
+            {
+                let ctx = backend_context(&b.name);
+                let plain = match encryptor.decrypt(&b.config, &ctx) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(backend = %b.name, error = %e, "Cannot upgrade backend config encryption");
+                        continue;
+                    }
+                };
+                // Re-read: skip if the row changed since the list.
+                match database.backends().get_backend(&b.name).await {
+                    Ok(Some(cur)) if cur.config == b.config => {
+                        let record = crate::database::models::BackendRecord {
+                            config: encryptor.encrypt(&plain, &ctx),
+                            ..cur
+                        };
+                        match database.backends().upsert_backend(&record).await {
+                            Ok(()) => upgraded += 1,
+                            Err(e) => {
+                                tracing::warn!(backend = %b.name, error = %e, "Failed to write upgraded backend config")
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(backend = %b.name, error = %e, "Failed to re-read backend for encryption upgrade")
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to list backends for encryption upgrade"),
+    }
+
+    match database.system_settings().list_settings().await {
+        Ok(records) => {
+            for r in records.into_iter().filter(|r| {
+                crate::api::admin::system_settings::is_sensitive_setting(&r.key, &r.ui_schema)
+                    && encryptor.needs_upgrade(&r.value)
+            }) {
+                let ctx = setting_context(&r.key);
+                let plain = match encryptor.decrypt(&r.value, &ctx) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(setting = %r.key, error = %e, "Cannot upgrade setting encryption");
+                        continue;
+                    }
+                };
+                match database.system_settings().get_setting(&r.key).await {
+                    Ok(Some(cur)) if cur.value == r.value => {
+                        let record = crate::database::models::SystemSettingRecord {
+                            value: encryptor.encrypt(&plain, &ctx),
+                            ..cur
+                        };
+                        match database.system_settings().upsert_setting(&record).await {
+                            Ok(()) => upgraded += 1,
+                            Err(e) => {
+                                tracing::warn!(setting = %r.key, error = %e, "Failed to write upgraded setting")
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(setting = %r.key, error = %e, "Failed to re-read setting for encryption upgrade")
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to list settings for encryption upgrade"),
+    }
+
+    if upgraded > 0 {
+        tracing::info!(
+            count = upgraded,
+            "Re-encrypted stored secrets in the current format"
+        );
+    }
+    upgraded
+}
+
 async fn build_dynamic_config(
     database: &Arc<dyn crate::database::traits::DatabaseService>,
     encryptor: &Encryptor,
@@ -687,7 +835,14 @@ async fn build_dynamic_config(
             .or_else(|| settings.web_search_provider.clone());
         let api_key = load_string_setting(database, "web_search_api_key")
             .await
-            .and_then(|v| encryptor.decrypt(&v).ok())
+            .and_then(|v| {
+                encryptor
+                    .decrypt(
+                        &v,
+                        &crate::database::encryption::setting_context("web_search_api_key"),
+                    )
+                    .ok()
+            })
             .filter(|v| !v.is_empty())
             .or_else(|| settings.web_search_api_key.clone());
         let max_kb = load_string_setting(database, "web_fetch_max_content_kb")
@@ -719,7 +874,8 @@ async fn build_dynamic_config(
 
         let mut executor = WebToolExecutor::with_fetch(search, fetch_provider, max_kb, 10);
 
-        // Attach code executor for Dynamic Filtering if Docker (PTC) is available
+        // Attach code executor for Dynamic Filtering if the PTC sandbox is enabled
+        // (`PTC_ENABLED=true` + Docker reachable)
         if let Some(ptc) = ptc_service {
             let sandbox = ptc.sandbox().clone();
             let code_exec: Arc<dyn crate::services::ptc::sandbox::CodeExecutor> =
@@ -790,7 +946,15 @@ async fn apply_auth_and_alert_settings(state: &AppState) {
     }
     if let Some(raw) = load_string_setting(&state.database, "budget_alert_webhook_url")
         .await
-        .and_then(|v| state.encryptor.decrypt(&v).ok())
+        .and_then(|v| {
+            state
+                .encryptor
+                .decrypt(
+                    &v,
+                    &crate::database::encryption::setting_context("budget_alert_webhook_url"),
+                )
+                .ok()
+        })
     {
         match parse_webhook_url(&raw) {
             Ok(u) => cfg.webhook_url = u,
@@ -958,5 +1122,104 @@ async fn shutdown_signal() {
         _ = terminate => {
             tracing::info!("Received SIGTERM, initiating graceful shutdown");
         }
+    }
+}
+
+#[cfg(test)]
+mod secret_upgrade_tests {
+    use super::*;
+    use crate::database::encryption::{backend_context, setting_context};
+    use crate::database::models::{BackendRecord, SystemSettingRecord};
+    use crate::database::seed::SeedMode;
+    use crate::database::traits::DatabaseService;
+
+    fn backend(name: &str, config: String) -> BackendRecord {
+        BackendRecord {
+            name: name.into(),
+            backend_type: "openai".into(),
+            config,
+            enabled: true,
+            priority: 0,
+            weight: 1,
+            strategy: "round_robin".into(),
+            max_failures: 3,
+            retry_after_secs: 300,
+            service_tier: None,
+            models: None,
+            created_at: 0,
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrades_plaintext_and_legacy_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let sqlite = crate::database::sqlite::SqliteBackend::new(path.to_str().unwrap())
+            .await
+            .unwrap();
+        sqlite.initialize(None, SeedMode::Missing).await.unwrap();
+        let db: Arc<dyn DatabaseService> = Arc::new(sqlite);
+        let enc = Encryptor::new(Some("k"));
+
+        let plain_cfg = r#"{"api_keys":["sk-plain"]}"#;
+        let v2_cfg = enc.encrypt(r#"{"api_keys":["sk-new"]}"#, &backend_context("fresh"));
+        db.backends()
+            .upsert_backend(&backend("legacy", plain_cfg.into()))
+            .await
+            .unwrap();
+        db.backends()
+            .upsert_backend(&backend("fresh", v2_cfg.clone()))
+            .await
+            .unwrap();
+        for (key, value) in [("web_search_api_key", "tvly-plain"), ("rate_limit", "100")] {
+            db.system_settings()
+                .upsert_setting(&SystemSettingRecord {
+                    key: key.into(),
+                    value: value.into(),
+                    description: String::new(),
+                    ui_schema: None,
+                    updated_at: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(upgrade_stored_secrets(&db, &enc).await, 2);
+
+        let legacy = db.backends().get_backend("legacy").await.unwrap().unwrap();
+        assert!(legacy.config.starts_with("encrypted:v2:"));
+        assert_eq!(
+            enc.decrypt(&legacy.config, &backend_context("legacy"))
+                .unwrap(),
+            plain_cfg
+        );
+        // Already current: untouched.
+        let fresh = db.backends().get_backend("fresh").await.unwrap().unwrap();
+        assert_eq!(fresh.config, v2_cfg);
+
+        let s = db
+            .system_settings()
+            .get_setting("web_search_api_key")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(s.value.starts_with("encrypted:v2:"));
+        assert_eq!(
+            enc.decrypt(&s.value, &setting_context("web_search_api_key"))
+                .unwrap(),
+            "tvly-plain"
+        );
+        // Non-sensitive settings stay plaintext.
+        let rl = db
+            .system_settings()
+            .get_setting("rate_limit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rl.value, "100");
+
+        // Idempotent.
+        assert_eq!(upgrade_stored_secrets(&db, &enc).await, 0);
     }
 }

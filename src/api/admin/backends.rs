@@ -17,6 +17,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::database::encryption::backend_context;
+
 use crate::database::models::BackendRecord;
 use crate::schemas::anthropic::ErrorResponse;
 use crate::server::app::reload_dynamic_config;
@@ -358,7 +360,9 @@ pub async fn create_backend(
         }
     };
 
-    let encrypted_config = state.encryptor.encrypt(&config_json);
+    let encrypted_config = state
+        .encryptor
+        .encrypt(&config_json, &backend_context(&body.name));
 
     let now = Utc::now().timestamp();
     let record = BackendRecord {
@@ -433,13 +437,25 @@ pub async fn update_backend(
     let config = if let Some(config_val) = body.config {
         let stored: Value = state
             .encryptor
-            .decrypt(&existing.config)
+            .decrypt(&existing.config, &backend_context(&existing.name))
             .ok()
             .and_then(|p| serde_json::from_str(&p).ok())
             .unwrap_or(Value::Null);
-        let config_val = secure_config::merge_masked(config_val, &stored);
+        // Masked secrets are only carried over while the destination
+        // (base_url / backend type) stays the same.
+        let type_changed = body.backend_type != existing.backend_type;
+        let config_val = match secure_config::merge_masked(config_val, &stored, type_changed) {
+            Ok(v) => v,
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("invalid_request_error", &msg)),
+                )
+                    .into_response();
+            }
+        };
         if let Err(msg) = secure_config::validate_backend_config(
-            &existing.backend_type,
+            &body.backend_type,
             &config_val,
             secure_config::CredentialPolicy::global(),
         ) {
@@ -450,7 +466,9 @@ pub async fn update_backend(
                 .into_response();
         }
         match serde_json::to_string(&config_val) {
-            Ok(json) => state.encryptor.encrypt(&json),
+            Ok(json) => state
+                .encryptor
+                .encrypt(&json, &backend_context(&existing.name)),
             Err(e) => {
                 tracing::error!(error = %e, "Failed to serialize backend config");
                 return (
@@ -463,6 +481,17 @@ pub async fn update_backend(
                     .into_response();
             }
         }
+    } else if body.backend_type != existing.backend_type {
+        // Re-typing a backend sends its stored secrets to another provider's
+        // endpoint: require the full config (real secrets) with the change.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "changing backend_type requires sending the full config with real secrets",
+            )),
+        )
+            .into_response();
     } else {
         existing.config.clone()
     };
@@ -658,7 +687,10 @@ pub async fn get_backend_config(
         }
     };
 
-    let plaintext = match state.encryptor.decrypt(&record.config) {
+    let plaintext = match state
+        .encryptor
+        .decrypt(&record.config, &backend_context(&record.name))
+    {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, backend = %name, "Failed to decrypt backend config");

@@ -6,21 +6,23 @@
 //! 3. Sandbox calls tool → return `tool_use` to client (with container ID)
 //! 4. Client sends back `tool_result` → inject into sandbox → resume
 //! 5. Sandbox completes → finalize with Claude using saved execution state
+//!
+//! Every Bedrock call's usage is accumulated into the caller-provided
+//! `Usage` (recorded by `messages.rs` even when the flow fails later). The
+//! session (and its container) is removed whenever a turn does not end in
+//! sandbox tool calls for the client — final answers and errors alike.
 
 use crate::api::messages::ApiError;
 use crate::middleware::auth::ApiKeyInfo;
 use crate::schemas::anthropic::{
     CallerInfo, ContainerResponse, ContentBlock, Message, MessageContent, MessageRequest,
-    MessageResponse, StopReason, ToolResultValue,
+    MessageResponse, StopReason, ToolResultValue, Usage,
 };
 use crate::server::state::AppState;
 use crate::services::ptc::sandbox::ContainerMessage;
 use crate::services::ptc::service::PtcExecutionState;
 use crate::services::ptc::PtcService;
 use std::sync::Arc;
-
-/// Maximum recursion depth for PTC execute_code loops
-const MAX_PTC_DEPTH: u32 = 10;
 
 /// Internal execute_code tool definition sent to Claude.
 const EXECUTE_CODE_TOOL: &str = r#"{
@@ -62,7 +64,13 @@ impl From<crate::services::ptc::PtcError> for ApiError {
 
             PtcError::InvalidToolResult(_) => ApiError::bad_request(err.to_string()),
 
-            PtcError::MaxIterationsExceeded(_) => ApiError::rate_limited(err.to_string()),
+            PtcError::MaxIterationsExceeded(_) | PtcError::SessionLimitExceeded(_) => {
+                ApiError::rate_limited(err.to_string())
+            }
+
+            PtcError::InvalidRequest(_) | PtcError::InvalidToolCall(_) => {
+                ApiError::bad_request(err.to_string())
+            }
 
             PtcError::PermissionDenied(_) => ApiError {
                 status: axum::http::StatusCode::FORBIDDEN,
@@ -92,6 +100,7 @@ pub async fn handle_ptc_request(
     target_model_id: &str,
     request_id: &str,
     key_info: &ApiKeyInfo,
+    usage: &mut Usage,
 ) -> Result<MessageResponse, ApiError> {
     // PTC drives the loop through Claude InvokeModel — non-Claude Bedrock
     // models (Nova, GPT, …) cannot serve it.
@@ -111,6 +120,9 @@ pub async fn handle_ptc_request(
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
 
+    // Fail before creating a container when there is no Bedrock backend.
+    get_bedrock(state).await?;
+
     let owner_hash = owner_key_hash(key_info);
     let session_id = ptc
         .create_session(&tool_names, &owner_hash)
@@ -119,27 +131,33 @@ pub async fn handle_ptc_request(
 
     tracing::info!(request_id, session_id, "PTC session created");
 
-    // 2. Build modified request for Claude
-    let modified_request = build_ptc_request(request);
+    let result = async {
+        // 2. Build modified request for Claude
+        let modified_request = build_ptc_request(request);
 
-    // 3. Call Claude
-    let bedrock = get_bedrock(state).await?;
-    let response = bedrock
-        .invoke_model_messages(&modified_request, target_model_id, None)
+        // 3. Call Claude
+        let bedrock = get_bedrock(state).await?;
+        let response = bedrock
+            .invoke_model_messages(&modified_request, target_model_id, None)
+            .await
+            .map_err(|e| ApiError::internal_error(format!("Bedrock call failed: {e}")))?;
+        add_usage(usage, &response.usage);
+
+        // 4. Process response
+        process_claude_response(
+            state,
+            ptc,
+            &session_id,
+            &response,
+            request,
+            target_model_id,
+            usage,
+        )
         .await
-        .map_err(|e| ApiError::internal_error(format!("Bedrock call failed: {e}")))?;
+    }
+    .await;
 
-    // 4. Process response
-    process_claude_response(
-        state,
-        ptc,
-        &session_id,
-        &response,
-        request,
-        target_model_id,
-        0,
-    )
-    .await
+    finish_turn(ptc, &session_id, result).await
 }
 
 /// Handle a PTC continuation (client sent back tool_result with container ID).
@@ -150,6 +168,7 @@ pub async fn handle_ptc_continuation(
     request_id: &str,
     container_id: &str,
     key_info: &ApiKeyInfo,
+    usage: &mut Usage,
 ) -> Result<MessageResponse, ApiError> {
     let ptc = get_ptc_service(state)?;
 
@@ -171,11 +190,21 @@ pub async fn handle_ptc_continuation(
 
     tracing::info!(request_id, session_id, container_id, "PTC continuation");
 
-    // Extract tool results from the request
-    let tool_results = extract_tool_results(request);
+    // Only results for the sandbox's pending tool calls are forwarded (the
+    // request history also carries earlier, already-consumed tool_results).
+    let session = ptc.get_session(&session_id).await.map_err(ApiError::from)?;
+    let pending: std::collections::HashSet<&str> = session
+        .pending_tool_calls
+        .iter()
+        .map(|c| c.tool_use_id.as_str())
+        .collect();
+    let tool_results: Vec<_> = extract_tool_results(request)
+        .into_iter()
+        .filter(|(id, _, _)| pending.contains(id.as_str()))
+        .collect();
     if tool_results.is_empty() {
         return Err(ApiError::bad_request(
-            "PTC continuation requires tool_result content blocks",
+            "PTC continuation requires tool_result content blocks for the pending sandbox tool calls",
         ));
     }
 
@@ -195,48 +224,102 @@ pub async fn handle_ptc_continuation(
         }).collect::<Vec<_>>()
     });
 
-    // Inject results into sandbox and wait for response
-    let msg = ptc
-        .send_tool_results_via_channel(&session_id, &results_json)
-        .await
-        .map_err(ApiError::from)?;
+    let result = async {
+        // Inject results into sandbox and wait for response
+        let msg = ptc
+            .send_tool_results_via_channel(&session_id, &results_json)
+            .await
+            .map_err(ApiError::from)?;
 
-    match msg {
-        ContainerMessage::ToolCall(calls) => {
-            // More tool calls from sandbox — return to client
-            tracing::info!(
-                session_id,
-                tool_count = calls.len(),
-                "Sandbox requesting more tool calls (continuation)"
-            );
-            build_tool_call_response(ptc, &session_id, &calls, request).await
-        }
-        ContainerMessage::CodeOutput(output) => {
-            // Code completed — finalize with Claude using saved state
-            tracing::info!(session_id, "Sandbox code completed (continuation)");
-            let code_output = if output.exit_code == 0 {
-                output.stdout.clone()
-            } else {
-                format!("Error (exit code {}):\n{}", output.exit_code, output.stderr)
-            };
-            finalize_with_claude_from_state(state, ptc, &session_id, &code_output, target_model_id)
+        match msg {
+            ContainerMessage::ToolCall(calls) => {
+                // More tool calls from sandbox — return to client
+                tracing::info!(
+                    session_id,
+                    tool_count = calls.len(),
+                    "Sandbox requesting more tool calls (continuation)"
+                );
+                build_tool_call_response(ptc, &session_id, &calls, request).await
+            }
+            ContainerMessage::CodeOutput(output) => {
+                // Code completed — finalize with Claude using saved state
+                tracing::info!(session_id, "Sandbox code completed (continuation)");
+                let code_output = format_code_output(&output);
+                finalize_with_claude_from_state(
+                    state,
+                    ptc,
+                    &session_id,
+                    &code_output,
+                    target_model_id,
+                    usage,
+                )
                 .await
+            }
+            other => Err(unexpected_message(&other)),
         }
-        ContainerMessage::Error(e) => Err(ApiError::internal_error(format!(
-            "Sandbox error during continuation: {e}"
-        ))),
-        ContainerMessage::StreamEnded => Err(ApiError::internal_error(
-            "Container exited during continuation",
-        )),
-        ContainerMessage::Ready => Err(ApiError::internal_error(
-            "Unexpected ready signal during continuation",
-        )),
     }
+    .await;
+
+    finish_turn(ptc, &session_id, result).await
 }
 
 // ============================================================================
 // Internal helpers
 // ============================================================================
+
+/// Result of one PTC turn: the response plus whether the session must stay
+/// alive (only when the sandbox is waiting for client tool results).
+type TurnResult = Result<(MessageResponse, bool), ApiError>;
+
+/// Remove the session unless the turn handed sandbox tool calls to the client.
+async fn finish_turn(
+    ptc: &Arc<PtcService>,
+    session_id: &str,
+    result: TurnResult,
+) -> Result<MessageResponse, ApiError> {
+    match result {
+        Ok((resp, true)) => Ok(resp),
+        Ok((resp, false)) => {
+            let _ = ptc.remove_session(session_id).await;
+            Ok(resp)
+        }
+        Err(e) => {
+            let _ = ptc.remove_session(session_id).await;
+            Err(e)
+        }
+    }
+}
+
+/// Accumulate one Bedrock call's usage.
+pub(crate) fn add_usage(acc: &mut Usage, u: &Usage) {
+    fn add_opt(a: Option<i32>, b: Option<i32>) -> Option<i32> {
+        match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        }
+    }
+    acc.input_tokens = acc.input_tokens.saturating_add(u.input_tokens);
+    acc.output_tokens = acc.output_tokens.saturating_add(u.output_tokens);
+    acc.cache_creation_input_tokens = add_opt(
+        acc.cache_creation_input_tokens,
+        u.cache_creation_input_tokens,
+    );
+    acc.cache_read_input_tokens = add_opt(acc.cache_read_input_tokens, u.cache_read_input_tokens);
+}
+
+fn format_code_output(output: &crate::services::ptc::sandbox::CodeOutputData) -> String {
+    if output.exit_code == 0 {
+        output.stdout.clone()
+    } else {
+        format!("Error (exit code {}):\n{}", output.exit_code, output.stderr)
+    }
+}
+
+/// `run_code_via_channel` / `send_tool_results_via_channel` already map
+/// error-type messages to `Err`; anything else here is unexpected.
+fn unexpected_message(msg: &ContainerMessage) -> ApiError {
+    ApiError::internal_error(format!("Unexpected sandbox message: {msg:?}"))
+}
 
 fn get_ptc_service(state: &AppState) -> Result<&Arc<PtcService>, ApiError> {
     state.ptc_service.as_ref().ok_or_else(|| {
@@ -379,14 +462,8 @@ async fn process_claude_response(
     response: &MessageResponse,
     original_request: &MessageRequest,
     target_model_id: &str,
-    depth: u32,
-) -> Result<MessageResponse, ApiError> {
-    if depth >= MAX_PTC_DEPTH {
-        return Err(ApiError::bad_request(format!(
-            "Maximum PTC recursion depth ({MAX_PTC_DEPTH}) exceeded"
-        )));
-    }
-
+    usage: &mut Usage,
+) -> TurnResult {
     // Look for execute_code tool_use in response
     let execute_code_call = response.content.iter().find_map(|block| {
         if let ContentBlock::ToolUse {
@@ -402,10 +479,8 @@ async fn process_claude_response(
     });
 
     let Some((tool_use_id, code)) = execute_code_call else {
-        // No execute_code call — return response as-is (with container info)
-        let mut resp = response.clone();
-        add_container_info(ptc, session_id, &mut resp).await;
-        return Ok(resp);
+        // No execute_code call — final answer; the session is closed.
+        return Ok((response.clone(), false));
     };
 
     tracing::info!(session_id, "Executing code in sandbox via channel");
@@ -449,31 +524,20 @@ async fn process_claude_response(
         }
         ContainerMessage::CodeOutput(output) => {
             // Code completed without tool calls — finalize with Claude
-            let code_output = if output.exit_code == 0 {
-                output.stdout.clone()
-            } else {
-                format!("Error (exit code {}):\n{}", output.exit_code, output.stderr)
-            };
+            let code_output = format_code_output(&output);
 
             call_claude_with_code_result(
                 state,
-                ptc,
-                session_id,
                 original_request,
                 response,
                 &tool_use_id,
                 &code_output,
                 target_model_id,
+                usage,
             )
             .await
         }
-        ContainerMessage::Error(e) => Err(ApiError::internal_error(format!("Sandbox error: {e}"))),
-        ContainerMessage::StreamEnded => Err(ApiError::internal_error(
-            "Container exited unexpectedly during code execution",
-        )),
-        ContainerMessage::Ready => Err(ApiError::internal_error(
-            "Unexpected ready signal during code execution",
-        )),
+        other => Err(unexpected_message(&other)),
     }
 }
 
@@ -483,7 +547,7 @@ async fn build_tool_call_response(
     session_id: &str,
     calls: &[crate::services::ptc::sandbox::ToolCallData],
     original_request: &MessageRequest,
-) -> Result<MessageResponse, ApiError> {
+) -> TurnResult {
     let server_tool_use_id = format!("srvtoolu_{}", uuid::Uuid::new_v4());
 
     let content: Vec<ContentBlock> = calls
@@ -508,21 +572,20 @@ async fn build_tool_call_response(
     resp.stop_reason = Some(StopReason::ToolUse);
     add_container_info(ptc, session_id, &mut resp).await;
 
-    Ok(resp)
+    // Usage is filled in by the caller (accumulated over the turn).
+    Ok((resp, true))
 }
 
 /// Call Claude with code execution result to get final response (first turn, no saved state).
-#[allow(clippy::too_many_arguments)]
 async fn call_claude_with_code_result(
     state: &AppState,
-    ptc: &Arc<PtcService>,
-    session_id: &str,
     original_request: &MessageRequest,
     assistant_response: &MessageResponse,
     tool_use_id: &str,
     code_output: &str,
     target_model_id: &str,
-) -> Result<MessageResponse, ApiError> {
+    usage: &mut Usage,
+) -> TurnResult {
     let bedrock = get_bedrock(state).await?;
 
     let mut messages = filter_non_direct_tool_calls(&original_request.messages);
@@ -548,13 +611,13 @@ async fn call_claude_with_code_result(
 
     let continuation = build_continuation_request(original_request, messages);
 
-    let mut final_response = bedrock
+    let final_response = bedrock
         .invoke_model_messages(&continuation, target_model_id, None)
         .await
         .map_err(|e| ApiError::internal_error(format!("Bedrock finalization failed: {e}")))?;
+    add_usage(usage, &final_response.usage);
 
-    add_container_info(ptc, session_id, &mut final_response).await;
-    Ok(final_response)
+    Ok((final_response, false))
 }
 
 /// Finalize with Claude using saved execution state (continuation turns).
@@ -564,7 +627,8 @@ async fn finalize_with_claude_from_state(
     session_id: &str,
     code_output: &str,
     target_model_id: &str,
-) -> Result<MessageResponse, ApiError> {
+    usage: &mut Usage,
+) -> TurnResult {
     let bedrock = get_bedrock(state).await?;
 
     // Retrieve saved execution state
@@ -618,13 +682,13 @@ async fn finalize_with_claude_from_state(
         fallback_credit_token: None,
     };
 
-    let mut final_response = bedrock
+    let final_response = bedrock
         .invoke_model_messages(&continuation, target_model_id, None)
         .await
         .map_err(|e| ApiError::internal_error(format!("Bedrock finalization failed: {e}")))?;
+    add_usage(usage, &final_response.usage);
 
-    add_container_info(ptc, session_id, &mut final_response).await;
-    Ok(final_response)
+    Ok((final_response, false))
 }
 
 /// Build a continuation request preserving original parameters.
@@ -728,4 +792,69 @@ fn extract_tool_results(request: &MessageRequest) -> Vec<(String, serde_json::Va
     }
 
     results
+}
+
+/// Whether a PTC-shaped request takes the proxy-side PTC branch: Bedrock
+/// route and the model's effective `ptc` capability enabled (per-model
+/// mapping, else the `enable_ptc` default — off).
+pub(crate) fn ptc_route_enabled(
+    provider: &str,
+    caps: &crate::services::capabilities::ModelCapabilities,
+) -> bool {
+    provider == "bedrock" && caps.ptc.enabled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::capabilities::{ModelCapabilities, SimpleCapability};
+
+    #[test]
+    fn test_ptc_route_requires_capability_and_bedrock() {
+        let mut caps = ModelCapabilities {
+            ptc: SimpleCapability { enabled: false },
+            ..Default::default()
+        };
+        assert!(!ptc_route_enabled("bedrock", &caps));
+        // The gateway default (`enable_ptc` unset) is off.
+        assert!(!ModelCapabilities::default().ptc.enabled);
+        caps.ptc = SimpleCapability { enabled: true };
+        assert!(ptc_route_enabled("bedrock", &caps));
+        assert!(!ptc_route_enabled("anthropic", &caps));
+        assert!(!ptc_route_enabled("gemini", &caps));
+    }
+
+    #[test]
+    fn test_add_usage_accumulates() {
+        let mut acc = Usage::new(0, 0);
+        add_usage(&mut acc, &Usage::new(100, 20));
+        let mut second = Usage::new(50, 5);
+        second.cache_read_input_tokens = Some(7);
+        add_usage(&mut acc, &second);
+        assert_eq!(acc.input_tokens, 150);
+        assert_eq!(acc.output_tokens, 25);
+        assert_eq!(acc.cache_read_input_tokens, Some(7));
+        assert_eq!(acc.cache_creation_input_tokens, None);
+        add_usage(&mut acc, &Usage::new(i32::MAX, 0));
+        assert_eq!(acc.input_tokens, i32::MAX);
+    }
+
+    #[test]
+    fn test_validate_tool_use_id() {
+        assert!(validate_tool_use_id("toolu_000000000001").is_ok());
+        assert!(validate_tool_use_id("srvtoolu_abc").is_ok());
+        assert!(validate_tool_use_id("toolu_").is_err());
+        assert!(validate_tool_use_id("bad").is_err());
+    }
+
+    #[test]
+    fn test_new_ptc_errors_map_to_status() {
+        use crate::services::ptc::PtcError;
+        let e: ApiError = PtcError::SessionLimitExceeded("x".into()).into();
+        assert_eq!(e.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let e: ApiError = PtcError::InvalidToolCall("x".into()).into();
+        assert_eq!(e.status, axum::http::StatusCode::BAD_REQUEST);
+        let e: ApiError = PtcError::InvalidRequest("x".into()).into();
+        assert_eq!(e.status, axum::http::StatusCode::BAD_REQUEST);
+    }
 }

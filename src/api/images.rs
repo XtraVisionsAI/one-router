@@ -25,6 +25,9 @@ use super::chat_completions::OpenAIApiError;
 /// POST /v1/images/generations
 pub async fn create_image(
     State(state): State<AppState>,
+    axum::extract::Extension(key_info): axum::extract::Extension<
+        crate::middleware::auth::ApiKeyInfo,
+    >,
     Json(request): Json<ImageGenerationRequest>,
 ) -> Result<impl IntoResponse, OpenAIApiError> {
     let start_time = Instant::now();
@@ -70,6 +73,27 @@ pub async fn create_image(
         images = response.data.len(),
         duration_ms = duration_ms,
         "Image generation request completed"
+    );
+
+    // Usage row + budget/TPM accounting. Images are not token-priced and
+    // model_mappings has no per-image price: the prompt is recorded as input
+    // tokens and billed only at the mapping's own input price (0 when the
+    // mapping is unpriced — no DEFAULT_* per-token fallback).
+    state.usage_tracker.spawn_record_usage(
+        key_info,
+        request_id,
+        request.model.clone(),
+        crate::schemas::anthropic::Usage::new(
+            crate::utils::tokens::estimate_text_tokens(&request.prompt).min(i32::MAX as u64) as i32,
+            0,
+        ),
+        if provider.is_empty() {
+            "bedrock".to_string()
+        } else {
+            provider.to_string()
+        },
+        "openai",
+        crate::services::usage_tracker::DefaultPricing::None,
     );
 
     Ok((StatusCode::OK, Json(response)))
@@ -123,11 +147,10 @@ async fn handle_openai_images(
 
     if !status.is_success() {
         // Try to propagate the upstream error message
+        // 401/403 never relay the provider's text (it names the gateway's key).
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body_text) {
-            let msg = val["error"]["message"]
-                .as_str()
-                .unwrap_or(&body_text)
-                .to_string();
+            let raw = val["error"]["message"].as_str().unwrap_or(&body_text);
+            let msg = crate::utils::redact::upstream_error_message(status.as_u16(), raw);
             return Err(OpenAIApiError {
                 status: axum::http::StatusCode::from_u16(status.as_u16())
                     .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
@@ -135,7 +158,8 @@ async fn handle_openai_images(
             });
         }
         return Err(OpenAIApiError::internal_error(format!(
-            "OpenAI returned status {status}: {body_text}"
+            "OpenAI returned status {status}: {}",
+            crate::utils::redact::upstream_error_message(status.as_u16(), &body_text)
         )));
     }
 

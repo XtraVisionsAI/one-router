@@ -9,9 +9,10 @@
 
 use super::exceptions::{PtcError, PtcResult};
 use super::runner;
+use base64::Engine as _;
 use bollard::container::{
     AttachContainerOptions, Config, CreateContainerOptions, LogOutput, LogsOptions,
-    RemoveContainerOptions, StartContainerOptions, StopContainerOptions, UploadToContainerOptions,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
@@ -56,12 +57,21 @@ impl CodeExecutor for OneshotExecutor {
             _ => vec!["python", "-c", code],
         };
 
-        let container = self.sandbox.create_container(None).await?;
-        self.sandbox.start_container(&container.id).await?;
+        // The container's main process only keeps it alive for the exec; the
+        // code itself runs via `docker exec` (output capped in
+        // `collect_exec_output`).
+        let keepalive = (self.sandbox.config().execution_timeout + 30).to_string();
+        let container = self
+            .sandbox
+            .create_container(None, vec!["sleep".to_string(), keepalive], Vec::new())
+            .await?;
 
-        let result = self.sandbox.exec_command(&container.id, cmd).await;
+        let result = match self.sandbox.start_container(&container.id).await {
+            Ok(()) => self.sandbox.exec_command(&container.id, cmd).await,
+            Err(e) => Err(e),
+        };
 
-        // Always clean up
+        // Always clean up (also on start failure).
         let _ = self.sandbox.stop_and_remove(&container.id).await;
 
         result
@@ -95,6 +105,22 @@ pub const DEFAULT_EXECUTION_TIMEOUT: u64 = 60;
 /// Default session timeout in seconds (4.5 minutes)
 pub const DEFAULT_SESSION_TIMEOUT: u64 = 270;
 
+/// Size of the writable tmpfs mounted at `/tmp` (the root filesystem is
+/// read-only).
+pub const DEFAULT_TMPFS_SIZE: &str = "64m";
+
+/// Env var overriding the sandbox image (operators can pin by digest,
+/// e.g. `python:3.11-slim@sha256:...`).
+pub const PTC_IMAGE_ENV: &str = "PTC_IMAGE";
+
+/// Max bytes buffered for one in-flight IPC frame (per stream). Beyond this
+/// the reader reports an error and stops; the session (and its container)
+/// is then torn down by the service.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Max combined stdout+stderr bytes collected from a one-shot exec.
+pub const MAX_EXEC_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
 // ============================================================================
 // Sandbox Configuration
 // ============================================================================
@@ -116,6 +142,23 @@ pub struct SandboxConfig {
     pub network_disabled: bool,
     /// Working directory in container
     pub working_dir: String,
+    /// Size of the tmpfs mounted at /tmp
+    pub tmpfs_size: String,
+}
+
+impl SandboxConfig {
+    /// Default configuration with the image taken from `PTC_IMAGE` (if set
+    /// and non-empty).
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(image) = std::env::var(PTC_IMAGE_ENV) {
+            let image = image.trim();
+            if !image.is_empty() {
+                cfg.image = image.to_string();
+            }
+        }
+        cfg
+    }
 }
 
 impl Default for SandboxConfig {
@@ -128,6 +171,7 @@ impl Default for SandboxConfig {
             execution_timeout: DEFAULT_EXECUTION_TIMEOUT,
             network_disabled: true,
             working_dir: "/tmp".to_string(),
+            tmpfs_size: DEFAULT_TMPFS_SIZE.to_string(),
         }
     }
 }
@@ -228,7 +272,7 @@ impl ContainerHandle {
         let payload = format!(
             "{}\n{}\n{}\n",
             runner::IPC_CODE_START,
-            code,
+            b64_encode(code.as_bytes()),
             runner::IPC_CODE_END
         );
         let mut stdin = self.stdin.lock().await;
@@ -250,7 +294,7 @@ impl ContainerHandle {
         let payload = format!(
             "{}{}{}\n",
             runner::IPC_TOOL_RESULT_START,
-            json_str,
+            b64_encode(json_str.as_bytes()),
             runner::IPC_TOOL_RESULT_END
         );
         let mut stdin = self.stdin.lock().await;
@@ -282,8 +326,20 @@ impl ContainerHandle {
             .map_err(|_| PtcError::ExecutionTimeout(duration.as_secs()))?
     }
 
-    /// Shut down the background reader and drop resources.
-    pub fn shutdown(self) {
+    /// Shut down the background reader.
+    pub fn shutdown(&self) {
+        self.reader_task.abort();
+    }
+
+    /// Abort handle for the background reader, usable without locking the
+    /// handle (the handle may be held by an in-flight exchange).
+    pub fn reader_abort_handle(&self) -> tokio::task::AbortHandle {
+        self.reader_task.abort_handle()
+    }
+}
+
+impl Drop for ContainerHandle {
+    fn drop(&mut self) {
         self.reader_task.abort();
     }
 }
@@ -349,8 +405,22 @@ impl SandboxExecutor {
     // Container Lifecycle
     // ========================================================================
 
-    /// Create a new container for code execution
-    pub async fn create_container(&self, name: Option<&str>) -> PtcResult<ContainerInfo> {
+    /// Create a PTC runner container: the runner script runs inline as the
+    /// main process, callable tool names are passed via `PTC_TOOLS`.
+    /// `tool_names` must already be validated (`[A-Za-z0-9_-]`).
+    pub async fn create_runner_container(&self, tool_names: &[String]) -> PtcResult<ContainerInfo> {
+        let env = vec![format!("PTC_TOOLS={}", tool_names.join(","))];
+        self.create_container(None, runner::runner_command(), env)
+            .await
+    }
+
+    /// Create a new (not started) container for code execution.
+    pub async fn create_container(
+        &self,
+        name: Option<&str>,
+        cmd: Vec<String>,
+        env: Vec<String>,
+    ) -> PtcResult<ContainerInfo> {
         // Generate container name if not provided
         let container_name = name
             .map(|n| n.to_string())
@@ -370,27 +440,35 @@ impl SandboxExecutor {
             cap_drop: Some(vec!["ALL".to_string()]),
             // Fork-bomb guard for model-written code.
             pids_limit: Some(SANDBOX_PIDS_LIMIT),
+            // No swap beyond the memory limit.
+            memory_swap: Some(self.config.memory_limit),
+            // Immutable image filesystem; the only writable path is a
+            // size-limited tmpfs at /tmp.
+            readonly_rootfs: Some(true),
+            tmpfs: Some(std::collections::HashMap::from([(
+                "/tmp".to_string(),
+                format!("rw,nosuid,nodev,size={},mode=1777", self.config.tmpfs_size),
+            )])),
+            // The daemon removes the container as soon as it exits, so a
+            // crashed runner never lingers (explicit removal still runs on
+            // every teardown path).
+            auto_remove: Some(true),
             ..Default::default()
         };
 
         let config = Config {
             image: Some(self.config.image.clone()),
             working_dir: Some(self.config.working_dir.clone()),
-            // Unprivileged inside the container (files are uploaded 0644 into
-            // the world-writable /tmp, so the runner can still read them).
+            // Unprivileged inside the container.
             user: Some(SANDBOX_USER.to_string()),
+            env: if env.is_empty() { None } else { Some(env) },
             host_config: Some(host_config),
             tty: Some(false), // Disable TTY for multiplexed stdout/stderr separation
             attach_stdin: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             open_stdin: Some(true),
-            // Run the runner script as main process (unbuffered Python)
-            cmd: Some(vec![
-                "python".to_string(),
-                "-u".to_string(),
-                "/tmp/runner.py".to_string(),
-            ]),
+            cmd: Some(cmd),
             ..Default::default()
         };
 
@@ -484,70 +562,6 @@ impl SandboxExecutor {
     }
 
     // ========================================================================
-    // File Operations
-    // ========================================================================
-
-    /// Copy a file to the container using put_archive API
-    ///
-    /// This method creates a tar archive and uploads it to the container,
-    /// which works correctly in Docker-in-Docker scenarios where bind mounts fail.
-    pub async fn copy_file_to_container(
-        &self,
-        container_id: &str,
-        content: &[u8],
-        dest_path: &str,
-    ) -> PtcResult<()> {
-        // Create a tar archive containing the file
-        let mut tar_buffer = Vec::new();
-        {
-            let mut tar_builder = tar::Builder::new(&mut tar_buffer);
-
-            // Extract filename from dest_path
-            let filename = std::path::Path::new(dest_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file");
-
-            // Create tar header
-            let mut header = tar::Header::new_gnu();
-            header
-                .set_path(filename)
-                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to set tar path: {e}")))?;
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-
-            // Add file to archive
-            tar_builder
-                .append(&header, content)
-                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to append to tar: {e}")))?;
-
-            tar_builder
-                .finish()
-                .map_err(|e| PtcError::FileCopyFailed(format!("Failed to finish tar: {e}")))?;
-        }
-
-        // Get the directory path
-        let dir_path = std::path::Path::new(dest_path)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/tmp".to_string());
-
-        // Upload the tar archive to the container
-        let options = UploadToContainerOptions {
-            path: dir_path,
-            ..Default::default()
-        };
-
-        self.docker
-            .upload_to_container(container_id, Some(options), tar_buffer.into())
-            .await
-            .map_err(|e| PtcError::FileCopyFailed(format!("Failed to upload to container: {e}")))?;
-
-        Ok(())
-    }
-
-    // ========================================================================
     // Code Execution
     // ========================================================================
 
@@ -603,22 +617,6 @@ impl SandboxExecutor {
         }
     }
 
-    /// Execute Python code in the container
-    pub async fn execute_python(
-        &self,
-        container_id: &str,
-        code: &str,
-    ) -> PtcResult<ExecutionResult> {
-        // Write code to a temporary file
-        let script_path = "/tmp/script.py";
-        self.copy_file_to_container(container_id, code.as_bytes(), script_path)
-            .await?;
-
-        // Execute the script
-        self.exec_command(container_id, vec!["python", script_path])
-            .await
-    }
-
     /// Collect output from an exec instance
     async fn collect_exec_output(&self, exec_id: &str) -> PtcResult<ExecutionResult> {
         let start_result = self
@@ -627,25 +625,30 @@ impl SandboxExecutor {
             .await
             .map_err(|e| PtcError::ExecFailed(format!("Failed to start exec: {e}")))?;
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        let mut out = CappedOutput::new(MAX_EXEC_OUTPUT_BYTES);
 
         if let StartExecResults::Attached { mut output, .. } = start_result {
             while let Some(result) = output.next().await {
-                match result {
-                    Ok(LogOutput::StdOut { message }) => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(LogOutput::StdErr { message }) => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(_) => {}
+                let full = match result {
+                    Ok(LogOutput::StdOut { message }) => out.push_stdout(&message),
+                    Ok(LogOutput::StdErr { message }) => out.push_stderr(&message),
+                    Ok(_) => false,
                     Err(e) => {
                         tracing::warn!("Error reading exec output: {}", e);
+                        false
                     }
+                };
+                if full {
+                    // Stop reading; the caller removes the container.
+                    tracing::warn!(
+                        limit = MAX_EXEC_OUTPUT_BYTES,
+                        "Sandbox exec output exceeded limit; truncated"
+                    );
+                    break;
                 }
             }
         }
+        let (stdout, stderr, truncated) = out.finish();
 
         // Get exit code
         let inspect = self
@@ -654,7 +657,11 @@ impl SandboxExecutor {
             .await
             .map_err(|e| PtcError::ExecFailed(format!("Failed to inspect exec: {e}")))?;
 
-        let exit_code = inspect.exit_code.unwrap_or(-1);
+        let exit_code = if truncated {
+            -1
+        } else {
+            inspect.exit_code.unwrap_or(-1)
+        };
 
         Ok(ExecutionResult {
             stdout,
@@ -668,19 +675,9 @@ impl SandboxExecutor {
     // Convenience Methods
     // ========================================================================
 
-    /// Create and start a container in one step
-    pub async fn create_and_start(&self, name: Option<&str>) -> PtcResult<ContainerInfo> {
-        let mut info = self.create_container(name).await?;
-        self.start_container(&info.id).await?;
-        info.running = true;
-        Ok(info)
-    }
-
-    /// Create a container, copy the runner script, attach, and start.
+    /// Attach to a created runner container and start it.
     ///
-    /// Returns both a `ContainerInfo` and a `ContainerHandle` for persistent
-    /// bidirectional communication. The runner script must already be copied
-    /// to the container before calling this method (via `copy_file_to_container`).
+    /// Returns a `ContainerHandle` for persistent bidirectional communication.
     ///
     /// Attach happens **before** start so we catch the runner's `__READY__` signal.
     pub async fn attach_and_start(&self, container_id: &str) -> PtcResult<ContainerHandle> {
@@ -716,22 +713,23 @@ impl SandboxExecutor {
             let mut stderr_buf = String::new();
 
             while let Some(result) = output_stream.next().await {
-                match result {
+                let parsed = match result {
                     Ok(LogOutput::StdOut { message }) => {
                         stdout_buf.push_str(&String::from_utf8_lossy(&message));
-                        parse_stdout_messages(&mut stdout_buf, &tx).await;
+                        parse_stdout_messages(&mut stdout_buf, &tx).await
                     }
                     Ok(LogOutput::StdErr { message }) => {
                         stderr_buf.push_str(&String::from_utf8_lossy(&message));
-                        parse_stderr_messages(&mut stderr_buf, &tx).await;
+                        parse_stderr_messages(&mut stderr_buf, &tx).await
                     }
-                    Ok(_) => {} // StdIn echo, Console — ignore
-                    Err(e) => {
-                        let _ = tx
-                            .send(ContainerMessage::Error(format!("Stream error: {e}")))
-                            .await;
-                        break;
-                    }
+                    Ok(_) => Ok(()), // StdIn echo, Console — ignore
+                    Err(e) => Err(format!("Stream error: {e}")),
+                };
+                if let Err(e) = parsed {
+                    // Oversized frame or stream failure: report and stop
+                    // reading; the service then removes the container.
+                    let _ = tx.send(ContainerMessage::Error(e)).await;
+                    break;
                 }
             }
 
@@ -745,10 +743,9 @@ impl SandboxExecutor {
         })
     }
 
-    /// Stop and remove a container in one step
+    /// Kill and remove a container in one step (`force` removal kills a
+    /// running container; callers ignore a 404 after `auto_remove`).
     pub async fn stop_and_remove(&self, container_id: &str) -> PtcResult<()> {
-        // Try to stop first, but don't fail if already stopped
-        let _ = self.stop_container(container_id).await;
         self.remove_container(container_id).await
     }
 
@@ -774,101 +771,222 @@ impl SandboxExecutor {
 // Boundary Marker Parsers (used by the background reader task)
 // ============================================================================
 
-/// Parse stdout buffer for `__PTC_OUTPUT__{json}__PTC_END_OUTPUT__` messages.
-async fn parse_stdout_messages(buf: &mut String, tx: &mpsc::Sender<ContainerMessage>) {
-    while let Some(start_idx) = buf.find(runner::IPC_CODE_OUTPUT_START) {
-        let json_start = start_idx + runner::IPC_CODE_OUTPUT_START.len();
-        if let Some(end_idx) = buf[json_start..].find(runner::IPC_CODE_OUTPUT_END) {
-            let json_str = &buf[json_start..json_start + end_idx];
-            let msg = match serde_json::from_str::<serde_json::Value>(json_str) {
-                Ok(val) => ContainerMessage::CodeOutput(CodeOutputData {
-                    stdout: val
-                        .get("stdout")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    stderr: val
-                        .get("stderr")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    exit_code: val.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1),
-                }),
-                Err(e) => ContainerMessage::Error(format!("Invalid code output JSON: {e}")),
-            };
-            let consume_end = json_start + end_idx + runner::IPC_CODE_OUTPUT_END.len();
-            // Also consume trailing newline if present
-            let consume_end = if buf[consume_end..].starts_with('\n') {
-                consume_end + 1
-            } else {
-                consume_end
-            };
-            buf.drain(..consume_end);
-            let _ = tx.send(msg).await;
-        } else {
-            // Incomplete marker — wait for more data
+fn b64_encode(data: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// Decode a base64 frame payload into a JSON value.
+fn decode_frame_json(payload: &str) -> Result<serde_json::Value, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim().as_bytes())
+        .map_err(|e| format!("invalid base64 frame: {e}"))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid frame JSON: {e}"))
+}
+
+/// One frame type recognised on a stream: start marker, optional end marker
+/// (`None` = bare signal such as `__READY__`).
+type FrameSpec = (&'static str, Option<&'static str>);
+
+/// Extract every complete frame from `buf`, in stream order.
+///
+/// Returns `(spec index, payload)` pairs. Bytes outside frames are noise
+/// (stray writes straight to fd 1/2) and are discarded, keeping only a tail
+/// that could still be the beginning of a marker, so the buffer never grows
+/// without a frame in flight. An in-flight frame larger than `max_frame`
+/// is an error (the caller tears the session down).
+fn drain_frames(
+    buf: &mut String,
+    specs: &[FrameSpec],
+    max_frame: usize,
+) -> Result<Vec<(usize, String)>, String> {
+    let mut out = Vec::new();
+    loop {
+        let earliest = specs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (start, _))| buf.find(start).map(|pos| (pos, i)))
+            .min();
+        let Some((pos, i)) = earliest else {
+            // No marker: keep at most (longest marker - 1) trailing bytes.
+            let keep = specs.iter().map(|(s, _)| s.len()).max().unwrap_or(1) - 1;
+            if buf.len() > keep {
+                let mut cut = buf.len() - keep;
+                while !buf.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                buf.drain(..cut);
+            }
             break;
+        };
+        buf.drain(..pos);
+        let (start, end) = specs[i];
+        match end {
+            None => {
+                let mut consume = start.len();
+                if buf[consume..].starts_with('\n') {
+                    consume += 1;
+                }
+                buf.drain(..consume);
+                out.push((i, String::new()));
+            }
+            Some(end) => {
+                let payload_start = start.len();
+                let Some(end_rel) = buf[payload_start..].find(end) else {
+                    break; // incomplete frame — wait for more data
+                };
+                let payload = buf[payload_start..payload_start + end_rel].to_string();
+                let mut consume = payload_start + end_rel + end.len();
+                if buf[consume..].starts_with('\n') {
+                    consume += 1;
+                }
+                buf.drain(..consume);
+                out.push((i, payload));
+            }
         }
+    }
+    if buf.len() > max_frame {
+        buf.clear();
+        return Err(format!(
+            "Sandbox output frame exceeded the {max_frame}-byte limit"
+        ));
+    }
+    Ok(out)
+}
+
+fn parse_code_output(payload: &str) -> ContainerMessage {
+    match decode_frame_json(payload) {
+        Ok(val) => ContainerMessage::CodeOutput(CodeOutputData {
+            stdout: val
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            stderr: val
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            exit_code: val.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1),
+        }),
+        Err(e) => ContainerMessage::Error(format!("Invalid code output: {e}")),
     }
 }
 
-/// Parse stderr buffer for `__READY__` and `__PTC_TOOL_CALL__` messages.
-async fn parse_stderr_messages(buf: &mut String, tx: &mpsc::Sender<ContainerMessage>) {
-    // Check for __READY__ signal
-    while let Some(idx) = buf.find(runner::IPC_READY) {
-        let consume_end = idx + runner::IPC_READY.len();
-        let consume_end = if buf[consume_end..].starts_with('\n') {
-            consume_end + 1
-        } else {
-            consume_end
+fn parse_tool_calls(payload: &str) -> ContainerMessage {
+    let val = match decode_frame_json(payload) {
+        Ok(v) => v,
+        Err(e) => return ContainerMessage::Error(format!("Invalid tool call: {e}")),
+    };
+    let Some(arr) = val.get("calls").and_then(|c| c.as_array()) else {
+        return ContainerMessage::Error("Invalid tool call: missing 'calls' array".into());
+    };
+    let mut calls = Vec::with_capacity(arr.len());
+    for call in arr {
+        let (Some(tool_use_id), Some(name)) = (
+            call.get("tool_use_id").and_then(|v| v.as_str()),
+            call.get("name").and_then(|v| v.as_str()),
+        ) else {
+            return ContainerMessage::Error(
+                "Invalid tool call: entry without string 'tool_use_id'/'name'".into(),
+            );
         };
-        buf.drain(..consume_end);
-        let _ = tx.send(ContainerMessage::Ready).await;
+        calls.push(ToolCallData {
+            tool_use_id: tool_use_id.to_string(),
+            name: name.to_string(),
+            input: call.get("input").cloned().unwrap_or(serde_json::json!({})),
+        });
+    }
+    ContainerMessage::ToolCall(calls)
+}
+
+/// Parse the stdout buffer for `__PTC_OUTPUT__{b64}__PTC_END_OUTPUT__` frames.
+async fn parse_stdout_messages(
+    buf: &mut String,
+    tx: &mpsc::Sender<ContainerMessage>,
+) -> Result<(), String> {
+    const SPECS: [FrameSpec; 1] = [(
+        runner::IPC_CODE_OUTPUT_START,
+        Some(runner::IPC_CODE_OUTPUT_END),
+    )];
+    for (_, payload) in drain_frames(buf, &SPECS, MAX_FRAME_BYTES)? {
+        let _ = tx.send(parse_code_output(&payload)).await;
+    }
+    Ok(())
+}
+
+/// Parse the stderr buffer for `__READY__` and `__PTC_TOOL_CALL__{b64}__PTC_END_CALL__`.
+async fn parse_stderr_messages(
+    buf: &mut String,
+    tx: &mpsc::Sender<ContainerMessage>,
+) -> Result<(), String> {
+    const SPECS: [FrameSpec; 2] = [
+        (runner::IPC_READY, None),
+        (runner::IPC_TOOL_CALL_START, Some(runner::IPC_TOOL_CALL_END)),
+    ];
+    for (i, payload) in drain_frames(buf, &SPECS, MAX_FRAME_BYTES)? {
+        let msg = if i == 0 {
+            ContainerMessage::Ready
+        } else {
+            parse_tool_calls(&payload)
+        };
+        let _ = tx.send(msg).await;
+    }
+    Ok(())
+}
+
+/// stdout/stderr collector with a combined byte cap.
+struct CappedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    limit: usize,
+    truncated: bool,
+}
+
+impl CappedOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            limit,
+            truncated: false,
+        }
     }
 
-    // Check for tool call messages
-    while let Some(start_idx) = buf.find(runner::IPC_TOOL_CALL_START) {
-        let json_start = start_idx + runner::IPC_TOOL_CALL_START.len();
-        if let Some(end_idx) = buf[json_start..].find(runner::IPC_TOOL_CALL_END) {
-            let json_str = &buf[json_start..json_start + end_idx];
-            let msg = match serde_json::from_str::<serde_json::Value>(json_str) {
-                Ok(val) => {
-                    let calls = val
-                        .get("calls")
-                        .and_then(|c| c.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|call| {
-                                    let tool_use_id =
-                                        call.get("tool_use_id")?.as_str()?.to_string();
-                                    let name = call.get("name")?.as_str()?.to_string();
-                                    let input =
-                                        call.get("input").cloned().unwrap_or(serde_json::json!({}));
-                                    Some(ToolCallData {
-                                        tool_use_id,
-                                        name,
-                                        input,
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    ContainerMessage::ToolCall(calls)
-                }
-                Err(e) => ContainerMessage::Error(format!("Invalid tool call JSON: {e}")),
-            };
-            let consume_end = json_start + end_idx + runner::IPC_TOOL_CALL_END.len();
-            let consume_end = if buf[consume_end..].starts_with('\n') {
-                consume_end + 1
-            } else {
-                consume_end
-            };
-            buf.drain(..consume_end);
-            let _ = tx.send(msg).await;
+    fn remaining(&self) -> usize {
+        self.limit
+            .saturating_sub(self.stdout.len() + self.stderr.len())
+    }
+
+    /// Append; returns `true` once the cap is reached.
+    fn push(&mut self, data: &[u8], to_stdout: bool) -> bool {
+        let take = data.len().min(self.remaining());
+        let dst = if to_stdout {
+            &mut self.stdout
         } else {
-            // Incomplete marker — wait for more data
-            break;
+            &mut self.stderr
+        };
+        dst.extend_from_slice(&data[..take]);
+        if take < data.len() {
+            self.truncated = true;
         }
+        self.truncated
+    }
+
+    fn push_stdout(&mut self, data: &[u8]) -> bool {
+        self.push(data, true)
+    }
+
+    fn push_stderr(&mut self, data: &[u8]) -> bool {
+        self.push(data, false)
+    }
+
+    fn finish(self) -> (String, String, bool) {
+        let stdout = String::from_utf8_lossy(&self.stdout).into_owned();
+        let mut stderr = String::from_utf8_lossy(&self.stderr).into_owned();
+        if self.truncated {
+            stderr.push_str(&format!("\n[output truncated at {} bytes]", self.limit));
+        }
+        (stdout, stderr, self.truncated)
     }
 }
 
@@ -936,11 +1054,9 @@ mod tests {
     #[tokio::test]
     async fn test_parse_stdout_code_output() {
         let (tx, mut rx) = mpsc::channel(8);
-        let mut buf =
-            r#"__PTC_OUTPUT__{"stdout":"hello","stderr":"","exit_code":0}__PTC_END_OUTPUT__
-"#
-            .to_string();
-        parse_stdout_messages(&mut buf, &tx).await;
+        let payload = b64_encode(br#"{"stdout":"hello","stderr":"","exit_code":0}"#);
+        let mut buf = format!("__PTC_OUTPUT__{payload}__PTC_END_OUTPUT__\n");
+        parse_stdout_messages(&mut buf, &tx).await.unwrap();
         let msg = rx.try_recv().unwrap();
         match msg {
             ContainerMessage::CodeOutput(data) => {
@@ -956,7 +1072,7 @@ mod tests {
     async fn test_parse_stderr_ready() {
         let (tx, mut rx) = mpsc::channel(8);
         let mut buf = "__READY__\n".to_string();
-        parse_stderr_messages(&mut buf, &tx).await;
+        parse_stderr_messages(&mut buf, &tx).await.unwrap();
         let msg = rx.try_recv().unwrap();
         assert!(matches!(msg, ContainerMessage::Ready));
         assert!(buf.is_empty());
@@ -965,9 +1081,11 @@ mod tests {
     #[tokio::test]
     async fn test_parse_stderr_tool_call() {
         let (tx, mut rx) = mpsc::channel(8);
-        let mut buf = r#"__PTC_TOOL_CALL__{"calls":[{"tool_use_id":"toolu_1","name":"web_search","input":{"query":"test"}}]}__PTC_END_CALL__
-"#.to_string();
-        parse_stderr_messages(&mut buf, &tx).await;
+        let payload = b64_encode(
+            br#"{"calls":[{"tool_use_id":"toolu_1","name":"web_search","input":{"query":"test"}}]}"#,
+        );
+        let mut buf = format!("__PTC_TOOL_CALL__{payload}__PTC_END_CALL__\n");
+        parse_stderr_messages(&mut buf, &tx).await.unwrap();
         let msg = rx.try_recv().unwrap();
         match msg {
             ContainerMessage::ToolCall(calls) => {
@@ -983,10 +1101,129 @@ mod tests {
     #[tokio::test]
     async fn test_parse_incomplete_marker() {
         let (tx, mut rx) = mpsc::channel(8);
-        let mut buf = "__PTC_OUTPUT__{\"stdout\":\"partial".to_string();
-        parse_stdout_messages(&mut buf, &tx).await;
+        let mut buf = "__PTC_OUTPUT__eyJzdGRvdXQiOiJwYXJ0".to_string();
+        parse_stdout_messages(&mut buf, &tx).await.unwrap();
         // Should not produce a message — waiting for end marker
         assert!(rx.try_recv().is_err());
-        assert!(buf.contains("partial"));
+        assert!(buf.contains("eyJzdGRvdXQiOiJwYXJ0"));
+    }
+
+    #[tokio::test]
+    async fn test_marker_inside_payload_does_not_truncate() {
+        // Output that contains the boundary markers literally.
+        let json = serde_json::json!({
+            "stdout": "a __PTC_END_OUTPUT__ b __PTC_END_RESULT__ c",
+            "stderr": "",
+            "exit_code": 0
+        });
+        let payload = b64_encode(json.to_string().as_bytes());
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buf = format!("__PTC_OUTPUT__{payload}__PTC_END_OUTPUT__\n");
+        parse_stdout_messages(&mut buf, &tx).await.unwrap();
+        match rx.try_recv().unwrap() {
+            ContainerMessage::CodeOutput(d) => {
+                assert_eq!(d.stdout, "a __PTC_END_OUTPUT__ b __PTC_END_RESULT__ c")
+            }
+            other => panic!("Expected CodeOutput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unframed_json_is_rejected() {
+        // Raw (non-base64) JSON must not be accepted as a tool call.
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buf = r#"__PTC_TOOL_CALL__{"calls":[]}__PTC_END_CALL__"#.to_string();
+        parse_stderr_messages(&mut buf, &tx).await.unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), ContainerMessage::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_entry_missing_name_is_error() {
+        let payload = b64_encode(br#"{"calls":[{"tool_use_id":"toolu_1"}]}"#);
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buf = format!("__PTC_TOOL_CALL__{payload}__PTC_END_CALL__");
+        parse_stderr_messages(&mut buf, &tx).await.unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), ContainerMessage::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_stdout_frame_is_error() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut buf = format!("__PTC_OUTPUT__{}", "A".repeat(MAX_FRAME_BYTES + 1));
+        assert!(parse_stdout_messages(&mut buf, &tx).await.is_err());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_drain_frames_discards_noise_and_bounds_buffer() {
+        const SPECS: [FrameSpec; 1] = [("__S__", Some("__E__"))];
+        let mut buf = "x".repeat(10_000);
+        let frames = drain_frames(&mut buf, &SPECS, 1024).unwrap();
+        assert!(frames.is_empty());
+        assert!(buf.len() < 5, "noise must not accumulate: {}", buf.len());
+
+        let mut buf = "noise__S__abc__E__\nmore__S__def__E__".to_string();
+        let frames = drain_frames(&mut buf, &SPECS, 1024).unwrap();
+        assert_eq!(frames, vec![(0, "abc".to_string()), (0, "def".to_string())]);
+    }
+
+    #[test]
+    fn test_drain_frames_partial_marker_tail_kept() {
+        const SPECS: [FrameSpec; 1] = [("__S__", Some("__E__"))];
+        let mut buf = "garbage__S".to_string();
+        drain_frames(&mut buf, &SPECS, 1024).unwrap();
+        buf.push_str("__ok__E__");
+        let frames = drain_frames(&mut buf, &SPECS, 1024).unwrap();
+        assert_eq!(frames, vec![(0, "ok".to_string())]);
+    }
+
+    #[test]
+    fn test_drain_frames_oversized_frame_errors() {
+        const SPECS: [FrameSpec; 1] = [("__S__", Some("__E__"))];
+        let mut buf = format!("__S__{}", "A".repeat(2048));
+        let err = drain_frames(&mut buf, &SPECS, 1024).unwrap_err();
+        assert!(err.contains("exceeded"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_drain_frames_multibyte_noise() {
+        const SPECS: [FrameSpec; 1] = [("__S__", Some("__E__"))];
+        let mut buf = "日本語のノイズ".repeat(100);
+        drain_frames(&mut buf, &SPECS, 1024).unwrap();
+        assert!(buf.len() <= 8);
+    }
+
+    #[test]
+    fn test_drain_frames_ready_and_call_in_order() {
+        const SPECS: [FrameSpec; 2] = [("__R__", None), ("__S__", Some("__E__"))];
+        let mut buf = "__S__one__E____R__\n__S__two__E__".to_string();
+        let frames = drain_frames(&mut buf, &SPECS, 1024).unwrap();
+        assert_eq!(
+            frames,
+            vec![
+                (1, "one".to_string()),
+                (0, String::new()),
+                (1, "two".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_capped_output() {
+        let mut out = CappedOutput::new(10);
+        assert!(!out.push_stdout(b"12345"));
+        assert!(out.push_stderr(b"6789012"));
+        let (stdout, stderr, truncated) = out.finish();
+        assert!(truncated);
+        assert_eq!(stdout, "12345");
+        assert!(stderr.starts_with("67890"));
+        assert!(stderr.contains("truncated"));
+    }
+
+    #[test]
+    fn test_sandbox_config_default_tmpfs() {
+        let cfg = SandboxConfig::default();
+        assert_eq!(cfg.tmpfs_size, DEFAULT_TMPFS_SIZE);
     }
 }

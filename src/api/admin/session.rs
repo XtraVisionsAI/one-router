@@ -23,15 +23,61 @@ pub struct LoginRequest {
 const MAX_LOGIN_FAILURES: u32 = 10;
 const LOGIN_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// client address → failed attempts in the current window (per instance).
-fn login_throttle() -> &'static moka::sync::Cache<String, u32> {
-    static T: std::sync::OnceLock<moka::sync::Cache<String, u32>> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        moka::sync::Cache::builder()
-            .max_capacity(100_000)
-            .time_to_live(LOGIN_LOCKOUT)
-            .build()
-    })
+/// (attempts in the window, window start).
+type ThrottleEntry = (u32, std::time::Instant);
+type ThrottleCache = moka::sync::Cache<String, ThrottleEntry>;
+
+/// client address (IPv6 by /64) → attempts in the current window (per instance).
+fn login_throttle() -> &'static ThrottleCache {
+    static T: std::sync::OnceLock<ThrottleCache> = std::sync::OnceLock::new();
+    T.get_or_init(new_throttle_cache)
+}
+
+fn new_throttle_cache() -> ThrottleCache {
+    moka::sync::Cache::builder()
+        .max_capacity(100_000)
+        // Eviction backstop only; the window itself is the stored start time
+        // (updates would otherwise keep extending a TTL).
+        .time_to_live(LOGIN_LOCKOUT)
+        .build()
+}
+
+/// Throttle bucket for a client: the address, IPv6 truncated to its /64 (one
+/// host usually owns a whole /64, so per-address buckets are trivially
+/// evaded). IPv4-mapped IPv6 is treated as IPv4.
+fn throttle_key(client: Option<&str>) -> String {
+    let Some(raw) = client else {
+        return "unknown".into();
+    };
+    match raw.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let prefix = u128::from(v6) & (u128::MAX << 64);
+                format!("{}/64", std::net::Ipv6Addr::from(prefix))
+            }
+        },
+        Ok(ip) => ip.to_string(),
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// Atomically count one login attempt for `key` **before** verification and
+/// return the attempt number in the current window. Concurrent attempts each
+/// get a distinct number, so at most `MAX_LOGIN_FAILURES` verifications run
+/// per window (no read-then-insert race).
+fn register_attempt(cache: &ThrottleCache, key: String) -> u32 {
+    let now = std::time::Instant::now();
+    cache
+        .entry(key)
+        .and_upsert_with(|existing| match existing.map(|e| e.into_value()) {
+            Some((n, start)) if now.duration_since(start) < LOGIN_LOCKOUT => {
+                (n.saturating_add(1), start)
+            }
+            _ => (1, now),
+        })
+        .into_value()
+        .0
 }
 
 /// `ADMIN_COOKIE_INSECURE=true` drops the cookie's `Secure` flag — only for
@@ -49,8 +95,10 @@ pub async fn login(
 ) -> impl IntoResponse {
     let key = body.key.trim();
     let client = crate::services::audit::meta(connect.map(|c| c.0), &headers, &state.settings).0;
-    let throttle_key = client.clone().unwrap_or_else(|| "unknown".into());
-    if login_throttle().get(&throttle_key).unwrap_or(0) >= MAX_LOGIN_FAILURES {
+    let throttle_key = throttle_key(client.as_deref());
+    // Counted before verification; a success clears the bucket, so N failures
+    // allow attempt N+1 only while N < MAX_LOGIN_FAILURES.
+    if register_attempt(login_throttle(), throttle_key.clone()) > MAX_LOGIN_FAILURES {
         // Throttled attempts are not audited individually (flood protection).
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -84,8 +132,6 @@ pub async fn login(
         .unwrap_or(false);
 
     if !is_master && !is_ephemeral {
-        let failures = login_throttle().get(&throttle_key).unwrap_or(0) + 1;
-        login_throttle().insert(throttle_key, failures);
         crate::services::audit::record_login(&audit_state, meta, "anonymous", false, 401);
         return (
             StatusCode::UNAUTHORIZED,
@@ -162,4 +208,49 @@ pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
             let pair = pair.trim();
             pair.strip_prefix("admin_session=").map(|v| v.to_string())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_keyed_by_slash_64() {
+        assert_eq!(
+            throttle_key(Some("2001:db8:1:2:aaaa::1")),
+            throttle_key(Some("2001:db8:1:2:ffff::9"))
+        );
+        assert_ne!(
+            throttle_key(Some("2001:db8:1:2::1")),
+            throttle_key(Some("2001:db8:1:3::1"))
+        );
+        assert_eq!(throttle_key(Some("2001:db8:1:2::1")), "2001:db8:1:2::/64");
+        assert_eq!(throttle_key(Some("::ffff:10.0.0.1")), "10.0.0.1");
+        assert_eq!(throttle_key(Some("10.0.0.1")), "10.0.0.1");
+        assert_eq!(throttle_key(None), "unknown");
+    }
+
+    #[test]
+    fn attempts_counted_atomically_before_verification() {
+        let cache = std::sync::Arc::new(new_throttle_cache());
+        // 32 concurrent attempts from one client: each gets a distinct number,
+        // so exactly MAX_LOGIN_FAILURES of them are allowed to verify.
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let c = cache.clone();
+                std::thread::spawn(move || register_attempt(&c, "1.2.3.4".into()))
+            })
+            .collect();
+        let mut nums: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        nums.sort();
+        assert_eq!(nums, (1..=32).collect::<Vec<_>>());
+        assert_eq!(
+            nums.iter().filter(|n| **n <= MAX_LOGIN_FAILURES).count(),
+            MAX_LOGIN_FAILURES as usize
+        );
+        // Another client is independent; a success clears the bucket.
+        assert_eq!(register_attempt(&cache, "5.6.7.8".into()), 1);
+        cache.invalidate("1.2.3.4");
+        assert_eq!(register_attempt(&cache, "1.2.3.4".into()), 1);
+    }
 }

@@ -52,6 +52,16 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|e| format!("budget_alert_webhook_url: {e}"))
         }
+        "pricing_sync_url" => {
+            let url = reqwest::Url::parse(value.trim())
+                .map_err(|e| format!("pricing_sync_url: invalid URL: {e}"))?;
+            if url.scheme() != "https" {
+                return Err("pricing_sync_url must use https".into());
+            }
+            return crate::services::web_tools::ssrf::check_url_static(&url)
+                .map(|_| ())
+                .map_err(|e| format!("pricing_sync_url: {e}"));
+        }
         "audit_log_retention_days" => match value.trim().parse::<i64>() {
             Ok(n) if n >= 0 => Ok(()),
             _ => Err("audit_log_retention_days must be an integer >= 0 (0 = keep forever)"),
@@ -119,6 +129,11 @@ const MASKED_VALUE: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2
 pub const SENSITIVE_KEYS: &[&str] = &["web_search_api_key", "budget_alert_webhook_url"];
 
 /// Check if a setting's ui_schema marks it as sensitive
+/// Whether a setting's value is a secret (encrypted at rest, masked on read).
+pub(crate) fn is_sensitive_setting(key: &str, ui_schema: &Option<String>) -> bool {
+    SENSITIVE_KEYS.contains(&key) || is_sensitive(ui_schema)
+}
+
 fn is_sensitive(ui_schema: &Option<String>) -> bool {
     ui_schema
         .as_ref()
@@ -227,7 +242,10 @@ pub async fn upsert_setting(
     // Sensitive values are encrypted at rest like backend configs (readers use
     // `Encryptor::decrypt`, which also accepts legacy plaintext).
     let stored_value = if sensitive && !body.value.is_empty() {
-        state.encryptor.encrypt(&body.value)
+        state.encryptor.encrypt(
+            &body.value,
+            &crate::database::encryption::setting_context(&key),
+        )
     } else {
         body.value
     };
@@ -273,6 +291,20 @@ pub async fn upsert_setting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_pricing_sync_url_blocks_internal_and_http() {
+        assert!(validate_setting(
+            "pricing_sync_url",
+            "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        )
+        .is_ok());
+        assert!(validate_setting("pricing_sync_url", "http://example.com/x.json").is_err());
+        assert!(validate_setting("pricing_sync_url", "https://169.254.169.254/latest").is_err());
+        assert!(validate_setting("pricing_sync_url", "https://10.0.0.5/x.json").is_err());
+        assert!(validate_setting("pricing_sync_url", "https://[::ffff:10.0.0.5]/x").is_err());
+        assert!(validate_setting("pricing_sync_url", "not a url").is_err());
+    }
 
     #[test]
     fn validate_prompt_cache_valid_values() {

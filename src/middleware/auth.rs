@@ -589,6 +589,9 @@ async fn lookup(
     if let Some(hit) = state.cache.get(hash) {
         return Ok(hit);
     }
+    // Snapshot before reading storage: an invalidation during the read makes
+    // the result unsafe to cache (it may predate the admin write).
+    let generation = state.cache.generation();
     let record = state
         .storage
         .api_keys()
@@ -596,7 +599,7 @@ async fn lookup(
         .await
         .map_err(|e| AuthError::InternalError(e.to_string()))?;
     let Some(record) = record else {
-        state.cache.put(hash, None);
+        state.cache.put_at(hash, None, generation);
         return Ok(None);
     };
     let user = if record.user_id.is_empty() {
@@ -621,7 +624,7 @@ async fn lookup(
         None => None,
     };
     let value = (record, user, team);
-    state.cache.put(hash, Some(value.clone()));
+    state.cache.put_at(hash, Some(value.clone()), generation);
     Ok(Some(Arc::new(value)))
 }
 

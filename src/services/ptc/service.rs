@@ -8,7 +8,7 @@
 
 use super::exceptions::{PtcError, PtcResult};
 use super::sandbox::{
-    ContainerHandle, ContainerInfo, ContainerMessage, SandboxConfig, SandboxExecutor,
+    ContainerHandle, ContainerInfo, ContainerMessage, SandboxConfig, SandboxExecutor, ToolCallData,
 };
 use crate::schemas::anthropic::{
     ContentBlock, Message, MessageRequest, MessageResponse, Metadata, SystemContent, ThinkingConfig,
@@ -50,6 +50,8 @@ pub struct PtcSession {
     pub container: ContainerInfo,
     /// HMAC hash of the API key that owns this session
     pub owner_key_hash: String,
+    /// Tool names callable from sandbox code (validated at creation)
+    pub allowed_tools: Vec<String>,
     /// Session creation time
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Last activity time
@@ -156,8 +158,256 @@ pub struct PtcExecutionState {
 }
 
 // ============================================================================
+// Detection helpers
+// ============================================================================
+
+/// Request shape check: `anthropic-beta` contains the PTC beta and a
+/// `code_execution_20250825` tool is declared.
+pub fn is_ptc_shaped(request: &MessageRequest, beta_header: Option<&str>) -> bool {
+    let has_beta_header = beta_header
+        .map(|h| h.split(',').any(|b| b.trim() == PTC_BETA_HEADER))
+        .unwrap_or(false);
+    if !has_beta_header {
+        return false;
+    }
+    request.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool.get("type").and_then(|t| t.as_str()) == Some(CODE_EXECUTION_TOOL_TYPE))
+    })
+}
+
+/// Tools whose `allowed_callers` include `code_execution_20250825`.
+pub fn callable_tools(request: &MessageRequest) -> Vec<serde_json::Value> {
+    request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| {
+                    tool.get("allowed_callers")
+                        .and_then(|ac| ac.as_array())
+                        .is_some_and(|callers| {
+                            callers
+                                .iter()
+                                .any(|c| c.as_str() == Some(CODE_EXECUTION_TOOL_TYPE))
+                        })
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ============================================================================
+// Limits & validation (pure, unit-tested)
+// ============================================================================
+
+/// Infra opt-in env var: the PTC sandbox (and the Docker-backed code executor
+/// used by web_search dynamic filtering) is only constructed when `true`.
+pub const PTC_ENABLED_ENV: &str = "PTC_ENABLED";
+/// Gateway-wide cap on concurrent PTC sessions (containers).
+pub const PTC_MAX_SESSIONS_ENV: &str = "PTC_MAX_SESSIONS";
+/// Per-API-key cap on concurrent PTC sessions.
+pub const PTC_MAX_SESSIONS_PER_KEY_ENV: &str = "PTC_MAX_SESSIONS_PER_KEY";
+
+pub const DEFAULT_MAX_SESSIONS: usize = 32;
+pub const DEFAULT_MAX_SESSIONS_PER_KEY: usize = 4;
+
+/// Max tool calls in one sandbox frame.
+pub const MAX_TOOL_CALLS_PER_FRAME: usize = 32;
+/// Max serialized size of one tool call's `input`.
+pub const MAX_TOOL_INPUT_BYTES: usize = 256 * 1024;
+/// Max length of a tool name passed into the sandbox.
+pub const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// Interval of the background expired-session sweep.
+pub const SESSION_SWEEP_INTERVAL_SECS: u64 = 60;
+
+/// Whether the operator opted in to PTC (`PTC_ENABLED=true|1`).
+pub fn ptc_enabled_from_env() -> bool {
+    parse_bool_env(std::env::var(PTC_ENABLED_ENV).ok().as_deref())
+}
+
+fn parse_bool_env(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("true" | "1" | "yes" | "on")
+    )
+}
+
+/// Session caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtcLimits {
+    pub max_sessions: usize,
+    pub max_sessions_per_owner: usize,
+}
+
+impl Default for PtcLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            max_sessions_per_owner: DEFAULT_MAX_SESSIONS_PER_KEY,
+        }
+    }
+}
+
+impl PtcLimits {
+    /// Defaults overridden by `PTC_MAX_SESSIONS` / `PTC_MAX_SESSIONS_PER_KEY`
+    /// (positive integers; anything else keeps the default).
+    pub fn from_env() -> Self {
+        Self::from_values(
+            std::env::var(PTC_MAX_SESSIONS_ENV).ok().as_deref(),
+            std::env::var(PTC_MAX_SESSIONS_PER_KEY_ENV).ok().as_deref(),
+        )
+    }
+
+    fn from_values(total: Option<&str>, per_owner: Option<&str>) -> Self {
+        let parse = |v: Option<&str>, default: usize| {
+            v.and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(default)
+        };
+        Self {
+            max_sessions: parse(total, DEFAULT_MAX_SESSIONS),
+            max_sessions_per_owner: parse(per_owner, DEFAULT_MAX_SESSIONS_PER_KEY),
+        }
+    }
+}
+
+/// Check whether one more session may be created given the current counts
+/// (live sessions + in-flight reservations).
+pub fn check_session_caps(total: usize, owner: usize, limits: &PtcLimits) -> PtcResult<()> {
+    if owner >= limits.max_sessions_per_owner {
+        return Err(PtcError::SessionLimitExceeded(format!(
+            "at most {} concurrent PTC sessions per API key",
+            limits.max_sessions_per_owner
+        )));
+    }
+    if total >= limits.max_sessions {
+        return Err(PtcError::SessionLimitExceeded(format!(
+            "gateway-wide limit of {} concurrent PTC sessions reached",
+            limits.max_sessions
+        )));
+    }
+    Ok(())
+}
+
+/// A tool name that may be exposed inside the sandbox: `[A-Za-z0-9_-]{1,64}`.
+pub fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Validate the client's code-callable tool names before they reach the
+/// container environment.
+pub fn validate_tool_names(names: &[String]) -> PtcResult<()> {
+    for name in names {
+        if !is_valid_tool_name(name) {
+            return Err(PtcError::InvalidRequest(format!(
+                "tool name '{}' is not allowed for code execution (expected [A-Za-z0-9_-]{{1,{MAX_TOOL_NAME_LEN}}})",
+                name.chars().take(80).collect::<String>()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Sandbox-generated tool_use id: `toolu_[A-Za-z0-9_-]{1,64}`.
+fn is_valid_sandbox_tool_use_id(id: &str) -> bool {
+    id.strip_prefix("toolu_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 64
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
+}
+
+/// Validate a tool-call frame emitted by sandbox code against the session's
+/// callable tool set (`allowed_callers` contains `code_execution_20250825`).
+///
+/// The frame is produced by model-written code running in the container, so
+/// every field is untrusted: names outside the callable set, malformed /
+/// duplicate ids, non-object or oversized inputs are rejected.
+pub fn validate_sandbox_tool_calls(calls: &[ToolCallData], allowed: &[String]) -> PtcResult<()> {
+    if calls.is_empty() {
+        return Err(PtcError::InvalidToolCall("empty tool call batch".into()));
+    }
+    if calls.len() > MAX_TOOL_CALLS_PER_FRAME {
+        return Err(PtcError::InvalidToolCall(format!(
+            "{} tool calls in one batch (max {MAX_TOOL_CALLS_PER_FRAME})",
+            calls.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for call in calls {
+        if !is_valid_sandbox_tool_use_id(&call.tool_use_id) {
+            return Err(PtcError::InvalidToolCall("malformed tool_use_id".into()));
+        }
+        if !seen.insert(call.tool_use_id.as_str()) {
+            return Err(PtcError::InvalidToolCall("duplicate tool_use_id".into()));
+        }
+        if !allowed.iter().any(|a| a == &call.name) {
+            return Err(PtcError::InvalidToolCall(format!(
+                "tool '{}' is not callable from code execution",
+                call.name.chars().take(80).collect::<String>()
+            )));
+        }
+        if !call.input.is_object() {
+            return Err(PtcError::InvalidToolCall(format!(
+                "input for '{}' must be a JSON object",
+                call.name
+            )));
+        }
+        let size = serde_json::to_vec(&call.input)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if size > MAX_TOOL_INPUT_BYTES {
+            return Err(PtcError::InvalidToolCall(format!(
+                "input for '{}' is {size} bytes (max {MAX_TOOL_INPUT_BYTES})",
+                call.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // PTC Service
 // ============================================================================
+
+/// Per-session container handle. The handle is behind its own mutex so a
+/// long exchange (up to execution_timeout + 5s) only serializes requests on
+/// the same session; `abort` lets teardown stop the reader without waiting
+/// for that mutex.
+struct SessionHandle {
+    handle: Arc<TokioMutex<ContainerHandle>>,
+    abort: tokio::task::AbortHandle,
+}
+
+/// Session-slot reservation held while a container is being created, so
+/// concurrent `create_session` calls cannot overshoot the caps.
+struct SlotReservation {
+    reservations: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    owner: String,
+}
+
+impl Drop for SlotReservation {
+    fn drop(&mut self) {
+        let mut res = self.reservations.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = res.get_mut(&self.owner) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                res.remove(&self.owner);
+            }
+        }
+    }
+}
 
 /// Main PTC service for handling Programmatic Tool Calling
 pub struct PtcService {
@@ -165,10 +415,14 @@ pub struct PtcService {
     sandbox: Arc<SandboxExecutor>,
     /// Active sessions (cloneable metadata)
     sessions: Arc<RwLock<HashMap<String, PtcSession>>>,
-    /// Container handles (not cloneable — stored separately)
-    container_handles: Arc<TokioMutex<HashMap<String, ContainerHandle>>>,
+    /// Container handles (not cloneable — stored separately, one mutex each)
+    container_handles: Arc<RwLock<HashMap<String, SessionHandle>>>,
     /// Execution states for continuation (preserved across turns)
     execution_states: Arc<RwLock<HashMap<String, PtcExecutionState>>>,
+    /// In-flight session creations per owner
+    reservations: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Session caps
+    limits: PtcLimits,
     /// Session timeout in seconds
     session_timeout: u64,
     /// Max iterations per session
@@ -176,17 +430,15 @@ pub struct PtcService {
 }
 
 impl PtcService {
-    /// Create a new PTC service
+    /// Create a new PTC service (image from `PTC_IMAGE`, caps from
+    /// `PTC_MAX_SESSIONS` / `PTC_MAX_SESSIONS_PER_KEY`).
     pub async fn new() -> PtcResult<Self> {
-        let sandbox = Arc::new(SandboxExecutor::new().await?);
-        Ok(Self {
-            sandbox,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            container_handles: Arc::new(TokioMutex::new(HashMap::new())),
-            execution_states: Arc::new(RwLock::new(HashMap::new())),
-            session_timeout: DEFAULT_SESSION_TIMEOUT_SECS,
-            max_iterations: DEFAULT_MAX_ITERATIONS,
-        })
+        Self::with_config(
+            SandboxConfig::from_env(),
+            DEFAULT_SESSION_TIMEOUT_SECS,
+            DEFAULT_MAX_ITERATIONS,
+        )
+        .await
     }
 
     /// Create a PTC service with custom configuration
@@ -199,45 +451,33 @@ impl PtcService {
         Ok(Self {
             sandbox,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            container_handles: Arc::new(TokioMutex::new(HashMap::new())),
+            container_handles: Arc::new(RwLock::new(HashMap::new())),
             execution_states: Arc::new(RwLock::new(HashMap::new())),
+            reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            limits: PtcLimits::from_env(),
             session_timeout,
             max_iterations,
         })
+    }
+
+    /// Configured session caps.
+    pub fn limits(&self) -> PtcLimits {
+        self.limits
     }
 
     // ========================================================================
     // PTC Detection
     // ========================================================================
 
-    /// Check if a request is a PTC request
+    /// Check if a request asks for PTC (beta header + code_execution tool).
+    ///
+    /// This is only the *shape* check; the caller must additionally require
+    /// the model's effective `ptc` capability.
     pub fn is_ptc_request(&self, request: &MessageRequest, beta_header: Option<&str>) -> bool {
-        // Check beta header
-        let has_beta_header = beta_header
-            .map(|h| h.contains(PTC_BETA_HEADER))
-            .unwrap_or(false);
-
-        if !has_beta_header {
-            return false;
-        }
-
-        // Check for code_execution tool
-        if let Some(ref tools) = request.tools {
-            return tools.iter().any(|tool| {
-                tool.get("type")
-                    .and_then(|t| t.as_str())
-                    .map(|t| t == CODE_EXECUTION_TOOL_TYPE)
-                    .unwrap_or(false)
-            });
-        }
-
-        false
+        is_ptc_shaped(request, beta_header)
     }
 
     /// Check if a request is a PTC continuation
-    ///
-    /// The container ID is typically passed via a custom header or request field.
-    /// This method validates the container ID exists in active sessions.
     pub fn is_ptc_continuation(&self, container_id: Option<&str>) -> bool {
         container_id.is_some()
     }
@@ -279,70 +519,95 @@ impl PtcService {
 
     /// Extract tools with allowed_callers from request
     pub fn get_callable_tools(&self, request: &MessageRequest) -> Vec<serde_json::Value> {
-        request
-            .tools
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .filter(|tool| {
-                        // Include tools with code_execution in allowed_callers
-                        tool.get("allowed_callers")
-                            .and_then(|ac| ac.as_array())
-                            .map(|callers| {
-                                callers.iter().any(|c| {
-                                    c.as_str()
-                                        .map(|s| s == CODE_EXECUTION_TOOL_TYPE)
-                                        .unwrap_or(false)
-                                })
-                            })
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        callable_tools(request)
     }
 
     // ========================================================================
     // Session Management
     // ========================================================================
 
+    /// Reserve a session slot under the per-owner and global caps.
+    async fn reserve_slot(&self, owner: &str) -> PtcResult<SlotReservation> {
+        let sessions = self.sessions.read().await;
+        let mut res = self.reservations.lock().unwrap_or_else(|e| e.into_inner());
+        let total = sessions.len() + res.values().sum::<usize>();
+        let owner_count = sessions
+            .values()
+            .filter(|s| s.owner_key_hash == owner)
+            .count()
+            + res.get(owner).copied().unwrap_or(0);
+        check_session_caps(total, owner_count, &self.limits)?;
+        *res.entry(owner.to_string()).or_default() += 1;
+        Ok(SlotReservation {
+            reservations: Arc::clone(&self.reservations),
+            owner: owner.to_string(),
+        })
+    }
+
     /// Create a new PTC session with tool support.
     ///
-    /// Sets up the runner script, attaches to the container, starts it,
-    /// and waits for the runner's `__READY__` signal.
+    /// Creates the runner container (tool names via `PTC_TOOLS` env), attaches,
+    /// starts it, and waits for the runner's `__READY__` signal. Every error
+    /// after the container exists removes it again.
     pub async fn create_session(
         &self,
         tool_names: &[String],
         owner_key_hash: &str,
     ) -> PtcResult<String> {
+        validate_tool_names(tool_names)?;
+
+        // Free slots held by expired sessions before checking the caps.
+        self.cleanup_expired_sessions().await;
+        let _slot = self.reserve_slot(owner_key_hash).await?;
+
         let session_id = format!("ptc_sess_{}", uuid::Uuid::new_v4());
 
-        // 1. Create container (not started yet — CMD is runner.py)
-        let container = self.sandbox.create_container(None).await?;
+        // 1. Create container (not started yet)
+        let container = self.sandbox.create_runner_container(tool_names).await?;
 
-        // 2. Copy runner script into container
-        self.sandbox
-            .copy_file_to_container(
-                &container.id,
-                &super::runner::get_runner_script_bytes(),
-                "/tmp/runner.py",
-            )
-            .await?;
+        // 2. Attach, start, wait for ready — remove the container on failure.
+        let handle = match self.start_runner(&container.id).await {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = self.sandbox.stop_and_remove(&container.id).await;
+                return Err(e);
+            }
+        };
 
-        // 3. Copy PTC_TOOLS env wrapper script
-        let tools_csv = tool_names.join(",");
-        let wrapper =
-            format!("#!/bin/sh\nexport PTC_TOOLS=\"{tools_csv}\"\npython -u /tmp/runner.py\n");
-        self.sandbox
-            .copy_file_to_container(&container.id, wrapper.as_bytes(), "/tmp/run.sh")
-            .await?;
+        // 3. Store session and handle
+        let session = PtcSession {
+            id: session_id.clone(),
+            container,
+            owner_key_hash: owner_key_hash.to_string(),
+            allowed_tools: tool_names.to_vec(),
+            created_at: chrono::Utc::now(),
+            last_activity: chrono::Utc::now(),
+            pending_tool_calls: Vec::new(),
+            iteration_count: 0,
+            state: SessionState::Active,
+        };
 
-        // 4. Attach and start (attach first, then start)
-        let mut handle = self.sandbox.attach_and_start(&container.id).await?;
+        let abort = handle.reader_abort_handle();
+        self.container_handles.write().await.insert(
+            session_id.clone(),
+            SessionHandle {
+                handle: Arc::new(TokioMutex::new(handle)),
+                abort,
+            },
+        );
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
 
-        // 5. Wait for __READY__ signal from runner
+        tracing::info!(session_id, "PTC session created with attach");
+        Ok(session_id)
+    }
+
+    /// Attach + start a created runner container and wait for `__READY__`.
+    async fn start_runner(&self, container_id: &str) -> PtcResult<ContainerHandle> {
+        let mut handle = self.sandbox.attach_and_start(container_id).await?;
+
         let msg = handle
             .recv_message_timeout(Duration::from_secs(30))
             .await
@@ -351,42 +616,14 @@ impl PtcService {
             })?;
 
         match msg {
-            ContainerMessage::Ready => {}
-            ContainerMessage::Error(e) => {
-                return Err(PtcError::RunnerNotReady(format!(
-                    "Runner error during startup: {e}"
-                )));
-            }
-            other => {
-                return Err(PtcError::RunnerNotReady(format!(
-                    "Unexpected message during startup: {other:?}"
-                )));
-            }
+            ContainerMessage::Ready => Ok(handle),
+            ContainerMessage::Error(e) => Err(PtcError::RunnerNotReady(format!(
+                "Runner error during startup: {e}"
+            ))),
+            other => Err(PtcError::RunnerNotReady(format!(
+                "Unexpected message during startup: {other:?}"
+            ))),
         }
-
-        // 6. Store session and handle
-        let session = PtcSession {
-            id: session_id.clone(),
-            container,
-            owner_key_hash: owner_key_hash.to_string(),
-            created_at: chrono::Utc::now(),
-            last_activity: chrono::Utc::now(),
-            pending_tool_calls: Vec::new(),
-            iteration_count: 0,
-            state: SessionState::Active,
-        };
-
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.insert(session_id.clone(), session);
-        }
-        {
-            let mut handles = self.container_handles.lock().await;
-            handles.insert(session_id.clone(), handle);
-        }
-
-        tracing::info!(session_id, "PTC session created with attach");
-        Ok(session_id)
     }
 
     /// Get a session by ID
@@ -398,95 +635,86 @@ impl PtcService {
             .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))
     }
 
-    /// Get a mutable reference to a session
+    /// Run `f` on a live session; an expired session is torn down instead.
     async fn with_session<F, R>(&self, session_id: &str, f: F) -> PtcResult<R>
     where
         F: FnOnce(&mut PtcSession) -> PtcResult<R>,
     {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))?;
-
-        // Check if session has expired — remove it and clean up the container
-        if session.is_expired(self.session_timeout) {
-            let session = sessions.remove(session_id).expect("session was just found");
-            let sandbox = Arc::clone(&self.sandbox);
-            let container_id = session.container.id.clone();
-            tokio::spawn(async move {
-                let _ = sandbox.stop_and_remove(&container_id).await;
-            });
-            return Err(PtcError::SessionExpired(session_id.to_string()));
+        let expired = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))?;
+            if session.is_expired(self.session_timeout) {
+                sessions.remove(session_id)
+            } else {
+                session.touch();
+                return f(session);
+            }
+        };
+        if let Some(session) = expired {
+            self.teardown(session_id, Some(session.container.id)).await;
         }
+        Err(PtcError::SessionExpired(session_id.to_string()))
+    }
 
-        session.touch();
-        f(session)
+    /// Drop handle + execution state and remove the container. No map lock is
+    /// held across the Docker call.
+    async fn teardown(&self, session_id: &str, container_id: Option<String>) {
+        if let Some(h) = self.container_handles.write().await.remove(session_id) {
+            h.abort.abort();
+        }
+        self.execution_states.write().await.remove(session_id);
+        if let Some(cid) = container_id {
+            if let Err(e) = self.sandbox.stop_and_remove(&cid).await {
+                tracing::debug!(session_id, error = %e, "PTC container removal failed");
+            }
+        }
     }
 
     /// Remove a session and clean up its container
     pub async fn remove_session(&self, session_id: &str) -> PtcResult<()> {
-        // Remove handle first (aborts background reader)
-        if let Some(handle) = self.container_handles.lock().await.remove(session_id) {
-            handle.shutdown();
-        }
-        // Remove execution state
-        self.execution_states.write().await.remove(session_id);
-        // Remove session and clean up container
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.remove(session_id) {
-            let _ = self.sandbox.stop_and_remove(&session.container.id).await;
-        }
+        let session = self.sessions.write().await.remove(session_id);
+        self.teardown(session_id, session.map(|s| s.container.id))
+            .await;
         Ok(())
     }
 
-    /// Clean up expired sessions
+    /// Clean up expired sessions. Called by the background sweep task and
+    /// before every session creation.
     pub async fn cleanup_expired_sessions(&self) -> usize {
-        let mut sessions = self.sessions.write().await;
-        let expired: Vec<String> = sessions
-            .iter()
-            .filter(|(_, s)| s.is_expired(self.session_timeout))
-            .map(|(id, _)| id.clone())
-            .collect();
-
+        let expired: Vec<(String, String)> = {
+            let mut sessions = self.sessions.write().await;
+            let ids: Vec<String> = sessions
+                .iter()
+                .filter(|(_, s)| s.is_expired(self.session_timeout))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| sessions.remove(&id).map(|s| (id, s.container.id)))
+                .collect()
+        };
         let count = expired.len();
-
-        for session_id in expired {
-            if let Some(session) = sessions.remove(&session_id) {
-                // Clean up handle
-                if let Some(handle) = self.container_handles.lock().await.remove(&session_id) {
-                    handle.shutdown();
-                }
-                // Clean up execution state
-                self.execution_states.write().await.remove(&session_id);
-                // Clean up container in background
-                let sandbox = Arc::clone(&self.sandbox);
-                let container_id = session.container.id.clone();
-                tokio::spawn(async move {
-                    let _ = sandbox.stop_and_remove(&container_id).await;
-                });
-            }
+        for (session_id, container_id) in expired {
+            self.teardown(&session_id, Some(container_id)).await;
         }
-
         count
     }
 
     /// Clean up ALL sessions (used during graceful shutdown).
     /// Returns the number of sessions cleaned up.
     pub async fn cleanup_all_sessions(&self) -> usize {
-        let mut sessions = self.sessions.write().await;
-        let all_ids: Vec<String> = sessions.keys().cloned().collect();
-        let count = all_ids.len();
-
-        for session_id in all_ids {
-            if let Some(session) = sessions.remove(&session_id) {
-                if let Some(handle) = self.container_handles.lock().await.remove(&session_id) {
-                    handle.shutdown();
-                }
-                self.execution_states.write().await.remove(&session_id);
-                let _ = self.sandbox.stop_and_remove(&session.container.id).await;
-            }
+        let all: Vec<(String, String)> = {
+            let mut sessions = self.sessions.write().await;
+            sessions
+                .drain()
+                .map(|(id, s)| (id, s.container.id))
+                .collect()
+        };
+        let count = all.len();
+        for (session_id, container_id) in all {
+            self.teardown(&session_id, Some(container_id)).await;
         }
-
         count
     }
 
@@ -503,58 +731,49 @@ impl PtcService {
     // Channel-based Code Execution
     // ========================================================================
 
+    /// Clone the session's handle out of the map (map lock released before
+    /// the caller awaits on the handle).
+    async fn handle_for(&self, session_id: &str) -> PtcResult<Arc<TokioMutex<ContainerHandle>>> {
+        self.container_handles
+            .read()
+            .await
+            .get(session_id)
+            .map(|h| Arc::clone(&h.handle))
+            .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))
+    }
+
+    fn exchange_timeout(&self) -> Duration {
+        Duration::from_secs(self.sandbox.config().execution_timeout + 5)
+    }
+
     /// Send code to the container and wait for the next message (ToolCall or CodeOutput).
+    ///
+    /// Any outcome other than a valid ToolCall / CodeOutput (timeout, sandbox
+    /// error, stream end, invalid tool call) tears the session down so the
+    /// still-running code cannot answer a later request.
     pub async fn run_code_via_channel(
         &self,
         session_id: &str,
         code: &str,
     ) -> PtcResult<ContainerMessage> {
-        // Update session state
-        self.with_session(session_id, |session| {
-            session.state = SessionState::Executing;
-            session.iteration_count += 1;
-            if session.iteration_count > self.max_iterations {
-                return Err(PtcError::MaxIterationsExceeded(self.max_iterations));
-            }
-            Ok(())
-        })
-        .await?;
-
-        let mut handles = self.container_handles.lock().await;
-        let handle = handles
-            .get_mut(session_id)
-            .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))?;
-
-        // Send code to container
-        handle.send_code(code).await?;
-
-        // Wait for response (ToolCall or CodeOutput)
-        let msg = handle
-            .recv_message_timeout(Duration::from_secs(
-                self.sandbox.config().execution_timeout + 5,
-            ))
+        let result = async {
+            self.with_session(session_id, |session| {
+                session.state = SessionState::Executing;
+                session.iteration_count += 1;
+                if session.iteration_count > self.max_iterations {
+                    return Err(PtcError::MaxIterationsExceeded(self.max_iterations));
+                }
+                Ok(())
+            })
             .await?;
 
-        // Update session state based on result
-        match &msg {
-            ContainerMessage::ToolCall(_) => {
-                self.with_session(session_id, |session| {
-                    session.state = SessionState::WaitingForToolResults;
-                    Ok(())
-                })
-                .await?;
-            }
-            ContainerMessage::CodeOutput(_) => {
-                self.with_session(session_id, |session| {
-                    session.state = SessionState::Active;
-                    Ok(())
-                })
-                .await?;
-            }
-            _ => {}
+            let handle = self.handle_for(session_id).await?;
+            let mut h = handle.lock().await;
+            h.send_code(code).await?;
+            h.recv_message_timeout(self.exchange_timeout()).await
         }
-
-        Ok(msg)
+        .await;
+        self.after_exchange(session_id, result).await
     }
 
     /// Send tool results to the container and wait for the next message.
@@ -563,41 +782,73 @@ impl PtcService {
         session_id: &str,
         results: &serde_json::Value,
     ) -> PtcResult<ContainerMessage> {
-        let mut handles = self.container_handles.lock().await;
-        let handle = handles
-            .get_mut(session_id)
-            .ok_or_else(|| PtcError::SessionNotFound(session_id.to_string()))?;
-
-        // Send tool results
-        handle.send_tool_result(results).await?;
-
-        // Wait for response
-        let msg = handle
-            .recv_message_timeout(Duration::from_secs(
-                self.sandbox.config().execution_timeout + 5,
-            ))
+        let result = async {
+            self.with_session(session_id, |session| {
+                session.state = SessionState::Executing;
+                session.pending_tool_calls.clear();
+                Ok(())
+            })
             .await?;
+            let handle = self.handle_for(session_id).await?;
+            let mut h = handle.lock().await;
+            h.send_tool_result(results).await?;
+            h.recv_message_timeout(self.exchange_timeout()).await
+        }
+        .await;
+        self.after_exchange(session_id, result).await
+    }
 
-        // Update session state
-        match &msg {
-            ContainerMessage::ToolCall(_) => {
-                self.with_session(session_id, |session| {
-                    session.state = SessionState::WaitingForToolResults;
-                    Ok(())
-                })
-                .await?;
+    /// Validate the exchange outcome and update session state; tear the
+    /// session down on anything unusable.
+    async fn after_exchange(
+        &self,
+        session_id: &str,
+        result: PtcResult<ContainerMessage>,
+    ) -> PtcResult<ContainerMessage> {
+        let outcome = match result {
+            Ok(ContainerMessage::ToolCall(calls)) => {
+                let checked = async {
+                    let allowed = self.get_session(session_id).await?.allowed_tools;
+                    validate_sandbox_tool_calls(&calls, &allowed)?;
+                    let pending = calls
+                        .iter()
+                        .map(|c| PendingToolCall {
+                            tool_use_id: c.tool_use_id.clone(),
+                            name: c.name.clone(),
+                            input: c.input.clone(),
+                            server_tool_use_id: None,
+                        })
+                        .collect();
+                    self.with_session(session_id, |session| {
+                        session.state = SessionState::WaitingForToolResults;
+                        session.pending_tool_calls = pending;
+                        Ok(())
+                    })
+                    .await
+                }
+                .await;
+                checked.map(|()| ContainerMessage::ToolCall(calls))
             }
-            ContainerMessage::CodeOutput(_) => {
-                self.with_session(session_id, |session| {
+            Ok(ContainerMessage::CodeOutput(out)) => self
+                .with_session(session_id, |session| {
                     session.state = SessionState::Active;
                     Ok(())
                 })
-                .await?;
-            }
-            _ => {}
+                .await
+                .map(|()| ContainerMessage::CodeOutput(out)),
+            Ok(ContainerMessage::Error(e)) => Err(PtcError::CodeExecutionError(e)),
+            Ok(ContainerMessage::StreamEnded) => Err(PtcError::IpcError(
+                "Sandbox container exited unexpectedly".into(),
+            )),
+            Ok(ContainerMessage::Ready) => Err(PtcError::UnexpectedMessage(
+                "unexpected ready signal".into(),
+            )),
+            Err(e) => Err(e),
+        };
+        if outcome.is_err() {
+            let _ = self.remove_session(session_id).await;
         }
-
-        Ok(msg)
+        outcome
     }
 
     // ========================================================================
@@ -767,5 +1018,171 @@ mod tests {
 
         assert_eq!(PTC_BETA_HEADER, "advanced-tool-use-2025-11-20");
         assert_eq!(CODE_EXECUTION_TOOL_TYPE, "code_execution_20250825");
+    }
+
+    fn ptc_request(tools: Vec<serde_json::Value>) -> MessageRequest {
+        let mut req = MessageRequest::new("claude", vec![], 100);
+        req.tools = Some(tools);
+        req
+    }
+
+    #[test]
+    fn test_is_ptc_shaped() {
+        let req = ptc_request(vec![
+            serde_json::json!({"type": "code_execution_20250825", "name": "code_execution"}),
+        ]);
+        assert!(is_ptc_shaped(&req, Some(PTC_BETA_HEADER)));
+        assert!(is_ptc_shaped(
+            &req,
+            Some("foo-2025-01-01, advanced-tool-use-2025-11-20")
+        ));
+        assert!(!is_ptc_shaped(&req, None));
+        // Substring of another beta name is not the PTC beta.
+        assert!(!is_ptc_shaped(
+            &req,
+            Some("x-advanced-tool-use-2025-11-20-y")
+        ));
+        let no_tool = ptc_request(vec![serde_json::json!({"name": "get_weather"})]);
+        assert!(!is_ptc_shaped(&no_tool, Some(PTC_BETA_HEADER)));
+    }
+
+    #[test]
+    fn test_callable_tools_filter() {
+        let req = ptc_request(vec![
+            serde_json::json!({"name": "a", "allowed_callers": ["code_execution_20250825"]}),
+            serde_json::json!({"name": "b", "allowed_callers": ["direct"]}),
+            serde_json::json!({"name": "c"}),
+        ]);
+        let names: Vec<_> = callable_tools(&req)
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["a"]);
+    }
+
+    #[test]
+    fn test_parse_bool_env() {
+        assert!(parse_bool_env(Some("true")));
+        assert!(parse_bool_env(Some(" TRUE ")));
+        assert!(parse_bool_env(Some("1")));
+        assert!(!parse_bool_env(Some("false")));
+        assert!(!parse_bool_env(Some("")));
+        assert!(!parse_bool_env(None));
+    }
+
+    #[test]
+    fn test_limits_from_values() {
+        assert_eq!(PtcLimits::from_values(None, None), PtcLimits::default());
+        let l = PtcLimits::from_values(Some("10"), Some("2"));
+        assert_eq!(l.max_sessions, 10);
+        assert_eq!(l.max_sessions_per_owner, 2);
+        // Zero / garbage fall back to defaults.
+        let l = PtcLimits::from_values(Some("0"), Some("abc"));
+        assert_eq!(l, PtcLimits::default());
+    }
+
+    #[test]
+    fn test_check_session_caps() {
+        let limits = PtcLimits {
+            max_sessions: 3,
+            max_sessions_per_owner: 2,
+        };
+        assert!(check_session_caps(0, 0, &limits).is_ok());
+        assert!(check_session_caps(2, 1, &limits).is_ok());
+        let e = check_session_caps(2, 2, &limits).unwrap_err();
+        assert!(matches!(e, PtcError::SessionLimitExceeded(_)));
+        assert_eq!(e.status_code(), 429);
+        assert!(matches!(
+            check_session_caps(3, 0, &limits),
+            Err(PtcError::SessionLimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn test_tool_name_validation() {
+        assert!(is_valid_tool_name("get_weather"));
+        assert!(is_valid_tool_name("mcp-tool_2"));
+        assert!(!is_valid_tool_name(""));
+        assert!(!is_valid_tool_name("a\"; rm -rf /; echo \""));
+        assert!(!is_valid_tool_name("$(id)"));
+        assert!(!is_valid_tool_name("a,b"));
+        assert!(!is_valid_tool_name("a b"));
+        assert!(!is_valid_tool_name("ünïcode"));
+        assert!(!is_valid_tool_name(&"a".repeat(MAX_TOOL_NAME_LEN + 1)));
+        assert!(validate_tool_names(&["ok".into(), "also-ok".into()]).is_ok());
+        assert!(matches!(
+            validate_tool_names(&["ok".into(), "bad name".into()]),
+            Err(PtcError::InvalidRequest(_))
+        ));
+    }
+
+    fn call(id: &str, name: &str, input: serde_json::Value) -> ToolCallData {
+        ToolCallData {
+            tool_use_id: id.to_string(),
+            name: name.to_string(),
+            input,
+        }
+    }
+
+    #[test]
+    fn test_validate_sandbox_tool_calls() {
+        let allowed = vec!["get_weather".to_string()];
+        let ok = call(
+            "toolu_000000000001",
+            "get_weather",
+            serde_json::json!({"q": 1}),
+        );
+        assert!(validate_sandbox_tool_calls(std::slice::from_ref(&ok), &allowed).is_ok());
+
+        // Not in the callable set (forged frame).
+        let forged = call("toolu_1", "delete_everything", serde_json::json!({}));
+        assert!(matches!(
+            validate_sandbox_tool_calls(&[forged], &allowed),
+            Err(PtcError::InvalidToolCall(_))
+        ));
+        // Malformed id.
+        for bad in ["srvtoolu_1", "toolu_", "toolu_a b", "x", "toolu_\n"] {
+            let c = call(bad, "get_weather", serde_json::json!({}));
+            assert!(
+                validate_sandbox_tool_calls(&[c], &allowed).is_err(),
+                "{bad}"
+            );
+        }
+        // Duplicate ids.
+        assert!(validate_sandbox_tool_calls(&[ok.clone(), ok.clone()], &allowed).is_err());
+        // Non-object input.
+        let c = call("toolu_2", "get_weather", serde_json::json!("str"));
+        assert!(validate_sandbox_tool_calls(&[c], &allowed).is_err());
+        // Oversized input.
+        let big = serde_json::json!({"x": "a".repeat(MAX_TOOL_INPUT_BYTES)});
+        let c = call("toolu_3", "get_weather", big);
+        assert!(validate_sandbox_tool_calls(&[c], &allowed).is_err());
+        // Empty / too many.
+        assert!(validate_sandbox_tool_calls(&[], &allowed).is_err());
+        let many: Vec<_> = (0..=MAX_TOOL_CALLS_PER_FRAME)
+            .map(|i| call(&format!("toolu_{i}"), "get_weather", serde_json::json!({})))
+            .collect();
+        assert!(validate_sandbox_tool_calls(&many, &allowed).is_err());
+        // No callable tools at all → nothing is allowed.
+        assert!(validate_sandbox_tool_calls(std::slice::from_ref(&ok), &[]).is_err());
+    }
+
+    #[test]
+    fn test_slot_reservation_released_on_drop() {
+        let map = Arc::new(std::sync::Mutex::new(HashMap::from([("k".to_string(), 2)])));
+        {
+            let _a = SlotReservation {
+                reservations: Arc::clone(&map),
+                owner: "k".into(),
+            };
+        }
+        assert_eq!(map.lock().unwrap().get("k"), Some(&1));
+        {
+            let _b = SlotReservation {
+                reservations: Arc::clone(&map),
+                owner: "k".into(),
+            };
+        }
+        assert!(map.lock().unwrap().get("k").is_none());
     }
 }

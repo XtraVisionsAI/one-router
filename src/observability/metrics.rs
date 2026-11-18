@@ -8,7 +8,10 @@
 //! HTTP middleware records request-duration for every route.
 //!
 //! **Label cardinality:** labels are restricted to bounded dimensions
-//! (`provider`, `protocol`, `model`, `direction`, `status`). The API key is
+//! (`provider`, `protocol`, `model`, `direction`, `status`). `model` is the
+//! resolved target model id (admin-configured), never the raw client string,
+//! and is additionally capped at 256 distinct values (overflow → `other`).
+//! The API key is
 //! deliberately **not** a label — an unbounded, high-cardinality, and sensitive
 //! dimension. (The reference implementation labels token counters by API key;
 //! we intentionally do not copy that.)
@@ -262,6 +265,44 @@ pub fn record_request(provider: &str, protocol: &str, success: bool) {
         .inc();
 }
 
+/// Upper bound on distinct `model` label values per process; later values are
+/// bucketed as [`OTHER_MODEL`]. Callers pass the resolved (admin-configured)
+/// target model id — this cap is the defence in depth for paths that don't.
+const MAX_MODEL_LABELS: usize = 256;
+/// Bucket for unknown / overflowing / malformed model labels.
+pub const OTHER_MODEL: &str = "other";
+const MAX_MODEL_LABEL_LEN: usize = 128;
+
+fn model_label_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static S: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Bounded `model` label: well-formed ids (`[A-Za-z0-9._:/@-]`, ≤ 128 chars)
+/// are admitted until [`MAX_MODEL_LABELS`] distinct values exist; anything
+/// else is [`OTHER_MODEL`].
+fn model_label(model: &str) -> String {
+    let well_formed = !model.is_empty()
+        && model.len() <= MAX_MODEL_LABEL_LEN
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_:/@".contains(&b));
+    if !well_formed {
+        return OTHER_MODEL.to_string();
+    }
+    let mut set = model_label_set()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if set.contains(model) {
+        return model.to_string();
+    }
+    if set.len() < MAX_MODEL_LABELS {
+        set.insert(model.to_string());
+        return model.to_string();
+    }
+    OTHER_MODEL.to_string()
+}
+
 /// Record token counts for a completed request. Zero-valued directions are
 /// skipped so cache directions do not create noise for non-caching backends.
 pub fn record_tokens(
@@ -272,6 +313,8 @@ pub fn record_tokens(
     cache_read: i64,
     cache_write: i64,
 ) {
+    let model = model_label(model);
+    let model = model.as_str();
     let t = &metrics().tokens_total;
     for (direction, count) in [
         ("input", input),
@@ -291,7 +334,7 @@ pub fn record_cost(provider: &str, model: &str, cost: f64) {
     if cost > 0.0 {
         metrics()
             .cost_usd_total
-            .with_label_values(&[provider, model])
+            .with_label_values(&[provider, &model_label(model)])
             .inc_by(cost);
     }
 }
@@ -423,6 +466,22 @@ mod tests {
         // provider/status labels are present; api_key is never a label.
         assert!(out.contains("provider=\"bedrock\""));
         assert!(!out.contains("api_key"));
+    }
+
+    #[test]
+    fn test_model_label_is_bounded() {
+        assert_eq!(model_label("claude x\n"), OTHER_MODEL);
+        assert_eq!(model_label(&"a".repeat(200)), OTHER_MODEL);
+        assert_eq!(model_label(""), OTHER_MODEL);
+        assert_eq!(
+            model_label("global.anthropic.claude-opus-5:0"),
+            "global.anthropic.claude-opus-5:0"
+        );
+        for i in 0..(MAX_MODEL_LABELS + 10) {
+            model_label(&format!("flood-model-{i}"));
+        }
+        assert!(model_label_set().lock().unwrap().len() <= MAX_MODEL_LABELS);
+        assert_eq!(model_label("never-seen-after-flood"), OTHER_MODEL);
     }
 
     #[test]

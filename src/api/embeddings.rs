@@ -25,6 +25,9 @@ use super::chat_completions::OpenAIApiError;
 /// POST /v1/embeddings
 pub async fn create_embeddings(
     State(state): State<AppState>,
+    axum::extract::Extension(key_info): axum::extract::Extension<
+        crate::middleware::auth::ApiKeyInfo,
+    >,
     Json(request): Json<EmbeddingRequest>,
 ) -> Result<impl IntoResponse, OpenAIApiError> {
     let start_time = Instant::now();
@@ -106,6 +109,18 @@ pub async fn create_embeddings(
         total_tokens = total_tokens,
         duration_ms = duration_ms,
         "Embedding request completed"
+    );
+
+    // Embeddings are token-priced like chat (input only): usage row, budget,
+    // TPM, and precharge settlement all go through record_usage.
+    state.usage_tracker.spawn_record_usage(
+        key_info,
+        request_id,
+        request.model.clone(),
+        crate::schemas::anthropic::Usage::new(total_tokens.min(i32::MAX as u32) as i32, 0),
+        "bedrock".to_string(),
+        "openai",
+        crate::services::usage_tracker::DefaultPricing::Fallback,
     );
 
     Ok((StatusCode::OK, Json(response)))

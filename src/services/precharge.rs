@@ -28,7 +28,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::database::models::BudgetLayer;
@@ -55,47 +54,209 @@ impl Default for PrechargeConfig {
     }
 }
 
-/// One reserved layer: (layer, storage id — key hash / user_id / team_id, amount).
-pub type Reservation = (BudgetLayer, String, f64);
+/// One reserved layer: the amount added to `id`'s counters in `period`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reservation {
+    pub layer: BudgetLayer,
+    /// Storage id — key hash / user_id / team_id.
+    pub id: String,
+    pub amount: f64,
+    /// Budget period key the reservation landed in (`BudgetPeriod::key_at`).
+    pub period: String,
+}
+
+/// How long a settled-on-body-end request waits for `record_usage` to report
+/// its cost before giving up. On timeout the reservation is **kept** (charged
+/// at the estimate) rather than refunded; a later report still corrects it.
+pub const SETTLE_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Amount already applied to one layer's counters for this request.
+#[derive(Debug)]
+struct LedgerEntry {
+    layer: BudgetLayer,
+    /// Period the applied amount landed in.
+    period: String,
+    applied: f64,
+}
+
+#[derive(Debug)]
+struct SettlementInner {
+    /// Sum of costs reported by `record_usage`.
+    actual: f64,
+    /// Number of `record_usage` reports.
+    reports: u32,
+    /// The response body has ended and the reservation is being settled.
+    settled: bool,
+    /// Settled without any report (timeout): keep the reservation until a
+    /// report arrives.
+    hold: bool,
+    ledger: Vec<LedgerEntry>,
+    /// Actual cost already used as an alert delta.
+    alerted: f64,
+}
+
+/// One counter adjustment produced by [`Settlement::plan`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Adjustment {
+    pub layer: BudgetLayer,
+    pub delta: f64,
+}
 
 /// Per-request precharge state shared by the middleware and `record_usage`.
+///
+/// Settlement needs two signals — the response body ended (middleware) and the
+/// request's cost is known (`record_usage`) — which may arrive in either
+/// order. The ledger makes the outcome order-independent: every flush moves
+/// each layer's counter from what was already applied to the current target
+/// (`actual`), under one lock, so a late report after settlement is charged
+/// by `record_usage` itself instead of being lost.
 #[derive(Debug)]
 pub struct Settlement {
     pub reserved: Vec<Reservation>,
-    actual: Mutex<f64>,
-    settled: AtomicBool,
+    inner: Mutex<SettlementInner>,
+    notify: tokio::sync::Notify,
 }
 
 impl Settlement {
     pub fn new(reserved: Vec<Reservation>) -> Self {
+        let ledger = reserved
+            .iter()
+            .map(|r| LedgerEntry {
+                layer: r.layer,
+                period: r.period.clone(),
+                applied: r.amount,
+            })
+            .collect();
         Self {
             reserved,
-            actual: Mutex::new(0.0),
-            settled: AtomicBool::new(false),
+            inner: Mutex::new(SettlementInner {
+                actual: 0.0,
+                reports: 0,
+                settled: false,
+                hold: false,
+                ledger,
+                alerted: 0.0,
+            }),
+            notify: tokio::sync::Notify::new(),
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, SettlementInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Called by `record_usage` with the computed cost (accumulates — a request
-    /// may record usage more than once, e.g. web-tool loops).
-    pub fn add_actual(&self, cost: f64) {
-        *self.actual.lock().unwrap_or_else(|e| e.into_inner()) += cost;
+    /// may record usage more than once, e.g. web-tool loops). Returns `true`
+    /// when the request was already settled, i.e. the caller must
+    /// [`flush`](crate::services::usage_tracker::UsageTracker::flush_settlement)
+    /// the late cost itself.
+    pub fn report(&self, cost: f64) -> bool {
+        let settled = {
+            let mut g = self.lock();
+            g.actual += cost.max(0.0);
+            g.reports += 1;
+            g.settled
+        };
+        self.notify.notify_waiters();
+        settled
     }
 
     pub fn actual(&self) -> f64 {
-        *self.actual.lock().unwrap_or_else(|e| e.into_inner())
+        self.lock().actual
+    }
+
+    pub fn reports(&self) -> u32 {
+        self.lock().reports
     }
 
     pub fn reserved_for(&self, layer: BudgetLayer) -> f64 {
         self.reserved
             .iter()
-            .filter(|(l, _, _)| *l == layer)
-            .map(|(_, _, a)| *a)
+            .filter(|r| r.layer == layer)
+            .map(|r| r.amount)
             .sum()
     }
 
-    /// `true` exactly once.
-    fn take(&self) -> bool {
-        !self.settled.swap(true, Ordering::AcqRel)
+    /// Wait until at least one report arrived, or `timeout` passed.
+    pub async fn wait_for_report(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.lock().reports > 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.lock().reports > 0;
+            }
+        }
+    }
+
+    /// Mark the request settled. `hold` keeps the reservation in place while
+    /// no report has arrived (timeout path). `true` exactly once.
+    pub fn finish(&self, hold: bool) -> bool {
+        let mut g = self.lock();
+        if g.settled {
+            return false;
+        }
+        g.settled = true;
+        g.hold = hold;
+        true
+    }
+
+    /// Compute (and book) the counter adjustments that bring every layer from
+    /// what is already applied to the current target. `current` lists the
+    /// caller's layers with their **current** period key. Returns the
+    /// adjustments and the alert delta (actual cost not yet alerted on).
+    ///
+    /// - target = `actual`, except while held without a report (= max(actual,
+    ///   applied), i.e. the reservation stays).
+    /// - A refund (negative delta) is skipped when the layer's period rolled
+    ///   since the reservation: the reserved amount was archived with the old
+    ///   period and must not drive the new period's counter negative. Total
+    ///   charge is then max(reserved, actual).
+    pub fn plan(&self, current: &[(BudgetLayer, String)]) -> (Vec<Adjustment>, f64) {
+        let mut g = self.lock();
+        if !g.settled {
+            return (Vec::new(), 0.0);
+        }
+        let actual = g.actual;
+        let hold = g.hold && g.reports == 0;
+        let mut out = Vec::new();
+        for (layer, period) in current {
+            let idx = match g.ledger.iter().position(|e| e.layer == *layer) {
+                Some(i) => i,
+                None => {
+                    g.ledger.push(LedgerEntry {
+                        layer: *layer,
+                        period: period.clone(),
+                        applied: 0.0,
+                    });
+                    g.ledger.len() - 1
+                }
+            };
+            let entry = &mut g.ledger[idx];
+            let target = if hold {
+                actual.max(entry.applied)
+            } else {
+                actual
+            };
+            let mut delta = target - entry.applied;
+            if entry.period != *period && delta < 0.0 {
+                delta = 0.0;
+            }
+            if delta != 0.0 {
+                entry.applied += delta;
+                out.push(Adjustment {
+                    layer: *layer,
+                    delta,
+                });
+            }
+        }
+        let alert_delta = (actual - g.alerted).max(0.0);
+        g.alerted = actual;
+        (out, alert_delta)
     }
 }
 
@@ -121,6 +282,29 @@ fn is_billable(path: &str) -> bool {
         p,
         "/messages" | "/chat/completions" | "/responses" | "/embeddings"
     )
+}
+
+/// Endpoints billed on input tokens only (no output reservation).
+fn is_input_only(path: &str) -> bool {
+    path.trim_start_matches("/v1") == "/embeddings"
+}
+
+/// The current period key of one of the caller's budget layers.
+fn layer_period(k: &ApiKeyInfo, layer: BudgetLayer) -> String {
+    let now = chrono::Utc::now();
+    match layer {
+        BudgetLayer::Key => k.budget_period.key_at(now),
+        BudgetLayer::User => k
+            .user
+            .as_ref()
+            .map(|u| u.budget_period.key_at(now))
+            .unwrap_or_default(),
+        BudgetLayer::Team => k
+            .team
+            .as_ref()
+            .map(|t| t.budget_period.key_at(now))
+            .unwrap_or_default(),
+    }
 }
 
 /// Estimate `(input_tokens, output_tokens)` from the raw body.
@@ -209,14 +393,19 @@ pub async fn budget_precharge(
             .await;
     }
 
-    let (input, output) = estimate_tokens(
-        bytes.len(),
-        hints
-            .max_tokens
-            .or(hints.max_output_tokens)
-            .or(hints.max_completion_tokens),
-        cfg.output_cap,
-    );
+    let (input, output) = if is_input_only(parts.uri.path()) {
+        // Embeddings bill input tokens only.
+        (estimate_tokens(bytes.len(), Some(0), 0).0, 0)
+    } else {
+        estimate_tokens(
+            bytes.len(),
+            hints
+                .max_tokens
+                .or(hints.max_output_tokens)
+                .or(hints.max_completion_tokens),
+            cfg.output_cap,
+        )
+    };
     let estimate = match hints.model.as_deref() {
         Some(model) => {
             state
@@ -236,7 +425,12 @@ pub async fn budget_precharge(
                 .reserve_budget(layer, &id, estimate, budget - estimate)
                 .await
             {
-                Ok(true) => reserved.push((layer, id, estimate)),
+                Ok(true) => reserved.push(Reservation {
+                    layer,
+                    period: layer_period(&key_info, layer),
+                    id,
+                    amount: estimate,
+                }),
                 Ok(false) => {
                     rollback(&state, &reserved).await;
                     crate::observability::metrics::record_precharge("rejected");
@@ -267,13 +461,19 @@ pub async fn budget_precharge(
         tracker: state.usage_tracker.clone(),
         key_info,
         settlement,
+        success: response.status().is_success(),
     };
     hold_until_body_done(response, guard)
 }
 
 async fn rollback(state: &PrechargeState, reserved: &[Reservation]) {
-    for (layer, id, amount) in reserved {
-        if let Err(e) = state.usage_tracker.adjust_layer(*layer, id, -amount).await {
+    for r in reserved {
+        let layer = &r.layer;
+        if let Err(e) = state
+            .usage_tracker
+            .adjust_layer(r.layer, &r.id, -r.amount)
+            .await
+        {
             tracing::error!(error = %e, layer = layer.as_str(), "Precharge rollback failed");
         }
     }
@@ -281,23 +481,57 @@ async fn rollback(state: &PrechargeState, reserved: &[Reservation]) {
 
 /// Settles when dropped — after the response body has been fully sent or the
 /// client went away.
+///
+/// Settlement waits (spawned, bounded by [`SETTLE_REPORT_TIMEOUT`]) for
+/// `record_usage` to report the request's cost: non-streaming handlers record
+/// usage from a spawned task that can finish after the body was sent. Error
+/// responses (non-2xx) settle immediately — they normally record nothing, so
+/// the reservation is refunded; a late report is still charged by
+/// `record_usage` itself.
 struct SettleGuard {
     tracker: Arc<UsageTracker>,
     key_info: ApiKeyInfo,
     settlement: Arc<Settlement>,
+    success: bool,
 }
 
 impl Drop for SettleGuard {
     fn drop(&mut self) {
-        if !self.settlement.take() {
-            return;
-        }
         let tracker = self.tracker.clone();
         let key_info = self.key_info.clone();
         let settlement = self.settlement.clone();
+        let success = self.success;
         tokio::spawn(async move {
-            tracker.settle(&key_info, &settlement).await;
+            settle_after_report(
+                &tracker,
+                &key_info,
+                &settlement,
+                success,
+                SETTLE_REPORT_TIMEOUT,
+            )
+            .await;
         });
+    }
+}
+
+/// Body ended: wait for the cost report (successful responses), then settle.
+pub async fn settle_after_report(
+    tracker: &UsageTracker,
+    key_info: &ApiKeyInfo,
+    settlement: &Settlement,
+    success: bool,
+    timeout: std::time::Duration,
+) {
+    let reported = !success || settlement.wait_for_report(timeout).await;
+    if !reported {
+        tracing::warn!(
+            key_id = %key_info.key_id,
+            "Precharge: no usage reported before the settle timeout; keeping the reservation"
+        );
+    }
+    if settlement.finish(!reported) {
+        tracker.flush_settlement(key_info, settlement).await;
+        crate::observability::metrics::record_precharge(if reported { "settled" } else { "held" });
     }
 }
 
@@ -332,15 +566,150 @@ mod tests {
         assert!(!is_billable("/models"));
     }
 
+    fn res(layer: BudgetLayer, amount: f64, period: &str) -> Reservation {
+        Reservation {
+            layer,
+            id: "id".into(),
+            amount,
+            period: period.into(),
+        }
+    }
+
+    fn layers(period: &str) -> Vec<(BudgetLayer, String)> {
+        vec![
+            (BudgetLayer::User, period.to_string()),
+            (BudgetLayer::Key, period.to_string()),
+        ]
+    }
+
     #[test]
-    fn settlement_accumulates_once() {
-        let s = Settlement::new(vec![(BudgetLayer::User, "u".into(), 2.0)]);
-        s.add_actual(0.5);
-        s.add_actual(0.25);
+    fn settlement_accumulates_and_finishes_once() {
+        let s = Settlement::new(vec![res(BudgetLayer::User, 2.0, "p")]);
+        assert!(!s.report(0.5));
+        assert!(!s.report(0.25));
         assert_eq!(s.actual(), 0.75);
+        assert_eq!(s.reports(), 2);
         assert_eq!(s.reserved_for(BudgetLayer::User), 2.0);
         assert_eq!(s.reserved_for(BudgetLayer::Key), 0.0);
-        assert!(s.take());
-        assert!(!s.take());
+        assert!(s.finish(false));
+        assert!(!s.finish(false));
+        // Reports after settlement tell the caller to flush.
+        assert!(s.report(0.1));
+    }
+
+    #[test]
+    fn plan_before_settle_is_empty() {
+        let s = Settlement::new(vec![res(BudgetLayer::User, 2.0, "p")]);
+        s.report(1.0);
+        assert!(s.plan(&layers("p")).0.is_empty());
+    }
+
+    #[test]
+    fn plan_report_then_settle() {
+        let s = Settlement::new(vec![res(BudgetLayer::User, 2.0, "p")]);
+        s.report(0.5);
+        s.finish(false);
+        let (adj, alert) = s.plan(&layers("p"));
+        assert_eq!(
+            adj,
+            vec![
+                Adjustment {
+                    layer: BudgetLayer::User,
+                    delta: -1.5
+                },
+                Adjustment {
+                    layer: BudgetLayer::Key,
+                    delta: 0.5
+                },
+            ]
+        );
+        assert_eq!(alert, 0.5);
+        // Idempotent: a second flush changes nothing.
+        assert!(s.plan(&layers("p")).0.is_empty());
+    }
+
+    #[test]
+    fn plan_settle_then_late_report() {
+        let s = Settlement::new(vec![res(BudgetLayer::User, 2.0, "p")]);
+        s.finish(false); // error path / no wait: refund everything
+        let (adj, _) = s.plan(&layers("p"));
+        assert_eq!(
+            adj,
+            vec![Adjustment {
+                layer: BudgetLayer::User,
+                delta: -2.0
+            }]
+        );
+        assert!(s.report(0.75)); // late cost
+        let (adj, alert) = s.plan(&layers("p"));
+        assert_eq!(
+            adj,
+            vec![
+                Adjustment {
+                    layer: BudgetLayer::User,
+                    delta: 0.75
+                },
+                Adjustment {
+                    layer: BudgetLayer::Key,
+                    delta: 0.75
+                },
+            ]
+        );
+        assert_eq!(alert, 0.75);
+    }
+
+    #[test]
+    fn plan_hold_keeps_reservation_until_report() {
+        let s = Settlement::new(vec![res(BudgetLayer::User, 2.0, "p")]);
+        s.finish(true); // timeout: no report
+        assert!(s.plan(&layers("p")).0.is_empty());
+        s.report(0.5);
+        let (adj, _) = s.plan(&layers("p"));
+        assert_eq!(adj[0].delta, -1.5);
+        assert_eq!(adj[1].delta, 0.5);
+    }
+
+    #[test]
+    fn plan_skips_refund_across_period_rollover() {
+        let s = Settlement::new(vec![res(BudgetLayer::User, 2.0, "old")]);
+        s.report(0.5);
+        s.finish(false);
+        let (adj, _) = s.plan(&layers("new"));
+        // No negative user adjustment into the new period.
+        assert_eq!(
+            adj,
+            vec![Adjustment {
+                layer: BudgetLayer::Key,
+                delta: 0.5
+            }]
+        );
+        // Excess over the reservation still lands in the new period.
+        s.report(2.0);
+        let (adj, _) = s.plan(&layers("new"));
+        assert_eq!(adj[0].layer, BudgetLayer::User);
+        assert!((adj[0].delta - 0.5).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn wait_for_report_wakes_on_report() {
+        let s = Arc::new(Settlement::new(vec![]));
+        let waiter = {
+            let s = s.clone();
+            tokio::spawn(async move { s.wait_for_report(std::time::Duration::from_secs(5)).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        s.report(0.0);
+        assert!(waiter.await.unwrap());
+        let s2 = Settlement::new(vec![]);
+        assert!(
+            !s2.wait_for_report(std::time::Duration::from_millis(10))
+                .await
+        );
+    }
+
+    #[test]
+    fn embeddings_reserve_input_only() {
+        assert!(is_input_only("/v1/embeddings"));
+        assert!(!is_input_only("/v1/messages"));
     }
 }

@@ -323,9 +323,14 @@ case "$MODE" in
                     if [[ -z "$DH_USER" || -z "$DH_TOKEN" ]]; then
                         err "Username and access token are required."; exit 1
                     fi
+                    # Token goes through a private file:// document, never argv.
+                    DH_SECRET_FILE=$(private_tmp)
+                    DH_USER="$DH_USER" DH_TOKEN="$DH_TOKEN" jq -n \
+                        '{username: env.DH_USER, accessToken: env.DH_TOKEN}' > "$DH_SECRET_FILE"
+                    unset DH_TOKEN
                     awscli secretsmanager create-secret \
                         --name "ecr-pullthroughcache/docker-hub" \
-                        --secret-string "{\"username\":\"${DH_USER}\",\"accessToken\":\"${DH_TOKEN}\"}" >/dev/null
+                        --secret-string "file://${DH_SECRET_FILE}" >/dev/null
                     SECRET_ARN=$(awscli secretsmanager describe-secret \
                         --secret-id "ecr-pullthroughcache/docker-hub" \
                         --query 'ARN' --output text)

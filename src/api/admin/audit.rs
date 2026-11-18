@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::common::internal_error;
+use super::common::{bad_request, internal_error, HandlerError};
 use crate::database::models::{AuditLogRecord, AuditQuery};
 use crate::server::state::AppState;
 
@@ -47,16 +47,47 @@ fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
+/// Validate a time bound: RFC 3339 (`2026-11-01T00:00:00Z`) or a plain date
+/// (`2026-11-01`). Storage compares these lexicographically against stored
+/// RFC 3339 timestamps and derives month partitions from them, so anything
+/// else is rejected with 400 rather than producing garbage (or a panic).
+fn time_bound(field: &str, v: Option<String>) -> Result<Option<String>, HandlerError> {
+    let Some(v) = non_empty(v) else {
+        return Ok(None);
+    };
+    let v = v.trim().to_string();
+    let ok = chrono::DateTime::parse_from_rfc3339(&v).is_ok()
+        || (v.len() == 10 && chrono::NaiveDate::parse_from_str(&v, "%Y-%m-%d").is_ok());
+    if ok {
+        Ok(Some(v))
+    } else {
+        Err(bad_request(format!(
+            "'{field}' must be an RFC 3339 timestamp or YYYY-MM-DD date"
+        )))
+    }
+}
+
 /// GET /admin/api/audit
 pub async fn list_audit(State(state): State<AppState>, Query(p): Query<AuditParams>) -> Response {
     let limit = p.limit.unwrap_or(100).clamp(1, 500);
+    let bounds = (|| {
+        Ok::<_, HandlerError>((
+            time_bound("start", p.start)?,
+            time_bound("end", p.end)?,
+            time_bound("before", p.before)?,
+        ))
+    })();
+    let (start, end, before) = match bounds {
+        Ok(b) => b,
+        Err(e) => return *e,
+    };
     let query = AuditQuery {
         action: non_empty(p.action),
         target_type: non_empty(p.target_type),
         target_id: non_empty(p.target_id),
-        start: non_empty(p.start),
-        end: non_empty(p.end),
-        before: non_empty(p.before),
+        start,
+        end,
+        before,
         limit: limit + 1,
     };
     let mut rows = match state.database.audit().query_audit(&query).await {
@@ -85,4 +116,35 @@ pub async fn list_audit(State(state): State<AppState>, Query(p): Query<AuditPara
         has_more,
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_bounds_validated() {
+        assert_eq!(time_bound("end", None).unwrap(), None);
+        assert_eq!(time_bound("end", Some("  ".into())).unwrap(), None);
+        assert!(
+            time_bound("end", Some("2026-11-18T10:00:00.123456Z".into()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(time_bound("end", Some("2026-11-18T10:00:00+08:00".into()))
+            .unwrap()
+            .is_some());
+        assert!(time_bound("start", Some("2026-11-18".into()))
+            .unwrap()
+            .is_some());
+        for bad in [
+            "2026",
+            "x",
+            "2026-13-01",
+            "26-11-18",
+            "2026-11-18T25:00:00Z",
+        ] {
+            assert!(time_bound("before", Some(bad.into())).is_err(), "{bad}");
+        }
+    }
 }

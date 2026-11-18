@@ -1,14 +1,16 @@
+use super::domains::DomainPolicy;
 use super::ssrf;
 use super::WebToolError;
 use async_trait::async_trait;
 
 #[async_trait]
 pub trait FetchProvider: Send + Sync {
+    /// Fetch `url`. Implementations must refuse URLs (and every redirect hop
+    /// they control) that `policy` does not permit.
     async fn fetch(
         &self,
         url: &str,
-        allowed_domains: Option<&[String]>,
-        blocked_domains: Option<&[String]>,
+        policy: &DomainPolicy,
         max_content_kb: u64,
     ) -> Result<FetchResult, WebToolError>;
 }
@@ -38,13 +40,11 @@ impl FetchProvider for ReqwestFetchProvider {
     async fn fetch(
         &self,
         url: &str,
-        allowed_domains: Option<&[String]>,
-        blocked_domains: Option<&[String]>,
+        policy: &DomainPolicy,
         max_content_kb: u64,
     ) -> Result<FetchResult, WebToolError> {
         // SSRF-guarded GET that re-validates every redirect hop against the
-        // domain filters and IP rules, pinning the connection to the validated
-        // address (DNS-rebinding defense).
+        // domain policy and IP rules (guarded resolver at connect time).
         let max_bytes = (max_content_kb * 1024) as usize;
         let result = ssrf::safe_get_bytes(
             url,
@@ -52,20 +52,18 @@ impl FetchProvider for ReqwestFetchProvider {
             self.timeout,
             "one-router/web-fetch 1.0",
             ssrf::OversizePolicy::Truncate,
-            |u| {
-                check_domain_filters(u.as_str(), allowed_domains, blocked_domains)
-                    .map_err(|e| e.to_string())
-            },
+            |u| policy.check_url(u.as_str()),
         )
         .await
         .map_err(WebToolError::FetchError)?;
 
         let content = if result.content_type.contains("html") {
-            strip_html(std::str::from_utf8(&result.bytes).unwrap_or(""))
+            strip_html(
+                &decode_text(&result.bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&result.bytes).into_owned()),
+            )
         } else {
-            std::str::from_utf8(&result.bytes)
-                .unwrap_or("[binary content]")
-                .to_string()
+            decode_text(&result.bytes).unwrap_or_else(|| "[binary content]".to_string())
         };
 
         Ok(FetchResult {
@@ -77,39 +75,29 @@ impl FetchProvider for ReqwestFetchProvider {
     }
 }
 
-/// `host` is `domain` or a subdomain of it (label-aligned: `notgood.com` does
-/// not match `good.com`). Case- and trailing-dot-insensitive.
-fn domain_matches(host: &str, domain: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let domain = domain
-        .trim()
-        .trim_start_matches('.')
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    !domain.is_empty() && (host == domain || host.ends_with(&format!(".{domain}")))
+/// Decode UTF-8 text that may have been truncated mid-character at the byte
+/// cap: an incomplete sequence at the very end is dropped instead of failing
+/// the whole page. `None` for bytes that are not UTF-8 elsewhere.
+fn decode_text(bytes: &[u8]) -> Option<String> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Some(s.to_string()),
+        Err(e) if e.error_len().is_none() => {
+            Some(String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned())
+        }
+        Err(_) => None,
+    }
 }
 
-fn check_domain_filters(
-    url: &str,
-    allowed_domains: Option<&[String]>,
-    blocked_domains: Option<&[String]>,
-) -> Result<(), WebToolError> {
-    let host = extract_host(url);
-    if let Some(blocked) = blocked_domains {
-        if blocked.iter().any(|d| domain_matches(&host, d)) {
-            return Err(WebToolError::FetchError(format!(
-                "Domain '{host}' is blocked"
-            )));
-        }
+/// Truncate `s` to at most `max_bytes`, backing off to a char boundary.
+fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
     }
-    if let Some(allowed) = allowed_domains {
-        if !allowed.is_empty() && !allowed.iter().any(|d| domain_matches(&host, d)) {
-            return Err(WebToolError::FetchError(format!(
-                "Domain '{host}' is not in allowed list"
-            )));
-        }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
     }
-    Ok(())
+    s.truncate(end);
 }
 
 /// Fetch provider that uses the Tavily Extract API for high-quality content extraction.
@@ -130,16 +118,20 @@ impl TavilyExtractProvider {
     }
 }
 
+/// Cap on the Tavily Extract API response we are willing to buffer.
+const TAVILY_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 #[async_trait]
 impl FetchProvider for TavilyExtractProvider {
     async fn fetch(
         &self,
         url: &str,
-        allowed_domains: Option<&[String]>,
-        blocked_domains: Option<&[String]>,
+        policy: &DomainPolicy,
         max_content_kb: u64,
     ) -> Result<FetchResult, WebToolError> {
-        check_domain_filters(url, allowed_domains, blocked_domains)?;
+        // Tavily fetches server-side, so the policy is enforced on the
+        // requested URL up front and on the URL Tavily reports back.
+        policy.check_url(url).map_err(WebToolError::FetchError)?;
 
         let response = self
             .client
@@ -151,34 +143,47 @@ impl FetchProvider for TavilyExtractProvider {
             }))
             .send()
             .await
-            .map_err(|e| WebToolError::FetchError(format!("Tavily Extract API error: {e}")))?;
+            .map_err(|e| {
+                WebToolError::FetchError(format!("Tavily Extract API error: {}", e.without_url()))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body = ssrf::read_body_capped(response, 4096, ssrf::OversizePolicy::Truncate)
+                .await
+                .unwrap_or_default();
             return Err(WebToolError::FetchError(format!(
-                "Tavily Extract API returned {status}: {body}"
+                "Tavily Extract API returned {status}: {}",
+                String::from_utf8_lossy(&body)
             )));
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| {
+        let body = ssrf::read_body_capped(
+            response,
+            TAVILY_MAX_RESPONSE_BYTES,
+            ssrf::OversizePolicy::Reject,
+        )
+        .await
+        .map_err(|e| WebToolError::FetchError(format!("Tavily Extract API: {e}")))?;
+        let json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
             WebToolError::FetchError(format!("Failed to parse Tavily response: {e}"))
         })?;
 
         // Tavily returns { "results": [{"url": "...", "raw_content": "..."}] }
-        let content = json["results"]
-            .as_array()
-            .and_then(|arr| arr.first())
+        let first = json["results"].as_array().and_then(|arr| arr.first());
+        if let Some(reported) = first.and_then(|r| r["url"].as_str()) {
+            if reported != url {
+                policy
+                    .check_url(reported)
+                    .map_err(WebToolError::FetchError)?;
+            }
+        }
+        let mut content = first
             .and_then(|r| r["raw_content"].as_str())
             .unwrap_or("")
             .to_string();
 
-        let max_bytes = (max_content_kb * 1024) as usize;
-        let content = if content.len() > max_bytes {
-            content[..max_bytes].to_string()
-        } else {
-            content
-        };
+        truncate_to_char_boundary(&mut content, (max_content_kb * 1024) as usize);
 
         Ok(FetchResult {
             url: url.to_string(),
@@ -189,19 +194,11 @@ impl FetchProvider for TavilyExtractProvider {
     }
 }
 
-fn extract_host(url: &str) -> String {
-    url.trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
 fn strip_html(html: &str) -> String {
     let html_owned;
-    let html = if html.to_lowercase().contains("<script") || html.to_lowercase().contains("<style")
-    {
+    // ASCII-only lowercasing keeps byte offsets identical to `html`.
+    let lower = html.to_ascii_lowercase();
+    let html = if lower.contains("<script") || lower.contains("<style") {
         html_owned = remove_script_style(html);
         &html_owned
     } else {
@@ -233,7 +230,9 @@ fn strip_html(html: &str) -> String {
 }
 
 fn remove_script_style(html: &str) -> String {
-    let lower = html.to_lowercase();
+    // `to_ascii_lowercase` (not `to_lowercase`): Unicode lowercasing can change
+    // byte lengths (`İ` → `i̇`), and offsets found in `lower` slice `html`.
+    let lower = html.to_ascii_lowercase();
     let mut result = String::with_capacity(html.len());
     let mut pos = 0;
 
@@ -282,16 +281,7 @@ fn remove_script_style(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn domain_match_is_label_aligned() {
-        assert!(domain_matches("good.com", "good.com"));
-        assert!(domain_matches("docs.good.com", "good.com"));
-        assert!(domain_matches("Docs.Good.com.", ".good.com"));
-        assert!(!domain_matches("notgood.com", "good.com"));
-        assert!(!domain_matches("good.com.evil.net", "good.com"));
-        assert!(!domain_matches("good.com", ""));
-    }
+    use serde_json::json;
 
     #[test]
     fn test_strip_html_basic() {
@@ -303,28 +293,62 @@ mod tests {
         let text = strip_html("<p>AT&amp;T &lt;Corp&gt;</p>");
         assert!(text.contains("AT&T") && text.contains("<Corp>"));
     }
+
     #[test]
-    fn test_extract_host() {
-        assert_eq!(extract_host("https://example.com/path"), "example.com");
-        assert_eq!(
-            extract_host("http://news.ycombinator.com/item?id=1"),
-            "news.ycombinator.com"
-        );
+    fn strip_html_with_length_changing_unicode_does_not_panic() {
+        // `İ`.to_lowercase() is 3 bytes vs 2: offsets from a Unicode-lowercased
+        // copy used to slice the original mid-character.
+        let html = "İİİİ<p>前</p><SCRIPT>evil()</SCRIPT>中文😀 <style>x{}</style>end İ";
+        let text = strip_html(html);
+        assert!(text.contains("前") && text.contains("中文😀") && text.contains("end"));
+        assert!(!text.contains("evil") && !text.contains("x{}"));
+        // Unclosed script after multibyte text.
+        let text = strip_html("ẞẞ😀<script>never closed");
+        assert_eq!(text, "ẞẞ😀");
     }
+
     #[test]
-    fn test_check_domain_filters_blocked() {
-        let blocked = vec!["evil.com".to_string()];
-        assert!(check_domain_filters("https://evil.com/page", None, Some(&blocked)).is_err());
+    fn truncation_respects_char_boundaries() {
+        let mut s = "中文😀abc".to_string(); // 3 + 3 + 4 + 3 bytes
+        truncate_to_char_boundary(&mut s, 8);
+        assert_eq!(s, "中文");
+        let mut s = "😀".to_string();
+        truncate_to_char_boundary(&mut s, 2);
+        assert_eq!(s, "");
+        let mut s = "abc".to_string();
+        truncate_to_char_boundary(&mut s, 10);
+        assert_eq!(s, "abc");
     }
+
     #[test]
-    fn test_check_domain_filters_allowed() {
-        let allowed = vec!["good.com".to_string()];
-        assert!(check_domain_filters("https://good.com/page", Some(&allowed), None).is_ok());
-        assert!(check_domain_filters("https://other.com/page", Some(&allowed), None).is_err());
+    fn decode_text_tolerates_cut_at_the_cap() {
+        let bytes = "页面内容".as_bytes();
+        // Cut inside the last character: the complete prefix survives.
+        assert_eq!(decode_text(&bytes[..bytes.len() - 1]).unwrap(), "页面内");
+        assert_eq!(decode_text(bytes).unwrap(), "页面内容");
+        // Invalid bytes in the middle: not text.
+        assert!(decode_text(&[b'a', 0xff, b'b']).is_none());
     }
+
     #[test]
-    fn test_check_domain_filters_empty_allowed_passes_all() {
-        let allowed: Vec<String> = vec![];
-        assert!(check_domain_filters("https://anything.com/", Some(&allowed), None).is_ok());
+    fn policy_blocks_and_allows() {
+        let blocked = DomainPolicy::from_tool_definition(&json!({"blocked_domains": ["evil.com"]}));
+        assert!(blocked.check_url("https://evil.com/page").is_err());
+        let allowed = DomainPolicy::from_tool_definition(&json!({"allowed_domains": ["good.com"]}));
+        assert!(allowed.check_url("https://good.com/page").is_ok());
+        assert!(allowed.check_url("https://other.com/page").is_err());
+        let open = DomainPolicy::from_tool_definition(&json!({"allowed_domains": []}));
+        assert!(open.check_url("https://anything.com/").is_ok());
+    }
+
+    #[tokio::test]
+    async fn tavily_provider_refuses_disallowed_url_before_calling_api() {
+        let p = TavilyExtractProvider::new("k".into());
+        let policy = DomainPolicy::from_tool_definition(&json!({"allowed_domains": ["good.com"]}));
+        let err = p
+            .fetch("https://evil.com?.good.com", &policy, 64)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not in allowed list"), "{err}");
     }
 }

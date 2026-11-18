@@ -316,19 +316,28 @@ impl UsageTracker {
         Ok(exceeded)
     }
 
-    /// Settle a precharged request: each layer gets `actual - reserved`.
-    pub async fn settle(&self, key_info: &ApiKeyInfo, settlement: &Settlement) {
-        let actual = settlement.actual();
-        let result = self
-            .charge_layers(
-                key_info,
-                |layer| actual - settlement.reserved_for(layer),
-                actual,
-            )
-            .await;
-        match result {
-            Ok(_) => crate::observability::metrics::record_precharge("settled"),
-            Err(e) => tracing::error!(error = %e, "Failed to settle budget precharge"),
+    /// Bring a precharged request's counters in line with its settlement
+    /// ledger (see [`Settlement::plan`]). Called once when the request settles
+    /// and again for every cost reported after that, so neither ordering of
+    /// "body ended" and "usage recorded" can lose cost.
+    pub async fn flush_settlement(&self, key_info: &ApiKeyInfo, settlement: &Settlement) {
+        let layers = Self::layers(key_info, Utc::now());
+        let current: Vec<(BudgetLayer, String)> =
+            layers.iter().map(|l| (l.layer, l.period.clone())).collect();
+        let (adjustments, alert_delta) = settlement.plan(&current);
+        for l in &layers {
+            let Some(adj) = adjustments.iter().find(|a| a.layer == l.layer) else {
+                continue;
+            };
+            match self.adjust_layer(l.layer, l.store_id, adj.delta).await {
+                Ok(spend) => self.check_alerts(l, spend, alert_delta).await,
+                Err(e) => tracing::error!(
+                    error = %e,
+                    layer = l.layer.as_str(),
+                    delta = adj.delta,
+                    "Failed to settle budget precharge"
+                ),
+            }
         }
     }
 
@@ -346,6 +355,71 @@ impl UsageTracker {
         provider: &str,
         protocol: &str,
         cache_ttl: Option<&str>,
+    ) -> Result<bool, UsageError> {
+        self.record_usage_priced(
+            key_info,
+            request_id,
+            model,
+            usage,
+            success,
+            provider,
+            protocol,
+            cache_ttl,
+            DefaultPricing::Fallback,
+        )
+        .await
+    }
+
+    /// Record a successful request's usage from a background task (the
+    /// response is not delayed; a precharge settlement waits for the report).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_record_usage(
+        self: &Arc<Self>,
+        key_info: ApiKeyInfo,
+        request_id: String,
+        model: String,
+        usage: Usage,
+        provider: String,
+        protocol: &'static str,
+        default_pricing: DefaultPricing,
+    ) {
+        let tracker = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tracker
+                .record_usage_priced(
+                    &key_info,
+                    &request_id,
+                    &model,
+                    &usage,
+                    true,
+                    &provider,
+                    protocol,
+                    None,
+                    default_pricing,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, request_id = %request_id, "Failed to record usage");
+            }
+        });
+    }
+
+    /// [`record_usage`](Self::record_usage) with an explicit fallback for
+    /// models whose mapping carries no prices. Token-priced endpoints (chat,
+    /// embeddings) use the DEFAULT_* rates; non-token endpoints (images,
+    /// rerank) pass [`DefaultPricing::None`] so an unpriced mapping costs 0.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_usage_priced(
+        &self,
+        key_info: &ApiKeyInfo,
+        request_id: &str,
+        model: &str,
+        usage: &Usage,
+        success: bool,
+        provider: &str,
+        protocol: &str,
+        cache_ttl: Option<&str>,
+        default_pricing: DefaultPricing,
     ) -> Result<bool, UsageError> {
         let timestamp = Utc::now();
         let is_internal_key = key_info.raw_api_key.is_empty();
@@ -406,40 +480,56 @@ impl UsageTracker {
         };
 
         let cost = self
-            .calculate_cost(model, usage, key_info.cost_rate, cache_ttl)
+            .calculate_cost_with(model, usage, key_info.cost_rate, cache_ttl, default_pricing)
             .await;
         record.cost = cost;
 
+        // Precharged: report the cost before anything else can fail. If the
+        // request already settled (non-streaming handlers record from a
+        // spawned task that may finish after the body), charge it here.
+        if let Some(settlement) = &key_info.settlement {
+            if settlement.report(cost) {
+                self.flush_settlement(key_info, settlement).await;
+            }
+        }
+
         // Prometheus metrics — bounded labels only (provider/protocol/model),
         // never the API key. See `observability::metrics`.
+        // `model` label = the mapping's admin-configured target id (the
+        // client string is unbounded under wildcard mappings); unmapped → other.
+        let metric_model = self
+            .model_mapping
+            .resolve(model)
+            .await
+            .map(|r| r.target_model_id)
+            .unwrap_or_else(|_| crate::observability::metrics::OTHER_MODEL.to_string());
         crate::observability::metrics::record_request(provider, protocol, success);
         crate::observability::metrics::record_tokens(
             provider,
-            model,
+            &metric_model,
             record.input_tokens,
             record.output_tokens,
             record.cached_tokens,
             record.cache_write_tokens,
         );
-        crate::observability::metrics::record_cost(provider, model, cost);
+        crate::observability::metrics::record_cost(provider, &metric_model, cost);
 
-        self.storage
+        // A failed usage-row insert must not make the request free: charge the
+        // budget counters first, report the insert error afterwards.
+        let inserted = self
+            .storage
             .usage()
             .record_usage(&record)
             .await
-            .map_err(|e| UsageError::Database(e.to_string()))?;
+            .map_err(|e| UsageError::Database(e.to_string()));
 
-        if is_internal_key || cost <= 0.0 {
-            return Ok(false);
-        }
-        if let Some(settlement) = &key_info.settlement {
-            // Precharged: the middleware settles when the response completes.
-            settlement.add_actual(cost);
-            return Ok(false);
+        if is_internal_key || cost <= 0.0 || key_info.settlement.is_some() {
+            return inserted.map(|_| false);
         }
         // Independent atomic increments per layer; a failure on one is
         // reported but does not undo the others.
         let exceeded = self.charge_layers(key_info, |_| cost, cost).await?;
+        inserted?;
         if exceeded {
             tracing::warn!(
                 api_key = %key_info.api_key,
@@ -473,9 +563,22 @@ impl UsageTracker {
         cost_rate: f64,
         cache_ttl: Option<&str>,
     ) -> f64 {
+        self.calculate_cost_with(model, usage, cost_rate, cache_ttl, DefaultPricing::Fallback)
+            .await
+    }
+
+    async fn calculate_cost_with(
+        &self,
+        model: &str,
+        usage: &Usage,
+        cost_rate: f64,
+        cache_ttl: Option<&str>,
+        default_pricing: DefaultPricing,
+    ) -> f64 {
         let (input_price, output_price, cache_read_price, cache_write_price) =
             match self.model_mapping.get_pricing(model).await {
                 Some(prices) if prices.0 > 0.0 || prices.1 > 0.0 => prices,
+                _ if default_pricing == DefaultPricing::None => return 0.0,
                 _ => (
                     DEFAULT_INPUT_PRICE,
                     DEFAULT_OUTPUT_PRICE,
@@ -504,6 +607,15 @@ impl UsageTracker {
         let base_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
         base_cost * cost_rate
     }
+}
+
+/// Price fallback when a model's mapping carries no prices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultPricing {
+    /// DEFAULT_* per-token rates (chat, embeddings).
+    Fallback,
+    /// Cost 0 (images, rerank — not token-priced; set mapping prices to bill).
+    None,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -550,5 +662,264 @@ mod tests {
             cache_write_price_for_ttl(3.0, 3.75, Some("passthrough")),
             3.75
         );
+    }
+}
+
+/// Test fixture: a file-backed SQLite store with one budgeted user and its key.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::database::models::{ApiKeyRecord, BudgetPeriod, UserRecord};
+    use crate::database::seed::SeedMode;
+
+    pub struct Fixture {
+        pub db: Arc<dyn DatabaseService>,
+        pub tracker: Arc<UsageTracker>,
+        pub key_info: ApiKeyInfo,
+        pub user_id: String,
+        pub key_hash: String,
+    }
+
+    impl Fixture {
+        pub async fn user_spend(&self) -> f64 {
+            self.db
+                .users()
+                .get_user(&self.user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .budget_used_mtd
+        }
+
+        pub async fn key_spend(&self) -> f64 {
+            self.db
+                .api_keys()
+                .get_api_key(&self.key_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .budget_used_mtd
+        }
+    }
+
+    pub async fn fixture(user_budget: f64) -> Fixture {
+        let path = std::env::temp_dir().join(format!(
+            "one-router-test-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let db = crate::database::create_database(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        db.initialize(None, SeedMode::Off).await.unwrap();
+        let mapping = Arc::new(ModelMappingService::new(db.clone()));
+        let tracker = Arc::new(UsageTracker::new(db.clone(), mapping));
+
+        let period = BudgetPeriod::Monthly.key_at(Utc::now());
+        let mut user = UserRecord::new("billing-user", 0);
+        user.monthly_budget = Some(user_budget);
+        user.budget_mtd_month = Some(period.clone());
+        db.users().create_user(&user).await.unwrap();
+
+        let key_hash = format!("hash-{}", uuid::Uuid::new_v4().simple());
+        let key = ApiKeyRecord {
+            api_key: key_hash.clone(),
+            key_id: crate::database::models::new_key_id(),
+            key_display: "sk-or-••••0000".into(),
+            name: "k".into(),
+            is_active: true,
+            rate_limit: 0,
+            cost_rate: 1.0,
+            monthly_budget: None,
+            budget_used: 0.0,
+            budget_used_mtd: 0.0,
+            budget_mtd_month: Some(period),
+            deactivated_reason: None,
+            budget_history: None,
+            tpm_limit: None,
+            cache_ttl: None,
+            metadata: None,
+            user_id: user.user_id.clone(),
+            expires_at: None,
+            allowed_models: None,
+            allowed_cidrs: None,
+            budget_period: BudgetPeriod::Monthly,
+            budget_alerts_sent: None,
+            default_tags: None,
+            last_used_at: None,
+            rotated_to: None,
+            max_concurrency: None,
+            created_at: 0,
+            updated_at: None,
+        };
+        db.api_keys().create_api_key(&key).await.unwrap();
+        let key_info = ApiKeyInfo::from_db_record(&key, Some(&user), None);
+        Fixture {
+            db,
+            tracker,
+            key_info,
+            user_id: user.user_id,
+            key_hash,
+        }
+    }
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::test_support::fixture;
+    use super::*;
+    use crate::services::precharge::{settle_after_report, Reservation, Settlement};
+    use std::time::Duration;
+
+    /// 1M input tokens on an unpriced model = DEFAULT_INPUT_PRICE ($3).
+    fn usage_costing_3() -> Usage {
+        Usage::new(1_000_000, 0)
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// Reserve `amount` on the fixture user in `period`, as the middleware does.
+    async fn reserve(
+        f: &super::test_support::Fixture,
+        amount: f64,
+        period: &str,
+    ) -> Arc<Settlement> {
+        assert!(f
+            .db
+            .budgets()
+            .reserve_budget(BudgetLayer::User, &f.user_id, amount, 100.0)
+            .await
+            .unwrap());
+        Arc::new(Settlement::new(vec![Reservation {
+            layer: BudgetLayer::User,
+            id: f.user_id.clone(),
+            amount,
+            period: period.to_string(),
+        }]))
+    }
+
+    async fn record(f: &super::test_support::Fixture, key: &ApiKeyInfo) {
+        f.tracker
+            .record_usage(
+                key,
+                "req",
+                "unpriced-model",
+                &usage_costing_3(),
+                true,
+                "bedrock",
+                "anthropic",
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn current_period() -> String {
+        crate::database::models::BudgetPeriod::Monthly.key_at(Utc::now())
+    }
+
+    #[tokio::test]
+    async fn usage_reported_before_body_end_settles_to_actual() {
+        let f = fixture(100.0).await;
+        let s = reserve(&f, 5.0, &current_period()).await;
+        let mut key = f.key_info.clone();
+        key.settlement = Some(s.clone());
+
+        record(&f, &key).await; // streaming: usage recorded inside the body
+        assert!(approx(f.user_spend().await, 5.0)); // still reserved
+        settle_after_report(&f.tracker, &key, &s, true, Duration::from_secs(1)).await;
+
+        assert!(approx(f.user_spend().await, 3.0));
+        assert!(approx(f.key_spend().await, 3.0));
+    }
+
+    #[tokio::test]
+    async fn usage_reported_after_body_end_is_not_lost() {
+        // The original race: a non-streaming handler spawns record_usage and
+        // returns; the body ends before the cost is known.
+        let f = fixture(100.0).await;
+        let s = reserve(&f, 5.0, &current_period()).await;
+        let mut key = f.key_info.clone();
+        key.settlement = Some(s.clone());
+
+        let settle = {
+            let (tracker, key, s) = (f.tracker.clone(), key.clone(), s.clone());
+            tokio::spawn(async move {
+                settle_after_report(&tracker, &key, &s, true, Duration::from_secs(5)).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(approx(f.user_spend().await, 5.0)); // waiting, not refunded
+        record(&f, &key).await;
+        settle.await.unwrap();
+
+        assert!(approx(f.user_spend().await, 3.0));
+        assert!(approx(f.key_spend().await, 3.0));
+    }
+
+    #[tokio::test]
+    async fn report_after_settle_timeout_charges_directly() {
+        let f = fixture(100.0).await;
+        let s = reserve(&f, 5.0, &current_period()).await;
+        let mut key = f.key_info.clone();
+        key.settlement = Some(s.clone());
+
+        // No report within the timeout: the reservation is kept, not refunded.
+        settle_after_report(&f.tracker, &key, &s, true, Duration::from_millis(10)).await;
+        assert!(approx(f.user_spend().await, 5.0));
+        assert!(approx(f.key_spend().await, 0.0));
+
+        // The late report corrects every layer to the actual cost.
+        record(&f, &key).await;
+        assert!(approx(f.user_spend().await, 3.0));
+        assert!(approx(f.key_spend().await, 3.0));
+    }
+
+    #[tokio::test]
+    async fn error_response_refunds_reservation() {
+        let f = fixture(100.0).await;
+        let s = reserve(&f, 5.0, &current_period()).await;
+        let mut key = f.key_info.clone();
+        key.settlement = Some(s.clone());
+        settle_after_report(&f.tracker, &key, &s, false, Duration::from_secs(5)).await;
+        assert!(approx(f.user_spend().await, 0.0));
+    }
+
+    #[tokio::test]
+    async fn period_rollover_does_not_refund_into_new_period() {
+        let f = fixture(100.0).await;
+        // Reserved in an earlier period, which has since been rolled over.
+        let s = reserve(&f, 5.0, "2000-01").await;
+        f.db.users()
+            .reset_user_monthly_budget(&f.user_id, &current_period(), "2000-01", 5.0)
+            .await
+            .unwrap();
+        assert!(approx(f.user_spend().await, 0.0));
+        let mut key = f.key_info.clone();
+        key.settlement = Some(s.clone());
+
+        record(&f, &key).await; // actual 3 < reserved 5
+        settle_after_report(&f.tracker, &key, &s, true, Duration::from_secs(1)).await;
+
+        // The -2 refund belonged to the old period: skipped, not applied to
+        // the new period's counter (which would go negative / hide spend).
+        assert!(approx(f.user_spend().await, 0.0));
+        assert!(approx(f.key_spend().await, 3.0)); // unreserved layer: actual
+    }
+
+    #[tokio::test]
+    async fn period_rollover_charges_excess_over_reservation() {
+        let f = fixture(100.0).await;
+        let s = reserve(&f, 1.0, "2000-01").await;
+        f.db.users()
+            .reset_user_monthly_budget(&f.user_id, &current_period(), "2000-01", 1.0)
+            .await
+            .unwrap();
+        let mut key = f.key_info.clone();
+        key.settlement = Some(s.clone());
+        record(&f, &key).await; // actual 3 > reserved 1
+        settle_after_report(&f.tracker, &key, &s, true, Duration::from_secs(1)).await;
+        assert!(approx(f.user_spend().await, 2.0));
     }
 }

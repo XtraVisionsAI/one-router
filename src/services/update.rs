@@ -20,6 +20,13 @@ const GITHUB_OWNER: &str = "XtraVisionsAI";
 const GITHUB_REPO: &str = "one-router";
 const USER_AGENT: &str = "one-router-updater/1.0";
 
+/// Download caps: release archive, and checksum / signature files.
+const MAX_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
+const MAX_SMALL_FILE_BYTES: u64 = 64 * 1024;
+
+/// Domain-separation header of the signed release manifest.
+const MANIFEST_HEADER: &str = "one-router-release-v1";
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -49,6 +56,14 @@ pub struct UpdateInfo {
     /// Detached Ed25519 signature over the checksum file (`<asset>.sha256.sig`).
     #[serde(default)]
     pub signature_url: Option<String>,
+    /// Ed25519 signature over the version-bound release manifest
+    /// (`<asset>.manifest.sig`, see [`release_manifest`]).
+    #[serde(default)]
+    pub manifest_signature_url: Option<String>,
+    /// Release tag exactly as published (e.g. `v0.21.0`); bound into the
+    /// signed manifest.
+    #[serde(default)]
+    pub release_tag: Option<String>,
     pub release_notes: Option<String>,
     pub published_at: Option<String>,
     pub update_available: bool,
@@ -65,6 +80,8 @@ impl UpdateInfo {
             download_url: None,
             checksum_url: None,
             signature_url: None,
+            manifest_signature_url: None,
+            release_tag: None,
             release_notes: None,
             published_at: None,
             update_available: false,
@@ -208,12 +225,20 @@ impl UpdateService {
             .iter()
             .find(|a| a.name == signature_name)
             .map(|a| a.browser_download_url.clone());
+        let manifest_sig_name = format!("{target}.manifest.sig");
+        let manifest_signature_url = release
+            .assets
+            .iter()
+            .find(|a| a.name == manifest_sig_name)
+            .map(|a| a.browser_download_url.clone());
 
         let mut info = self.info.write().await;
         info.latest_version = Some(latest_tag.to_string());
+        info.release_tag = Some(release.tag_name.clone());
         info.download_url = download_url;
         info.checksum_url = checksum_url;
         info.signature_url = signature_url;
+        info.manifest_signature_url = manifest_signature_url;
         info.release_notes = release.body;
         info.published_at = release.published_at;
         info.update_available = update_available;
@@ -242,7 +267,7 @@ impl UpdateService {
              so self-update is disabled; update by deploying a new image or binary",
         )?;
         // Ensure we have a check result
-        let (download_url, checksum_url, signature_url) = {
+        let (download_url, checksum_url, signature_url, manifest_sig_url, tag) = {
             let info = self.info.read().await;
             if !info.update_available {
                 bail!("No update available");
@@ -259,8 +284,17 @@ impl UpdateService {
                 .signature_url
                 .clone()
                 .context("Release has no checksum signature; refusing to update")?;
-            (dl, cs, sig)
+            let msig = info.manifest_signature_url.clone().context(
+                "Release has no version-bound manifest signature (<asset>.manifest.sig); \
+                 refusing to update",
+            )?;
+            let tag = info
+                .release_tag
+                .clone()
+                .context("Release tag unknown; run an update check first")?;
+            (dl, cs, sig, msig, tag)
         };
+        let asset_name = target_asset_name();
 
         // Download binary archive
         {
@@ -273,7 +307,8 @@ impl UpdateService {
         let archive_path = temp_dir.path().join("update.tar.gz");
 
         tracing::info!(url = %download_url, "Downloading update archive");
-        self.download_file(&download_url, &archive_path).await?;
+        self.download_file(&download_url, &archive_path, MAX_ARCHIVE_BYTES)
+            .await?;
 
         // Verify checksum
         {
@@ -283,13 +318,22 @@ impl UpdateService {
 
         let checksum_path = temp_dir.path().join("checksum.sha256");
         let signature_path = temp_dir.path().join("checksum.sha256.sig");
-        self.download_file(&checksum_url, &checksum_path).await?;
-        self.download_file(&signature_url, &signature_path).await?;
+        let manifest_sig_path = temp_dir.path().join("release.manifest.sig");
+        self.download_file(&checksum_url, &checksum_path, MAX_SMALL_FILE_BYTES)
+            .await?;
+        self.download_file(&signature_url, &signature_path, MAX_SMALL_FILE_BYTES)
+            .await?;
+        self.download_file(&manifest_sig_url, &manifest_sig_path, MAX_SMALL_FILE_BYTES)
+            .await?;
         // Authenticity first (the checksum file is signed by the release key),
-        // then integrity of the archive against that checksum.
+        // then integrity of the archive against that checksum (whose filename
+        // must be this platform's asset), then the version-bound manifest
+        // signature over (tag, asset, sha256) — a validly signed checksum from
+        // another release or asset cannot be replayed under this tag.
         verify_signature(&checksum_path, &signature_path, &public_key)?;
-        verify_checksum(&archive_path, &checksum_path)?;
-        tracing::info!("Release signature and SHA256 checksum verified");
+        let sha256 = verify_checksum(&archive_path, &checksum_path, &asset_name)?;
+        verify_manifest(&tag, &asset_name, &sha256, &manifest_sig_path, &public_key)?;
+        tracing::info!(tag = %tag, "Release signatures (checksum + manifest) and SHA256 verified");
 
         // Extract and apply
         {
@@ -310,8 +354,12 @@ impl UpdateService {
         Ok(())
     }
 
-    /// Download a file to a local path.
-    async fn download_file(&self, url: &str, dest: &PathBuf) -> Result<()> {
+    /// Download a file to a local path, streaming to disk and aborting once
+    /// more than `max_bytes` arrive (declared or actual).
+    async fn download_file(&self, url: &str, dest: &PathBuf, max_bytes: u64) -> Result<()> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
         let resp = self
             .client
             .get(url)
@@ -322,15 +370,31 @@ impl UpdateService {
         if !resp.status().is_success() {
             bail!("Download failed with status {}: {url}", resp.status());
         }
+        if let Some(len) = resp.content_length() {
+            if len > max_bytes {
+                bail!("Download too large ({len} > {max_bytes} bytes): {url}");
+            }
+        }
 
-        let bytes = resp
-            .bytes()
+        let mut file = tokio::fs::File::create(dest)
             .await
-            .with_context(|| format!("Failed to read response body from {url}"))?;
-
-        std::fs::write(dest, &bytes)
+            .with_context(|| format!("Failed to create {}", dest.display()))?;
+        let mut written: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.with_context(|| format!("Failed to read response body from {url}"))?;
+            written += chunk.len() as u64;
+            if written > max_bytes {
+                bail!("Download exceeds {max_bytes} bytes: {url}");
+            }
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed to write to {}", dest.display()))?;
+        }
+        file.flush()
+            .await
             .with_context(|| format!("Failed to write to {}", dest.display()))?;
-
         Ok(())
     }
 
@@ -406,31 +470,84 @@ fn verify_signature(
     signature_path: &PathBuf,
     public_key: &[u8],
 ) -> Result<()> {
-    use base64::Engine;
     let message = std::fs::read(checksum_path).context("Failed to read checksum file")?;
     let sig_raw = std::fs::read(signature_path).context("Failed to read signature file")?;
-    let signature = if sig_raw.len() == 64 {
-        sig_raw
-    } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(String::from_utf8_lossy(&sig_raw).trim())
-            .context("Signature file is neither raw nor base64")?
-    };
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
-        .verify(&message, &signature)
+    verify_ed25519(&message, &sig_raw, public_key)
         .map_err(|_| anyhow::anyhow!("Release signature verification FAILED; refusing to update"))
 }
 
-fn verify_checksum(file_path: &PathBuf, checksum_path: &PathBuf) -> Result<()> {
+/// Verify a detached Ed25519 signature (raw 64 bytes or base64) over `message`.
+fn verify_ed25519(message: &[u8], sig_raw: &[u8], public_key: &[u8]) -> Result<()> {
+    use base64::Engine;
+    let signature = if sig_raw.len() == 64 {
+        sig_raw.to_vec()
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(String::from_utf8_lossy(sig_raw).trim())
+            .context("Signature file is neither raw nor base64")?
+    };
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+        .verify(message, &signature)
+        .map_err(|_| anyhow::anyhow!("signature verification failed"))
+}
+
+/// The version-bound release manifest signed by `release.yml`
+/// (`<asset>.manifest.sig`). Binding the tag and asset name means a validly
+/// signed checksum from an older release (downgrade / replay) or another
+/// platform's asset cannot be installed under this release.
+pub(crate) fn release_manifest(tag: &str, asset: &str, sha256: &str) -> String {
+    format!("{MANIFEST_HEADER}\n{tag}\n{asset}\n{sha256}\n")
+}
+
+/// Verify the manifest signature for exactly (`tag`, `asset`, `sha256`).
+fn verify_manifest(
+    tag: &str,
+    asset: &str,
+    sha256: &str,
+    manifest_sig_path: &PathBuf,
+    public_key: &[u8],
+) -> Result<()> {
+    let sig_raw = std::fs::read(manifest_sig_path).context("Failed to read manifest signature")?;
+    let manifest = release_manifest(tag, asset, sha256);
+    verify_ed25519(manifest.as_bytes(), &sig_raw, public_key).map_err(|_| {
+        anyhow::anyhow!(
+            "Release manifest signature verification FAILED for {tag} / {asset}; refusing to update"
+        )
+    })
+}
+
+/// Check the archive against a `sha256sum` file. The file must name exactly
+/// `expected_name` (so a signed checksum of another asset is refused).
+/// Returns the verified lowercase hex digest.
+fn verify_checksum(
+    file_path: &PathBuf,
+    checksum_path: &PathBuf,
+    expected_name: &str,
+) -> Result<String> {
     let checksum_content =
         std::fs::read_to_string(checksum_path).context("Failed to read checksum file")?;
 
-    // Format: "<hash>  <filename>" or "<hash> <filename>"
-    let expected_hash = checksum_content
-        .split_whitespace()
+    // Format (sha256sum): "<hash>  <filename>" ("*<filename>" in binary mode).
+    let mut lines = checksum_content.lines().filter(|l| !l.trim().is_empty());
+    let line = lines.next().context("Empty checksum file")?;
+    if lines.next().is_some() {
+        bail!("Checksum file must contain exactly one entry");
+    }
+    let mut parts = line.split_whitespace();
+    let expected_hash = parts.next().context("Empty checksum file")?.to_lowercase();
+    let name = parts
         .next()
-        .context("Empty checksum file")?
-        .to_lowercase();
+        .context("Checksum file has no filename")?
+        .trim_start_matches('*');
+    if parts.next().is_some() {
+        bail!("Malformed checksum line");
+    }
+    if name != expected_name {
+        bail!("Checksum file is for '{name}', expected '{expected_name}'; refusing to update");
+    }
+    if expected_hash.len() != 64 || !expected_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("Malformed SHA256 in checksum file");
+    }
 
     let file_bytes = std::fs::read(file_path).context("Failed to read archive for checksum")?;
     let mut hasher = Sha256::new();
@@ -441,7 +558,7 @@ fn verify_checksum(file_path: &PathBuf, checksum_path: &PathBuf) -> Result<()> {
         bail!("Checksum mismatch: expected {expected_hash}, got {actual_hash}");
     }
 
-    Ok(())
+    Ok(actual_hash)
 }
 
 /// Extract the `one-router` binary from a .tar.gz archive.
@@ -561,9 +678,39 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(content);
         let hash = format!("{:x}", hasher.finalize());
-        std::fs::write(&checksum_path, format!("{hash}  test.bin")).unwrap();
+        std::fs::write(&checksum_path, format!("{hash}  test.bin\n")).unwrap();
+        assert_eq!(
+            verify_checksum(&file_path, &checksum_path, "test.bin").unwrap(),
+            hash
+        );
+        // Binary-mode marker is accepted.
+        std::fs::write(&checksum_path, format!("{hash} *test.bin")).unwrap();
+        assert!(verify_checksum(&file_path, &checksum_path, "test.bin").is_ok());
+    }
 
-        assert!(verify_checksum(&file_path, &checksum_path).is_ok());
+    #[test]
+    fn test_verify_checksum_requires_expected_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.bin");
+        let checksum_path = dir.path().join("test.bin.sha256");
+        std::fs::write(&file_path, b"hello world").unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"hello world");
+        let hash = format!("{:x}", hasher.finalize());
+
+        // Right hash, wrong asset name (e.g. the other architecture's file).
+        std::fs::write(&checksum_path, format!("{hash}  other.tar.gz")).unwrap();
+        assert!(verify_checksum(&file_path, &checksum_path, "test.bin").is_err());
+        // No filename at all.
+        std::fs::write(&checksum_path, hash.clone()).unwrap();
+        assert!(verify_checksum(&file_path, &checksum_path, "test.bin").is_err());
+        // Two entries.
+        std::fs::write(
+            &checksum_path,
+            format!("{hash}  test.bin\n{hash}  test.bin\n"),
+        )
+        .unwrap();
+        assert!(verify_checksum(&file_path, &checksum_path, "test.bin").is_err());
     }
 
     #[test]
@@ -573,9 +720,41 @@ mod tests {
         let checksum_path = dir.path().join("test.bin.sha256");
 
         std::fs::write(&file_path, b"hello world").unwrap();
-        std::fs::write(&checksum_path, "0000000000000000  test.bin").unwrap();
+        std::fs::write(&checksum_path, format!("{}  test.bin", "0".repeat(64))).unwrap();
 
-        assert!(verify_checksum(&file_path, &checksum_path).is_err());
+        assert!(verify_checksum(&file_path, &checksum_path, "test.bin").is_err());
+    }
+
+    /// Serve `len` bytes once without Content-Length (read until EOF).
+    async fn serve_once(len: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = sock.write_all(&vec![b'x'; len]).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://127.0.0.1:{port}/asset")
+    }
+
+    #[tokio::test]
+    async fn download_is_size_capped_while_streaming() {
+        let svc = UpdateService::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f");
+
+        let url = serve_once(50_000).await;
+        assert!(svc.download_file(&url, &dest, 10_000).await.is_err());
+
+        let url = serve_once(5_000).await;
+        svc.download_file(&url, &dest, 10_000).await.unwrap();
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 5_000);
     }
 }
 
@@ -626,6 +805,75 @@ mod signature_tests {
         let pk = parse_public_key("MCowBQYDK2VwAyEAcHbS7taSZNSjapWRqUQJkKzbzMwVwurSmit4gHYW59c=")
             .unwrap();
         assert!(verify_signature(&cs, &sig, &pk).is_ok());
+    }
+
+    #[test]
+    fn manifest_signature_binds_tag_asset_and_hash() {
+        let rng = ring::rand::SystemRandom::new();
+        let kp = Ed25519KeyPair::from_pkcs8(Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref())
+            .unwrap();
+        let pk = kp.public_key().as_ref().to_vec();
+        let asset = "one-router-x86_64-unknown-linux-gnu.tar.gz";
+        let sha = "a".repeat(64);
+        let manifest = release_manifest("v0.21.0", asset, &sha);
+        assert_eq!(
+            manifest,
+            format!("one-router-release-v1\nv0.21.0\n{asset}\n{sha}\n")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let sig = dir.path().join("m.sig");
+        std::fs::write(&sig, kp.sign(manifest.as_bytes()).as_ref()).unwrap();
+
+        assert!(verify_manifest("v0.21.0", asset, &sha, &sig, &pk).is_ok());
+        // Replayed under another tag (downgrade / rollback).
+        assert!(verify_manifest("v0.22.0", asset, &sha, &sig, &pk).is_err());
+        // Another platform's asset.
+        assert!(verify_manifest(
+            "v0.21.0",
+            "one-router-aarch64-unknown-linux-gnu.tar.gz",
+            &sha,
+            &sig,
+            &pk
+        )
+        .is_err());
+        // Another archive.
+        assert!(verify_manifest("v0.21.0", asset, &"b".repeat(64), &sig, &pk).is_err());
+        // Another key.
+        let other =
+            Ed25519KeyPair::from_pkcs8(Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref())
+                .unwrap();
+        assert!(
+            verify_manifest("v0.21.0", asset, &sha, &sig, other.public_key().as_ref()).is_err()
+        );
+        // A signature over the checksum file is not a manifest signature.
+        std::fs::write(
+            &sig,
+            kp.sign(format!("{sha}  {asset}\n").as_bytes()).as_ref(),
+        )
+        .unwrap();
+        assert!(verify_manifest("v0.21.0", asset, &sha, &sig, &pk).is_err());
+    }
+
+    /// Interop with the release.yml manifest signer (same printf format,
+    /// `openssl pkeyutl -sign -rawin`, throwaway key).
+    #[test]
+    fn openssl_manifest_signature_verifies() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let sig = dir.path().join("m.sig");
+        std::fs::write(
+            &sig,
+            base64::engine::general_purpose::STANDARD
+                .decode("lmxh7R+9e8yVC2rywtiSqv8InWTgyYbFzlbSl5/fhURofQQbg8gJ1WsVYpAzlNMrj73/HFMJFdrfdNVwQ9E5BQ==")
+                .unwrap(),
+        )
+        .unwrap();
+        let pk = parse_public_key("MCowBQYDK2VwAyEAiwMW4KxfXPRAlgOmj6Lkb43QSFZDV+qZs2azaLTUaYY=")
+            .unwrap();
+        let asset = "one-router-x86_64-unknown-linux-gnu.tar.gz";
+        let sha = "a".repeat(64);
+        assert!(verify_manifest("v0.21.0", asset, &sha, &sig, &pk).is_ok());
+        assert!(verify_manifest("v0.20.0", asset, &sha, &sig, &pk).is_err());
     }
 
     #[test]
