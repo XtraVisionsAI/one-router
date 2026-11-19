@@ -63,8 +63,15 @@ enum Command {
         #[arg(long)]
         no_write: bool,
     },
-    /// Read a key from stdin and print its `sha256:<hex>` form (for MASTER_API_KEY)
-    HashKey,
+    /// Read a key from stdin and print its `sha256:<hex>` form (for MASTER_API_KEY).
+    /// Weak keys are refused: a hashed master key is treated as strong (it may
+    /// bypass the admin-auth lockout, see CLAUDE.md).
+    HashKey {
+        /// Hash a weak key anyway (it will then get no lockout bypass protection
+        /// guarantees — prefer `reset-master-key`).
+        #[arg(long)]
+        allow_weak: bool,
+    },
     /// Wrap the current ENCRYPTION_KEY with a key provider and print the new value
     WrapKey {
         #[arg(long, value_enum)]
@@ -107,7 +114,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Update { check }) => run_update(check).await,
         Some(Command::ResetMasterKey { no_write }) => run_reset_master_key(no_write),
-        Some(Command::HashKey) => run_hash_key(),
+        Some(Command::HashKey { allow_weak }) => run_hash_key(allow_weak),
         Some(Command::WrapKey {
             provider,
             key,
@@ -125,10 +132,22 @@ async fn main() -> Result<()> {
 /// `migrate-secrets`: offline plaintext / v1 → v2 re-encryption.
 ///
 /// DATABASE / ENCRYPTION_KEY resolve exactly like server startup (.env < env
-/// < `-d` / `--encryption-key`; provider-wrapped keys are unwrapped). Opening
-/// the database runs the same `initialize` as startup (schema migrations, API
-/// key hash backfill, key → user migration, settings backfill); model-mapping
-/// seeding is forced off. Exits non-zero if any row failed.
+/// < `-d` / `--encryption-key`; provider-wrapped keys are unwrapped). The
+/// database must already exist (SQLite is opened `mode=rw`/`ro`, never
+/// created).
+///
+/// - `--dry-run` is strictly read-only: the store is opened read-only and
+///   **not** initialized (no schema migration, backfill or seeding); backends
+///   and settings are read as they are. A schema too old to read is reported
+///   and exits non-zero — run the real migration (below), which upgrades the
+///   schema first.
+/// - Without `--dry-run`, the database runs the same `initialize` as startup
+///   (schema migrations, API key hash backfill, key → user migration, settings
+///   backfill; model-mapping seeding forced off) before secrets are rewritten.
+///   The server itself would run that `initialize` and then abort on legacy
+///   secrets, so this command is the supported upgrade path.
+///
+/// Exits non-zero if any row failed.
 async fn run_migrate_secrets(
     database: Option<String>,
     encryption_key: Option<String>,
@@ -161,12 +180,29 @@ async fn run_migrate_secrets(
         "Database: {}",
         one_router::config::settings::redact_database_uri(&settings.database)
     );
-    let db = one_router::database::create_database(&settings.database).await?;
-    db.initialize(settings.encryption_key.as_deref(), settings.seed_defaults)
-        .await?;
+    use one_router::database::{open_existing_database, OpenMode};
+    let mode = if dry_run {
+        OpenMode::ReadOnly
+    } else {
+        OpenMode::ReadWrite
+    };
+    let db = open_existing_database(&settings.database, mode).await?;
+    if !dry_run {
+        db.initialize(settings.encryption_key.as_deref(), settings.seed_defaults)
+            .await?;
+    }
     let encryptor = Encryptor::new(settings.encryption_key.as_deref());
 
-    let report = secret_migration::migrate_secrets(&db, &encryptor, dry_run).await?;
+    let report = match secret_migration::migrate_secrets(&db, &encryptor, dry_run).await {
+        Ok(r) => r,
+        Err(e) if dry_run => anyhow::bail!(
+            "dry run could not read backends / settings without migrating the schema \
+             ({e:#}). The dry run never upgrades the schema. Back up the database, then run \
+             `one-router migrate-secrets` without --dry-run (it applies the schema \
+             migrations first, then re-encrypts)."
+        ),
+        Err(e) => return Err(e),
+    };
     for line in report.lines(dry_run) {
         println!("{line}");
     }
@@ -271,7 +307,7 @@ fn run_reset_master_key(no_write: bool) -> Result<()> {
 }
 
 /// `hash-key`: stdin → `sha256:<hex>`.
-fn run_hash_key() -> Result<()> {
+fn run_hash_key(allow_weak: bool) -> Result<()> {
     use std::io::{BufRead, IsTerminal};
     if std::io::stdin().is_terminal() {
         eprint!("Key (input is echoed): ");
@@ -283,9 +319,17 @@ fn run_hash_key() -> Result<()> {
         anyhow::bail!("no key on stdin");
     }
     if !one_router::config::master_key::is_strong(key) {
+        if !allow_weak {
+            anyhow::bail!(
+                "this key is weak (short, low-variety or a well-known value): an unsalted hash \
+                 of it can be brute-forced, and a hashed MASTER_API_KEY is treated as strong \
+                 (a correct key is admitted even while the admin-auth throttle is locked). \
+                 Use `one-router reset-master-key`, or pass --allow-weak to hash it anyway."
+            );
+        }
         eprintln!(
-            "Warning: this key is weak (short or a well-known value); an unsalted hash of it \
-             can be brute-forced. Prefer `one-router reset-master-key`."
+            "Warning: hashing a weak key (--allow-weak); an unsalted hash of it can be \
+             brute-forced. Prefer `one-router reset-master-key`."
         );
     }
     println!("{}", one_router::config::master_key::hash(key));

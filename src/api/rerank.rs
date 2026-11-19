@@ -133,7 +133,9 @@ pub async fn create_rerank(
     );
 
     // Usage row + budget/TPM accounting. Rerank is billed upstream per search
-    // unit (one query over ≤ 100 documents): cost = `price_per_search_unit` ×
+    // unit (one query over ≤ 100 documents; a document longer than 500
+    // query + document tokens counts once per 500-token chunk — see
+    // `BillableUnits::rerank`): cost = `price_per_search_unit` ×
     // units + `price_per_request` + query/documents as input tokens at the
     // mapping's own input price (no DEFAULT_* fallback).
     let input_tokens: u64 = crate::utils::tokens::estimate_text_tokens(&request.query)
@@ -150,7 +152,10 @@ pub async fn create_rerank(
         "bedrock".to_string(),
         "openai",
         crate::services::usage_tracker::DefaultPricing::Units(
-            crate::services::usage_tracker::BillableUnits::rerank(request.documents.len()),
+            crate::services::usage_tracker::BillableUnits::rerank(
+                &request.query,
+                request.documents.iter().map(String::as_str),
+            ),
         ),
     );
 

@@ -1059,6 +1059,7 @@ async fn handle_mantle_responses_request(
         use futures::StreamExt;
         let mut byte_stream = Box::pin(byte_stream);
         let mut buffer = String::new();
+        let mut utf8 = crate::utils::utf8_stream::Utf8StreamDecoder::new();
         let mut state =
             anthropic_responses::ResponsesToAnthropicStreamState::new(source_model);
 
@@ -1070,7 +1071,7 @@ async fn handle_mantle_responses_request(
                     break;
                 }
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            utf8.push(&chunk, &mut buffer);
             while let Some(pos) = buffer.find("\n\n") {
                 let frame = buffer[..pos].to_string();
                 buffer.drain(..pos + 2);
@@ -1244,6 +1245,7 @@ async fn proxy_anthropic_sse_stream(
     let stream = async_stream::stream! {
         let mut response = upstream;
         let mut buffer = String::new();
+        let mut utf8 = crate::utils::utf8_stream::Utf8StreamDecoder::new();
         let mut stream_error = false;
         let mut input_tokens: i32 = 0;
         let mut output_tokens: i32 = 0;
@@ -1253,9 +1255,7 @@ async fn proxy_anthropic_sse_stream(
         loop {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
-                    if let Ok(text) = std::str::from_utf8(&chunk) {
-                        buffer.push_str(text);
-                    }
+                    utf8.push(&chunk, &mut buffer);
 
                     // Parse complete SSE events (separated by \n\n)
                     while let Some(pos) = buffer.find("\n\n") {
@@ -1448,6 +1448,7 @@ async fn handle_openai_backend(
         let stream = async_stream::stream! {
             let mut response = resp;
             let mut buffer = String::new();
+            let mut utf8 = crate::utils::utf8_stream::Utf8StreamDecoder::new();
             let mut stream_error = false;
             let response_converter = crate::converters::anthropic_openai::AnthropicToOpenAIConverter::new();
             let mut conv_state = OpenAIToAnthropicStreamState::default();
@@ -1465,9 +1466,7 @@ async fn handle_openai_backend(
             'outer: loop {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
-                        if let Ok(text) = std::str::from_utf8(&chunk) {
-                            buffer.push_str(text);
-                        }
+                        utf8.push(&chunk, &mut buffer);
 
                         while let Some(pos) = buffer.find("\n\n") {
                             let line = buffer[..pos].to_string();

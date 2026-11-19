@@ -194,13 +194,18 @@ if [[ -n "$MASTER_API_KEY" && "$MASTER_API_KEY" != sha256:* ]]; then
     else
         _mk_hex=$(printf '%s' "$MASTER_API_KEY" | shasum -a 256 | cut -d' ' -f1)
     fi
+    if [[ ! "$_mk_hex" =~ ^[0-9a-f]{64}$ ]]; then
+        err "Failed to hash MASTER_API_KEY (sha256sum / shasum produced no digest)"; exit 1
+    fi
     MASTER_API_KEY="sha256:${_mk_hex}"
     unset _mk_hex
     info "MASTER_API_KEY will be deployed as its SHA-256 (log in with the original key)"
 fi
 
 # Store a secret as an SSM SecureString (value never on a command line) and
-# print its ARN.
+# print its ARN. Always called as `arn=$(put_secret …) || return 1` — `set -e`
+# does not fire inside a command substitution used as an argument
+# (`jq --arg a "$(put_secret …)"` would deploy an empty ARN on failure).
 put_secret() {
     local name="/${SERVICE_NAME}/$1" value="$2" f rc=0
     private_tmp f
@@ -211,8 +216,25 @@ put_secret() {
         '{Name: $n, Value: env.SECRET_VALUE, Type: "SecureString", Overwrite: true}' > "$f" \
       && awscli ssm put-parameter --cli-input-json "file://$f" >/dev/null; } || rc=$?
     rm -f "$f"
-    [[ $rc -eq 0 ]] || return "$rc"
+    if [[ $rc -ne 0 ]]; then
+        err "Failed to store secret ${name} in SSM (exit ${rc})"
+        return "$rc"
+    fi
     echo "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter${name}"
+}
+
+# Store secret $1 = $2 and add `{$1: <arn>}` to the JSON object held in the
+# variable named by $3. Fails (non-zero, nothing added) unless put_secret
+# succeeded and printed a well-formed SSM parameter ARN.
+add_secret() {
+    local key="$1" value="$2" var="$3" arn updated
+    arn=$(put_secret "$key" "$value") || return 1
+    if [[ ! "$arn" =~ ^arn:aws[a-z-]*:ssm:[a-z0-9-]+:[0-9]{12}:parameter/.+ ]]; then
+        err "Refusing to deploy ${key}: invalid secret ARN '${arn}'"
+        return 1
+    fi
+    updated=$(jq --arg k "$key" --arg a "$arn" '. + {($k): $a}' <<<"${!var}") || return 1
+    printf -v "$var" '%s' "$updated"
 }
 
 # ─── Validate ───────────────────────────────────────────────────────────────
@@ -512,18 +534,33 @@ info "Step 4: Configuring App Runner service..."
 # DATABASE is a secret too when it carries credentials (user:pass@).
 build_image_configuration() {
     local db="$1" secrets='{}' vars
-    vars=$(jq -n --arg region "${REGION}" '{PORT: "8000", LOG_LEVEL: "info", AWS_REGION: $region}')
+    vars=$(jq -n --arg region "${REGION}" '{PORT: "8000", LOG_LEVEL: "info", AWS_REGION: $region}') || return 1
     if [[ -n "$db" ]]; then
         if [[ "$db" == *"@"* ]]; then
-            secrets=$(jq --arg a "$(put_secret DATABASE "$db")" '. + {DATABASE: $a}' <<<"$secrets")
+            add_secret DATABASE "$db" secrets || return 1
         else
-            vars=$(jq --arg d "$db" '. + {DATABASE: $d}' <<<"$vars")
+            vars=$(jq --arg d "$db" '. + {DATABASE: $d}' <<<"$vars") || return 1
         fi
     fi
-    [[ -n "$MASTER_API_KEY" ]] && secrets=$(jq --arg a "$(put_secret MASTER_API_KEY "$MASTER_API_KEY")" '. + {MASTER_API_KEY: $a}' <<<"$secrets")
-    [[ -n "$ENCRYPTION_KEY" ]] && secrets=$(jq --arg a "$(put_secret ENCRYPTION_KEY "$ENCRYPTION_KEY")" '. + {ENCRYPTION_KEY: $a}' <<<"$secrets")
+    if [[ -n "$MASTER_API_KEY" ]]; then
+        add_secret MASTER_API_KEY "$MASTER_API_KEY" secrets || return 1
+    fi
+    if [[ -n "$ENCRYPTION_KEY" ]]; then
+        add_secret ENCRYPTION_KEY "$ENCRYPTION_KEY" secrets || return 1
+    fi
     jq -n --argjson v "$vars" --argjson s "$secrets" \
         '{Port: "8000", RuntimeEnvironmentVariables: $v, RuntimeEnvironmentSecrets: $s}'
+}
+
+# IMAGE_CONFIG=<ImageConfiguration JSON> or exit: build_image_configuration
+# runs in a command substitution, where `set -e` does not reach — check it.
+image_configuration_or_exit() {
+    IMAGE_CONFIG=$(build_image_configuration "$1") || {
+        err "Could not store deployment secrets; aborting (nothing deployed)"; exit 1
+    }
+    if [[ -z "$IMAGE_CONFIG" ]]; then
+        err "Empty image configuration; aborting (nothing deployed)"; exit 1
+    fi
 }
 
 private_tmp SOURCE_CONFIG_FILE
@@ -552,7 +589,8 @@ JSON
 
 if [[ "$CREATE" == "true" ]]; then
     echo "  Creating new service: ${SERVICE_NAME}..."
-    jq -n --argjson ic "$(build_image_configuration "${EFFECTIVE_DB}")" \
+    image_configuration_or_exit "${EFFECTIVE_DB}"
+    jq -n --argjson ic "${IMAGE_CONFIG}" \
         --arg image "${DEPLOY_IMAGE}" --arg role "${ACCESS_ROLE_ARN}" \
         '{ImageRepository: {ImageIdentifier: $image, ImageConfiguration: $ic, ImageRepositoryType: "ECR"},
           AuthenticationConfiguration: {AccessRoleArn: $role}}' > "${SOURCE_CONFIG_FILE}"
@@ -581,7 +619,8 @@ else
     if [[ -n "$DATABASE" || -n "$MASTER_API_KEY" || -n "$ENCRYPTION_KEY" ]]; then
         # Replaces RuntimeEnvironmentVariables wholesale — this also removes
         # plaintext keys left by older versions of this script.
-        jq -n --argjson ic "$(build_image_configuration "${DATABASE}")" \
+        image_configuration_or_exit "${DATABASE}"
+        jq -n --argjson ic "${IMAGE_CONFIG}" \
             --arg image "${DEPLOY_IMAGE}" --arg role "${ACCESS_ROLE_ARN}" \
             '{ImageRepository: {ImageIdentifier: $image, ImageConfiguration: $ic, ImageRepositoryType: "ECR"},
               AuthenticationConfiguration: {AccessRoleArn: $role}}' > "${SOURCE_CONFIG_FILE}"

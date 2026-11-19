@@ -502,4 +502,104 @@ mod tests {
             .await
             .is_err());
     }
+
+    /// Bytes of the database file and its WAL (the `-shm` index is
+    /// bookkeeping that readers may touch).
+    fn file_state(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for suffix in ["", "-wal"] {
+            let p = format!("{}{suffix}", path.display());
+            if let Ok(bytes) = std::fs::read(&p) {
+                out.push((suffix.to_string(), bytes));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn dry_run_on_read_only_open_changes_no_bytes() {
+        use crate::database::{open_existing_database, OpenMode};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let enc = Encryptor::new(Some("k"));
+        {
+            let sqlite = crate::database::sqlite::SqliteBackend::new(path.to_str().unwrap())
+                .await
+                .unwrap();
+            sqlite.initialize(None, SeedMode::Off).await.unwrap();
+            let db: Arc<dyn DatabaseService> = Arc::new(sqlite);
+            seed(&db, &enc).await;
+        }
+        // Writer fully closed so its files are settled.
+        let w = crate::database::sqlite::SqliteBackend::new(path.to_str().unwrap())
+            .await
+            .unwrap();
+        w.close().await;
+        let before = file_state(&path);
+
+        let uri = format!("sqlite://{}", path.display());
+        let db = open_existing_database(&uri, OpenMode::ReadOnly)
+            .await
+            .unwrap();
+        let report = migrate_secrets(&db, &enc, true).await.unwrap();
+        assert_eq!(
+            (report.migrated(), report.current(), report.failed()),
+            (3, 1, 1)
+        );
+        // The read-only connection refuses writes outright.
+        assert!(db
+            .backends()
+            .upsert_backend(&backend("x", String::new()))
+            .await
+            .is_err());
+        drop(db);
+        assert_eq!(file_state(&path), before);
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_upgrade_an_old_schema() {
+        use crate::database::{open_existing_database, OpenMode};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        // A pre-current schema: `backends` without the newer columns.
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+            sqlx::query("CREATE TABLE backends (name TEXT PRIMARY KEY, config TEXT)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+        let before = file_state(&path);
+        let uri = format!("sqlite://{}", path.display());
+        let db = open_existing_database(&uri, OpenMode::ReadOnly)
+            .await
+            .unwrap();
+        // Reading fails (no initialize ran) instead of silently migrating.
+        assert!(migrate_secrets(&db, &Encryptor::new(Some("k")), true)
+            .await
+            .is_err());
+        drop(db);
+        assert_eq!(file_state(&path), before);
+    }
+
+    #[tokio::test]
+    async fn missing_sqlite_file_is_an_error_and_not_created() {
+        use crate::database::{open_existing_database, OpenMode};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("missing.db");
+        let uri = format!("sqlite://{}", path.display());
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let err = open_existing_database(&uri, mode)
+                .await
+                .err()
+                .expect("missing file must fail");
+            assert!(err.to_string().contains("not found"), "{err}");
+        }
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+    }
 }

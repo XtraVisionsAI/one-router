@@ -173,7 +173,7 @@ curl -N http://localhost:8000/v1/responses \
   -d '{"model":"gpt-4o","input":"Hello!","stream":true}'
 ```
 
-Multi-turn conversations are stateful: pass a prior response's `id` as `previous_response_id` to continue where it left off (stored responses are bound to the API key that created them). Context is kept in memory for 1 hour, text only (images and tool definitions are not stored); a turn whose history exceeds 8 MB, or a key / user over its storage quota, is still answered normally — it is just not stored, so continuing from *that* response returns not-found (resend the conversation as `input` instead). To point the Codex CLI at One Router, set its base URL to `http://localhost:8000/v1` and use your API key.
+Multi-turn conversations are stateful: pass a prior response's `id` as `previous_response_id` to continue where it left off (stored responses are bound to the API key that created them). Context is kept in memory for 1 hour, text only (images and tool definitions are not stored); when the whole store is full, room is made by evicting from the user (or ownerless key) holding the most context, so light users keep theirs; a turn whose history exceeds 8 MB, or a key / user over its storage quota, is still answered normally — it is just not stored, so continuing from *that* response returns not-found (resend the conversation as `input` instead). To point the Codex CLI at One Router, set its base URL to `http://localhost:8000/v1` and use your API key.
 
 > **Bedrock GPT-5.x:** GPT-5.x models on AWS Bedrock are Responses-only (no Converse API). When a mapping targets one (`openai.gpt-5*`), `/v1/responses` passes the raw request through to the Bedrock Mantle Responses endpoint with native SSE relay, and `/v1/messages` / `/v1/chat/completions` reach the same models via built-in one-hop protocol conversion — including thinking-signature round-trips for Claude Code. Note these models are region-restricted (e.g. sol is us-east-1/us-east-2 only), so the Bedrock backend credential's region must match — pair this with a per-backend `models` filter to route only GPT models to the matching region.
 
@@ -323,7 +323,7 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
 
 ## Admin Web UI
 
-One Router includes a built-in admin UI at **`/admin`**. Open it in a browser and sign in with your master key or ephemeral key (debug builds). Authentication uses HttpOnly session cookies — no key is stored in the browser after login. Logins are throttled to 10 failed attempts per 15 minutes per client address; once the limit is hit, attempts from that address are refused (429) without the key being checked, so behind a reverse proxy set `TRUSTED_PROXY_CIDRS` or every client shares one bucket.
+One Router includes a built-in admin UI at **`/admin`**. Open it in a browser and sign in with your master key or ephemeral key (debug builds). Authentication uses HttpOnly session cookies — no key is stored in the browser after login. Logins are throttled to 10 failed attempts per 15 minutes per client address; once the limit is hit, attempts from that address are refused (429) without the key being checked, so behind a reverse proxy set `TRUSTED_PROXY_CIDRS` or every client shares one bucket. The same buckets cover the master key sent as `x-api-key` / `Authorization: Bearer` to `/admin/api/*` and `/metrics`: only wrong keys count (a request without a key or with a valid session cookie does not), and a correct key only refunds its own attempt (it does not reset other clients' failures). With a **strong** master key — a random plaintext key or any `sha256:` hash (`hash-key` refuses weak keys unless `--allow-weak`) — a correct key is admitted even while the bucket is full, so nobody sharing your proxy address can lock out the UI, scripted admin calls or the Prometheus scraper. A weak plaintext master key keeps the strict lockout.
 
 | Page | What you can do |
 |---|---|
@@ -357,7 +357,7 @@ One Router uses environment variables for infrastructure config. All runtime set
 | `BEDROCK_ALLOWED_PROFILES` | _(unset = any)_ | Comma-separated AWS profile names Bedrock backends may reference. A backend naming another profile is rejected on write and skipped on load |
 | `BEDROCK_ALLOW_DEFAULT_CREDENTIALS` | `true` | Allow Bedrock backends without explicit keys/profile to use the host's default AWS credential chain (env / instance role / SSO cache). Set `false` so the gateway's own identity can never be borrowed through the admin API |
 | `ADMIN_COOKIE_INSECURE` | _(unset)_ | Drop the `Secure` flag from the `admin_session` cookie (plain-HTTP admin access on a non-localhost host). Leave unset behind TLS |
-| `OUTBOUND_PROXY` | `off` | Proxy for SSRF-guarded fetches: `off` / `env` (use `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`) / an explicit `http://` or `https://` proxy URL (userinfo allowed, never logged; SOCKS not supported). Provider clients (Bedrock / Gemini / OpenAI / Anthropic / Tavily / Brave) always honor `HTTPS_PROXY` already |
+| `OUTBOUND_PROXY` | `off` | Proxy for SSRF-guarded fetches: `off` / `env` (use `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`) / an explicit `http://` or `https://` proxy URL (userinfo allowed, never logged; SOCKS not supported) / scheme-less `host:port` (port required; in `env` mode a port-less `HTTPS_PROXY=proxy.corp` is read as `http://proxy.corp:80`, like curl). Boolean-like values (`on`, `true`, `1`, `yes`, `enabled`, …) are rejected at startup — use `env` or a URL. Provider clients (Bedrock / Gemini / OpenAI / Anthropic / Tavily / Brave) always honor `HTTPS_PROXY` already |
 | `OUTBOUND_PROXY_SCOPE` | `admin` | `admin`: pricing sync, LiteLLM catalog / import, budget webhook. `all`: also web_fetch direct fetches and image URL inlining (user-supplied URLs — the proxy must deny private ranges) |
 | `PTC_MAX_SESSIONS_PER_USER` | `8` | Per-user cap (all of a user's keys) on concurrent PTC sessions and dynamic-filtering code runs; over the cap → 429 |
 
@@ -381,9 +381,16 @@ OUTBOUND_PROXY_SCOPE=admin    # or all (also web_fetch + image URLs)
 ```
 
 Proxied requests still get the static URL checks (scheme, IP literals, blocked
-hostnames) and a local DNS pre-check (any private / metadata address → rejected;
-local resolution failure → allowed, since only the proxy may resolve), and redirects
-are still followed manually with per-hop checks. With `OUTBOUND_PROXY_SCOPE=all` the
+hostnames incl. `*.localhost`) and a local DNS pre-check (any private / metadata
+address → rejected; local resolution failure → allowed for public-looking names, since
+only the proxy may resolve, but **refused** for names the proxy could map to an
+internal service: single-label hosts, `*.local` / `*.internal` / `*.corp` / `*.lan` /
+`*.home` / `*.home.arpa` / `*.intranet` / `*.localdomain` / `*.private`, and
+IP-embedding wildcard-DNS services such as `*.nip.io` / `*.sslip.io` / `*.xip.io` /
+`*.traefik.me` / `*.localtest.me` / `lvh.me`, which are refused outright), and
+redirects are still followed manually with per-hop checks. For user-supplied URLs a
+refused destination and a name that does not resolve return the same generic
+`destination not allowed` error (details only in the gateway log). With `OUTBOUND_PROXY_SCOPE=all` the
 **proxy is the last line of defense** for user-supplied URLs: it must refuse private
 destinations, for example:
 
@@ -541,7 +548,7 @@ Each mapping carries per-1M-token prices (`input_price`, `output_price`, `cache_
 |---|---|---|
 | `price_per_request` | once per call | `/v1/images/generations`, `/v1/rerank` (token endpoints ignore it) |
 | `price_per_image` | per image actually returned | `/v1/images/generations` |
-| `price_per_search_unit` | per search unit = one query over up to 100 documents (101–200 docs = 2 units) | `/v1/rerank` |
+| `price_per_search_unit` | per search unit = one query over up to 100 documents (101–200 docs = 2 units); a document whose query + document tokens exceed 500 is split into 500-token chunks that each count as a document (`ceil(Σ ceil((query + docᵢ tokens) / 500) / 100)`, min 1, tokens estimated) | `/v1/rerank` |
 
 Cost = token cost + non-token cost, × the caller's cost rate (user × team). Images bill the prompt as input tokens, rerank bills query + documents as input tokens — both at the mapping's own input price only (no default per-token fallback). The seeded Cohere Rerank 3.5 mappings ship at `$0.002` per search unit (Bedrock: $2.00 / 1K queries); image mappings must be priced before they cost anything — a budgeted key calling an unpriced image/rerank mapping logs a one-time warning. With `budget_enforcement = precharge`, images reserve `price_per_image × n` (default 1) and rerank reserves its search units up front.
 
@@ -665,7 +672,7 @@ Upgrades are **stop-the-world**: run one version at a time against a database (n
    ```bash
    one-router migrate-secrets
    ```
-   It prints one line per changed row (`backend <name>: v1 → v2`, `setting <key>: plaintext → v2`, `… decrypt failed (skipped)`) and a summary — never secret values. It is idempotent ("Nothing to migrate") and exits non-zero if any row could not be decrypted (wrong `ENCRYPTION_KEY`, or a corrupted / copied value). Opening the database runs the regular schema migrations; default model mappings are not seeded.
+   It prints one line per changed row (`backend <name>: v1 → v2`, `setting <key>: plaintext → v2`, `… decrypt failed (skipped)`) and a summary — never secret values. It is idempotent ("Nothing to migrate") and exits non-zero if any row could not be decrypted (wrong `ENCRYPTION_KEY`, or a corrupted / copied value). The database must already exist (a SQLite path that does not exist is an error — no empty file is created). `--dry-run` is strictly read-only: the database is opened read-only and no schema migration or backfill runs; if the schema is too old to read as-is, the dry run says so and exits non-zero — then go straight to step 4. Without `--dry-run`, the command first runs the regular startup schema migrations and backfills (default model mappings are not seeded), then re-encrypts. (Starting the new server would also migrate the schema, then abort on the legacy secrets.)
 5. Start the new version.
 
 Stored backend credentials and sensitive settings must be in the current `encrypted:v2:` format: the server refuses to start while any are still plaintext or legacy v1, and lists the affected backend names / setting keys. Rollback = stop, restore the backup taken in step 2, start the old version.
@@ -680,7 +687,7 @@ Docker: `docker run --rm -e DATABASE=… -e ENCRYPTION_KEY=… -v one-router-dat
 | `one-router update [--check]` | Check for / apply a signed self-update (bare metal) |
 | `one-router migrate-secrets [--dry-run]` | Re-encrypt plaintext / v1 stored secrets as v2 (server stopped) |
 | `one-router reset-master-key [--no-write]` | New master key, shown once; only its SHA-256 is saved to `.env` |
-| `one-router hash-key` | stdin key → `sha256:<hex>` (for `MASTER_API_KEY`) |
+| `one-router hash-key [--allow-weak]` | stdin key → `sha256:<hex>` (for `MASTER_API_KEY`); weak keys are refused unless `--allow-weak` |
 | `one-router wrap-key --provider aws-kms\|vault-transit\|systemd-creds` | Wrap `ENCRYPTION_KEY` with a key provider |
 
 ## Development

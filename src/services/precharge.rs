@@ -275,8 +275,10 @@ struct BodyHints {
     max_completion_tokens: Option<u64>,
     /// Images requested (`/v1/images/generations`).
     n: Option<u64>,
-    /// Rerank documents (only counted).
-    documents: Option<Vec<serde::de::IgnoredAny>>,
+    /// Rerank query + documents (sized into search units). Kept as `Value` so
+    /// an unexpected shape on another endpoint never fails the hint parse.
+    query: Option<serde_json::Value>,
+    documents: Option<Vec<serde_json::Value>>,
 }
 
 /// Endpoints whose cost is priced (count_tokens / GETs never precharge).
@@ -300,7 +302,12 @@ fn non_token_pricing(path: &str, hints: &BodyHints) -> Option<DefaultPricing> {
             hints.n.unwrap_or(1).max(1),
         ))),
         "/rerank" => Some(DefaultPricing::Units(BillableUnits::rerank(
-            hints.documents.as_ref().map_or(0, Vec::len),
+            hints.query.as_ref().and_then(|q| q.as_str()).unwrap_or(""),
+            hints
+                .documents
+                .iter()
+                .flatten()
+                .map(|d| d.as_str().unwrap_or("")),
         ))),
         _ => None,
     }
@@ -632,10 +639,32 @@ mod tests {
         .unwrap();
         assert_eq!(
             non_token_pricing("/v1/rerank", &hints),
-            Some(DefaultPricing::Units(BillableUnits::rerank(150)))
+            Some(DefaultPricing::Units(
+                crate::services::usage_tracker::rerank_short(150)
+            ))
         );
-        assert_eq!(BillableUnits::rerank(150).search_units, 2);
+        assert_eq!(
+            crate::services::usage_tracker::rerank_short(150).search_units,
+            2
+        );
         assert_eq!(non_token_pricing("/v1/messages", &hints), None);
+
+        // Long documents: precharge sizes chunks exactly like the recorder
+        // (60 × 1200-token docs = 180 billed documents = 2 units, not 1).
+        let long = "x".repeat(4_800);
+        let body =
+            serde_json::json!({"model": "m", "query": "q", "documents": vec![long.clone(); 60]});
+        let hints: BodyHints = serde_json::from_value(body).unwrap();
+        let expected = BillableUnits::rerank("q", std::iter::repeat_n(long.as_str(), 60));
+        assert_eq!(expected.search_units, 2);
+        assert_eq!(
+            non_token_pricing("/v1/rerank", &hints),
+            Some(DefaultPricing::Units(expected))
+        );
+        // Non-string shapes on other endpoints still parse.
+        let hints: BodyHints =
+            serde_json::from_str(r#"{"model":"m","query":{"a":1},"documents":[{"x":1}]}"#).unwrap();
+        assert!(non_token_pricing("/v1/rerank", &hints).is_some());
     }
 
     fn res(layer: BudgetLayer, amount: f64, period: &str) -> Reservation {

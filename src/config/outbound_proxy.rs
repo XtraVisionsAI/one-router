@@ -8,14 +8,18 @@
 //!
 //! - `OUTBOUND_PROXY`: `off` (default) | `env` (`HTTPS_PROXY` / `HTTP_PROXY` /
 //!   `NO_PROXY`) | an explicit `http://` / `https://` proxy URL (userinfo
-//!   allowed for proxy auth; never logged).
+//!   allowed for proxy auth; never logged) or a scheme-less `host:port`
+//!   (explicit port required). Boolean-like values (`on`, `true`, `1`, `yes`,
+//!   `enabled`, …) are rejected at startup instead of becoming `http://on:80`.
 //! - `OUTBOUND_PROXY_SCOPE`: `admin` (default: pricing sync, LiteLLM catalog /
 //!   import, budget webhook) | `all` (also web_fetch direct fetches and image
 //!   URL inlining — user-controlled URLs).
 //!
 //! Proxied requests keep the static URL checks and a local DNS pre-check
-//! (forbidden address → reject; local resolution failure → allow, the proxy
-//! may be the only resolver), so the proxy must enforce its own egress ACL
+//! (forbidden address → reject; local resolution failure → allow for
+//! public-looking names, the proxy may be the only resolver, but refuse
+//! single-label / `*.internal`-style / IP-embedding wildcard-DNS names), so the
+//! proxy must enforce its own egress ACL
 //! for private ranges. Read once at startup; not hot-reloadable.
 
 use std::fmt;
@@ -106,15 +110,63 @@ pub fn redact_proxy_url(url: &reqwest::Url) -> String {
     }
 }
 
-/// Validate a proxy URL (`http` / `https`, with a host). Errors never echo
-/// the input — it may carry a password.
+/// Boolean-like words that are not proxy URLs (`OUTBOUND_PROXY=on` would
+/// otherwise become `http://on:80`).
+const BOOLEAN_WORDS: &[&str] = &[
+    "on", "1", "true", "yes", "y", "enable", "enabled", "0", "false", "no", "n", "disable",
+    "disabled", "none", "null",
+];
+
+/// `host:port` with an explicit numeric port (userinfo allowed, `[v6]:port`
+/// accepted). Used for scheme-less proxy values.
+fn has_explicit_port(raw: &str) -> bool {
+    let authority = raw.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    host_port.rsplit_once(':').is_some_and(|(host, port)| {
+        !host.is_empty()
+            && !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && (!host.starts_with('[') || host.ends_with(']'))
+    })
+}
+
+/// Validate a proxy URL (`http` / `https`, with a host). A scheme-less value
+/// (env style, `proxy.corp:3128`) is read as `http://` and must carry an
+/// explicit port; boolean-like words (`on`, `true`, `1`, …) are rejected.
+/// Errors never echo the input — it may carry a password.
 pub fn validate_proxy_url(raw: &str) -> Result<reqwest::Url, String> {
+    validate_proxy_value(raw, false)
+}
+
+/// `lenient` (values read from `HTTPS_PROXY` / `HTTP_PROXY` in `env` mode):
+/// a scheme-less value without a port is accepted as `http://host` — the
+/// same reading curl and reqwest apply to these variables — with a warning,
+/// so existing proxy environments keep working. The explicit
+/// `OUTBOUND_PROXY=<value>` form stays strict.
+fn validate_proxy_value(raw: &str, lenient: bool) -> Result<reqwest::Url, String> {
     let raw = raw.trim();
+    if BOOLEAN_WORDS.iter().any(|w| raw.eq_ignore_ascii_case(w)) {
+        return Err(format!(
+            "'{raw}' is not a proxy; use `env` (HTTPS_PROXY / HTTP_PROXY) or a proxy URL \
+             such as http://proxy.corp:3128 (`off` disables)"
+        ));
+    }
     // Env-style values often omit the scheme ("proxy.corp:3128").
     let with_scheme = if raw.contains("://") {
         raw.to_string()
-    } else {
+    } else if has_explicit_port(raw) {
         format!("http://{raw}")
+    } else if lenient {
+        tracing::warn!(
+            "proxy environment variable has no scheme or port; assuming http://<host> (port 80)"
+        );
+        format!("http://{raw}")
+    } else {
+        return Err(
+            "a proxy value without a scheme must be host:port (e.g. proxy.corp:3128); \
+             otherwise use `env` or a full http:// / https:// URL"
+                .to_string(),
+        );
     };
     let url = reqwest::Url::parse(&with_scheme)
         .map_err(|_| "proxy URL is not a valid URL".to_string())?;
@@ -213,7 +265,8 @@ impl OutboundProxyConfig {
                 let parse = |names: &[&str]| -> Result<Option<reqwest::Url>, String> {
                     read(names)
                         .map(|v| {
-                            validate_proxy_url(&v).map_err(|e| format!("invalid {}: {e}", names[0]))
+                            validate_proxy_value(&v, true)
+                                .map_err(|e| format!("invalid {}: {e}", names[0]))
                         })
                         .transpose()
                 };
@@ -378,6 +431,51 @@ mod tests {
         // Scheme-less values default to http.
         let u = validate_proxy_url("proxy.corp:3128").unwrap();
         assert_eq!(u.scheme(), "http");
+        assert_eq!(u.port(), Some(3128));
+        let u = validate_proxy_url("u:secret@10.0.0.5:8080").unwrap();
+        assert_eq!(u.host_str(), Some("10.0.0.5"));
+        assert!(validate_proxy_url("[fd00::1]:3128").is_ok());
+    }
+
+    #[test]
+    fn boolean_like_and_bare_words_are_rejected() {
+        for bad in [
+            "on", "ON", "1", "true", "True", "yes", "enabled", "enable", "y", "0", "false", "no",
+            "disabled", "none",
+        ] {
+            let err = OutboundProxyConfig::parse(Some(bad), None).unwrap_err();
+            assert!(err.contains("`env`"), "{bad}: {err}");
+        }
+        // Scheme-less without an explicit port: not guessed as :80.
+        for bad in [
+            "proxy",
+            "proxy.corp",
+            "proxy.corp:",
+            "proxy.corp:abc",
+            "u:secret@proxy.corp",
+            "[fd00::1]",
+        ] {
+            let err = OutboundProxyConfig::parse(Some(bad), None).unwrap_err();
+            assert!(err.contains("host:port"), "{bad}: {err}");
+            assert!(!err.contains("secret"), "{bad}: {err}");
+        }
+        // Env mode applies the same rule to HTTPS_PROXY / HTTP_PROXY.
+        let c = OutboundProxyConfig::parse(Some("env"), None).unwrap();
+        assert!(c.resolve(env(&[("HTTPS_PROXY", "true")])).is_err());
+        // …but a scheme-less, port-less env value is read like curl does
+        // (http://host:80) instead of failing startup.
+        let r = c
+            .resolve(env(&[("HTTP_PROXY", "proxy.corp")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.http.as_ref().unwrap().as_str(), "http://proxy.corp/");
+        assert!(c
+            .resolve(env(&[("HTTP_PROXY", "proxy.corp:3128")]))
+            .unwrap()
+            .is_some());
+        // Full URLs keep working with or without a port.
+        assert!(validate_proxy_url("http://proxy.corp").is_ok());
+        assert!(validate_proxy_url("https://proxy.corp").is_ok());
     }
 
     #[test]

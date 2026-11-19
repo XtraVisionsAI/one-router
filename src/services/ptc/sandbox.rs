@@ -74,12 +74,29 @@ impl CodeExecutor for OneshotExecutor {
             Err(e) => Err(e),
         };
 
-        // Always clean up (also on start failure).
-        guard.disarm();
-        let _ = self.sandbox.stop_and_remove(&container.id).await;
+        // Always clean up (also on start failure). The removal runs on a
+        // spawned task, so dropping this future mid-removal cannot cancel
+        // it; the guard is disarmed only once removal has completed (a
+        // failed removal leaves it armed → one retry on drop).
+        if let Ok(Ok(())) = spawn_remove(&self.sandbox, container.id.clone()).await {
+            guard.disarm();
+        }
 
         result
     }
+}
+
+/// Remove a container on a spawned task. Awaiting the returned handle waits
+/// for completion, but dropping the awaiting future (client disconnect)
+/// does not cancel the removal — callers that already dropped their
+/// ownership record (session map entry, armed guard) use this so no
+/// cancellation point exists between "forgotten" and "removed".
+pub fn spawn_remove(
+    sandbox: &Arc<SandboxExecutor>,
+    container_id: String,
+) -> JoinHandle<PtcResult<()>> {
+    let sandbox = Arc::clone(sandbox);
+    tokio::spawn(async move { sandbox.stop_and_remove(&container_id).await })
 }
 
 /// Removes a created container when dropped while still armed — makes
@@ -148,10 +165,26 @@ pub const SANDBOX_NAME_PREFIX: &str = "ptc_sandbox_";
 
 /// Orphan sweep: a container that was created but never started is
 /// abandoned after this long (start follows create within milliseconds).
-const ORPHAN_CREATED_MIN_AGE_SECS: i64 = 120;
+/// Age is measured on the daemon's clock when `/info` answers; the margin
+/// (minutes, not seconds) also absorbs gateway↔daemon skew on the
+/// local-clock fallback. A never-started container runs nothing, so a late
+/// removal is harmless.
+const ORPHAN_CREATED_MIN_AGE_SECS: i64 = 600;
 /// Orphan sweep: a running sandbox older than this cannot belong to a live
-/// session of any instance (idle expiry 270 s; ≤ 10 iterations of ≤ 65 s).
+/// session of any instance running this version (hard session lifetime
+/// `MAX_SESSION_LIFETIME_SECS` = 30 min); the other 30 min are margin for
+/// clock skew on the local-clock fallback. Instances *older* than the
+/// lifetime cap have no such bound — drain PTC (or set `PTC_ENABLED=false`)
+/// for the stop-the-world upgrade.
 const ORPHAN_RUNNING_MIN_AGE_SECS: i64 = 3600;
+
+/// Parse the daemon's `SystemTime` (RFC 3339, nanosecond precision) into a
+/// Unix timestamp; `None` when absent or unparsable.
+fn daemon_now(system_time: Option<&str>) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(system_time?.trim())
+        .ok()
+        .map(|t| t.timestamp())
+}
 
 /// Whether a listed container is a leftover sandbox to remove at startup.
 /// Age thresholds keep the sweep safe when several gateway instances share
@@ -980,7 +1013,20 @@ impl SandboxExecutor {
                 return 0;
             }
         };
-        let now = chrono::Utc::now().timestamp();
+        // Container `created` timestamps come from the daemon's clock; age
+        // is measured against the daemon's own `SystemTime` (`/info`) so a
+        // skewed gateway clock (or a remote daemon) cannot make a live
+        // container of another instance look old. Fallback: the local
+        // clock, with the thresholds' built-in margin (see
+        // `ORPHAN_*_MIN_AGE_SECS`).
+        let now = match self.docker.info().await {
+            Ok(info) => daemon_now(info.system_time.as_deref()),
+            Err(e) => {
+                tracing::debug!(error = %e, "PTC orphan sweep: docker info failed; using local clock");
+                None
+            }
+        }
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
         let mut removed = 0;
         for c in list {
             let names = c.names.unwrap_or_default();
@@ -1520,6 +1566,25 @@ mod tests {
         let frames = parse_stdout_frames(&mut buf).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].1, payload.len());
+    }
+
+    #[test]
+    fn daemon_clock_parsing() {
+        assert_eq!(
+            daemon_now(Some("2026-11-18T12:00:00.123456789Z")),
+            Some(1_795_003_200)
+        );
+        assert_eq!(
+            daemon_now(Some("2026-11-18T20:00:00.5+08:00")),
+            Some(1_795_003_200)
+        );
+        assert_eq!(daemon_now(Some("")), None);
+        assert_eq!(daemon_now(Some("garbage")), None);
+        assert_eq!(daemon_now(None), None);
+        // A container "created in the future" (skewed clocks) is never old.
+        let n = vec!["/ptc_sandbox_x".to_string()];
+        assert!(!is_orphan_sandbox(&n, "created", 2_000, 1_000));
+        assert!(!is_orphan_sandbox(&n, "created", 1_000 - 599, 1_000));
     }
 
     #[test]

@@ -13,12 +13,17 @@
 //! on our behalf and bypass both layers) **unless** the operator opted in via
 //! `OUTBOUND_PROXY` (see `config::outbound_proxy`). A proxied client keeps
 //! [`check_url_static`] and adds a local DNS pre-check ([`precheck_proxied`]:
-//! a forbidden address rejects, a local resolution failure allows — the proxy
-//! may be the only resolver); the proxy must enforce its own egress ACL.
+//! a forbidden address rejects, a local resolution failure allows public-
+//! looking names only — the proxy may be the only resolver — while
+//! single-label / private-suffix / IP-embedding names are refused, see
+//! [`is_internal_name`]); the proxy must still enforce its own egress ACL.
 //!
 //! Errors that would reveal *why* a destination is refused (the resolved
 //! private address) are returned to callers as the generic
-//! [`DESTINATION_NOT_ALLOWED`]; details are logged server-side.
+//! [`DESTINATION_NOT_ALLOWED`]; details are logged server-side. For
+//! request-supplied URLs ([`validate_url`] / [`safe_get_bytes`]) a local
+//! resolution failure returns the same message, so "internal name exists"
+//! and "does not resolve" are indistinguishable to the caller.
 //!
 //! IP-literal hosts never reach a resolver, so [`check_url_static`] must run
 //! on every URL sent with a guarded client — [`send_guarded`] and
@@ -55,7 +60,60 @@ pub const MAX_REDIRECTS: usize = 5;
 pub const MAX_URL_LEN: usize = 2048;
 
 /// Hostnames that must never be fetched regardless of what they resolve to.
+/// `*.localhost` is blocked too ([`is_blocked_host`]; RFC 6761 loopback).
 const BLOCKED_HOSTS: &[&str] = &["localhost", "metadata.google.internal", "metadata"];
+
+/// `host` (normalized: lowercase, no trailing dot) is blocked on every path.
+fn is_blocked_host(host: &str) -> bool {
+    BLOCKED_HOSTS.contains(&host) || host.ends_with(".localhost")
+}
+
+/// Private-use / internal DNS suffixes. A proxied request for a name under
+/// one of these is refused when the gateway cannot resolve it locally (the
+/// proxy might resolve it to an internal service).
+const INTERNAL_SUFFIXES: &[&str] = &[
+    "localhost",
+    "local",
+    "internal",
+    "corp",
+    "lan",
+    "home",
+    "home.arpa",
+    "intranet",
+    "localdomain",
+    "private",
+];
+
+/// Public wildcard-DNS services that answer with an IP embedded in the name
+/// (`10.0.0.1.nip.io`, `10-0-0-1.sslip.io`, `app.localtest.me` → 127.0.0.1).
+/// They are refused **entirely** when local resolution fails (rather than
+/// parsing the embedded address: the encodings — dotted, dashed, hex,
+/// prefixed — vary per service, and these names have no production use).
+const IP_EMBEDDING_DOMAINS: &[&str] = &[
+    "nip.io",
+    "sslip.io",
+    "xip.io",
+    "traefik.me",
+    "localtest.me",
+    "lvh.me",
+];
+
+fn is_or_under(host: &str, suffix: &str) -> bool {
+    host == suffix
+        || host
+            .strip_suffix(suffix)
+            .is_some_and(|rest| rest.ends_with('.'))
+}
+
+/// Names that must not be handed to an outbound proxy unless the gateway can
+/// resolve (and so check) them itself: single-label names, private-use
+/// suffixes ([`INTERNAL_SUFFIXES`]) and IP-embedding wildcard-DNS services
+/// ([`IP_EMBEDDING_DOMAINS`]). `host` must be normalized.
+pub fn is_internal_name(host: &str) -> bool {
+    !host.contains('.')
+        || INTERNAL_SUFFIXES.iter().any(|s| is_or_under(host, s))
+        || IP_EMBEDDING_DOMAINS.iter().any(|s| is_or_under(host, s))
+}
 
 /// A validated fetch target: the hostname plus the resolved socket addresses
 /// the connection must be pinned to.
@@ -146,7 +204,7 @@ pub fn check_url_static(url: &reqwest::Url) -> Result<(String, Option<IpAddr>), 
     if host.is_empty() {
         return Err("URL has no host".to_string());
     }
-    if BLOCKED_HOSTS.contains(&host.as_str()) {
+    if is_blocked_host(&host) {
         return Err(refused("blocked hostname", &host, None));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -162,6 +220,11 @@ pub fn check_url_static(url: &reqwest::Url) -> Result<(String, Option<IpAddr>), 
 /// blocked hostnames, and any target address in a forbidden range. For
 /// hostnames, resolves DNS and returns the addresses so the caller can pin
 /// the connection to them.
+///
+/// Used for request-supplied URLs (web_fetch, image URLs): a resolution
+/// failure is reported as the same [`DESTINATION_NOT_ALLOWED`] as a forbidden
+/// destination, so a caller cannot tell "internal name exists" from "does not
+/// resolve" (details are logged server-side).
 pub async fn validate_url(url: &reqwest::Url) -> Result<ValidatedTarget, String> {
     let (host, ip) = check_url_static(url)?;
 
@@ -175,12 +238,15 @@ pub async fn validate_url(url: &reqwest::Url) -> Result<ValidatedTarget, String>
 
     // Hostname: resolve and validate every address it maps to.
     let port = url.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|e| format!("Failed to resolve host '{host}': {e}"))?
-        .collect();
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(addrs) => addrs.collect(),
+        Err(e) => {
+            tracing::warn!(host = %host, error = %e, "Guarded fetch refused: resolution failed");
+            return Err(DESTINATION_NOT_ALLOWED.to_string());
+        }
+    };
     if addrs.is_empty() {
-        return Err(format!("Host '{host}' did not resolve to any address"));
+        return Err(refused("resolved to no address", &host, None));
     }
     if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(a.ip())) {
         return Err(refused(
@@ -220,7 +286,7 @@ impl reqwest::dns::Resolve for GuardedResolver {
         let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
         let exempt = self.exempt.contains(&host);
         Box::pin(async move {
-            if !exempt && BLOCKED_HOSTS.contains(&host.as_str()) {
+            if !exempt && is_blocked_host(&host) {
                 return Err(refused("blocked hostname", &host, None).into());
             }
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
@@ -351,8 +417,11 @@ fn build_guarded_client(
 /// Local DNS pre-check for a proxied request (the proxy resolves the name,
 /// so the connect-time guard never sees it): static checks first, then any
 /// forbidden resolved address rejects; a local resolution failure or timeout
-/// allows (in proxy-only networks the gateway often cannot resolve public
-/// names itself).
+/// (or an empty answer) allows **public-looking** names only (in proxy-only
+/// networks the gateway often cannot resolve public names itself) — names the
+/// proxy could map to an internal service ([`is_internal_name`]: single
+/// label, `*.internal` / `*.corp` / …, IP-embedding wildcard DNS) are refused.
+/// Every redirect hop goes through this check ([`send_guarded`]).
 pub async fn precheck_proxied(url: &reqwest::Url) -> Result<(), String> {
     let (host, ip) = check_url_static(url)?;
     if ip.is_some() {
@@ -364,7 +433,7 @@ pub async fn precheck_proxied(url: &reqwest::Url) -> Result<(), String> {
         tokio::net::lookup_host((host.as_str(), port)),
     )
     .await;
-    match lookup {
+    let failure = match lookup {
         Ok(Ok(addrs)) => {
             let addrs: Vec<SocketAddr> = addrs.collect();
             if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(a.ip())) {
@@ -374,17 +443,24 @@ pub async fn precheck_proxied(url: &reqwest::Url) -> Result<(), String> {
                     Some(bad.ip()),
                 ));
             }
-            Ok(())
+            if !addrs.is_empty() {
+                return Ok(());
+            }
+            "no address".to_string()
         }
-        Ok(Err(e)) => {
-            tracing::debug!(host = %host, error = %e, "Local resolution failed; deferring to the outbound proxy");
-            Ok(())
-        }
-        Err(_) => {
-            tracing::debug!(host = %host, "Local resolution timed out; deferring to the outbound proxy");
-            Ok(())
-        }
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => "timed out".to_string(),
+    };
+    if is_internal_name(&host) {
+        tracing::debug!(host = %host, error = %failure, "Local resolution failed for an internal-looking name");
+        return Err(refused(
+            "internal-looking name not resolvable locally (proxied)",
+            &host,
+            None,
+        ));
     }
+    tracing::debug!(host = %host, error = %failure, "Local resolution failed; deferring to the outbound proxy");
+    Ok(())
 }
 
 /// Build `request`, run the static URL check (IP literals, scheme, blocked
@@ -761,6 +837,110 @@ mod tests {
         assert!(precheck_proxied(&url).await.is_ok());
         let url: reqwest::Url = "ftp://example.com/".parse().unwrap();
         assert!(precheck_proxied(&url).await.is_err());
+    }
+
+    #[test]
+    fn internal_name_classification() {
+        for h in [
+            "intranet",
+            "onerouter-test-no-such-host",
+            "wiki.corp",
+            "printer.local",
+            "svc.internal",
+            "nas.lan",
+            "router.home",
+            "x.home.arpa",
+            "home.arpa",
+            "portal.intranet",
+            "db.localdomain",
+            "app.private",
+            "a.localhost",
+            "10.0.0.1.nip.io",
+            "10-0-0-1.sslip.io",
+            "127.0.0.1.xip.io",
+            "app.traefik.me",
+            "x.localtest.me",
+            "lvh.me",
+            "sub.lvh.me",
+        ] {
+            assert!(is_internal_name(h), "{h}");
+        }
+        for h in [
+            "example.com",
+            "does-not-exist.invalid",
+            "corp.example.com",
+            "mycorp.com",
+            "notlvh.me",
+            "localhost.example.com",
+            "home.example",
+        ] {
+            assert!(!is_internal_name(h), "{h}");
+        }
+    }
+
+    #[test]
+    fn subdomains_of_localhost_are_blocked_statically() {
+        for u in [
+            "http://foo.localhost/",
+            "http://a.b.LOCALHOST./x",
+            "https://api.localhost:8443/",
+        ] {
+            let url: reqwest::Url = u.parse().unwrap();
+            assert_eq!(
+                check_url_static(&url).unwrap_err(),
+                DESTINATION_NOT_ALLOWED,
+                "{u}"
+            );
+        }
+        let ok: reqwest::Url = "https://localhost.example.com/".parse().unwrap();
+        assert!(check_url_static(&ok).is_ok());
+    }
+
+    #[tokio::test]
+    async fn guarded_resolver_rejects_localhost_subdomains() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        let r = GuardedResolver::default();
+        for name in ["foo.localhost", "foo.localhost."] {
+            let n = hyper014::client::connect::dns::Name::from_str(name).unwrap();
+            assert!(r.resolve(n).await.is_err(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn proxied_precheck_refuses_unresolvable_internal_names() {
+        // Whatever local DNS does with these (fail, time out, or answer with
+        // a private address), the pre-check must refuse — uniformly.
+        for u in [
+            "http://onerouter-test-no-such-host/",
+            "https://wiki.onerouter-test.corp/",
+            "https://svc.onerouter-test.internal/x",
+            "https://nas.onerouter-test.home.arpa/",
+            "https://x.onerouter-test.localdomain/",
+            "http://10.0.0.1.nip.io/",
+            "http://app.localtest.me/",
+            "http://foo.localhost/",
+        ] {
+            let url: reqwest::Url = u.parse().unwrap();
+            assert_eq!(
+                precheck_proxied(&url).await.unwrap_err(),
+                DESTINATION_NOT_ALLOWED,
+                "{u}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolvable_user_urls_get_the_generic_refusal() {
+        // A non-resolving name and a forbidden destination must read the
+        // same to the caller (no internal-name enumeration oracle).
+        let nx: reqwest::Url = "https://does-not-exist.invalid/x".parse().unwrap();
+        let private: reqwest::Url = "http://10.0.0.1/".parse().unwrap();
+        let a = validate_url(&nx).await.err().unwrap();
+        let b = validate_url(&private).await.err().unwrap();
+        assert_eq!(a, DESTINATION_NOT_ALLOWED);
+        assert_eq!(a, b);
+        assert!(!a.contains("does-not-exist"));
     }
 
     /// Minimal forward proxy: answers every request with 200 "proxied" and

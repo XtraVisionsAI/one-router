@@ -124,7 +124,8 @@ fn sse_error_event(error_type: &str, message: &str) -> Event {
 }
 
 /// Effective domain policies for the two web tools, from the client's
-/// server-tool definitions.
+/// server-tool definitions. Several definitions of the same tool combine to
+/// the most restrictive policy (intersection), never the last one.
 #[derive(Debug, Clone, Default)]
 struct ToolPolicies {
     search: DomainPolicy,
@@ -138,9 +139,13 @@ impl ToolPolicies {
             let name = tool["name"].as_str().unwrap_or("");
             let ty = tool["type"].as_str().unwrap_or("");
             if name == "web_search" || ty.starts_with("web_search_") {
-                out.search = DomainPolicy::from_tool_definition(tool);
+                out.search = out
+                    .search
+                    .intersect(&DomainPolicy::from_tool_definition(tool));
             } else if name == "web_fetch" || ty.starts_with("web_fetch_") {
-                out.fetch = DomainPolicy::from_tool_definition(tool);
+                out.fetch = out
+                    .fetch
+                    .intersect(&DomainPolicy::from_tool_definition(tool));
             }
         }
         out
@@ -999,6 +1004,26 @@ fn extract_bracket_refs(text: &str, max_index: usize, out: &mut Vec<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_tool_definitions_intersect_policies() {
+        let tools = vec![
+            serde_json::json!({"type": "web_fetch_20250910", "name": "web_fetch",
+                "allowed_domains": ["good.com"]}),
+            serde_json::json!({"type": "web_fetch_20250910", "name": "web_fetch"}),
+            serde_json::json!({"type": "web_search_20250305", "name": "web_search",
+                "blocked_domains": ["evil.com"]}),
+            serde_json::json!({"type": "web_search_20250305", "name": "web_search",
+                "allowed_domains": ["evil.com", "ok.com"]}),
+        ];
+        let p = ToolPolicies::from_server_tools(&tools);
+        // The later unrestricted web_fetch definition does not lift the first.
+        assert!(p.fetch.check_url("https://good.com/").is_ok());
+        assert!(p.fetch.check_url("https://other.com/").is_err());
+        // The earlier web_search blocklist survives the later allowlist.
+        assert!(p.search.check_url("https://evil.com/").is_err());
+        assert!(p.search.check_url("https://ok.com/").is_ok());
+    }
 
     #[test]
     fn test_has_server_tools_true() {

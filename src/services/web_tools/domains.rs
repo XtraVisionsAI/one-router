@@ -24,10 +24,18 @@
 //! - an entry may carry a path (`example.com/blog`), which then also has to
 //!   prefix the URL path on a segment boundary;
 //! - entries containing a query / fragment / userinfo / backslash /
-//!   whitespace, or a `*` anywhere but a leading `*.`, are invalid. In the
-//!   client's tool definition that is a 400 ([`validate_tool_definition`]);
-//!   invalid entries from the model's tool input are ignored (an allowlist
-//!   made only of invalid entries matches nothing — fail closed).
+//!   whitespace, or a `*` anywhere but a leading `*.`, are invalid.
+//!
+//! Client tool definition (strict, [`validate_tool_definition`] → 400): each
+//! list must be absent, `null`, or an array of non-blank valid domain
+//! strings — a non-array value or a non-string / blank / malformed entry is
+//! rejected (never read as "unrestricted"). An explicitly empty
+//! `allowed_domains: []` in the client definition means "no allowlist", the
+//! same as omitting it (clients that always send the field keep working; a
+//! client widening its own policy is not an escalation). Model tool input (lenient): invalid / non-string entries
+//! are ignored, but an allowlist that had entries yet none valid matches
+//! nothing — fail closed. Several definitions of the same tool in one
+//! request combine to the most restrictive policy ([`DomainPolicy::intersect`]).
 
 use serde_json::Value;
 
@@ -177,24 +185,20 @@ pub fn domain_matches(host: &str, domain: &str) -> bool {
     DomainFilter::parse(domain).is_ok_and(|d| d.matches_host(&host))
 }
 
-fn string_list(v: &Value) -> Option<Vec<&str>> {
-    v.as_array().map(|a| {
-        a.iter()
-            .filter_map(|x| x.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect()
-    })
-}
-
-/// Parse a list; invalid entries are dropped with a warning (`strict` = error).
-fn parse_list(v: &Value, field: &str, strict: bool) -> Result<Option<Vec<DomainFilter>>, String> {
-    let Some(raw) = string_list(v) else {
-        return Ok(None);
-    };
-    let mut out = Vec::with_capacity(raw.len());
-    for entry in raw {
-        match DomainFilter::parse(entry) {
+/// Parse the entries of a list field (deduplicated). A non-string, blank or
+/// malformed entry is an error when `strict`, else dropped with a warning.
+fn parse_entries<'a>(
+    entries: impl IntoIterator<Item = &'a Value>,
+    field: &str,
+    strict: bool,
+) -> Result<Vec<DomainFilter>, String> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let parsed = match entry.as_str() {
+            Some(s) => DomainFilter::parse(s),
+            None => Err("invalid domain filter: entries must be strings".to_string()),
+        };
+        match parsed {
             Ok(f) => {
                 if !out.contains(&f) {
                     out.push(f);
@@ -204,7 +208,26 @@ fn parse_list(v: &Value, field: &str, strict: bool) -> Result<Option<Vec<DomainF
             Err(e) => tracing::warn!(field, error = %e, "Ignoring invalid domain filter"),
         }
     }
-    Ok(Some(out))
+    Ok(out)
+}
+
+/// Strict shape check of a client tool definition's list field: absent /
+/// `null`, or an array (entries are checked by [`parse_entries`]).
+fn check_shape(v: &Value, field: &str) -> Result<(), String> {
+    match v {
+        Value::Null | Value::Array(_) => Ok(()),
+        _ => Err(format!("{field}: must be an array of domain strings")),
+    }
+}
+
+/// Entries of a model-supplied list field: an array's items, a bare string
+/// as one entry, nothing otherwise.
+fn entries_of(v: &Value) -> Vec<&Value> {
+    match v {
+        Value::Array(a) => a.iter().collect(),
+        Value::String(_) => vec![v],
+        _ => Vec::new(),
+    }
 }
 
 /// Validate the domain filters of a client server-tool definition. Any
@@ -224,49 +247,95 @@ pub struct DomainPolicy {
 }
 
 impl DomainPolicy {
-    /// Policy declared by the client's server-tool definition. An empty
-    /// `allowed_domains` array means "no allowlist". Invalid entries are
-    /// rejected up front by [`validate_tool_definition`]; here they are
-    /// dropped (an allowlist of only invalid entries matches nothing).
+    /// Policy declared by the client's server-tool definition, lenient form
+    /// (used after [`validate_tool_definition`] accepted it). Any present,
+    /// non-`null`, non-empty `allowed_domains` becomes an allowlist layer of
+    /// its valid entries — `[123]`, `[""]` or a non-array value match nothing
+    /// (fail closed, never "unrestricted"); an empty `[]` means "no list".
     pub fn from_tool_definition(tool: &Value) -> Self {
         Self::build(tool, false).unwrap_or_default()
     }
 
-    /// Strict variant: any invalid entry is an error.
+    /// Strict variant (client tool definition → 400): `allowed_domains` /
+    /// `blocked_domains` must be absent, `null`, or an array of non-blank,
+    /// valid domain strings. Empty `allowed_domains: []` / `blocked_domains: []`
+    /// are accepted and mean "no list" (same as omitting the field).
     pub fn try_from_tool_definition(tool: &Value) -> Result<Self, String> {
         Self::build(tool, true)
     }
 
     fn build(tool: &Value, strict: bool) -> Result<Self, String> {
-        let mut policy = Self::default();
-        let raw_allowed = string_list(&tool["allowed_domains"]).unwrap_or_default();
-        if let Some(allowed) = parse_list(&tool["allowed_domains"], "allowed_domains", strict)? {
-            // Non-empty input keeps its layer even if every entry was
-            // invalid: fail closed rather than become unrestricted.
-            if !raw_allowed.is_empty() {
-                policy.allow_layers.push(allowed);
-            }
+        let allowed = &tool["allowed_domains"];
+        let blocked = &tool["blocked_domains"];
+        if strict {
+            check_shape(allowed, "allowed_domains")?;
+            check_shape(blocked, "blocked_domains")?;
         }
-        policy.blocked =
-            parse_list(&tool["blocked_domains"], "blocked_domains", strict)?.unwrap_or_default();
+        // An explicitly empty client allowlist is read as "no allowlist"
+        // (same as omitting it): rejecting it would break clients that always
+        // send the field, and a client widening its *own* policy is not a
+        // privilege escalation. Model input never gets this reading (see
+        // `narrowed_by`), so the model still cannot widen the client's policy.
+        let empty_client_allow = allowed.as_array().is_some_and(Vec::is_empty);
+        let allowed = if empty_client_allow {
+            &Value::Null
+        } else {
+            allowed
+        };
+        let mut policy = Self::default();
+        if !allowed.is_null() {
+            // A present allowlist keeps its layer even when no entry
+            // survived: fail closed rather than become unrestricted.
+            let layer = match allowed {
+                Value::Array(a) => parse_entries(a, "allowed_domains", strict)?,
+                _ => Vec::new(),
+            };
+            policy.allow_layers.push(layer);
+        }
+        if let Value::Array(a) = blocked {
+            policy.blocked = parse_entries(a, "blocked_domains", strict)?;
+        }
         Ok(policy)
     }
 
-    /// Narrow with the model's tool-call input: its allowlist becomes another
-    /// layer (intersection), its blocklist is unioned. Never widens.
-    pub fn narrowed_by(&self, input: &Value) -> Self {
+    /// Most restrictive combination of two policies — used when a request
+    /// carries several definitions of the same web tool: every allowlist
+    /// layer of both must match, and either blocklist refuses.
+    pub fn intersect(&self, other: &Self) -> Self {
         let mut out = self.clone();
-        let raw_allowed = string_list(&input["allowed_domains"]).unwrap_or_default();
-        if let Ok(Some(allowed)) = parse_list(&input["allowed_domains"], "allowed_domains", false) {
-            if !raw_allowed.is_empty() {
-                out.allow_layers.push(allowed);
+        out.allow_layers.extend(other.allow_layers.iter().cloned());
+        for b in &other.blocked {
+            if !out.blocked.contains(b) {
+                out.blocked.push(b.clone());
             }
         }
-        if let Ok(Some(blocked)) = parse_list(&input["blocked_domains"], "blocked_domains", false) {
-            for b in blocked {
-                if !out.blocked.contains(&b) {
-                    out.blocked.push(b);
-                }
+        out
+    }
+
+    /// Narrow with the model's tool-call input: its allowlist becomes another
+    /// layer (intersection), its blocklist is unioned. Never widens. Lenient
+    /// (model input is not a client error): an empty list is a no-op, a bare
+    /// string counts as one entry, invalid / non-string entries are dropped —
+    /// an allowlist that had entries but none valid, or of any other JSON
+    /// type, matches nothing.
+    pub fn narrowed_by(&self, input: &Value) -> Self {
+        let mut out = self.clone();
+        let allowed = &input["allowed_domains"];
+        let empty_array = allowed.as_array().is_some_and(Vec::is_empty);
+        if !allowed.is_null() && !empty_array {
+            let layer =
+                parse_entries(entries_of(allowed), "allowed_domains", false).unwrap_or_default();
+            out.allow_layers.push(layer);
+        }
+        let blocked = parse_entries(
+            entries_of(&input["blocked_domains"]),
+            "blocked_domains",
+            false,
+        )
+        .unwrap_or_default();
+        for b in blocked {
+            if !out.blocked.contains(&b) {
+                out.blocked.push(b);
             }
         }
         out
@@ -459,9 +528,7 @@ mod tests {
         ] {
             assert!(DomainFilter::parse(bad).is_err(), "{bad} must be rejected");
             let tool = json!({"type": "web_fetch_20250910", "allowed_domains": [bad]});
-            if !bad.is_empty() {
-                assert!(validate_tool_definition(&tool).is_err(), "{bad}");
-            }
+            assert!(validate_tool_definition(&tool).is_err(), "{bad}");
         }
         assert!(validate_tool_definition(&json!({
             "allowed_domains": ["good.com", "https://docs.example.com/blog/"],
@@ -559,8 +626,102 @@ mod tests {
     }
 
     #[test]
-    fn empty_client_policy_is_unrestricted_but_model_may_restrict() {
-        let open = DomainPolicy::from_tool_definition(&json!({"allowed_domains": []}));
+    fn strict_definition_rejects_non_string_blank_and_non_array_lists() {
+        for tool in [
+            json!({"allowed_domains": [123]}),
+            json!({"allowed_domains": ["good.com", 123]}),
+            json!({"allowed_domains": ["", " "]}),
+            json!({"allowed_domains": [null]}),
+            json!({"allowed_domains": "good.com"}),
+            json!({"allowed_domains": {"good.com": true}}),
+            json!({"allowed_domains": true}),
+            json!({"blocked_domains": [123]}),
+            json!({"blocked_domains": [" "]}),
+            json!({"blocked_domains": "evil.com"}),
+        ] {
+            let err = validate_tool_definition(&tool).unwrap_err();
+            assert!(
+                err.starts_with("allowed_domains:") || err.starts_with("blocked_domains:"),
+                "{tool}: {err}"
+            );
+        }
+        // Absent / null / empty lists are fine ("no list").
+        for ok in [
+            json!({}),
+            json!({"allowed_domains": null, "blocked_domains": null}),
+            json!({"blocked_domains": []}),
+            json!({"allowed_domains": []}),
+        ] {
+            assert!(validate_tool_definition(&ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn lenient_definition_never_reads_bad_allowlists_as_unrestricted() {
+        for tool in [
+            json!({"allowed_domains": [123]}),
+            json!({"allowed_domains": ["", " "]}),
+            json!({"allowed_domains": "good.com"}),
+        ] {
+            let p = DomainPolicy::from_tool_definition(&tool);
+            assert!(!p.is_unrestricted(), "{tool}");
+            assert!(p.check_url("https://good.com/").is_err(), "{tool}");
+        }
+        // Client `allowed_domains: []` = no allowlist (same as omitted).
+        let p = DomainPolicy::from_tool_definition(&json!({"allowed_domains": []}));
+        assert!(p.is_unrestricted());
+        let p = DomainPolicy::from_tool_definition(&json!({"allowed_domains": null}));
+        assert!(p.is_unrestricted());
+    }
+
+    #[test]
+    fn model_input_non_string_allowlist_fails_closed() {
+        let open = DomainPolicy::default();
+        for input in [
+            json!({"allowed_domains": [123]}),
+            json!({"allowed_domains": [null, " "]}),
+            json!({"allowed_domains": {"a": 1}}),
+            json!({"allowed_domains": 7}),
+        ] {
+            let p = open.narrowed_by(&input);
+            assert!(p.check_url("https://anything.example/").is_err(), "{input}");
+        }
+        // Mixed: the valid entries survive.
+        let p = open.narrowed_by(&json!({"allowed_domains": [1, "good.com"]}));
+        assert!(p.check_url("https://good.com/").is_ok());
+        assert!(p.check_url("https://evil.com/").is_err());
+        // A bare string is one entry; empty list / null is a no-op.
+        let p = open.narrowed_by(&json!({"allowed_domains": "good.com"}));
+        assert!(p.check_url("https://evil.com/").is_err());
+        assert_eq!(open.narrowed_by(&json!({"allowed_domains": null})), open);
+        // Non-string blocklist entries are ignored (cannot widen).
+        let p = open.narrowed_by(&json!({"blocked_domains": [1, "evil.com"]}));
+        assert!(p.check_url("https://evil.com/").is_err());
+        assert!(p.check_url("https://good.com/").is_ok());
+    }
+
+    #[test]
+    fn intersect_is_most_restrictive() {
+        let a = DomainPolicy::from_tool_definition(&json!({"allowed_domains": ["good.com"]}));
+        let b = DomainPolicy::from_tool_definition(&json!({
+            "allowed_domains": ["docs.good.com", "other.com"],
+            "blocked_domains": ["old.docs.good.com"]
+        }));
+        let open = DomainPolicy::default();
+        for p in [a.intersect(&b), b.intersect(&a)] {
+            assert!(p.check_url("https://docs.good.com/").is_ok());
+            assert!(p.check_url("https://good.com/").is_err());
+            assert!(p.check_url("https://other.com/").is_err());
+            assert!(p.check_url("https://old.docs.good.com/").is_err());
+        }
+        // An unrestricted definition never widens a restricted one.
+        assert_eq!(open.intersect(&a), a);
+        assert_eq!(a.intersect(&open), a);
+    }
+
+    #[test]
+    fn absent_client_allowlist_is_unrestricted_but_model_may_restrict() {
+        let open = DomainPolicy::from_tool_definition(&json!({"blocked_domains": []}));
         assert!(open.is_unrestricted());
         assert!(open.check_url("https://anything.example/").is_ok());
         assert_eq!(open.allowed_hint(), None);

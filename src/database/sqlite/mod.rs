@@ -51,6 +51,32 @@ impl SqliteBackend {
         Ok(backend)
     }
 
+    /// Close every pooled connection (tests: flush before inspecting files).
+    #[cfg(test)]
+    pub(crate) async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    /// Open an **existing** database file — never creates the file or its
+    /// directory (`mode=rw`, or `mode=ro` when `read_only`). Used by offline
+    /// tools (`migrate-secrets`) that must not conjure an empty database
+    /// from a mistyped path. A missing file is an error.
+    pub async fn open_existing(path: &str, read_only: bool) -> Result<Self> {
+        if path.is_empty() || path == ":memory:" || !Path::new(path).is_file() {
+            anyhow::bail!("SQLite database file not found: {path}");
+        }
+        let mode = if read_only { "ro" } else { "rw" };
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{path}?mode={mode}"))?
+            .create_if_missing(false)
+            .read_only(read_only);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(if read_only { 1 } else { 5 })
+            .connect_with(options)
+            .await?;
+        tracing::info!(path = %path, read_only, "SQLite backend opened (existing file)");
+        Ok(Self { pool })
+    }
+
     /// Run schema DDL (CREATE TABLE IF NOT EXISTS).
     async fn run_migrations(&self) -> Result<()> {
         // --- api_keys ---

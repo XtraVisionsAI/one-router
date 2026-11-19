@@ -587,6 +587,7 @@ impl GeminiService {
 pub struct GeminiStream {
     response: reqwest::Response,
     buffer: String,
+    utf8: crate::utils::utf8_stream::Utf8StreamDecoder,
 }
 
 impl GeminiStream {
@@ -594,6 +595,7 @@ impl GeminiStream {
         Self {
             response,
             buffer: String::new(),
+            utf8: crate::utils::utf8_stream::Utf8StreamDecoder::new(),
         }
     }
 
@@ -628,9 +630,7 @@ impl GeminiStream {
             // Read more data from the response
             match self.response.chunk().await {
                 Ok(Some(chunk)) => {
-                    if let Ok(text) = String::from_utf8(chunk.to_vec()) {
-                        self.buffer.push_str(&text);
-                    }
+                    self.utf8.push(&chunk, &mut self.buffer);
                 }
                 Ok(None) => {
                     // Stream ended

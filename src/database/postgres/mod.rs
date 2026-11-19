@@ -26,6 +26,20 @@ impl PostgresBackend {
         Ok(Self { pool })
     }
 
+    /// Connect with every session in `default_transaction_read_only` mode, so
+    /// any accidental write fails server-side (offline dry runs).
+    pub async fn new_read_only(url: &str) -> Result<Self> {
+        use std::str::FromStr;
+        let options = sqlx::postgres::PgConnectOptions::from_str(url)?
+            .options([("default_transaction_read_only", "on")]);
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        tracing::info!("PostgreSQL backend connected (read-only)");
+        Ok(Self { pool })
+    }
+
     async fn run_migrations(&self) -> Result<()> {
         migrations::run_ddl(&self.pool).await
     }

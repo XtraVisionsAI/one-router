@@ -13,10 +13,16 @@
 //! for context size), a total byte budget, and per-owner (API key) **and**
 //! per-user byte / entry quotas (an owner or user over quota evicts its own
 //! oldest entries first, so one user with many keys cannot flush others).
-//! Eviction is O(log n) via `seq`-ordered `BTreeMap` indexes. In-memory only —
-//! entries do not survive a restart and are not shared across instances.
+//! Global eviction (store over its entry count / byte budget) is **fair**: it
+//! takes the oldest entry of the *tenant* (user, or the key for ownerless
+//! keys) with the largest current usage (bytes, then entry count, then oldest
+//! entry), so a tenant at or below its fair share is never evicted while a
+//! bigger one exists. Eviction is O(log n) via `seq`-ordered `BTreeMap`
+//! indexes and a `BTreeSet` usage index. In-memory only — entries do not
+//! survive a restart and are not shared across instances.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -135,31 +141,95 @@ struct OwnerUsage {
     order: BTreeMap<u64, String>,
 }
 
+/// Tenant of an entry for global (fair) eviction: the user, or — for keys
+/// without a user (master / ephemeral / legacy) — the key itself. Prefixed so
+/// a user id can never collide with a key hash.
+fn tenant_of(entry: &StoredResponse) -> String {
+    match &entry.user_id {
+        Some(u) => format!("u:{u}"),
+        None => format!("k:{}", entry.owner_key_hash),
+    }
+}
+
+/// Usage-index key: ordered so the **last** element is the tenant to evict
+/// from — most bytes, then most entries, then the oldest entry.
+type UsageKey = (usize, usize, Reverse<u64>, String);
+
 /// Entries plus the indexes that make eviction O(log n).
 #[derive(Default)]
 struct Inner {
     entries: HashMap<String, StoredResponse>,
-    /// seq → response id across all owners, oldest first.
-    order: BTreeMap<u64, String>,
     owners: HashMap<String, OwnerUsage>,
     users: HashMap<String, OwnerUsage>,
+    /// Fair-eviction tenants (see [`tenant_of`]).
+    tenants: HashMap<String, OwnerUsage>,
+    /// One key per tenant in `tenants`, mirroring its current usage.
+    by_usage: BTreeSet<UsageKey>,
     total_bytes: usize,
 }
 
+fn usage_key(tenant: &str, u: &OwnerUsage) -> Option<UsageKey> {
+    let (&oldest, _) = u.order.first_key_value()?;
+    Some((u.bytes, u.order.len(), Reverse(oldest), tenant.to_string()))
+}
+
 impl Inner {
+    /// Apply `f` to a tenant's usage, keeping `by_usage` in step (O(log n)).
+    fn update_tenant(&mut self, tenant: &str, f: impl FnOnce(&mut OwnerUsage)) {
+        let usage = self.tenants.entry(tenant.to_string()).or_default();
+        if let Some(k) = usage_key(tenant, usage) {
+            self.by_usage.remove(&k);
+        }
+        f(usage);
+        match usage_key(tenant, usage) {
+            Some(k) => {
+                self.by_usage.insert(k);
+            }
+            None => {
+                self.tenants.remove(tenant);
+            }
+        }
+    }
+
     fn remove(&mut self, id: &str) -> Option<StoredResponse> {
         let entry = self.entries.remove(id)?;
-        self.order.remove(&entry.seq);
         self.total_bytes -= entry.bytes;
         unaccount(&mut self.owners, &entry.owner_key_hash, &entry);
         if let Some(user) = &entry.user_id {
             unaccount(&mut self.users, user, &entry);
         }
+        self.update_tenant(&tenant_of(&entry), |u| {
+            u.bytes -= entry.bytes;
+            u.order.remove(&entry.seq);
+        });
         Some(entry)
     }
 
-    fn evict_oldest(&mut self) -> bool {
-        match self.order.first_key_value().map(|(_, id)| id.clone()) {
+    /// Fair global eviction: the oldest entry of the tenant with the largest
+    /// usage. `incoming` is the tenant about to insert `incoming_bytes`; it
+    /// competes with its usage *including* the pending entry, so a tenant
+    /// that is itself the biggest pays for its own insert.
+    fn evict_fair(&mut self, incoming: &str, incoming_bytes: usize) -> bool {
+        let Some(top) = self.by_usage.last().cloned() else {
+            return false;
+        };
+        let victim = match self
+            .tenants
+            .get(incoming)
+            .and_then(|u| usage_key(incoming, u))
+        {
+            Some((b, n, oldest, t))
+                if t != top.3 && (b + incoming_bytes, n + 1, oldest) >= (top.0, top.1, top.2) =>
+            {
+                t
+            }
+            _ => top.3,
+        };
+        let id = self
+            .tenants
+            .get(&victim)
+            .and_then(|u| u.order.first_key_value().map(|(_, id)| id.clone()));
+        match id {
             Some(id) => self.remove(&id).is_some(),
             None => false,
         }
@@ -188,7 +258,6 @@ impl Inner {
 
     fn insert(&mut self, id: String, entry: StoredResponse) {
         self.total_bytes += entry.bytes;
-        self.order.insert(entry.seq, id.clone());
         let o = self.owners.entry(entry.owner_key_hash.clone()).or_default();
         o.bytes += entry.bytes;
         o.order.insert(entry.seq, id.clone());
@@ -197,6 +266,12 @@ impl Inner {
             u.bytes += entry.bytes;
             u.order.insert(entry.seq, id.clone());
         }
+        let (bytes, seq) = (entry.bytes, entry.seq);
+        let id_for_tenant = id.clone();
+        self.update_tenant(&tenant_of(&entry), |u| {
+            u.bytes += bytes;
+            u.order.insert(seq, id_for_tenant);
+        });
         self.entries.insert(id, entry);
     }
 }
@@ -250,7 +325,8 @@ impl ResponsesContextStore {
     /// `previous_response_id` naming it gets the normal not-found error.
     /// Otherwise evicts, oldest first: the key owner's own entries while it is
     /// over its quota, then the user's own entries while the user is over its
-    /// quota, then global entries while the store is over capacity / bytes.
+    /// quota, then — while the store is over capacity / bytes — the oldest
+    /// entry of the largest tenant (fair eviction, see the module docs).
     pub async fn save(
         &self,
         response_id: &str,
@@ -310,10 +386,11 @@ impl ResponsesContextStore {
                 }
             }
         }
-        // Global capacity / byte budget.
+        // Global capacity / byte budget: fair across tenants.
+        let tenant = tenant_of(&entry);
         while (inner.entries.len() >= limits.max_entries
             || inner.total_bytes + bytes > limits.max_total_bytes)
-            && inner.evict_oldest()
+            && inner.evict_fair(&tenant, bytes)
         {}
         inner.insert(response_id.to_string(), entry);
         true
@@ -628,7 +705,9 @@ mod tests {
         let inner = store.inner.read().await;
         let sum: usize = inner.entries.values().map(|e| e.bytes).sum();
         assert_eq!(inner.total_bytes, sum);
-        assert_eq!(inner.order.len(), inner.entries.len());
+        let tenant_entries: usize = inner.tenants.values().map(|t| t.order.len()).sum();
+        assert_eq!(tenant_entries, inner.entries.len());
+        assert_eq!(inner.by_usage.len(), inner.tenants.len());
     }
 
     #[tokio::test]
@@ -689,5 +768,108 @@ mod tests {
         let inner = store.inner.read().await;
         assert!(inner.users.is_empty());
         assert!(inner.owners.is_empty());
+        assert!(inner.tenants.is_empty());
+        assert!(inner.by_usage.is_empty());
+    }
+
+    /// Store-wide pressure: per-user quotas are generous, so only global
+    /// eviction runs.
+    fn shared_limits() -> ContextLimits {
+        ContextLimits {
+            max_entries: 1_000,
+            max_entry_bytes: 1_000,
+            max_total_bytes: 10_000,
+            max_owner_bytes: 10_000,
+            max_owner_entries: 1_000,
+            max_user_bytes: 10_000,
+            max_user_entries: 1_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_global_eviction_spares_light_user_under_fair_share() {
+        let store = ResponsesContextStore::with_limits(3600, shared_limits());
+        let light = ContextOwner::new("kl", Some("light".into()));
+        let heavy = ContextOwner::new("kh", Some("heavy".into()));
+        // The light user stores early (globally oldest entries) and stays
+        // well under half the store.
+        for i in 0..3 {
+            assert!(
+                store
+                    .save(&format!("l{i}"), &light, big(900), serde_json::json!({}))
+                    .await
+            );
+        }
+        // The heavy user floods the store many times over.
+        for i in 0..100 {
+            assert!(
+                store
+                    .save(&format!("h{i}"), &heavy, big(900), serde_json::json!({}))
+                    .await
+            );
+        }
+        for i in 0..3 {
+            assert!(store.load(&format!("l{i}"), "kl").await.is_ok(), "l{i}");
+        }
+        assert!(store.load("h99", "kh").await.is_ok());
+        assert!(store.load("h0", "kh").await.is_err());
+        assert!(store.total_bytes().await <= 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_global_eviction_takes_from_largest_user_first() {
+        let store = ResponsesContextStore::with_limits(3600, shared_limits());
+        let a = ContextOwner::new("ka", Some("a".into()));
+        let b = ContextOwner::new("kb", Some("b".into()));
+        let c = ContextOwner::new("kc", None); // ownerless key = its own tenant
+                                               // a: 6 entries, b: 2, c: 1 → 9 × ~950 bytes, near the 10_000 budget.
+        for i in 0..6 {
+            store
+                .save(&format!("a{i}"), &a, big(900), serde_json::json!({}))
+                .await;
+        }
+        for i in 0..2 {
+            store
+                .save(&format!("b{i}"), &b, big(900), serde_json::json!({}))
+                .await;
+        }
+        store.save("c0", &c, big(900), serde_json::json!({})).await;
+        // A new light tenant arrives repeatedly: room is made from "a" only.
+        let d = ContextOwner::new("kd", Some("d".into()));
+        for i in 0..3 {
+            store
+                .save(&format!("d{i}"), &d, big(900), serde_json::json!({}))
+                .await;
+        }
+        assert!(store.load("b0", "kb").await.is_ok());
+        assert!(store.load("b1", "kb").await.is_ok());
+        assert!(store.load("c0", "kc").await.is_ok());
+        assert!(store.load("d0", "kd").await.is_ok());
+        assert!(store.load("a0", "ka").await.is_err());
+        assert!(store.load("a5", "ka").await.is_ok());
+        let inner = store.inner.read().await;
+        assert_eq!(inner.by_usage.len(), inner.tenants.len());
+    }
+
+    #[tokio::test]
+    async fn test_entry_count_cap_is_fair_too() {
+        let limits = ContextLimits {
+            max_entries: 4,
+            ..shared_limits()
+        };
+        let store = ResponsesContextStore::with_limits(3600, limits);
+        let light = ContextOwner::new("kl", Some("light".into()));
+        let heavy = ContextOwner::new("kh", Some("heavy".into()));
+        store
+            .save("l0", &light, msgs(), serde_json::json!({}))
+            .await;
+        for i in 0..10 {
+            store
+                .save(&format!("h{i}"), &heavy, msgs(), serde_json::json!({}))
+                .await;
+        }
+        assert_eq!(store.len().await, 4);
+        assert!(store.load("l0", "kl").await.is_ok());
+        assert!(store.load("h9", "kh").await.is_ok());
     }
 }

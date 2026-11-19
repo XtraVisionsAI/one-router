@@ -356,8 +356,11 @@ mod tests {
         let allowed = DomainPolicy::from_tool_definition(&json!({"allowed_domains": ["good.com"]}));
         assert!(allowed.check_url("https://good.com/page").is_ok());
         assert!(allowed.check_url("https://other.com/page").is_err());
-        let open = DomainPolicy::from_tool_definition(&json!({"allowed_domains": []}));
+        let open = DomainPolicy::from_tool_definition(&json!({"blocked_domains": []}));
         assert!(open.check_url("https://anything.com/").is_ok());
+        // A client's explicit empty allowlist means "no allowlist".
+        let none = DomainPolicy::from_tool_definition(&json!({"allowed_domains": []}));
+        assert!(none.check_url("https://anything.com/").is_ok());
     }
 
     #[tokio::test]

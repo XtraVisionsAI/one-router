@@ -687,21 +687,45 @@ impl BillableUnits {
         }
     }
 
-    /// One query over up to [`RERANK_DOCS_PER_SEARCH_UNIT`] documents is one
-    /// search unit (Cohere / Bedrock rerank billing); a bigger request counts
-    /// as several. At least 1.
-    pub fn rerank(documents: usize) -> Self {
+    /// Rerank search units (Cohere / Bedrock rerank billing): one query over
+    /// up to [`RERANK_DOCS_PER_SEARCH_UNIT`] documents is one search unit, and
+    /// a document whose query + document tokens exceed
+    /// [`RERANK_TOKENS_PER_DOCUMENT_CHUNK`] is split into chunks that each
+    /// count as a document:
+    ///
+    /// `units = ceil(Σᵢ ceil((query_tokens + doc_tokensᵢ) / 500) / 100)`, min 1.
+    ///
+    /// Tokens are estimated with `utils::tokens::estimate_text_tokens`. The
+    /// single source for both the usage recorder and the budget precharge.
+    pub fn rerank<'a>(query: &str, documents: impl IntoIterator<Item = &'a str>) -> Self {
+        use crate::utils::tokens::estimate_text_tokens;
+        let query_tokens = estimate_text_tokens(query);
+        let billed_docs: u64 = documents
+            .into_iter()
+            .map(|d| {
+                (query_tokens + estimate_text_tokens(d))
+                    .div_ceil(RERANK_TOKENS_PER_DOCUMENT_CHUNK)
+                    .max(1)
+            })
+            .sum();
         Self {
             images: 0,
-            search_units: (documents as u64)
-                .div_ceil(RERANK_DOCS_PER_SEARCH_UNIT)
-                .max(1),
+            search_units: billed_docs.div_ceil(RERANK_DOCS_PER_SEARCH_UNIT).max(1),
         }
     }
 }
 
 /// Documents per rerank search unit.
 pub const RERANK_DOCS_PER_SEARCH_UNIT: u64 = 100;
+/// Query + document tokens per billed rerank document; longer documents are
+/// split into several billed chunks.
+pub const RERANK_TOKENS_PER_DOCUMENT_CHUNK: u64 = 500;
+
+/// Test helper: rerank units for `n` short (single-chunk) documents.
+#[cfg(test)]
+pub(crate) fn rerank_short(n: usize) -> BillableUnits {
+    BillableUnits::rerank("q", std::iter::repeat_n("d", n))
+}
 
 /// Whether any of the caller's layers (key, user, team) carries a budget.
 fn has_any_budget(k: &ApiKeyInfo) -> bool {
@@ -808,12 +832,36 @@ mod tests {
             &Usage::new(50_000, 0),
             1.0,
             None,
-            DefaultPricing::Units(BillableUnits::rerank(250)),
+            DefaultPricing::Units(rerank_short(250)),
         );
         assert!(approx(cost, 0.006), "{cost}");
-        assert_eq!(BillableUnits::rerank(0).search_units, 1);
-        assert_eq!(BillableUnits::rerank(100).search_units, 1);
-        assert_eq!(BillableUnits::rerank(101).search_units, 2);
+        assert_eq!(rerank_short(0).search_units, 1);
+        assert_eq!(rerank_short(100).search_units, 1);
+        assert_eq!(rerank_short(101).search_units, 2);
+
+        // Long documents are split into 500-token chunks, each billed as a
+        // document: 60 docs × (≈1200 tokens → 3 chunks) = 180 → 2 units.
+        let long = "x".repeat(4_800); // 1200 tokens
+        let docs: Vec<&str> = vec![long.as_str(); 60];
+        assert_eq!(BillableUnits::rerank("q", docs).search_units, 2);
+        // The query counts toward every document's chunk size: a 300-token
+        // query + 300-token docs = 2 chunks each → 60 docs = 120 → 2 units.
+        let query = "y".repeat(1_200);
+        let doc = "z".repeat(1_200);
+        assert_eq!(
+            BillableUnits::rerank(&query, std::iter::repeat_n(doc.as_str(), 60)).search_units,
+            2
+        );
+        // Exactly 500 tokens is still one chunk; CJK counts ~1 token/char.
+        assert_eq!(
+            BillableUnits::rerank("", ["a".repeat(2_000).as_str()]).search_units,
+            1
+        );
+        let cjk = "中".repeat(501);
+        let docs: Vec<&str> = vec![cjk.as_str(); 50];
+        assert_eq!(BillableUnits::rerank("", docs).search_units, 1);
+        let docs: Vec<&str> = vec![cjk.as_str(); 51];
+        assert_eq!(BillableUnits::rerank("", docs).search_units, 2);
 
         // Unpriced / unmapped non-token request costs 0.
         let units = DefaultPricing::Units(BillableUnits::images(1));
@@ -1210,7 +1258,7 @@ mod non_token_billing_tests {
             "{}",
             f.user_spend().await
         );
-        record("rerank", BillableUnits::rerank(150)).await;
+        record("rerank", rerank_short(150)).await;
         // + 2 search units × 0.002 × 2
         assert!(
             approx(f.user_spend().await, 0.188),

@@ -568,35 +568,55 @@ fn input_to_anthropic_messages(
     messages
 }
 
-/// Build the Anthropic web_search tool definition from the Responses hosted tool,
-/// mapping `filters.allowed_domains` / `filters.blocked_domains` when present.
-fn web_search_tool_def(req: &ResponsesRequest) -> serde_json::Value {
-    let mut tool = serde_json::json!({
-        "type": "web_search_20250305",
-        "name": "web_search",
-    });
-    if let Some(tools) = &req.tools {
-        if let Some(ws) = tools.iter().find(|t| {
-            t.get("type")
-                .and_then(|ty| ty.as_str())
-                .is_some_and(|ty| WEB_SEARCH_TOOL_TYPES.contains(&ty))
-        }) {
-            let filters = ws.get("filters");
-            if let Some(allowed) = filters
-                .and_then(|f| f.get("allowed_domains"))
-                .filter(|v| v.is_array())
-            {
-                tool["allowed_domains"] = allowed.clone();
-            }
-            if let Some(blocked) = filters
-                .and_then(|f| f.get("blocked_domains"))
-                .filter(|v| v.is_array())
-            {
-                tool["blocked_domains"] = blocked.clone();
-            }
+fn hosted_web_search_tools(req: &ResponsesRequest) -> impl Iterator<Item = &serde_json::Value> {
+    req.tools.iter().flatten().filter(|t| {
+        t.get("type")
+            .and_then(|ty| ty.as_str())
+            .is_some_and(|ty| WEB_SEARCH_TOOL_TYPES.contains(&ty))
+    })
+}
+
+/// Reject a hosted web_search tool whose `filters` is present but not an
+/// object (`"x"`, `[]`, …) — it would otherwise be read as "no filters".
+/// The domain lists themselves are validated strictly on the converted tool
+/// (`web_tools::validate_server_tool`).
+pub fn validate_web_search_filters(req: &ResponsesRequest) -> Result<(), String> {
+    for ws in hosted_web_search_tools(req) {
+        match ws.get("filters") {
+            None | Some(serde_json::Value::Null) | Some(serde_json::Value::Object(_)) => {}
+            Some(_) => return Err("web_search filters: must be an object".to_string()),
         }
     }
-    tool
+    Ok(())
+}
+
+/// Build one Anthropic web_search tool definition per Responses hosted
+/// web_search tool, mapping `filters.allowed_domains` / `filters.blocked_domains`.
+/// Several hosted tools become several definitions, which the executor
+/// combines into the most restrictive policy (so a filtered tool cannot be
+/// bypassed by adding an unfiltered one). Filter values are copied verbatim
+/// (any non-null value): `/v1/responses` validates the converted tools
+/// strictly, so a malformed filter is a 400 rather than "unrestricted".
+fn web_search_tool_defs(req: &ResponsesRequest) -> Vec<serde_json::Value> {
+    let mut defs: Vec<serde_json::Value> = hosted_web_search_tools(req)
+        .map(|ws| {
+            let mut tool = serde_json::json!({
+                "type": "web_search_20250305",
+                "name": "web_search",
+            });
+            let filters = ws.get("filters");
+            for field in ["allowed_domains", "blocked_domains"] {
+                if let Some(v) = filters.and_then(|f| f.get(field)).filter(|v| !v.is_null()) {
+                    tool[field] = v.clone();
+                }
+            }
+            tool
+        })
+        .collect();
+    if defs.is_empty() {
+        defs.push(serde_json::json!({"type": "web_search_20250305", "name": "web_search"}));
+    }
+    defs
 }
 
 /// Convert a Responses web_search request into an Anthropic `MessageRequest`
@@ -608,7 +628,7 @@ pub fn responses_to_message_request(
     let messages = input_to_anthropic_messages(&req.input, prev);
     let max_tokens = req.max_output_tokens.unwrap_or(4096);
     let mut message_req = MessageRequest::new(req.model.clone(), messages, max_tokens);
-    message_req.tools = Some(vec![web_search_tool_def(req)]);
+    message_req.tools = Some(web_search_tool_defs(req));
     if let Some(instructions) = &req.instructions {
         if !instructions.is_empty() {
             message_req.system = Some(SystemContent::Text(instructions.clone()));
@@ -1531,6 +1551,60 @@ mod tests {
         assert_eq!(tools[0]["allowed_domains"][0], "weather.gov");
         assert_eq!(tools[0]["blocked_domains"][0], "ads.example");
         assert!(mr.system.is_some());
+    }
+
+    #[test]
+    fn test_malformed_web_search_filters_are_kept_for_strict_validation() {
+        for bad in [
+            serde_json::json!("weather.gov"),
+            serde_json::json!([123]),
+            serde_json::json!({"weather.gov": true}),
+        ] {
+            let mut req = req_with_input(ResponsesInput::Text("q".into()));
+            req.tools = Some(vec![serde_json::json!({
+                "type": "web_search",
+                "filters": {"allowed_domains": bad.clone()}
+            })]);
+            let mr = responses_to_message_request(&req, &[]);
+            let tool = &mr.tools.unwrap()[0];
+            assert_eq!(tool["allowed_domains"], bad);
+            assert!(
+                crate::services::web_tools::validate_server_tool(tool).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_multiple_hosted_web_search_tools_all_converted() {
+        let mut req = req_with_input(ResponsesInput::Text("q".into()));
+        req.tools = Some(vec![
+            serde_json::json!({"type": "web_search"}),
+            serde_json::json!({"type": "web_search", "filters": {"allowed_domains": ["a.com"]}}),
+        ]);
+        let tools = responses_to_message_request(&req, &[]).tools.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1]["allowed_domains"][0], "a.com");
+    }
+
+    #[test]
+    fn test_non_object_web_search_filters_rejected() {
+        for bad in [
+            serde_json::json!("x"),
+            serde_json::json!([]),
+            serde_json::json!(1),
+        ] {
+            let mut req = req_with_input(ResponsesInput::Text("q".into()));
+            req.tools = Some(vec![
+                serde_json::json!({"type": "web_search", "filters": bad}),
+            ]);
+            assert!(validate_web_search_filters(&req).is_err());
+        }
+        let mut req = req_with_input(ResponsesInput::Text("q".into()));
+        req.tools = Some(vec![
+            serde_json::json!({"type": "web_search", "filters": {}}),
+        ]);
+        assert!(validate_web_search_filters(&req).is_ok());
     }
 
     #[test]

@@ -837,6 +837,11 @@ impl BedrockService {
         // Force stream: true in the request
         let mut streaming_request = openai_request.clone();
         streaming_request["stream"] = serde_json::json!(true);
+        // Bedrock's OpenAI-compatible chat endpoint follows the OpenAI schema:
+        // without `stream_options.include_usage` it sends no usage chunk and
+        // the stream could only be billed from an estimate. The client sees
+        // the Anthropic SSE converted below, so the usage chunk never leaks.
+        crate::api::chat_completions::force_include_usage(&mut streaming_request);
 
         let body = serde_json::to_vec(&streaming_request)
             .map_err(|e| BedrockError::Serialization(e.to_string()))?;
@@ -1463,6 +1468,7 @@ fn openai_sse_to_anthropic_sse(
     async_stream::stream! {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let mut buffer = String::new();
+        let mut utf8 = crate::utils::utf8_stream::Utf8StreamDecoder::new();
         // Content blocks are opened lazily with dynamic indexes so a thinking
         // (reasoning) block can precede — or interleave with — the text block.
         let mut next_block_index: usize = 0;
@@ -1473,6 +1479,7 @@ fn openai_sse_to_anthropic_sse(
             std::collections::BTreeMap::new();
         let mut input_tokens: i32 = 0;
         let mut output_tokens: i32 = 0;
+        let mut cached_tokens: i32 = 0;
         let mut stop_reason = "end_turn".to_string();
 
         // Emit message_start
@@ -1502,7 +1509,7 @@ fn openai_sse_to_anthropic_sse(
                     break;
                 }
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            utf8.push(&chunk, &mut buffer);
 
             // Process complete lines from buffer
             while let Some(newline_pos) = buffer.find('\n') {
@@ -1523,10 +1530,16 @@ fn openai_sse_to_anthropic_sse(
                     Err(_) => continue,
                 };
 
-                // Extract usage if present (typically in the last chunk)
-                if let Some(usage) = chunk_json.get("usage") {
+                // Usage arrives in the final (`choices: []`) chunk because the
+                // request forces `include_usage`; other chunks may carry
+                // `usage: null`, which must not reset what was seen.
+                if let Some(usage) = chunk_json.get("usage").filter(|u| u.is_object()) {
                     input_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0) as i32;
                     output_tokens = usage["completion_tokens"].as_i64().unwrap_or(0) as i32;
+                    cached_tokens = usage
+                        .pointer("/prompt_tokens_details/cached_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0) as i32;
                 }
 
                 let choices = match chunk_json["choices"].as_array() {
@@ -1697,8 +1710,13 @@ fn openai_sse_to_anthropic_sse(
         // Populate stream_usage so the outer wrapper can record usage
         if let Some(ref su) = stream_usage {
             let mut u = su.lock().await;
-            u.input_tokens = input_tokens;
+            // OpenAI accounting: prompt_tokens includes cached tokens — bill
+            // them at the cache-read rate instead.
+            u.input_tokens = (input_tokens - cached_tokens).max(0);
             u.output_tokens = output_tokens;
+            if cached_tokens > 0 {
+                u.cache_read_input_tokens = Some(cached_tokens);
+            }
         }
     }
 }
@@ -2122,6 +2140,65 @@ mod tests {
     }
 
     use super::{mantle_http_error, BedrockError, BedrockService, MantleHost};
+
+    /// Run `openai_sse_to_anthropic_sse` over `body` split at `cut` and return
+    /// (concatenated text deltas, recorded stream usage).
+    async fn mantle_chat_stream_text(
+        body: &[u8],
+        cut: usize,
+    ) -> (String, crate::api::messages::StreamUsage) {
+        use axum::response::IntoResponse;
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::copy_from_slice(&body[..cut])),
+            Ok(bytes::Bytes::copy_from_slice(&body[cut..])),
+        ];
+        let usage = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::api::messages::StreamUsage::default(),
+        ));
+        let stream = super::openai_sse_to_anthropic_sse(
+            futures::stream::iter(chunks),
+            "cred".into(),
+            Some(usage.clone()),
+        );
+        let resp = axum::response::Sse::new(stream).into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let out = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut text = String::new();
+        for line in out.lines() {
+            if let Some(d) = line.strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(d) {
+                    if let Some(t) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+        let u = usage.lock().await.clone();
+        (text, u)
+    }
+
+    #[tokio::test]
+    async fn mantle_chat_stream_survives_utf8_split_and_reads_usage_chunk() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好🙂\"}}],\"usage\":null}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":7,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":10}}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes();
+        let start = body.iter().position(|&b| b >= 0x80).unwrap();
+        // Every cut inside (and around) the multibyte run.
+        for cut in start..start + "你好🙂".len() + 1 {
+            let (text, usage) = mantle_chat_stream_text(body, cut).await;
+            assert_eq!(text, "你好🙂", "cut at {cut}");
+            assert_eq!(usage.input_tokens, 30);
+            assert_eq!(usage.output_tokens, 7);
+            assert_eq!(usage.cache_read_input_tokens, Some(10));
+        }
+    }
 
     #[test]
     fn test_ensure_anthropic_beta() {

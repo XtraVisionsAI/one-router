@@ -9,6 +9,7 @@ pub mod retry;
 pub mod string;
 pub mod timeout;
 pub mod tokens;
+pub mod utf8_stream;
 
 pub use retry::{retry, retry_with_backoff, RetryConfig, RetryResult};
 pub use string::{truncate_str, truncate_with_suffix};

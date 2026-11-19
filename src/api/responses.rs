@@ -375,9 +375,19 @@ async fn handle_mantle_responses_passthrough(
             .map_err(|e| OpenAIApiError::from_bedrock_error(&e))?;
         response_json["model"] = serde_json::json!(source_model);
 
-        if let Some(usage) = response_json.get("usage") {
-            record_mantle_responses_usage(state, key_info, request_id, &source_model, usage);
+        // Bill exact usage when upstream reports it, else an estimate — a
+        // usage-less (or `usage: null`) response must not be free.
+        let usage = mantle_usage_or_estimate(&response_json, &upstream);
+        if usage.estimated {
+            tracing::warn!(
+                request_id = %request_id,
+                target_model = %target_model_id,
+                input_tokens = usage.value["input_tokens"].as_i64().unwrap_or(0),
+                output_tokens = usage.value["output_tokens"].as_i64().unwrap_or(0),
+                "Mantle /v1/responses returned no usage; billing an estimate"
+            );
         }
+        record_mantle_responses_usage(state, key_info, request_id, &source_model, &usage.value);
 
         if request.should_store() {
             let response_id = response_json
@@ -446,6 +456,7 @@ fn relay_mantle_responses_sse(
     Box::pin(async_stream::stream! {
         let mut byte_stream = Box::pin(byte_stream);
         let mut buffer = String::new();
+        let mut utf8 = crate::utils::utf8_stream::Utf8StreamDecoder::new();
         let mut completed: Option<serde_json::Value> = None;
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
@@ -455,7 +466,7 @@ fn relay_mantle_responses_sse(
                     break;
                 }
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            utf8.push(&chunk, &mut buffer);
             while let Some(pos) = buffer.find("\n\n") {
                 let frame = buffer[..pos].to_string();
                 buffer.drain(..pos + 2);
@@ -675,6 +686,75 @@ fn extract_output_text(response: &serde_json::Value) -> String {
         }
     }
     out
+}
+
+/// A Responses `usage` object to bill, and whether it was estimated.
+struct MantleUsage {
+    value: serde_json::Value,
+    estimated: bool,
+}
+
+/// The upstream `usage` object if it is one, else an estimate in the same
+/// shape: input from the upstream request (`input` + `instructions`), output
+/// from the response's text, function-call arguments and reasoning summaries.
+fn mantle_usage_or_estimate(
+    response: &serde_json::Value,
+    upstream_request: &serde_json::Value,
+) -> MantleUsage {
+    if let Some(u) = response.get("usage").filter(|u| u.is_object()) {
+        return MantleUsage {
+            value: u.clone(),
+            estimated: false,
+        };
+    }
+    let input: i64 = ["input", "instructions"]
+        .iter()
+        .filter_map(|k| upstream_request.get(*k))
+        .map(|v| crate::services::stream_billing::estimate_json_tokens(v) as i64)
+        .sum();
+    MantleUsage {
+        value: serde_json::json!({
+            "input_tokens": input,
+            "output_tokens": estimate_responses_output_tokens(response),
+        }),
+        estimated: true,
+    }
+}
+
+/// Output-token estimate of a raw Responses response object.
+fn estimate_responses_output_tokens(response: &serde_json::Value) -> i64 {
+    use crate::utils::tokens::estimate_text_tokens;
+    let mut total = estimate_text_tokens(&extract_output_text(response));
+    for item in response
+        .get("output")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("function_call") | Some("custom_tool_call") => {
+                for k in ["name", "arguments", "input"] {
+                    if let Some(s) = item.get(k).and_then(|v| v.as_str()) {
+                        total += estimate_text_tokens(s);
+                    }
+                }
+            }
+            Some("reasoning") => {
+                for part in item
+                    .get("summary")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
+                        total += estimate_text_tokens(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    total.min(i32::MAX as u64) as i64
 }
 
 /// Record usage from a raw Responses `usage` object under the `responses`
@@ -907,6 +987,8 @@ async fn handle_web_search(
         )));
     }
 
+    crate::converters::responses_chat::validate_web_search_filters(request)
+        .map_err(OpenAIApiError::bad_request)?;
     let message_req = responses_to_message_request(request, &prev_stored);
     // Client-supplied `filters.allowed_domains` / `blocked_domains`.
     for tool in message_req.tools.as_deref().unwrap_or(&[]) {
@@ -1372,5 +1454,38 @@ mod tests {
         // Explicit output_text field wins when present.
         let resp = serde_json::json!({"output_text": "direct", "output": []});
         assert_eq!(extract_output_text(&resp), "direct");
+    }
+
+    #[test]
+    fn test_mantle_usage_or_estimate() {
+        let upstream = serde_json::json!({
+            "model": "openai.gpt-5.4",
+            "instructions": "x".repeat(400),
+            "input": [{"role": "user", "content": "y".repeat(800)}],
+        });
+        // Exact usage is passed through.
+        let resp = serde_json::json!({"usage": {"input_tokens": 5, "output_tokens": 6}});
+        let u = mantle_usage_or_estimate(&resp, &upstream);
+        assert!(!u.estimated);
+        assert_eq!(u.value["output_tokens"], 6);
+
+        // Missing or null usage → estimate (never zero for a real exchange).
+        let resp = serde_json::json!({
+            "usage": null,
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "z".repeat(40)}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "w".repeat(400)}]},
+                {"type": "function_call", "name": "shell", "arguments": "{\"cmd\":\"ls -la\"}"},
+            ],
+        });
+        let u = mantle_usage_or_estimate(&resp, &upstream);
+        assert!(u.estimated);
+        // 400/4 + 800/4 (+ role tag) input; 400/4 + 40/4 + args output.
+        assert!(u.value["input_tokens"].as_i64().unwrap() >= 300);
+        let out = u.value["output_tokens"].as_i64().unwrap();
+        assert!(out >= 110, "{out}");
+        let u = mantle_usage_or_estimate(&serde_json::json!({}), &upstream);
+        assert!(u.estimated);
+        assert_eq!(u.value["output_tokens"], 0);
     }
 }

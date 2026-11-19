@@ -55,6 +55,7 @@ import asyncio
 import uuid
 import base64
 import secrets
+import threading
 from typing import Any, Dict, List, Optional
 
 # ── IPC markers ──────────────────────────────────────────────────────
@@ -178,16 +179,44 @@ def _read_tool_result(timeout: float = 300.0) -> Optional[Dict]:
 
 # ── Tool calling ─────────────────────────────────────────────────────
 
-BATCH_WINDOW_MS = 100
+# Batching: the thread that opens a round-trip waits until no new call has
+# arrived for BATCH_QUIET_MS (at most BATCH_MAX_WAIT_MS), so calls issued
+# concurrently from several threads (ThreadPoolExecutor, ...) share one
+# frame.
+BATCH_QUIET_MS = 20
+BATCH_MAX_WAIT_MS = 200
+# Host-side cap on calls per frame (`validate_sandbox_tool_calls`).
+MAX_CALLS_PER_BATCH = 32
+
 
 class ToolCallHandler:
-    """Handles tool calls by writing to stderr and waiting for results on stdin."""
+    """Thread-safe tool calling over the single host channel.
+
+    Invariant (host protocol): exactly one frame per host message — at
+    most one tool-call frame is in flight, and the next one is written
+    only after the host's result message for the previous one was read.
+
+    `call_tool` may be called from any thread. Calls are queued under a
+    lock; when no round-trip is in flight, one caller becomes the leader:
+    it collects the queue into one batch (≤ MAX_CALLS_PER_BATCH; any
+    excess gets an error result), writes one frame, reads one result
+    message and routes the results to their callers by tool_use_id. Calls
+    made while a batch is in flight wait for the next round-trip. Every
+    caller blocks until its own result (or an error) is available — never
+    None for a missing result.
+    """
 
     def __init__(self):
-        self.call_counter = 0
-        self._pending_calls: List[Dict] = []
-        self._last_call_time: Optional[float] = None
-        self._results_cache: Dict[str, Any] = {}
+        self._cond = threading.Condition()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._cond:
+            self.call_counter = 0
+            self._queue: List[Dict] = []
+            self._results: Dict[str, Any] = {}
+            self._in_flight = False
+            self._closed = False
 
     def _generate_id(self) -> str:
         # Random per call (not a per-session counter): ids never repeat
@@ -195,53 +224,111 @@ class ToolCallHandler:
         self.call_counter += 1
         return "toolu_" + secrets.token_hex(12)
 
+    def close_and_drain(self) -> None:
+        """The code block finished: refuse new calls and wait for any
+        round-trip still in flight (a straggler thread), so the output
+        frame is never written while a tool-call frame awaits its reply."""
+        with self._cond:
+            self._closed = True
+            for call in self._queue:
+                self._results[call["tool_use_id"]] = {
+                    "error": "Code execution finished before the tool call was sent"
+                }
+            self._queue = []
+            self._cond.notify_all()
+            while self._in_flight:
+                self._cond.wait()
+
     def request_tool_call(self, name: str, **kwargs) -> Any:
-        """Issue a tool call. Batches with other calls within the batch window."""
-        tool_use_id = self._generate_id()
+        """Issue a tool call; blocks until this call's result arrives."""
+        with self._cond:
+            tool_use_id = self._generate_id()
+            if self._closed:
+                return {"error": "Code execution finished before the tool call was sent"}
+            self._queue.append({"tool_use_id": tool_use_id, "name": name, "input": kwargs})
+            self._cond.notify_all()
+            while True:
+                if tool_use_id in self._results:
+                    return self._results.pop(tool_use_id)
+                if not self._in_flight and self._queue:
+                    self._lead_round_trip()
+                    continue
+                self._cond.wait()
 
-        self._pending_calls.append({
-            "tool_use_id": tool_use_id,
-            "name": name,
-            "input": kwargs,
-        })
-        self._last_call_time = time.monotonic()
-
-        # Wait for the batch window to collect parallel calls
-        time.sleep(BATCH_WINDOW_MS / 1000.0)
-
-        # Check if batch window elapsed
-        elapsed_ms = (time.monotonic() - self._last_call_time) * 1000
-        if elapsed_ms >= BATCH_WINDOW_MS and self._pending_calls:
-            calls = self._pending_calls
-            self._pending_calls = []
-            self._last_call_time = None
-            self._flush_calls(calls)
-
-        return self._results_cache.get(tool_use_id)
-
-    def _flush_calls(self, calls: List[Dict]) -> None:
-        """Write tool calls to stderr and wait for results on stdin."""
-        request = _b64e(json.dumps({"calls": calls}))
-        _write_stderr(f"{IPC_TOOL_CALL_START}{request}{IPC_TOOL_CALL_END}\n")
-
-        # Wait for results
-        ids_needed = {c["tool_use_id"] for c in calls}
-        while not ids_needed.issubset(self._results_cache.keys()):
-            data = _read_tool_result()
-            if data is None:
-                # Timeout or EOF — fill missing with errors
-                for cid in ids_needed:
-                    if cid not in self._results_cache:
-                        self._results_cache[cid] = {"error": "Timeout waiting for tool result"}
+    def _lead_round_trip(self) -> None:
+        """Called with the lock held; releases it while sleeping / doing IO."""
+        self._in_flight = True
+        try:
+            # Collect concurrent callers into this batch.
+            started = time.monotonic()
+            while len(self._queue) < MAX_CALLS_PER_BATCH:
+                seen = len(self._queue)
+                self._cond.release()
+                try:
+                    time.sleep(BATCH_QUIET_MS / 1000.0)
+                finally:
+                    self._cond.acquire()
+                if len(self._queue) == seen:
+                    break
+                if (time.monotonic() - started) * 1000 >= BATCH_MAX_WAIT_MS:
+                    break
+            batch = self._queue[:MAX_CALLS_PER_BATCH]
+            excess = self._queue[MAX_CALLS_PER_BATCH:]
+            self._queue = []
+            for call in excess:
+                self._results[call["tool_use_id"]] = {
+                    "error": f"Too many concurrent tool calls (max {MAX_CALLS_PER_BATCH} per batch)"
+                }
+            self._cond.notify_all()
+            # The code block may have ended while we slept (close_and_drain
+            # errors out and clears the queue): never send an empty frame —
+            # the host treats `{"calls": []}` as invalid and tears the
+            # session down, losing the real output.
+            if not batch or self._closed:
+                for call in batch:
+                    self._results[call["tool_use_id"]] = {"error": "Code execution finished"}
                 return
-            if "results" in data:
-                for r in data["results"]:
-                    rid = r.get("tool_use_id")
-                    if rid:
-                        if r.get("is_error"):
-                            self._results_cache[rid] = {"error": r.get("content", "Tool error")}
-                        else:
-                            self._results_cache[rid] = r.get("content")
+
+            self._cond.release()
+            try:
+                results = self._round_trip(batch)
+            finally:
+                self._cond.acquire()
+            self._results.update(results)
+        finally:
+            self._in_flight = False
+            self._cond.notify_all()
+
+    def _round_trip(self, calls: List[Dict]) -> Dict[str, Any]:
+        """Write one tool-call frame, read one result message (no lock held)."""
+        ids = [c["tool_use_id"] for c in calls]
+        out: Dict[str, Any] = {}
+        try:
+            request = _b64e(json.dumps({"calls": calls}))
+            _write_stderr(f"{IPC_TOOL_CALL_START}{request}{IPC_TOOL_CALL_END}\n")
+            data = _read_tool_result()
+        except Exception as e:  # e.g. non-JSON-serializable tool input
+            data = None
+            for cid in ids:
+                out[cid] = {"error": f"Tool call failed: {e}"}
+            return out
+        if data is None:
+            for cid in ids:
+                out[cid] = {"error": "Timeout waiting for tool result"}
+            return out
+        wanted = set(ids)
+        for r in data.get("results", []) if isinstance(data, dict) else []:
+            rid = r.get("tool_use_id") if isinstance(r, dict) else None
+            if rid not in wanted:
+                continue
+            if r.get("is_error"):
+                out[rid] = {"error": r.get("content", "Tool error")}
+            else:
+                out[rid] = r.get("content")
+        for cid in ids:
+            if cid not in out:
+                out[cid] = {"error": "No tool result received for this call"}
+        return out
 
 
 _handler = ToolCallHandler()
@@ -325,12 +412,12 @@ def main():
             break  # EOF or exit signal
 
         # Reset tool handler state between executions
-        _handler.call_counter = 0
-        _handler._pending_calls = []
-        _handler._last_call_time = None
-        _handler._results_cache = {}
+        _handler.reset()
 
         result = execute_code(code, tools)
+        # Straggler threads must not write a tool-call frame after (or
+        # while) the output frame is written.
+        _handler.close_and_drain()
 
         # Send result to host via stdout
         result_json = _b64e(json.dumps(result))
@@ -414,6 +501,7 @@ mod tests {
         assert!(RUNNER_SCRIPT.contains("import base64"));
         assert!(RUNNER_SCRIPT.contains("_b64e(json.dumps(result))"));
         assert!(RUNNER_SCRIPT.contains("_b64e(json.dumps({\"calls\": calls}))"));
+        assert!(RUNNER_SCRIPT.contains("MAX_CALLS_PER_BATCH = 32"));
         assert!(RUNNER_SCRIPT.contains("json.loads(_b64d(line[start:end]))"));
         assert!(RUNNER_SCRIPT.contains("MAX_CAPTURE_CHARS"));
     }
@@ -425,6 +513,41 @@ mod tests {
         assert!(RUNNER_SCRIPT.contains("import secrets"));
         assert!(RUNNER_SCRIPT.contains(r#"return "toolu_" + secrets.token_hex(12)"#));
         assert!(!RUNNER_SCRIPT.contains("call_counter:012d"));
+    }
+
+    /// Drives the real runner script with a fake host (`testdata/runner_host.py`):
+    /// concurrent calls from 8 threads, nested batches, > 32 concurrent calls,
+    /// missing results, straggler threads — asserting exactly one frame per
+    /// host message and correct result routing. Skipped without `python3`.
+    #[test]
+    fn test_runner_thread_safe_batching_with_python() {
+        let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".into());
+        if std::process::Command::new(&python)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 not available; skipping runner integration test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let runner = dir.path().join("runner.py");
+        let host = dir.path().join("host.py");
+        std::fs::write(&runner, RUNNER_SCRIPT).unwrap();
+        std::fs::write(&host, include_str!("testdata/runner_host.py")).unwrap();
+        let out = std::process::Command::new(&python)
+            .arg("-I")
+            .arg(&host)
+            .arg(&runner)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("ALL OK"),
+            "runner host test failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

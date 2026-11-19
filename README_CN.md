@@ -173,7 +173,7 @@ curl -N http://localhost:8000/v1/responses \
   -d '{"model":"gpt-4o","input":"你好！","stream":true}'
 ```
 
-多轮对话是有状态的：把上一次响应的 `id` 作为 `previous_response_id` 传入即可续接（已存储的响应绑定创建它的 API Key）。上下文仅在内存中保存 1 小时且只保存文本（图片、工具定义不保存）；历史超过 8 MB、或 Key / 用户超出存储配额的轮次仍会正常应答，只是不被存储——以*该*响应续接会返回 not-found（改为把对话作为 `input` 重新发送）。若要让 Codex CLI 接入 One Router，将其 base URL 设为 `http://localhost:8000/v1` 并使用你的 API Key。
+多轮对话是有状态的：把上一次响应的 `id` 作为 `previous_response_id` 传入即可续接（已存储的响应绑定创建它的 API Key）。上下文仅在内存中保存 1 小时且只保存文本（图片、工具定义不保存）；整个存储已满时，优先从占用上下文最多的用户（或无归属用户的 Key）中淘汰，轻量用户的上下文得以保留；历史超过 8 MB、或 Key / 用户超出存储配额的轮次仍会正常应答，只是不被存储——以*该*响应续接会返回 not-found（改为把对话作为 `input` 重新发送）。若要让 Codex CLI 接入 One Router，将其 base URL 设为 `http://localhost:8000/v1` 并使用你的 API Key。
 
 > **Bedrock GPT-5.x：** Bedrock 上的 GPT-5.x 模型只支持 Responses 协议（无 Converse API）。当映射目标为此类模型（`openai.gpt-5*`）时，`/v1/responses` 将原始请求透传到 Bedrock Mantle Responses 端点并原生转发 SSE，`/v1/messages` 与 `/v1/chat/completions` 则通过内置一跳协议转换调用同一模型 —— 包括 Claude Code 的思维签名往返。注意这些模型有区域限制（如 sol 仅 us-east-1/us-east-2），Bedrock 后端凭证的区域必须匹配 —— 可配合后端 `models` 过滤器让 GPT 模型只落到对应区域的后端。
 
@@ -327,7 +327,7 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
 
 ## Admin 管理界面
 
-One Router 内置了一个 Admin 管理界面，访问地址：**`/admin`**。在浏览器中打开，使用 master key 或临时 key（debug 构建）登录。登录后使用 HttpOnly cookie 会话认证，浏览器中不存储任何密钥。登录按客户端地址限流：每 15 分钟最多 10 次失败；达到上限后该地址的尝试直接返回 429，不再校验密钥。部署在反向代理后面时请设置 `TRUSTED_PROXY_CIDRS`，否则所有客户端共用同一个限流桶。
+One Router 内置了一个 Admin 管理界面，访问地址：**`/admin`**。在浏览器中打开，使用 master key 或临时 key（debug 构建）登录。登录后使用 HttpOnly cookie 会话认证，浏览器中不存储任何密钥。登录按客户端地址限流：每 15 分钟最多 10 次失败；达到上限后该地址的尝试直接返回 429，不再校验密钥。部署在反向代理后面时请设置 `TRUSTED_PROXY_CIDRS`，否则所有客户端共用同一个限流桶。通过 `x-api-key` / `Authorization: Bearer` 向 `/admin/api/*` 与 `/metrics` 发送 master key 的请求共用同一组限流桶：只有错误的密钥计数（未携带密钥或携带有效会话 cookie 的请求不计数），正确的密钥只退还自己这一次的计数，不会清空其他客户端的失败记录。主密钥为**强密钥**时（随机生成的明文密钥，或任意 `sha256:` 哈希——`hash-key` 默认拒绝弱密钥，除非加 `--allow-weak`），即使限流桶已满，正确的密钥仍会放行，因此与你共用代理地址的人无法锁住管理界面、脚本调用或 Prometheus 抓取。弱的明文主密钥仍保持严格锁定。
 
 | 页面 | 功能 |
 |---|---|
@@ -361,7 +361,7 @@ One Router 使用环境变量配置基础设施。所有运行时设置存储在
 | `BEDROCK_ALLOWED_PROFILES` | _(未设置=不限)_ | Bedrock 后端允许引用的 AWS profile（逗号分隔）。引用其它 profile 的后端写入时被拒绝、加载时被跳过 |
 | `BEDROCK_ALLOW_DEFAULT_CREDENTIALS` | `true` | 是否允许未配置密钥/profile 的 Bedrock 后端使用主机默认凭证链（环境变量 / 实例角色 / SSO 缓存）。设为 `false` 可防止通过管理 API 借用网关自身身份 |
 | `ADMIN_COOKIE_INSECURE` | _(未设置)_ | 去掉 `admin_session` cookie 的 `Secure` 标志（非 localhost 的纯 HTTP 管理访问）。有 TLS 时不要设置 |
-| `OUTBOUND_PROXY` | `off` | SSRF 防护抓取所用的出站代理：`off` / `env`（使用 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`）/ 显式 `http://` 或 `https://` 代理 URL（可带认证信息，不会写入日志；不支持 SOCKS）。各上游 provider 客户端（Bedrock / Gemini / OpenAI / Anthropic / Tavily / Brave）本就遵循 `HTTPS_PROXY` |
+| `OUTBOUND_PROXY` | `off` | SSRF 防护抓取所用的出站代理：`off` / `env`（使用 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`）/ 显式 `http://` 或 `https://` 代理 URL（可带认证信息，不会写入日志；不支持 SOCKS）/ 不带 scheme 的 `host:port`（必须写端口；`env` 模式下 `HTTPS_PROXY=proxy.corp` 这种不带端口的写法按 curl 的规则视为 `http://proxy.corp:80`）。布尔样式的值（`on`、`true`、`1`、`yes`、`enabled` 等）启动时直接报错 —— 请使用 `env` 或 URL。各上游 provider 客户端（Bedrock / Gemini / OpenAI / Anthropic / Tavily / Brave）本就遵循 `HTTPS_PROXY` |
 | `OUTBOUND_PROXY_SCOPE` | `admin` | `admin`：价格同步、LiteLLM 目录/导入、预算 webhook。`all`：另含 web_fetch 直连抓取与图片 URL 内联（用户提供的 URL — 代理必须拒绝内网地址段） |
 | `PTC_MAX_SESSIONS_PER_USER` | `8` | 单个用户（其全部 key 合计）并发 PTC 会话及动态过滤代码执行上限；超出 → 429 |
 
@@ -383,8 +383,13 @@ OUTBOUND_PROXY=env            # 或 OUTBOUND_PROXY=http://user:pass@proxy.corp:3
 OUTBOUND_PROXY_SCOPE=admin    # 或 all（同时覆盖 web_fetch 与图片 URL）
 ```
 
-走代理的请求仍执行静态 URL 校验（scheme、IP 字面量、禁用主机名）和本地 DNS 预检（解析到
-内网 / 元数据地址 → 拒绝；本地解析失败 → 放行，因为可能只有代理能解析），重定向仍逐跳手动校验。
+走代理的请求仍执行静态 URL 校验（scheme、IP 字面量、禁用主机名，含 `*.localhost`）和本地 DNS
+预检（解析到内网 / 元数据地址 → 拒绝；本地解析失败 → 对公网形态的域名放行，因为可能只有代理能解析，
+但对代理可能解析到内部服务的名字**拒绝**：单标签主机名、`*.local` / `*.internal` / `*.corp` /
+`*.lan` / `*.home` / `*.home.arpa` / `*.intranet` / `*.localdomain` / `*.private`，以及
+`*.nip.io` / `*.sslip.io` / `*.xip.io` / `*.traefik.me` / `*.localtest.me` / `lvh.me` 这类在域名中
+嵌入 IP 的通配 DNS 服务（一律拒绝）），重定向仍逐跳手动校验。对用户提供的 URL，被拒绝的目标与无法
+解析的域名返回同一个通用错误 `destination not allowed`（细节只写入网关日志）。
 `OUTBOUND_PROXY_SCOPE=all` 时**代理是用户 URL 的最后一道防线**，必须拒绝内网目标，例如：
 
 ```
@@ -541,7 +546,7 @@ Bedrock 和 Gemini 仅返回 `b64_json` 格式；OpenAI 透传同时支持 `url`
 |---|---|---|
 | `price_per_request` | 每次调用一次 | `/v1/images/generations`、`/v1/rerank`（token 计费端点忽略此字段） |
 | `price_per_image` | 按实际返回的图像张数 | `/v1/images/generations` |
-| `price_per_search_unit` | 按搜索单元：一次查询最多 100 个文档（101–200 个文档 = 2 个单元） | `/v1/rerank` |
+| `price_per_search_unit` | 按搜索单元：一次查询最多 100 个文档（101–200 个文档 = 2 个单元）；query + 文档超过 500 token 的文档按 500 token 切块，每块计为一个文档（`ceil(Σ ceil((query + 文档ᵢ token) / 500) / 100)`，至少 1，token 为估算值） | `/v1/rerank` |
 
 费用 = token 费用 + 非 token 费用，再乘以调用方的费率（user × team）。图像生成把 prompt 记为输入 token，rerank 把 query + 文档记为输入 token——两者都只按映射自身的输入价计费（不使用默认 token 价兜底）。预置的 Cohere Rerank 3.5 映射为每搜索单元 `$0.002`（Bedrock：每千次查询 $2.00）；图像映射需先设置价格才会产生费用——有预算的 key 调用未定价的图像/rerank 映射时会记录一次警告。`budget_enforcement = precharge` 时，图像请求预扣 `price_per_image × n`（默认 1），rerank 预扣其搜索单元费用。
 
@@ -665,7 +670,7 @@ docker compose --profile dynamodb up
    ```bash
    one-router migrate-secrets
    ```
-   每个变更行输出一行（`backend <name>: v1 → v2`、`setting <key>: plaintext → v2`、`… decrypt failed (skipped)`）以及汇总——绝不输出密钥值。命令是幂等的（"Nothing to migrate"），若有任何行无法解密（`ENCRYPTION_KEY` 错误，或值损坏 / 被复制到其他行）则以非零退出码结束。打开数据库时会执行常规的表结构迁移，但不会写入默认模型映射。
+   每个变更行输出一行（`backend <name>: v1 → v2`、`setting <key>: plaintext → v2`、`… decrypt failed (skipped)`）以及汇总——绝不输出密钥值。命令是幂等的（"Nothing to migrate"），若有任何行无法解密（`ENCRYPTION_KEY` 错误，或值损坏 / 被复制到其他行）则以非零退出码结束。数据库必须已存在（SQLite 路径不存在时直接报错，不会创建空文件）。`--dry-run` 严格只读：以只读方式打开数据库，不执行任何表结构迁移或回填；若表结构过旧无法直接读取，dry run 会说明原因并以非零退出码结束——此时直接执行第 4 步。不带 `--dry-run` 时，命令会先执行与启动时相同的表结构迁移与回填（不写入默认模型映射），再重新加密。（直接启动新版本服务也会迁移表结构，但随后会因旧格式密钥而拒绝启动。）
 5. 启动新版本。
 
 已存储的后端凭证与敏感设置必须是当前的 `encrypted:v2:` 格式：只要仍有明文或旧版 v1 数据，服务就会拒绝启动，并列出受影响的后端名 / 设置键。回滚 = 停机、恢复第 2 步的备份、启动旧版本。
@@ -680,7 +685,7 @@ Docker：`docker run --rm -e DATABASE=… -e ENCRYPTION_KEY=… -v one-router-da
 | `one-router update [--check]` | 检查 / 应用已签名的自更新（裸机） |
 | `one-router migrate-secrets [--dry-run]` | 将明文 / v1 存储密钥重新加密为 v2（需停机） |
 | `one-router reset-master-key [--no-write]` | 生成新主密钥并仅显示一次；`.env` 中只保存其 SHA-256 |
-| `one-router hash-key` | 从 stdin 读取密钥 → `sha256:<hex>`（用于 `MASTER_API_KEY`） |
+| `one-router hash-key [--allow-weak]` | 从 stdin 读取密钥 → `sha256:<hex>`（用于 `MASTER_API_KEY`）；弱密钥默认拒绝，除非加 `--allow-weak` |
 | `one-router wrap-key --provider aws-kms\|vault-transit\|systemd-creds` | 用密钥提供方包装 `ENCRYPTION_KEY` |
 
 ## 开发

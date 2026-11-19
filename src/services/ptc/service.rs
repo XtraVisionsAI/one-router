@@ -670,8 +670,14 @@ impl PtcService {
         let handle = match self.start_runner(&container.id).await {
             Ok(h) => h,
             Err(e) => {
-                guard.disarm();
-                let _ = self.sandbox.stop_and_remove(&container.id).await;
+                // Spawned removal (not cancellable by dropping this future);
+                // disarm only after it completed, so a cancellation while
+                // waiting still leaves the guard to remove the container.
+                if let Ok(Ok(())) =
+                    super::sandbox::spawn_remove(&self.sandbox, container.id.clone()).await
+                {
+                    guard.disarm();
+                }
                 return Err(e);
             }
         };
@@ -769,16 +775,37 @@ impl PtcService {
 
     /// Drop handle + execution state and remove the container. No map lock is
     /// held across the Docker call.
+    ///
+    /// Callers have already removed the session from `sessions`, so nothing
+    /// else would ever remove this container: the whole teardown runs on a
+    /// spawned task (started synchronously, before the first `.await`), and
+    /// dropping the awaiting future (client disconnect) cannot cancel it.
     async fn teardown(&self, session_id: &str, container_id: Option<String>) {
-        if let Some(h) = self.container_handles.write().await.remove(session_id) {
-            h.abort.abort();
-        }
-        self.execution_states.write().await.remove(session_id);
-        if let Some(cid) = container_id {
-            if let Err(e) = self.sandbox.stop_and_remove(&cid).await {
-                tracing::debug!(session_id, error = %e, "PTC container removal failed");
+        let _ = self
+            .spawn_teardown(session_id.to_string(), container_id)
+            .await;
+    }
+
+    /// Spawn [`Self::teardown`]'s work; see there.
+    fn spawn_teardown(
+        &self,
+        session_id: String,
+        container_id: Option<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let handles = Arc::clone(&self.container_handles);
+        let states = Arc::clone(&self.execution_states);
+        let sandbox = Arc::clone(&self.sandbox);
+        tokio::spawn(async move {
+            if let Some(h) = handles.write().await.remove(&session_id) {
+                h.abort.abort();
             }
-        }
+            states.write().await.remove(&session_id);
+            if let Some(cid) = container_id {
+                if let Err(e) = sandbox.stop_and_remove(&cid).await {
+                    tracing::debug!(session_id, error = %e, "PTC container removal failed");
+                }
+            }
+        })
     }
 
     /// Remove a session and clean up its container
@@ -812,9 +839,13 @@ impl PtcService {
                 .collect()
         };
         let count = expired.len();
-        for (session_id, container_id) in expired {
-            self.teardown(&session_id, Some(container_id)).await;
-        }
+        // Spawn every teardown before awaiting any, so cancelling this
+        // future mid-loop cannot strand the not-yet-started ones.
+        let tasks: Vec<_> = expired
+            .into_iter()
+            .map(|(id, cid)| self.spawn_teardown(id, Some(cid)))
+            .collect();
+        futures::future::join_all(tasks).await;
         count
     }
 
@@ -829,9 +860,11 @@ impl PtcService {
                 .collect()
         };
         let count = all.len();
-        for (session_id, container_id) in all {
-            self.teardown(&session_id, Some(container_id)).await;
-        }
+        let tasks: Vec<_> = all
+            .into_iter()
+            .map(|(id, cid)| self.spawn_teardown(id, Some(cid)))
+            .collect();
+        futures::future::join_all(tasks).await;
         count
     }
 

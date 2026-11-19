@@ -331,6 +331,9 @@ if [[ -n "$MASTER_API_KEY" && "$MASTER_API_KEY" != sha256:* ]]; then
     else
         _mk_hex=$(printf '%s' "$MASTER_API_KEY" | shasum -a 256 | cut -d' ' -f1)
     fi
+    if [[ ! "$_mk_hex" =~ ^[0-9a-f]{64}$ ]]; then
+        err "Failed to hash MASTER_API_KEY (sha256sum / shasum produced no digest)"; exit 1
+    fi
     MASTER_API_KEY="sha256:${_mk_hex}"
     unset _mk_hex
     info "MASTER_API_KEY will be deployed as its SHA-256 (log in with the original key)"

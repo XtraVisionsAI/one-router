@@ -27,10 +27,72 @@ const LOGIN_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(15 * 6
 type ThrottleEntry = (u32, std::time::Instant);
 type ThrottleCache = moka::sync::Cache<String, ThrottleEntry>;
 
-/// client address (IPv6 by /64) → attempts in the current window (per instance).
-fn login_throttle() -> &'static ThrottleCache {
-    static T: std::sync::OnceLock<ThrottleCache> = std::sync::OnceLock::new();
-    T.get_or_init(new_throttle_cache)
+/// Per-client admin-auth throttle shared by `POST /admin/api/login` and the
+/// header-key path of `require_admin_key` (`x-api-key` / `Authorization` on
+/// `/admin/api/*` and `/metrics`): both draw from the **same** buckets, so
+/// splitting guesses across the two entry points gains nothing. Cheap to
+/// clone (shared cache). Semantics: see [`reserve_attempt`].
+#[derive(Clone)]
+pub struct AdminThrottle(std::sync::Arc<ThrottleCache>);
+
+/// Outcome of [`AdminThrottle::reserve`].
+pub enum Reservation {
+    /// Slot reserved under this bucket key; verify the key, then call
+    /// [`AdminThrottle::succeeded`] on success (a failure keeps the slot).
+    Allowed(String),
+    /// Bucket full: refuse **without verifying** the key.
+    Throttled,
+}
+
+impl AdminThrottle {
+    /// Fresh, independent throttle (tests).
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(new_throttle_cache()))
+    }
+
+    /// The process-wide instance used by login and admin header auth.
+    pub fn shared() -> Self {
+        static T: std::sync::OnceLock<AdminThrottle> = std::sync::OnceLock::new();
+        T.get_or_init(AdminThrottle::new).clone()
+    }
+
+    /// Reserve one attempt for `client` before verification (IPv6 by /64,
+    /// unknown client → the shared `unknown` bucket).
+    pub fn reserve(&self, client: Option<&str>) -> Reservation {
+        let key = throttle_key(client);
+        match reserve_attempt(&self.0, key.clone()) {
+            Some(_) => Reservation::Allowed(key),
+            None => Reservation::Throttled,
+        }
+    }
+
+    /// A verified key refunds its own slot — only failures accumulate, so a
+    /// correctly keyed client (e.g. Prometheus) never uses up the quota. It
+    /// does **not** clear other attempts in the bucket: behind a shared
+    /// address (proxy without `TRUSTED_PROXY_CIDRS`) a legitimate scraper
+    /// must not reset an attacker's failure count every few seconds.
+    pub fn succeeded(&self, bucket: &str) {
+        self.0
+            .entry(bucket.to_string())
+            .and_compute_with(|existing| match existing.map(|e| e.into_value()) {
+                Some((n, start)) if n > 1 => {
+                    moka::ops::compute::Op::Put((n.min(MAX_LOGIN_FAILURES) - 1, start))
+                }
+                Some(_) => moka::ops::compute::Op::Remove,
+                None => moka::ops::compute::Op::Nop,
+            });
+    }
+
+    /// Seconds a throttled client should wait (`Retry-After`).
+    pub fn retry_after_secs() -> u64 {
+        LOGIN_LOCKOUT.as_secs()
+    }
+}
+
+impl Default for AdminThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn new_throttle_cache() -> ThrottleCache {
@@ -75,7 +137,8 @@ fn throttle_key(client: Option<&str>) -> String {
 ///   correct key from the same bucket also waits out the window.
 /// - Buckets are keyed by the resolved client address. Behind a reverse proxy
 ///   without `TRUSTED_PROXY_CIDRS`, every client shares the proxy's bucket and
-///   anyone can lock admins out for `LOGIN_LOCKOUT`; [`warn_untrusted_proxy`]
+///   anyone can lock admins out for `LOGIN_LOCKOUT` (login and admin
+///   header-key auth alike — they share the buckets); [`warn_untrusted_proxy`]
 ///   logs a one-time warning when that configuration is detected.
 ///
 /// Returns `None` when the bucket is full (attempt refused, not counted).
@@ -95,19 +158,53 @@ fn reserve_attempt(cache: &ThrottleCache, key: String) -> Option<u32> {
     (entry.0 <= MAX_LOGIN_FAILURES).then_some(entry.0)
 }
 
+/// Match `key` against the admin secrets: `Some((actor, strong))`.
+///
+/// `strong` = the matched secret is too strong to brute-force online, so a
+/// correct key may be admitted even while the client's throttle bucket is
+/// full (the "correct-key oracle" a locked bucket otherwise hides is useless
+/// against a high-entropy key). This keeps a shared bucket (all clients
+/// behind a proxy without `TRUSTED_PROXY_CIDRS`) from letting anyone lock out
+/// UI login, header-key API calls and `/metrics` scraping. Strong: a
+/// plaintext master key passing `master_key::is_strong`, any `sha256:` hash
+/// (`hash-key` refuses weak input unless `--allow-weak`; first-run /
+/// `reset-master-key` keys are random), the ephemeral key (random). A weak
+/// plaintext master key keeps the strict lockout.
+pub(crate) fn match_admin_key(
+    key: &str,
+    settings: &crate::config::settings::Settings,
+) -> Option<(&'static str, bool)> {
+    if let Some(mk) = settings.master_api_key.as_deref() {
+        if crate::config::master_key::matches(key, mk) {
+            let strong = crate::config::master_key::is_hashed(mk)
+                || crate::config::master_key::is_strong(mk);
+            return Some(("master", strong));
+        }
+    }
+    if let Some(ek) = settings.ephemeral_api_key.as_deref() {
+        if crate::utils::api_key::secret_eq(key, ek) {
+            return Some(("ephemeral", true));
+        }
+    }
+    None
+}
+
 /// One-time warning: an admin login carried `X-Forwarded-For` but no trusted
 /// proxies are configured, so the header is ignored and every client behind
 /// the proxy shares one throttle bucket (and one audit address).
-fn warn_untrusted_proxy(headers: &HeaderMap, settings: &crate::config::settings::Settings) {
+pub(crate) fn warn_untrusted_proxy(
+    headers: &HeaderMap,
+    settings: &crate::config::settings::Settings,
+) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if settings.trusted_proxy_cidrs.is_empty()
         && headers.contains_key("x-forwarded-for")
         && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
         tracing::warn!(
-            "Admin login received X-Forwarded-For but TRUSTED_PROXY_CIDRS is empty: the header \
-             is ignored, so all clients behind this proxy share one login-throttle bucket \
-             (anyone can trigger a {}-minute admin lockout) and one audit address. Set \
+            "Admin authentication received X-Forwarded-For but TRUSTED_PROXY_CIDRS is empty: the header \
+             is ignored, so all clients behind this proxy share one admin-auth throttle bucket \
+             (anyone can trigger a {}-minute lockout of UI login, header-key API calls and /metrics scraping) and one audit address. Set \
              TRUSTED_PROXY_CIDRS to the proxy's address range.",
             LOGIN_LOCKOUT.as_secs() / 60
         );
@@ -130,12 +227,19 @@ pub async fn login(
     let key = body.key.trim();
     let client = crate::services::audit::meta(connect.map(|c| c.0), &headers, &state.settings).0;
     warn_untrusted_proxy(&headers, &state.settings);
-    let throttle_key = throttle_key(client.as_deref());
+    let throttle = AdminThrottle::shared();
     // Slot reserved before verification (see `reserve_attempt`); a success
     // clears the bucket, so only failures accumulate.
-    if reserve_attempt(login_throttle(), throttle_key.clone()).is_none() {
-        // Throttled attempts are not audited individually (flood protection).
-        return (
+    let reservation = throttle.reserve(client.as_deref());
+    let matched = match_admin_key(key, &state.settings);
+    let throttle_key = match reservation {
+        Reservation::Allowed(k) => Some(k),
+        // Full bucket: only a correct *strong* key gets through (see
+        // `match_admin_key`); everything else is refused unverified-looking.
+        Reservation::Throttled if matches!(matched, Some((_, true))) => None,
+        Reservation::Throttled => {
+            // Throttled attempts are not audited individually (flood protection).
+            return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, LOGIN_LOCKOUT.as_secs().to_string())],
             Json(serde_json::json!({
@@ -143,30 +247,15 @@ pub async fn login(
             })),
         )
             .into_response();
-    }
+        }
+    };
     let audit_state = crate::services::audit::AuditState {
         database: state.database.clone(),
         settings: state.settings.clone(),
     };
     let meta = crate::services::audit::meta(connect.map(|c| c.0), &headers, &state.settings);
 
-    // Verify against master key
-    let is_master = state
-        .settings
-        .master_api_key
-        .as_deref()
-        .map(|mk| crate::config::master_key::matches(key, mk))
-        .unwrap_or(false);
-
-    // Verify against ephemeral key
-    let is_ephemeral = state
-        .settings
-        .ephemeral_api_key
-        .as_deref()
-        .map(|ek| crate::utils::api_key::secret_eq(key, ek))
-        .unwrap_or(false);
-
-    if !is_master && !is_ephemeral {
+    if matched.is_none() {
         crate::services::audit::record_login(&audit_state, meta, "anonymous", false, 401);
         return (
             StatusCode::UNAUTHORIZED,
@@ -178,7 +267,9 @@ pub async fn login(
     }
 
     // Generate session token and store it
-    login_throttle().invalidate(&throttle_key);
+    if let Some(k) = &throttle_key {
+        throttle.succeeded(k);
+    }
     let token = Uuid::new_v4().to_string();
     {
         let mut sessions = state.sessions.write().await;
@@ -188,7 +279,7 @@ pub async fn login(
             crate::server::state::AdminSession::new(),
         );
     }
-    let actor = if is_master { "master" } else { "ephemeral" };
+    let actor = matched.map(|(a, _)| a).unwrap_or("ephemeral");
     crate::services::audit::record_login(&audit_state, meta, actor, true, 200);
 
     // Build Set-Cookie header
