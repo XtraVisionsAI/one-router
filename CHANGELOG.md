@@ -1,3 +1,10 @@
+## v0.35.1 (2026-11-19)
+
+### Fix
+
+- **security**: audit round 3 — admin throttle, read-only dry-run, stream UTF-8, PTC runner
+- **security**: audit round 2 — strict v2 secrets, billing integrity, unit pricing, outbound proxy
+
 ## v0.35.0 (2026-11-18)
 
 ### Feat
