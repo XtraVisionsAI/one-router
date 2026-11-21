@@ -1,3 +1,9 @@
+## v0.36.0 (2026-11-21)
+
+### Feat
+
+- **api**: GET /v1/key self-query, auth error codes, usage budget_period
+
 ## v0.35.1 (2026-11-19)
 
 ### Fix
