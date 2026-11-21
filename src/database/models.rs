@@ -111,6 +111,28 @@ impl BudgetPeriod {
             BudgetPeriod::Daily => now.format("%Y-%m-%d").to_string(),
         }
     }
+
+    /// Start (UTC midnight) of the period after the one containing `now` — the
+    /// instant [`Self::key_at`] changes: the 1st of next month, next ISO-week
+    /// Monday, or tomorrow.
+    pub fn next_start(self, now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        use chrono::{Datelike, Days, Months, NaiveDate};
+        let today = now.date_naive();
+        let next: Option<NaiveDate> = match self {
+            BudgetPeriod::Monthly => today
+                .with_day(1)
+                .and_then(|d| d.checked_add_months(Months::new(1))),
+            BudgetPeriod::Weekly => {
+                let to_monday = 7 - u64::from(today.weekday().num_days_from_monday());
+                today.checked_add_days(Days::new(to_monday))
+            }
+            BudgetPeriod::Daily => today.checked_add_days(Days::new(1)),
+        };
+        // Out of chrono's date range only at the far end of time.
+        next.and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|dt| dt.and_utc())
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    }
 }
 
 /// Spend counters after an atomic increment.
@@ -653,4 +675,40 @@ pub fn explode_tag_rows(
         }
     }
     acc.into_values().collect()
+}
+
+#[cfg(test)]
+mod budget_period_tests {
+    use super::BudgetPeriod;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn next_start_is_where_the_period_key_changes() {
+        // 2026-11-21 is a Saturday; 2026-12-31 a Thursday in ISO week 53.
+        let cases = [
+            (2026, 11, 21, 13, 5),
+            (2026, 12, 31, 23, 59),
+            (2028, 2, 29, 0, 0),
+            (2026, 11, 23, 0, 0), // a Monday at midnight
+        ];
+        for (y, m, d, h, min) in cases {
+            let now = Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap();
+            for p in [
+                BudgetPeriod::Monthly,
+                BudgetPeriod::Weekly,
+                BudgetPeriod::Daily,
+            ] {
+                let next = p.next_start(now);
+                assert!(next > now, "{p:?} {now}");
+                // Same key one second before the boundary, a new key at it.
+                assert_eq!(p.key_at(next - chrono::Duration::seconds(1)), p.key_at(now));
+                assert_ne!(p.key_at(next), p.key_at(now));
+            }
+        }
+        let now = Utc.with_ymd_and_hms(2026, 11, 21, 13, 5, 0).unwrap();
+        let at = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap();
+        assert_eq!(BudgetPeriod::Monthly.next_start(now), at(2026, 12, 1));
+        assert_eq!(BudgetPeriod::Weekly.next_start(now), at(2026, 11, 23));
+        assert_eq!(BudgetPeriod::Daily.next_start(now), at(2026, 11, 22));
+    }
 }

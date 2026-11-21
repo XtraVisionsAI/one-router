@@ -6,6 +6,7 @@ pub mod embeddings;
 pub mod extractors;
 pub mod health;
 pub mod images;
+pub mod key;
 pub mod messages;
 pub mod models;
 pub mod ptc_handler;

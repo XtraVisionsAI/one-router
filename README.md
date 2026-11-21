@@ -304,10 +304,13 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
     "total_cached_tokens": 800,
     "total_cost": 0.45,
     "budget_used_mtd": 4.50,
-    "monthly_budget": 100.0
+    "monthly_budget": 100.0,
+    "budget_period": "monthly"
   }
 }
 ```
+
+`budget_period` (`monthly` / `weekly` / `daily`) is the period `budget_used_mtd` and `monthly_budget` refer to — the field names predate budget periods. With `scope=user` all three describe the key's user.
 
 | Query Param | Values | Description |
 |---|---|---|
@@ -320,6 +323,46 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
 | `start_time` | RFC3339 | **Required** (unless `before_id` provided) |
 | `limit` | 1–1000 (default 100) | Records per page |
 | `before_id` | integer | Cursor for next page (use last record's `id`) |
+
+### Key Status API
+
+`GET /v1/key` lets an API key read its own expiry and current-period budgets — meant for status lines and other clients that poll. It is authenticated by the key itself and is **not** rate limited, never writes a usage row and does not update the key's `last_used_at`.
+
+```bash
+curl "http://localhost:8000/v1/key" -H "x-api-key: sk-or-xxxxxxxx" | jq .
+```
+
+```json
+{
+  "object": "key",
+  "key_id": "a0af1f2d-84ca-4f19-af15-751e22c65b79",
+  "name": "laptop",
+  "key_display": "sk-or-0973••••dafb",
+  "server_time": 1795266233,
+  "expires_at": 1796040000,
+  "expired": false,
+  "rotated": true,
+  "budgets": [
+    { "scope": "key", "period": "monthly", "period_key": "2026-11", "used": 45.6, "budget": 100.0, "exhausted": false, "resets_at": 1796083200 },
+    { "scope": "user", "name": "alice", "period": "weekly", "period_key": "2026-W47", "used": 12.5, "budget": 50.0, "exhausted": false, "resets_at": 1795392000 }
+  ]
+}
+```
+
+- Times are Unix seconds; compute the remaining lifetime against `server_time`. `expires_at: null` = never expires. `rotated: true` = a replacement key was issued and this one only lives until `expires_at`.
+- `budgets` lists the key and user layers (`budget: null` = no budget on that layer) and the team layer **only when the team has a budget**. `used` is the value the gateway's own budget check compares (up to `auth_cache_ttl_secs` old; under `budget_enforcement = precharge` it includes in-flight reservations). `resets_at` is the start of the next period (UTC).
+- A key whose budget is spent still gets `200` here (the layer has `exhausted: true`), while business endpoints answer `403`.
+- An **expired** key gets `200` with `expired: true`, `expires_at`, `rotated` and nothing else (`name` omitted, `budgets` empty). A deactivated key / owner / team or a client outside the IP allowlist is refused as everywhere else.
+
+### Authentication error codes
+
+`401` / `403` responses from API-key authentication carry a stable `error.code` next to the human-readable message, so clients need not match on wording:
+
+```json
+{ "type": "error", "error": { "type": "permission_error", "message": "Budget exceeded for this API key's user.", "code": "budget_exceeded", "scope": "user" } }
+```
+
+`code` is one of `missing_key`, `invalid_key`, `inactive_key`, `expired_key`, `inactive_owner`, `inactive_team`, `budget_exceeded`, `ip_not_allowed` (`internal_error` on a `500`). `budget_exceeded` also carries `scope`: `key` / `user` / `team`.
 
 ## Admin Web UI
 

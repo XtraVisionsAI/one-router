@@ -113,6 +113,9 @@ pub struct UsageTotals {
     pub total_cost: f64,
     pub budget_used_mtd: f64,
     pub monthly_budget: Option<f64>,
+    /// Period `budget_used_mtd` / `monthly_budget` refer to (the field names
+    /// predate periods): `monthly` / `weekly` / `daily`, of the scope's principal.
+    pub budget_period: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,24 +220,27 @@ pub async fn get_usage_summary(
     // key_info already contains budget info (loaded from DB by auth middleware into Extension).
     // Budget of the scope's principal; a counter from an earlier month counts as 0.
     let now = chrono::Utc::now();
-    let (monthly_budget, budget_used_mtd) = match (user_filter, key_info.user.as_ref()) {
-        (Some(_), Some(u)) => (
-            u.monthly_budget,
-            period_spend(
-                u.budget_used_mtd,
-                u.budget_mtd_month.as_deref(),
-                &u.budget_period.key_at(now),
+    let (monthly_budget, budget_used_mtd, budget_period) =
+        match (user_filter, key_info.user.as_ref()) {
+            (Some(_), Some(u)) => (
+                u.monthly_budget,
+                period_spend(
+                    u.budget_used_mtd,
+                    u.budget_mtd_month.as_deref(),
+                    &u.budget_period.key_at(now),
+                ),
+                u.budget_period,
             ),
-        ),
-        _ => (
-            key_info.monthly_budget,
-            period_spend(
-                key_info.budget_used_mtd,
-                key_info.budget_mtd_month.as_deref(),
-                &key_info.budget_period.key_at(now),
+            _ => (
+                key_info.monthly_budget,
+                period_spend(
+                    key_info.budget_used_mtd,
+                    key_info.budget_mtd_month.as_deref(),
+                    &key_info.budget_period.key_at(now),
+                ),
+                key_info.budget_period,
             ),
-        ),
-    };
+        };
 
     let summary = UsageTotals {
         total_requests: rows.iter().map(|r| r.total_requests).sum(),
@@ -244,6 +250,7 @@ pub async fn get_usage_summary(
         total_cost: rows.iter().map(|r| r.total_cost).sum(),
         budget_used_mtd,
         monthly_budget,
+        budget_period: budget_period.as_str(),
     };
 
     let data: Vec<UsageBucket> = rows

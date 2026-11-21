@@ -12,11 +12,12 @@ use axum::{
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api::{
-    admin, chat_completions, embeddings, health, images, messages, models, rerank, responses, usage,
+    admin, chat_completions, embeddings, health, images, key, messages, models, rerank, responses,
+    usage,
 };
 use crate::middleware::{
     admin_auth::{require_admin_key, AdminAuthState},
-    auth::{extract_api_key, require_api_key, AuthState},
+    auth::{extract_api_key, identify_api_key, require_api_key, AuthState},
     model_access::{enforce_model_allowlist, ModelAccessState},
     rate_limit::{rate_limit, RateLimitState},
 };
@@ -139,6 +140,17 @@ pub fn create_router(state: AppState) -> Router {
             auth_state_clone,
             require_api_key,
         ));
+
+    // GET /v1/key — a key reads its own expiry / budgets. Polled by clients, so
+    // it sits outside rate limiting and precharge and has its own auth layer
+    // (an expired key or a spent budget is reported, not refused).
+    let key_routes =
+        Router::new()
+            .route("/key", get(key::get_key))
+            .layer(middleware::from_fn_with_state(
+                auth_state.clone(),
+                identify_api_key,
+            ));
 
     // Admin auth state
     let admin_auth_state = AdminAuthState::new(state.settings.clone(), state.sessions.clone());
@@ -268,6 +280,7 @@ pub fn create_router(state: AppState) -> Router {
         // credentialed requests with custom headers.
         .nest("/v1", anthropic_routes.layer(create_cors_layer()))
         .nest("/v1", openai_routes.layer(create_cors_layer()))
+        .nest("/v1", key_routes.layer(create_cors_layer()))
         .merge(health_routes)
         .merge(metrics_routes)
         // Admin responses (UI, API, login) carry CSP / anti-framing headers;

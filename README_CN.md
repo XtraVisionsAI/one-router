@@ -304,10 +304,13 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
     "total_cached_tokens": 800,
     "total_cost": 0.45,
     "budget_used_mtd": 4.50,
-    "monthly_budget": 100.0
+    "monthly_budget": 100.0,
+    "budget_period": "monthly"
   }
 }
 ```
+
+`budget_period`（`monthly` / `weekly` / `daily`）是 `budget_used_mtd` 与 `monthly_budget` 所属的预算周期——这两个字段名早于预算周期功能。`scope=user` 时三者描述的都是该 Key 的用户。
 
 **`GET /v1/usage` 查询参数：**
 
@@ -324,6 +327,46 @@ curl "http://localhost:8000/v1/usage/records?start_time=2026-03-24T00:00:00Z&lim
 | `start_time` | RFC3339 | **必填**（或提供 `before_id`） |
 | `limit` | 1–1000（默认 100） | 每页记录数 |
 | `before_id` | 整数 | 翻页游标（使用上一页最后一条记录的 `id`） |
+
+### Key 状态查询 API
+
+`GET /v1/key` 让 API Key 查询自己的过期时间和各层当期预算，供状态栏等需要轮询的客户端使用。用被查询的 Key 自身鉴权，**不计入**限流、不写 usage 记录、不更新该 Key 的 `last_used_at`。
+
+```bash
+curl "http://localhost:8000/v1/key" -H "x-api-key: sk-or-xxxxxxxx" | jq .
+```
+
+```json
+{
+  "object": "key",
+  "key_id": "a0af1f2d-84ca-4f19-af15-751e22c65b79",
+  "name": "laptop",
+  "key_display": "sk-or-0973••••dafb",
+  "server_time": 1795266233,
+  "expires_at": 1796040000,
+  "expired": false,
+  "rotated": true,
+  "budgets": [
+    { "scope": "key", "period": "monthly", "period_key": "2026-11", "used": 45.6, "budget": 100.0, "exhausted": false, "resets_at": 1796083200 },
+    { "scope": "user", "name": "alice", "period": "weekly", "period_key": "2026-W47", "used": 12.5, "budget": 50.0, "exhausted": false, "resets_at": 1795392000 }
+  ]
+}
+```
+
+- 时间均为 Unix 秒；剩余有效期请以 `server_time` 为基准计算。`expires_at: null` 表示永不过期。`rotated: true` 表示已签发替换 Key，本 Key 只在 `expires_at` 之前有效。
+- `budgets` 包含 key 层和 user 层（`budget: null` 表示该层未设预算）；team 层**仅在团队设有预算时**返回。`used` 与网关自身预算检查所用的值相同（最多滞后 `auth_cache_ttl_secs`；`budget_enforcement = precharge` 时包含进行中的预扣额）。`resets_at` 是下一个周期的起点（UTC）。
+- 预算已用尽的 Key 在此仍返回 `200`（对应层 `exhausted: true`），业务端点则返回 `403`。
+- **已过期**的 Key 返回 `200`，只包含 `expired: true`、`expires_at`、`rotated`（不含 `name`，`budgets` 为空）。已停用的 Key / 用户 / 团队，以及不在 IP 白名单内的客户端，与其它端点一样被拒绝。
+
+### 鉴权错误码
+
+API Key 鉴权返回的 `401` / `403` 在可读消息之外带有稳定的 `error.code`，客户端无需匹配消息文本：
+
+```json
+{ "type": "error", "error": { "type": "permission_error", "message": "Budget exceeded for this API key's user.", "code": "budget_exceeded", "scope": "user" } }
+```
+
+`code` 取值：`missing_key`、`invalid_key`、`inactive_key`、`expired_key`、`inactive_owner`、`inactive_team`、`budget_exceeded`、`ip_not_allowed`（`500` 时为 `internal_error`）。`budget_exceeded` 另带 `scope`：`key` / `user` / `team`。
 
 ## Admin 管理界面
 

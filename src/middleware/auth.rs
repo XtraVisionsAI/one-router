@@ -383,6 +383,16 @@ pub enum BudgetScope {
     Team,
 }
 
+impl BudgetScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetScope::Key => "key",
+            BudgetScope::User => "user",
+            BudgetScope::Team => "team",
+        }
+    }
+}
+
 // ============================================================================
 // Authentication Errors
 // ============================================================================
@@ -400,11 +410,11 @@ pub enum AuthError {
     InternalError(String),
 }
 
-impl IntoResponse for AuthError {
-    fn into_response(self) -> Response {
-        // Record the auth failure before the match — covers every path. Reason
-        // labels are bounded to the variant names.
-        let reason = match &self {
+impl AuthError {
+    /// Stable machine-readable reason: the `error.code` of the response body
+    /// and the `reason` label of `onerouter_auth_failures_total`.
+    pub fn code(&self) -> &'static str {
+        match self {
             AuthError::MissingApiKey => "missing_key",
             AuthError::InvalidApiKey => "invalid_key",
             AuthError::InactiveKey { .. } => "inactive_key",
@@ -414,8 +424,21 @@ impl IntoResponse for AuthError {
             AuthError::BudgetExceeded(_) => "budget_exceeded",
             AuthError::IpNotAllowed => "ip_not_allowed",
             AuthError::InternalError(_) => "internal_error",
+        }
+    }
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        // Record the auth failure before the match — covers every path. Reason
+        // labels are bounded to the variant names.
+        let code = self.code();
+        crate::observability::metrics::record_auth_failure(code);
+        // Which budget layer refused (`error.scope`), for `budget_exceeded` only.
+        let scope = match &self {
+            AuthError::BudgetExceeded(scope) => Some(scope.as_str()),
+            _ => None,
         };
-        crate::observability::metrics::record_auth_failure(reason);
 
         let (status, error_type, message): (StatusCode, &str, String) = match self {
             AuthError::MissingApiKey => (
@@ -477,8 +500,46 @@ impl IntoResponse for AuthError {
             }
         };
 
-        (status, Json(ErrorResponse::new(error_type, message))).into_response()
+        (status, Json(error_body(error_type, message, code, scope))).into_response()
     }
+}
+
+/// The Anthropic error envelope plus `error.code` (and `error.scope` for a
+/// spent budget), so clients need not match on the message wording.
+fn error_body(
+    error_type: &str,
+    message: String,
+    code: &'static str,
+    scope: Option<&'static str>,
+) -> AuthErrorBody {
+    // `ErrorResponse::new` redacts the message like every client-facing error.
+    let base = ErrorResponse::new(error_type, message);
+    AuthErrorBody {
+        response_type: base.response_type,
+        error: AuthErrorDetail {
+            error_type: base.error.error_type,
+            message: base.error.message,
+            code,
+            scope,
+        },
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AuthErrorBody {
+    #[serde(rename = "type")]
+    response_type: String,
+    error: AuthErrorDetail,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthErrorDetail {
+    #[serde(rename = "type")]
+    error_type: String,
+    message: String,
+    code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'static str>,
 }
 
 // ============================================================================
@@ -544,14 +605,40 @@ pub fn authorize(
     team: Option<&TeamRecord>,
     ctx: &RequestContext,
 ) -> Result<ApiKeyInfo, AuthError> {
-    let now = ctx.now.timestamp();
+    check_revocation(record, user, team, ctx)?;
+    if is_expired(record, ctx.now) {
+        return Err(AuthError::ExpiredKey);
+    }
+    let mut info = ApiKeyInfo::from_db_record(record, user, team);
+    if let Some(scope) = info.exhausted_budget(ctx.now) {
+        return Err(AuthError::BudgetExceeded(scope));
+    }
+    info.tags = merge_tags(
+        &ctx.tags,
+        record.default_tags.as_deref(),
+        user.and_then(|u| u.default_tags.as_deref()),
+    );
+    Ok(info)
+}
+
+fn is_expired(record: &ApiKeyRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
+    record.expires_at.is_some_and(|t| now.timestamp() >= t)
+}
+
+/// The checks an administrator uses to cut a caller off — deactivated key /
+/// owner / team, client address outside an allowlist. Expiry and spent budgets
+/// are not checked here: they are states `GET /v1/key` reports rather than
+/// refuses on.
+fn check_revocation(
+    record: &ApiKeyRecord,
+    user: Option<&UserRecord>,
+    team: Option<&TeamRecord>,
+    ctx: &RequestContext,
+) -> Result<(), AuthError> {
     if !record.is_valid() {
         return Err(AuthError::InactiveKey {
             reason: record.deactivated_reason.clone(),
         });
-    }
-    if record.expires_at.is_some_and(|t| now >= t) {
-        return Err(AuthError::ExpiredKey);
     }
     if user.is_some_and(|u| !u.is_active) {
         return Err(AuthError::InactiveOwner);
@@ -569,16 +656,7 @@ pub fn authorize(
     ) {
         return Err(AuthError::IpNotAllowed);
     }
-    let mut info = ApiKeyInfo::from_db_record(record, user, team);
-    if let Some(scope) = info.exhausted_budget(ctx.now) {
-        return Err(AuthError::BudgetExceeded(scope));
-    }
-    info.tags = merge_tags(
-        &ctx.tags,
-        record.default_tags.as_deref(),
-        user.and_then(|u| u.default_tags.as_deref()),
-    );
-    Ok(info)
+    Ok(())
 }
 
 /// Key + owner for a hash: auth cache first, then storage (result cached).
@@ -658,24 +736,7 @@ pub async fn require_api_key(
         return Err(AuthError::InactiveOwner);
     }
 
-    let peer = request
-        .extensions()
-        .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|c| c.0);
-    let ctx = RequestContext {
-        now: chrono::Utc::now(),
-        client_ip: client_ip(
-            peer,
-            request.headers(),
-            &auth_state.settings.trusted_proxy_cidrs,
-        ),
-        tags: request
-            .headers()
-            .get("x-onerouter-tags")
-            .and_then(|v| v.to_str().ok())
-            .map(parse_request_tags)
-            .unwrap_or_default(),
-    };
+    let ctx = request_context(&auth_state, &request);
     let key_info = authorize(record, user, team, &ctx)?;
 
     // last_used_at, debounced per instance; never blocks the request.
@@ -690,6 +751,83 @@ pub async fn require_api_key(
     }
 
     request.extensions_mut().insert(key_info);
+    Ok(next.run(request).await)
+}
+
+fn request_context(auth_state: &AuthState, request: &Request<Body>) -> RequestContext {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    RequestContext {
+        now: chrono::Utc::now(),
+        client_ip: client_ip(
+            peer,
+            request.headers(),
+            &auth_state.settings.trusted_proxy_cidrs,
+        ),
+        tags: request
+            .headers()
+            .get("x-onerouter-tags")
+            .and_then(|v| v.to_str().ok())
+            .map(parse_request_tags)
+            .unwrap_or_default(),
+    }
+}
+
+/// The caller of `GET /v1/key`, as resolved by [`identify_api_key`].
+#[derive(Clone)]
+pub struct KeyIdentity {
+    pub now: chrono::DateTime<chrono::Utc>,
+    /// Key, owner and team as authentication sees them (same cache); `None`
+    /// for the debug-build ephemeral key.
+    pub principals: Option<Arc<crate::services::auth_cache::Principals>>,
+    /// The key is past `expires_at` — every other endpoint answers 401.
+    pub expired: bool,
+}
+
+/// Authentication for `GET /v1/key` only: the caller proves possession of a
+/// key and gets to read that key's own state. Unlike [`require_api_key`] an
+/// expired key and a spent budget pass (they are what the endpoint reports),
+/// and `last_used_at` is not touched (status polling is not use). Revocation —
+/// deactivated key / owner / team, IP allowlists — is enforced unchanged.
+pub async fn identify_api_key(
+    State(auth_state): State<AuthState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let Some(api_key) = extract_api_key(&request) else {
+        return Err(AuthError::MissingApiKey);
+    };
+    let ctx = request_context(&auth_state, &request);
+
+    if let Some(ref ephemeral_key) = auth_state.settings.ephemeral_api_key {
+        if crate::utils::api_key::secret_eq(&api_key, ephemeral_key) {
+            request.extensions_mut().insert(KeyIdentity {
+                now: ctx.now,
+                principals: None,
+                expired: false,
+            });
+            return Ok(next.run(request).await);
+        }
+    }
+
+    let hashed = hash_key(&api_key, auth_state.settings.encryption_key.as_deref());
+    let Some(entry) = lookup(&auth_state, &hashed).await? else {
+        return Err(AuthError::InvalidApiKey);
+    };
+    let (record, user, team) = (&entry.0, entry.1.as_ref(), entry.2.as_ref());
+    if !record.user_id.is_empty() && user.is_none() {
+        return Err(AuthError::InactiveOwner);
+    }
+    check_revocation(record, user, team, &ctx)?;
+
+    let expired = is_expired(record, ctx.now);
+    request.extensions_mut().insert(KeyIdentity {
+        now: ctx.now,
+        principals: Some(entry),
+        expired,
+    });
     Ok(next.run(request).await)
 }
 
@@ -841,6 +979,70 @@ mod tests {
             authorize(&k, Some(&user()), None, &ctx(0)),
             Err(AuthError::InactiveKey { .. })
         ));
+    }
+
+    #[test]
+    fn revocation_check_passes_expiry_and_spent_budget_only() {
+        // What `identify_api_key` (GET /v1/key) enforces.
+        let mut k = key();
+        k.expires_at = Some(ctx(100).now.timestamp());
+        k.monthly_budget = Some(1.0);
+        k.budget_used_mtd = 2.0;
+        k.budget_mtd_month = Some(MONTH.into());
+        let c = ctx(200);
+        assert!(is_expired(&k, c.now));
+        assert!(!is_expired(&k, ctx(99).now));
+        assert!(check_revocation(&k, Some(&user()), None, &c).is_ok());
+
+        let mut off = k.clone();
+        off.is_active = false;
+        assert!(matches!(
+            check_revocation(&off, Some(&user()), None, &c),
+            Err(AuthError::InactiveKey { .. })
+        ));
+        let mut u = user();
+        u.is_active = false;
+        assert!(matches!(
+            check_revocation(&k, Some(&u), None, &c),
+            Err(AuthError::InactiveOwner)
+        ));
+        let mut team = TeamRecord::new("infra", 0);
+        team.is_active = false;
+        assert!(matches!(
+            check_revocation(&k, Some(&user()), Some(&team), &c),
+            Err(AuthError::InactiveTeam)
+        ));
+        let mut fenced = k.clone();
+        fenced.allowed_cidrs = Some(vec!["192.168.0.0/16".into()]);
+        assert!(matches!(
+            check_revocation(&fenced, Some(&user()), None, &c),
+            Err(AuthError::IpNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn error_body_carries_code_and_budget_scope() {
+        let body = error_body(
+            "permission_error",
+            "Budget exceeded for this API key's user.".into(),
+            AuthError::BudgetExceeded(BudgetScope::User).code(),
+            Some(BudgetScope::User.as_str()),
+        );
+        // Existing fields keep their order; the new ones follow.
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"type":"error","error":{"type":"permission_error","message":"Budget exceeded for this API key's user.","code":"budget_exceeded","scope":"user"}}"#
+        );
+        let body = error_body(
+            "authentication_error",
+            "API key expired.".into(),
+            AuthError::ExpiredKey.code(),
+            None,
+        );
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"type":"error","error":{"type":"authentication_error","message":"API key expired.","code":"expired_key"}}"#
+        );
     }
 
     #[test]
